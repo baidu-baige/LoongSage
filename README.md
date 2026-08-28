@@ -1,7 +1,7 @@
 <div align="center">
 
 <div align="right">
-  <a href="./README_zh.md">中文</a> | <strong>English</strong>
+  <a href="https://baidu-baige.github.io/LoongSage/zh/">中文</a> | <strong>English</strong>
 </div>
 
 # LoongSage: the coda of LLM training
