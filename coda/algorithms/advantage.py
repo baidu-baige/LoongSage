@@ -6,12 +6,15 @@ provides the top-level ``compute_advantages`` dispatcher.
 
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
 
 import torch
 import torch.distributed as dist
 
 from omegaconf import DictConfig
+
+logger = logging.getLogger(__name__)
 
 from coda.utils.types import RolloutBatch
 from coda.algorithms.registry import register_advantage, get_advantage
@@ -78,8 +81,16 @@ def _group_normalize(
     centered = group_rewards - group_rewards.mean(dim=1, keepdim=True)
 
     if divide_std:
-        std = group_rewards.std(dim=1, unbiased=True, keepdim=True)
-        centered = centered / (std + 1e-6)
+        group_size = group_rewards.size(1)
+        if group_size >= 2:
+            std = group_rewards.std(dim=1, unbiased=True, keepdim=True)
+            centered = centered / (std + 1e-6)
+        else:
+            logger.warning(
+                "Skipping std normalization (group_zscore) because "
+                "num_trajectories_per_prompt=%d < 2; falling back to group_mean.",
+                group_size,
+            )
 
     advantages_tensor = torch.empty(len(reward_tensor), dtype=torch.float32)
     advantages_tensor[indices_2d.flatten()] = centered.flatten()
