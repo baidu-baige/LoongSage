@@ -1,0 +1,264 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2040" height="950" viewBox="0 0 2040 950" role="img" aria-labelledby="title desc">
+  <title id="title">Coda TransferMesh Weight Transfer Architecture</title>
+  <desc id="desc">TransferMesh acts as the core channel: Trainer Worker (sender) hands tensors to TransferMesh, which delivers them to SGLang TP Worker (receiver) via same-GPU IPC zero-copy or cross-GPU NCCL broadcast.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#111827"/>
+    </marker>
+    <marker id="arrow-orange" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#f97316"/>
+    </marker>
+    <marker id="arrow-gray" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#6b7280"/>
+    </marker>
+    <filter id="shadow" x="-10%" y="-10%" width="125%" height="130%">
+      <feDropShadow dx="4" dy="5" stdDeviation="5" flood-color="#111827" flood-opacity="0.13"/>
+    </filter>
+    <filter id="box-shadow" x="-8%" y="-8%" width="120%" height="125%">
+      <feDropShadow dx="2" dy="3" stdDeviation="3" flood-color="#111827" flood-opacity="0.18"/>
+    </filter>
+    <style>
+      text { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", Arial, sans-serif; fill: #111827; }
+      .group-title { font-size: 26px; font-weight: 700; }
+      .role-inline { font-size: 18px; font-weight: 700; fill: #4b5563; }
+      .worker-title { font-size: 22px; font-weight: 700; fill: #4b5563; }
+      .section-title { font-size: 18px; font-weight: 700; fill: #c2410c; }
+      .box-title { font-size: 20px; font-weight: 700; }
+      .sub-title { font-size: 16px; font-weight: 700; }
+      .small { font-size: 14px; fill: #4b5563; }
+      .edge-label { font-size: 15px; font-weight: 700; }
+      .legend { font-size: 14px; fill: #4b5563; }
+      .worker-note { font-size: 13px; fill: #6b7280; }
+    </style>
+  </defs>
+
+  <rect width="2040" height="950" fill="#ffffff"/>
+
+  <!-- Legend explaining solid vs dashed convention -->
+  <g>
+    <rect x="60" y="38" width="30" height="16" fill="#fff7ed" stroke="#f97316" stroke-width="2.5"/>
+    <text x="100" y="52" class="legend">TransferMesh core components (solid, primary)</text>
+    <rect x="430" y="38" width="30" height="16" fill="#eef2f7" stroke="#9ca3af" stroke-width="1.5" stroke-dasharray="6 4"/>
+    <text x="470" y="52" class="legend">Worker-side components (dashed, secondary)</text>
+  </g>
+
+  <!-- ============ Trainer Worker (secondary, dashed) ============ -->
+  <rect x="40" y="120" width="240" height="725" fill="#ffffff" stroke="#9ca3af" stroke-width="1.5" stroke-dasharray="8 5" filter="url(#shadow)"/>
+  <text x="160" y="160" text-anchor="middle" class="worker-title">Trainer Worker</text>
+  <text x="160" y="184" text-anchor="middle" class="role-inline">(Sender)</text>
+
+  <!-- Trainer Box 1: Megatron model source -->
+  <rect x="55" y="245" width="210" height="90" rx="10" fill="#eef2f7" stroke="#9ca3af" stroke-width="1.2" stroke-dasharray="5 3" filter="url(#box-shadow)"/>
+  <text x="160" y="277" text-anchor="middle" class="sub-title">Megatron core model</text>
+  <text x="160" y="300" text-anchor="middle" class="small">TP/PP-sharded params</text>
+  <text x="160" y="320" text-anchor="middle" class="small">(weight source)</text>
+
+  <!-- Arrow -->
+  <line x1="160" y1="337" x2="160" y2="373" stroke="#6b7280" stroke-width="1.5" marker-end="url(#arrow-gray)"/>
+
+  <!-- Trainer Box 2: bridge.export_hf_weights (main) -->
+  <rect x="55" y="375" width="210" height="145" rx="10" fill="#eef2f7" stroke="#9ca3af" stroke-width="1.2" stroke-dasharray="5 3" filter="url(#box-shadow)"/>
+  <text x="160" y="407" text-anchor="middle" class="box-title">bridge</text>
+  <text x="160" y="433" text-anchor="middle" class="box-title">.export_hf_weights</text>
+  <text x="160" y="461" text-anchor="middle" class="small">generator: TP/PP shards</text>
+  <text x="160" y="481" text-anchor="middle" class="small">-&gt; HF full tensors</text>
+  <text x="160" y="503" text-anchor="middle" class="small">(yield on demand)</text>
+
+  <!-- Arrow -->
+  <line x1="160" y1="522" x2="160" y2="558" stroke="#6b7280" stroke-width="1.5" marker-end="url(#arrow-gray)"/>
+
+  <!-- Trainer Box 3: send loop -->
+  <rect x="55" y="560" width="210" height="100" rx="10" fill="#eef2f7" stroke="#9ca3af" stroke-width="1.2" stroke-dasharray="5 3" filter="url(#box-shadow)"/>
+  <text x="160" y="590" text-anchor="middle" class="sub-title">send_channel.send()</text>
+  <text x="160" y="616" text-anchor="middle" class="small">iterate the generator,</text>
+  <text x="160" y="638" text-anchor="middle" class="small">hand tensors to Mesh</text>
+
+  <!-- Trainer footer / context -->
+  <line x1="70" y1="690" x2="250" y2="690" stroke="#9ca3af" stroke-width="1" stroke-dasharray="3 3"/>
+  <text x="160" y="710" text-anchor="middle" class="worker-note">Trigger</text>
+  <text x="160" y="732" text-anchor="middle" class="worker-note">at training step boundary,</text>
+  <text x="160" y="754" text-anchor="middle" class="worker-note">initiated by controller</text>
+
+  <!-- ============ TransferMesh (PROMINENT SOLID) ============ -->
+  <rect x="410" y="120" width="1240" height="725" fill="#fff7ed" stroke="#f97316" stroke-width="3" filter="url(#shadow)"/>
+  <text x="1030" y="158" text-anchor="middle" class="group-title" fill="#c2410c">TransferMesh Channel</text>
+  <text x="1030" y="185" text-anchor="middle" class="small">create_channel -&gt; init_groups -&gt; all_gather_object | split same-GPU IPC / cross-GPU NCCL by (ip, gpu_id)</text>
+
+  <!-- === Send Path === -->
+  <rect x="430" y="210" width="330" height="615" rx="12" fill="#ffffff" stroke="#fdba74" stroke-width="1.4" filter="url(#box-shadow)"/>
+  <text x="595" y="240" text-anchor="middle" class="section-title">(1) Send Path</text>
+
+  <rect x="450" y="280" width="290" height="80" rx="10" fill="#d6e5fb" stroke="#668fca" stroke-width="1"/>
+  <text x="595" y="310" text-anchor="middle" class="box-title">send_channel.send</text>
+  <text x="595" y="336" text-anchor="middle" class="small">((name, tensor)) flush once threshold hit</text>
+
+  <rect x="450" y="400" width="290" height="170" rx="12" fill="#fff1c7" stroke="#ddb43f" stroke-width="1"/>
+  <text x="595" y="430" text-anchor="middle" class="box-title">GPU-side bucket (uint8 flat)</text>
+  <rect x="456" y="452" width="42" height="50" rx="4" fill="#d6e5fb" stroke="#668fca" stroke-width="1.5"/>
+  <rect x="502" y="452" width="42" height="50" rx="4" fill="#d6e5fb" stroke="#668fca" stroke-width="1.5"/>
+  <rect x="548" y="452" width="42" height="50" rx="4" fill="#d6e5fb" stroke="#668fca" stroke-width="1.5"/>
+  <rect x="594" y="452" width="42" height="50" rx="4" fill="#d6e5fb" stroke="#668fca" stroke-width="1.5"/>
+  <rect x="640" y="452" width="42" height="50" rx="4" fill="#d6e5fb" stroke="#668fca" stroke-width="1.5"/>
+  <rect x="686" y="452" width="54" height="50" rx="4" fill="#f4d1c0" stroke="#c98060" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="713" y="483" text-anchor="middle" class="small">free</text>
+  <text x="595" y="525" text-anchor="middle" class="small">threshold buffer_size_bytes</text>
+  <text x="595" y="548" text-anchor="middle" class="small">(default 1 GiB, configurable)</text>
+
+  <rect x="450" y="610" width="290" height="80" rx="10" fill="#d9ead3" stroke="#79ad5e" stroke-width="1"/>
+  <text x="595" y="642" text-anchor="middle" class="box-title">_flush_bucket()</text>
+  <text x="595" y="667" text-anchor="middle" class="small">build MetaFrame + dispatch to IPC / NCCL</text>
+
+  <line x1="595" y1="362" x2="595" y2="398" stroke="#111827" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="595" y1="572" x2="595" y2="608" stroke="#111827" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <text x="455" y="722" class="small">- send() flushes when threshold hit</text>
+  <text x="455" y="744" class="small">- bucket size tuned via buffer_size_bytes</text>
+  <text x="455" y="766" class="small">- oversize: max(threshold, tensor_bytes)</text>
+  <text x="455" y="788" class="small">- after flush, dispatch to transport layer</text>
+
+  <!-- === Transport === -->
+  <rect x="800" y="210" width="430" height="615" rx="12" fill="#ffffff" stroke="#fdba74" stroke-width="1.4" filter="url(#box-shadow)"/>
+  <text x="1015" y="240" text-anchor="middle" class="section-title">(2) Transport</text>
+
+  <!-- Three parallel dist process groups -->
+  <rect x="812" y="280" width="130" height="145" rx="10" fill="#ffffff" stroke="#111827" stroke-width="1"/>
+  <text x="877" y="310" text-anchor="middle" class="sub-title">Gloo main</text>
+  <text x="877" y="333" text-anchor="middle" class="small">port</text>
+  <text x="877" y="360" text-anchor="middle" class="small">RankInfo</text>
+  <text x="877" y="382" text-anchor="middle" class="small">all_gather_object</text>
+  <text x="877" y="404" text-anchor="middle" class="small">IPC handle p2p</text>
+
+  <rect x="950" y="280" width="130" height="145" rx="10" fill="#ffffff" stroke="#111827" stroke-width="1"/>
+  <text x="1015" y="310" text-anchor="middle" class="sub-title">NCCL data</text>
+  <text x="1015" y="333" text-anchor="middle" class="small">port+1</text>
+  <text x="1015" y="360" text-anchor="middle" class="small">dist.broadcast</text>
+  <text x="1015" y="382" text-anchor="middle" class="small">broadcast payload</text>
+  <text x="1015" y="404" text-anchor="middle" class="small">cross-GPU only</text>
+
+  <rect x="1088" y="280" width="130" height="145" rx="10" fill="#ffffff" stroke="#111827" stroke-width="1"/>
+  <text x="1153" y="310" text-anchor="middle" class="sub-title">NCCL meta</text>
+  <text x="1153" y="333" text-anchor="middle" class="small">port+2</text>
+  <text x="1153" y="360" text-anchor="middle" class="small" style="font-size:11px">broadcast_object_list</text>
+  <text x="1153" y="382" text-anchor="middle" class="small">carries MetaFrame</text>
+  <text x="1153" y="404" text-anchor="middle" class="small">backend: Gloo</text>
+
+  <!-- Three parallel groups merge into partition_receivers -->
+  <line x1="877" y1="427" x2="877" y2="462" stroke="#111827" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="1015" y1="427" x2="1015" y2="462" stroke="#111827" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="1153" y1="427" x2="1153" y2="462" stroke="#111827" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <rect x="820" y="465" width="390" height="90" rx="12" fill="#fdecee" stroke="#c1416a" stroke-width="1"/>
+  <text x="1015" y="497" text-anchor="middle" class="box-title">partition_receivers</text>
+  <text x="1015" y="521" text-anchor="middle" class="small">lookup by (ip, gpu_id) to pick a path</text>
+  <text x="1015" y="540" text-anchor="middle" class="small">MetaFrame carries tensor_specs / is_end</text>
+
+  <rect x="830" y="630" width="175" height="60" rx="12" fill="#ecfdf5" stroke="#15803d" stroke-width="1.6"/>
+  <text x="917" y="659" text-anchor="middle" class="box-title" fill="#15803d">IPC</text>
+  <text x="917" y="679" text-anchor="middle" class="small" fill="#15803d">same-GPU zero-copy</text>
+
+  <rect x="1025" y="630" width="175" height="60" rx="12" fill="#eff6ff" stroke="#1d4ed8" stroke-width="1.6"/>
+  <text x="1112" y="659" text-anchor="middle" class="box-title" fill="#1d4ed8">NCCL</text>
+  <text x="1112" y="679" text-anchor="middle" class="small" fill="#1d4ed8">cross-GPU broadcast</text>
+
+  <!-- partition_receivers dispatch to IPC / NCCL -->
+  <path d="M1015 557 V590 H917 V628" fill="none" stroke="#111827" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <path d="M1015 557 V590 H1112 V628" fill="none" stroke="#111827" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <text x="835" y="722" class="small">- three dist groups on port / port+1 / port+2</text>
+  <text x="835" y="744" class="small">- Gloo main: swap RankInfo and IPC handles</text>
+  <text x="835" y="766" class="small">- NCCL data: broadcast tensor byte payload</text>
+  <text x="835" y="788" class="small">- meta group: broadcast MetaFrame (is_end / specs)</text>
+
+  <!-- === Recv Path === -->
+  <rect x="1270" y="210" width="360" height="615" rx="12" fill="#ffffff" stroke="#fdba74" stroke-width="1.4" filter="url(#box-shadow)"/>
+  <text x="1450" y="240" text-anchor="middle" class="section-title">(3) Recv Path</text>
+
+  <rect x="1280" y="280" width="340" height="80" rx="10" fill="#d9ead3" stroke="#79ad5e" stroke-width="1"/>
+  <text x="1450" y="310" text-anchor="middle" class="box-title">channel.get_iterator()</text>
+  <text x="1450" y="336" text-anchor="middle" class="small">unpack bucket by TensorSpec</text>
+
+  <rect x="1290" y="420" width="140" height="130" rx="10" fill="#d9ead3" stroke="#79ad5e" stroke-width="1"/>
+  <text x="1360" y="452" text-anchor="middle" class="box-title">_recv_ipc</text>
+  <text x="1360" y="478" text-anchor="middle" class="small">_new_shared_cuda</text>
+  <text x="1360" y="498" text-anchor="middle" class="small">open shared</text>
+  <text x="1360" y="518" text-anchor="middle" class="small">CUDA storage</text>
+
+  <rect x="1470" y="420" width="140" height="130" rx="10" fill="#d9ead3" stroke="#79ad5e" stroke-width="1"/>
+  <text x="1540" y="452" text-anchor="middle" class="box-title">_recv_nccl</text>
+  <text x="1540" y="478" text-anchor="middle" class="small">temp buffer receives</text>
+  <text x="1540" y="498" text-anchor="middle" class="small">dist.broadcast</text>
+  <text x="1540" y="518" text-anchor="middle" class="small">recv payload</text>
+
+  <rect x="1280" y="610" width="340" height="80" rx="10" fill="#fff1c7" stroke="#ddb43f" stroke-width="1"/>
+  <text x="1450" y="642" text-anchor="middle" class="box-title">view(dtype).view(shape).clone()</text>
+  <text x="1450" y="667" text-anchor="middle" class="small">one D2D copy -&gt; independent tensor</text>
+
+  <!-- Recv internal vertical arrows -->
+  <path d="M1450 360 V390 H1360 V418" fill="none" stroke="#111827" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <path d="M1450 360 V390 H1540 V418" fill="none" stroke="#111827" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <path d="M1360 550 V580 H1450 V608" fill="none" stroke="#111827" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <path d="M1540 550 V580 H1450 V608" fill="none" stroke="#111827" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <text x="1315" y="722" class="small">- get_iterator: unpack + clone tensors</text>
+  <text x="1315" y="744" class="small">- IPC: open shared CUDA storage</text>
+  <text x="1315" y="766" class="small">- NCCL: receive broadcast payload</text>
+  <text x="1315" y="788" class="small">- yield in order for Worker to consume</text>
+
+  <!-- Cross-section arrows inside TransferMesh -->
+  <line x1="762" y1="490" x2="798" y2="490" stroke="#f97316" stroke-width="2" marker-end="url(#arrow-orange)"/>
+  <line x1="1232" y1="490" x2="1268" y2="490" stroke="#f97316" stroke-width="2" marker-end="url(#arrow-orange)"/>
+
+  <!-- ============ SGLang TP Worker (secondary, dashed) ============ -->
+  <rect x="1780" y="120" width="240" height="725" fill="#ffffff" stroke="#9ca3af" stroke-width="1.5" stroke-dasharray="8 5" filter="url(#shadow)"/>
+  <text x="1900" y="160" text-anchor="middle" class="worker-title">SGLang TP Worker</text>
+  <text x="1900" y="184" text-anchor="middle" class="role-inline">(Receiver)</text>
+
+  <!-- SGLang Box 1: update_weights_from_channel (aligned center-y=320) -->
+  <rect x="1795" y="245" width="210" height="150" rx="10" fill="#eef2f7" stroke="#9ca3af" stroke-width="1.2" stroke-dasharray="5 3" filter="url(#box-shadow)"/>
+  <text x="1900" y="277" text-anchor="middle" class="box-title">update_weights</text>
+  <text x="1900" y="303" text-anchor="middle" class="box-title">_from_channel</text>
+  <text x="1900" y="330" text-anchor="middle" class="small">runtime entry point</text>
+  <text x="1900" y="352" text-anchor="middle" class="small">_flush_cache() first</text>
+  <text x="1900" y="374" text-anchor="middle" class="small">if not yet flushed</text>
+
+  <!-- Arrow -->
+  <line x1="1900" y1="397" x2="1900" y2="433" stroke="#6b7280" stroke-width="1.5" marker-end="url(#arrow-gray)"/>
+
+  <!-- SGLang Box 2: for-loop consumer -->
+  <rect x="1795" y="435" width="210" height="110" rx="10" fill="#eef2f7" stroke="#9ca3af" stroke-width="1.2" stroke-dasharray="5 3" filter="url(#box-shadow)"/>
+  <text x="1900" y="465" text-anchor="middle" class="sub-title">for (name, tensor) in</text>
+  <text x="1900" y="490" text-anchor="middle" class="small">channel.get_iterator():</text>
+  <text x="1900" y="515" text-anchor="middle" class="small">consume each tensor</text>
+
+  <!-- Arrow -->
+  <line x1="1900" y1="547" x2="1900" y2="585" stroke="#6b7280" stroke-width="1.5" marker-end="url(#arrow-gray)"/>
+
+  <!-- SGLang Box 3: write model weights (aligned center-y=650) -->
+  <rect x="1795" y="587" width="210" height="125" rx="10" fill="#eef2f7" stroke="#9ca3af" stroke-width="1.2" stroke-dasharray="5 3" filter="url(#box-shadow)"/>
+  <text x="1900" y="619" text-anchor="middle" class="box-title">Write model weights</text>
+  <text x="1900" y="647" text-anchor="middle" class="small">SGLang internal load</text>
+  <text x="1900" y="667" text-anchor="middle" class="small">(name, tensor)</text>
+  <text x="1900" y="692" text-anchor="middle" class="small">applied in SGLang runtime</text>
+
+  <!-- SGLang footer / context -->
+  <line x1="1800" y1="735" x2="2000" y2="735" stroke="#9ca3af" stroke-width="1" stroke-dasharray="3 3"/>
+  <text x="1900" y="755" text-anchor="middle" class="worker-note">Trigger</text>
+  <text x="1900" y="777" text-anchor="middle" class="worker-note">at rollout start or before</text>
+  <text x="1900" y="799" text-anchor="middle" class="worker-note">switching served model</text>
+
+  <!-- ============ Inter-column arrows (unified style: solid, same color, same weight) ============ -->
+  <!-- (1) Trainer send loop -> TM send_channel.send (L-shape) -->
+  <path d="M265 610 L360 610 L360 320 L448 320" fill="none" stroke="#111827" stroke-width="1.8" marker-end="url(#arrow)"/>
+  <text x="345" y="275" text-anchor="middle" class="edge-label">(1) tensors in</text>
+
+  <!-- (2) SGLang update -> TM channel.get_iterator (straight) -->
+  <path d="M1793 320 L1622 320" fill="none" stroke="#111827" stroke-width="1.8" marker-end="url(#arrow)"/>
+  <text x="1708" y="275" text-anchor="middle" class="edge-label">(2) call iterator</text>
+
+  <!-- (3) TM payload.view.clone -> SGLang write model weights (straight) -->
+  <path d="M1622 650 L1793 650" fill="none" stroke="#111827" stroke-width="1.8" marker-end="url(#arrow)"/>
+  <text x="1708" y="595" text-anchor="middle" class="edge-label">(3) tensors out</text>
+
+  <!-- Footer -->
+  <text x="1020" y="900" text-anchor="middle" class="small">Data flow: Trainer hands tensors -&gt; TransferMesh handles buffering / group mgmt / path selection / copy -&gt; SGLang consumes and writes.</text>
+</svg>

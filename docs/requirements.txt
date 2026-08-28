@@ -1,0 +1,15 @@
+# Documentation toolchain (independent from coda's runtime deps: Sphinx only
+# converts Markdown to HTML, it never imports coda, so no torch / Megatron here).
+#
+# Versions are pinned on purpose: sphinx-book-theme / pydata-sphinx-theme change
+# their DOM between minor releases, and _static/js/lang-toggle.js hooks onto
+# concrete class names of the article header.
+sphinx==9.1.0
+myst-parser==5.1.0
+sphinx-book-theme==1.4.0
+sphinx-copybutton==0.5.2
+sphinx-autobuild==2025.8.25
+# Sphinx's Chinese search language needs jieba to segment CJK text. Without it
+# the zh search index contains zero Han tokens, i.e. Chinese full-text search
+# silently returns nothing.
+jieba==0.42.1

@@ -1,0 +1,64 @@
+# @package _global_
+# Qwen3-30B-A3B GSM8K on a single 8-GPU H20 node (colocated rollout + training).
+#
+# 1. Download the model and dataset:
+#      hf download Qwen/Qwen3-30B-A3B --local-dir /root/Qwen3-30B-A3B
+#      hf download openai/gsm8k --repo-type=dataset --local-dir /root/gsm8k
+#
+# 2. Launch with those paths. prompt_data_path must name one .jsonl/.parquet file:
+#      bash examples/start.sh qwen3_30b_a3b/gsm8k_h20_1node \
+#        hf_model_path=/root/Qwen3-30B-A3B \
+#        data_source.dataset.prompt_data_path=/root/gsm8k/main/train-00000-of-00001.parquet
+defaults:
+  - /default
+  - _self_
+
+checkpoint_path: "./checkpoints"
+hf_model_path: ???
+colocate: true
+total_steps: 300
+log_level: INFO
+
+data_source:
+  dataset:
+    prompt_data_path: ???
+    data_pre_processor: "gsm8k"
+    input_key: question
+    label_key: answer
+  num_trajectories_per_prompt: 8
+  num_prompts_per_step: 64
+  agent:
+    name: gsm8k  # multi_turn mode; set to null to run single_turn (no agent)
+  reward:
+    name: gsm8k
+  max_response_len_per_trajectory: 32768
+
+rollout:
+  num_gpus_per_node: 8
+  sglang_replicas:
+    regular:
+      num_nodes: 1
+      num_gpus_per_replica: 8
+
+agentflow:
+  dump_trajectory_path: "log/trajectories"
+  tokenizer:
+    generation_prompt_kwargs:
+      enable_thinking: false
+
+trainer:
+  num_gpus_per_node: 8
+  num_nodes: 1
+  mini_batch_size: 64
+  micro_batch_size: 8
+
+megatron:
+  model:
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 2
+
+algorithm:
+  advantage_estimator: grpo
+  advantage_norm_mode: group_zscore
+  policy_loss: grpo
+  loss_agg_mode: token-mean

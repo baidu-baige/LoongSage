@@ -1,0 +1,346 @@
+diff --git a/python/sglang/srt/debug_utils/dumper.py b/python/sglang/srt/debug_utils/dumper.py
+index b73f75b340..9af4c9bf9c 100644
+--- a/python/sglang/srt/debug_utils/dumper.py
++++ b/python/sglang/srt/debug_utils/dumper.py
+@@ -1804,12 +1804,18 @@ class _SGLangPlugin(_FrameworkPlugin):
+ 
+ 
+ class _MegatronPlugin(_FrameworkPlugin):
+-    _available = True
+-    try:
+-        from megatron.core import parallel_state as _mpu
+-        from megatron.core.packed_seq_params import PackedSeqParams
+-    except ImportError:
+-        _available = False
++    # NOTE(coda): eager `import megatron.core` disabled on purpose.
++    # In colocate mode the sglang engine process loads weights via Megatron-FSDP;
++    # importing megatron flips torch_memory_saver's global hook_mode to "torch",
++    # which breaks sglang's pauseable CUDA graph (needs hook_mode="preload") and
++    # crashes startup with "Only hook_mode=preload supports pauseable CUDA Graph".
++    # The dumper is unused in the engine process, so force _available=False.
++    _available = False
++    #try:
++    #    from megatron.core import parallel_state as _mpu
++    #    from megatron.core.packed_seq_params import PackedSeqParams
++    #except ImportError:
++    #    _available = False
+ 
+     @property
+     def name(self) -> str:
+diff --git a/python/sglang/srt/entrypoints/http_server.py b/python/sglang/srt/entrypoints/http_server.py
+index 51c85e6302..24470c2c04 100644
+--- a/python/sglang/srt/entrypoints/http_server.py
++++ b/python/sglang/srt/entrypoints/http_server.py
+@@ -140,6 +140,7 @@ from sglang.srt.managers.io_struct import (
+     UpdateWeightFromDiskReqInput,
+     UpdateWeightsFromDistributedReqInput,
+     UpdateWeightsFromIPCReqInput,
++    UpdateWeightsFromChannelReqInput,
+     UpdateWeightsFromTensorReqInput,
+     UpdateWeightVersionReqInput,
+     VertexGenerateReqInput,
+@@ -1304,6 +1305,19 @@ async def destroy_weights_update_group(
+     )
+ 
+ 
++@app.post("/update_weights_from_channel")
++@auth_level(AuthLevel.ADMIN_OPTIONAL)
++async def update_weights_from_channel(
++    obj: Annotated[UpdateWeightsFromChannelReqInput, Body()], request: Request
++):
++    """Update weights by receiving from the TransferMesh channel."""
++    success, message = await _global_state.tokenizer_manager.update_weights_from_channel(
++        obj, request
++    )
++    content = {"success": success, "message": message}
++    return ORJSONResponse(content, status_code=200 if success else HTTPStatus.BAD_REQUEST)
++
++
+ @app.post("/update_weights_from_tensor")
+ @auth_level(AuthLevel.ADMIN_OPTIONAL)
+ async def update_weights_from_tensor(
+diff --git a/python/sglang/srt/layers/layernorm.py b/python/sglang/srt/layers/layernorm.py
+index 8b0ca51417..6a3b5f2541 100644
+--- a/python/sglang/srt/layers/layernorm.py
++++ b/python/sglang/srt/layers/layernorm.py
+@@ -46,6 +46,8 @@ from sglang.srt.utils import (
+ 
+ _is_cuda = is_cuda()
+ _is_flashinfer_available = is_flashinfer_available()
++import os as _os_no_pdl
++_RMSNORM_NO_PDL = _os_no_pdl.environ.get("SGLANG_RMSNORM_NO_PDL", "0") == "1"
+ _is_hip = is_hip()
+ _is_musa = is_musa()
+ _is_npu = is_npu()
+@@ -342,7 +344,7 @@ class RMSNorm(MultiPlatformOp):
+                 residual = residual + post_residual_addition
+             fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
+             return x, residual
+-        out = rmsnorm(x, self.weight.data, self.variance_epsilon)
++        out = rmsnorm(x, self.weight.data, self.variance_epsilon, enable_pdl=(False if _RMSNORM_NO_PDL else None))
+         if needs_reshape:
+             out = out.reshape(original_shape)
+         return out
+@@ -591,7 +593,7 @@ class RMSNorm(MultiPlatformOp):
+                 residual = residual + post_residual_addition
+             fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
+             return x, residual
+-        out = rmsnorm(x, self.weight.data, self.variance_epsilon)
++        out = rmsnorm(x, self.weight.data, self.variance_epsilon, enable_pdl=(False if _RMSNORM_NO_PDL else None))
+         return out
+ 
+     def forward_with_allreduce_fusion(
+diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
+index fa359c5483..301ac4f9f6 100644
+--- a/python/sglang/srt/managers/io_struct.py
++++ b/python/sglang/srt/managers/io_struct.py
+@@ -1713,6 +1713,25 @@ class DestroyWeightsUpdateGroupReqOutput(BaseReq, kw_only=True):
+     message: str
+ 
+ 
++class UpdateWeightsFromChannelReqInput(BaseReq, kw_only=True):
++    master_addr: str
++    world_size: int
++    train_world_size: int
++    weight_version: str
++    engine_id: int = 0
++    recreate: bool = False
++    buffer_size_bytes: int = 256 * 1024 * 1024
++    timeout: float = 300.0
++    gloo_port: int = 29500
++    flush_cache: bool = True
++    torch_empty_cache: bool = False
++
++
++class UpdateWeightsFromChannelReqOutput(BaseReq, kw_only=True):
++    success: bool
++    message: str
++
++
+ class UpdateWeightVersionReqInput(BaseReq, kw_only=True):
+     # The new weight version
+     new_version: str
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index c46a8c5968..34399f1353 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -143,6 +143,7 @@ from sglang.srt.managers.io_struct import (
+     UpdateWeightFromDiskReqInput,
+     UpdateWeightsFromDistributedReqInput,
+     UpdateWeightsFromIPCReqInput,
++    UpdateWeightsFromChannelReqInput,
+     UpdateWeightsFromTensorReqInput,
+     sock_send,
+ )
+@@ -1376,6 +1377,10 @@ class Scheduler(
+                     UpdateWeightsFromIPCReqInput,
+                     self.weight_updater.update_weights_from_ipc,
+                 ),
++                (
++                    UpdateWeightsFromChannelReqInput,
++                    self.weight_updater.update_weights_from_channel,
++                ),
+                 (
+                     GetWeightsByNameReqInput,
+                     self.weight_updater.get_weights_by_name,
+diff --git a/python/sglang/srt/managers/scheduler_components/weight_updater.py b/python/sglang/srt/managers/scheduler_components/weight_updater.py
+index 7013ce04fe..4867719698 100644
+--- a/python/sglang/srt/managers/scheduler_components/weight_updater.py
++++ b/python/sglang/srt/managers/scheduler_components/weight_updater.py
+@@ -38,6 +38,8 @@ from sglang.srt.managers.io_struct import (
+     UpdateWeightsFromDistributedReqOutput,
+     UpdateWeightsFromIPCReqInput,
+     UpdateWeightsFromIPCReqOutput,
++    UpdateWeightsFromChannelReqInput,
++    UpdateWeightsFromChannelReqOutput,
+     UpdateWeightsFromTensorReqInput,
+     UpdateWeightsFromTensorReqOutput,
+ )
+@@ -183,6 +185,17 @@ class SchedulerWeightUpdaterManager:
+         parameter = self.tp_worker.get_weights_by_name(recv_req)
+         return GetWeightsByNameReqOutput(parameter=parameter)
+ 
++    def update_weights_from_channel(
++        self, recv_req: UpdateWeightsFromChannelReqInput
++    ):
++        """Update model weights by receiving from the TransferMesh channel."""
++        with self._observe_weight_load("channel"):
++            success, message = self.tp_worker.update_weights_from_channel(recv_req)
++            if not success:
++                logger.error(message)
++            torch.distributed.barrier(group=self.tp_cpu_group)
++            return UpdateWeightsFromChannelReqOutput(success=success, message=message)
++
+     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
+         assert (
+             self.is_fully_idle()
+diff --git a/python/sglang/srt/managers/tokenizer_control_mixin.py b/python/sglang/srt/managers/tokenizer_control_mixin.py
+index 86b7b378f8..b0c8c2a172 100644
+--- a/python/sglang/srt/managers/tokenizer_control_mixin.py
++++ b/python/sglang/srt/managers/tokenizer_control_mixin.py
+@@ -70,6 +70,8 @@ from sglang.srt.managers.io_struct import (
+     UpdateWeightsFromDistributedReqOutput,
+     UpdateWeightsFromIPCReqInput,
+     UpdateWeightsFromIPCReqOutput,
++    UpdateWeightsFromChannelReqInput,
++    UpdateWeightsFromChannelReqOutput,
+     UpdateWeightsFromTensorReqInput,
+     UpdateWeightsFromTensorReqOutput,
+ )
+@@ -101,6 +103,7 @@ _COMMUNICATOR_SPECS = [
+     ("send_weights_to_remote_instance", SendWeightsToRemoteInstanceReqOutput),
+     ("update_weights_from_tensor", UpdateWeightsFromTensorReqOutput),
+     ("update_weights_from_ipc", UpdateWeightsFromIPCReqOutput),
++    ("update_weights_from_channel", UpdateWeightsFromChannelReqOutput),
+     ("get_weights_by_name", GetWeightsByNameReqOutput),
+     ("release_memory_occupation", ReleaseMemoryOccupationReqOutput),
+     ("resume_memory_occupation", ResumeMemoryOccupationReqOutput),
+@@ -541,6 +544,23 @@ class TokenizerControlMixin:
+ 
+         return success, message
+ 
++    async def update_weights_from_channel(
++        self: TokenizerManager,
++        obj: UpdateWeightsFromChannelReqInput,
++        request: Optional[fastapi.Request] = None,
++    ) -> Tuple[bool, str]:
++        """Update weights by receiving from the TransferMesh channel."""
++        self.auto_create_handle_loop()
++        async with self.model_update_lock.writer_lock:
++            if obj.weight_version == "":
++                return False, "weight_version must not be empty"
++            results = await self.update_weights_from_channel_communicator(obj)
++            success, message = FanOutCommunicator.merge_results(results)
++            if success:
++                self._update_weight_version_if_provided(obj.weight_version)
++                message += f" Weight version updated to {obj.weight_version}."
++            return success, message
++
+     async def _unload_lora_adapter_locked(
+         self: TokenizerManager,
+         obj: UnloadLoRAAdapterReqInput,
+diff --git a/python/sglang/srt/managers/tp_worker.py b/python/sglang/srt/managers/tp_worker.py
+index 6d09e81332..4e5b7137d3 100644
+--- a/python/sglang/srt/managers/tp_worker.py
++++ b/python/sglang/srt/managers/tp_worker.py
+@@ -191,6 +191,9 @@ class BaseTpWorker(ABC):
+         )
+         return success, message
+ 
++    def update_weights_from_channel(self, recv_req):
++        return self.model_runner.weight_updater.update_weights_from_channel(recv_req)
++
+     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
+         parameter = self.model_runner.weight_exporter.get_weights_by_name(
+             recv_req.name, recv_req.truncate_size
+diff --git a/python/sglang/srt/model_executor/model_runner_components/weight_updater.py b/python/sglang/srt/model_executor/model_runner_components/weight_updater.py
+index 8ea10ef04c..a2bba07497 100644
+--- a/python/sglang/srt/model_executor/model_runner_components/weight_updater.py
++++ b/python/sglang/srt/model_executor/model_runner_components/weight_updater.py
+@@ -353,6 +353,35 @@ class WeightUpdater:
+             logger.error(f"IPC weight update failed: {e}")
+             return False, str(e)
+ 
++    def update_weights_from_channel(self: WeightUpdater, recv_req):
++        """Receive weights from TransferMesh channel and update model in-place.
++
++        Uses channel_helper.create_receiver_channel() to lazily create or reuse a
++        process-local TransferMeshChannel based on the request parameters.
++        """
++        try:
++            from coda.utils.channel_helper import ChannelMeta, create_receiver_channel
++            from sglang.srt.utils.network import get_local_ip_auto
++
++            meta = ChannelMeta(
++                master_addr=recv_req.master_addr,
++                world_size=recv_req.world_size,
++                train_world_size=recv_req.train_world_size,
++                engine_id=recv_req.engine_id,
++                recreate=recv_req.recreate,
++                buffer_size_bytes=recv_req.buffer_size_bytes,
++                timeout=recv_req.timeout,
++                gloo_port=recv_req.gloo_port,
++                local_ip=get_local_ip_auto(),
++            )
++            channel = create_receiver_channel(meta)
++            self.get_model().load_weights(channel.get_iterator())
++            return True, "Succeeded to update weights from channel."
++        except Exception as e:
++            error_msg = f"Failed to update weights from channel: {e}."
++            logger.error(error_msg)
++            return False, error_msg
++
+ 
+ def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):
+     params_dict = dict(model.named_parameters())
+diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
+index 2648061239..8742e15882 100644
+--- a/python/sglang/srt/models/deepseek_v4.py
++++ b/python/sglang/srt/models/deepseek_v4.py
+@@ -2729,13 +2729,12 @@ class DeepseekV4ForCausalLM(nn.Module):
+                 raise ValueError("num_nextn_predict_layers is not in the config")
+ 
+         if not envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
+-            weights = list(weights)
+-            exists_wo_a_scale = any(n.endswith(".wo_a.scale") for n, t in weights)
+-            if exists_wo_a_scale:
+-                logger.info("Execute dequant fp8 wo_a")
+-                weights = _dequant_fp8_wo_a(weights)
+-            else:
+-                logger.info("Skip dequant fp8 wo_a")
++            # Streaming dequant of the fp8 `wo_a` weights. Only the small
++            # ".wo_a.weight"/".wo_a.scale" tensors are buffered (for pairing);
++            # every other weight passes straight through. This avoids the previous
++            # `weights = list(weights)` that materialized the entire weight stream
++            # in memory and caused OOM during colocate weight transfer.
++            weights = _dequant_fp8_wo_a(weights)
+ 
+         stacked_params_mapping = DEEPSEEK_V4_STACKED_PARAMS_MAPPING
+ 
+@@ -3112,17 +3111,32 @@ def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+ def _dequant_fp8_wo_a(
+     weights: Iterable[Tuple[str, torch.Tensor]],
+ ) -> Iterable[Tuple[str, torch.Tensor]]:
+-    weights_dict = dict(weights)
+-
+-    for name in list(weights_dict.keys()):
+-        if name not in weights_dict:
+-            continue
+-        if not name.endswith(".wo_a.weight"):
+-            continue
+-        scale_name = name.replace(".wo_a.weight", ".wo_a.scale")
+-        assert scale_name in weights_dict
+-        weight = weights_dict.pop(name)
+-        scale = weights_dict.pop(scale_name)
+-        yield name, _dequant_fp8(weight, scale)
+-
+-    yield from weights_dict.items()
++    # Stream weights through, buffering only ".wo_a.weight"/".wo_a.scale" tensors so a
++    # weight can be paired with its scale regardless of arrival order. This keeps peak
++    # memory low, unlike dict(weights)/list(weights) which hold the whole model at once.
++    pending_weight = {}
++    pending_scale = {}
++
++    for name, tensor in weights:
++        if name.endswith(".wo_a.weight"):
++            prefix = name[: -len(".weight")]
++            scale = pending_scale.pop(prefix, None)
++            if scale is None:
++                pending_weight[prefix] = tensor
++            else:
++                yield name, _dequant_fp8(tensor, scale)
++        elif name.endswith(".wo_a.scale"):
++            prefix = name[: -len(".scale")]
++            weight = pending_weight.pop(prefix, None)
++            if weight is None:
++                pending_scale[prefix] = tensor
++            else:
++                yield prefix + ".weight", _dequant_fp8(weight, tensor)
++        else:
++            yield name, tensor
++
++    # Unpaired leftovers (e.g. no scales present -> not an fp8 checkpoint): pass through.
++    for prefix, tensor in pending_weight.items():
++        yield prefix + ".weight", tensor
++    for prefix, tensor in pending_scale.items():
++        yield prefix + ".scale", tensor

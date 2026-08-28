@@ -1,0 +1,85 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+.venv-docs/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Testing
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+
+# Logs
+*.log
+log/
+logs/
+nohup.out
+
+# Core dumps — may contain model weights or in-memory secrets
+core
+core.*
+
+# Model cache
+.cache/
+models/
+*.h5
+*.pkl
+*.pth
+*.bin
+
+# Environment
+.env
+.env.local
+*.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific
+data/
+output/
+outputs/
+checkpoints/
+*.ckpt
+
+# Editor / assistant local state
+.ruff_cache/
+.sisyphus/
+tmp/
+.claude
+.comate/

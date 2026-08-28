@@ -1,0 +1,291 @@
+# Default configuration parameters for Coda. Users shall not edit this file.
+
+run_mode: default  # or "train-only" or "rollout-only"
+seed: 42
+colocate: true
+checkpoint_path: ???  # Training model ckpt base dir: both output and resume input. The latest step is found via latest_checkpointed_iteration.txt.
+hf_model_path: ???
+rollout_data_path: ./rollout_data  # rollout-only / train-only data dir
+# Reference model weights, read-only. Set exactly one when algorithm.ref_kl.enable=true.
+ref_dist_ckpt_path: null  # One concrete dist_ckpt dir, e.g. /path/to/run/train_step_100/dist_ckpt (preferred)
+ref_hf_model_path: null   # HF weights path (alternative)
+total_steps: 3000
+log_level: INFO  # DEBUG INFO WARNING ERROR CRITICAL
+
+fully_async:
+  enable: false
+  sliding_window: no-window  # no-window | window-gated | windowed-fifo
+  stale_steps: 0
+
+# Default values for each entry in data_sources below. Every data_source_unit
+# inherits these defaults; per-unit overrides take precedence.
+data_source:
+  dataset:
+    # Path to the prompt dataset file (.jsonl or .parquet), or to a directory containing such files
+    # (all of them are read, in sorted path order).
+    # Supports an optional row-slice suffix, e.g. "data.jsonl@[0:1000]".
+    prompt_data_path: ???
+    # Path to this source's eval split, in the same format as prompt_data_path.
+    # Null disables eval for this source; eval also requires rollout.eval.interval > 0.
+    eval_prompt_data_path: null
+
+    # Maximum number of characters allowed per prompt. Samples that exceed this limit are dropped during loading. Set
+    # to null to disable filtering.
+    max_prompt_len: null
+
+    # Dataset column names
+    input_key: ???            # Column holding the prompt text or message list.
+    label_key: ???            # Column holding the ground-truth label. null = disabled.
+    metadata_key: metadata    # Column holding per-row metadata dicts.
+
+    shuffle: true
+
+    # Registered name of a raw-record pre-processor, applied to every dataset record before messages are built.
+    # Pre-processors are registered via @register_data_pre_processor("name") in
+    # coda/data_factory/data_pre_processor.py. Built-ins: "gsm8k" (appends the "#### <answer>" format instruction),
+    # "bcp" (decrypts and reshapes raw BrowseComp-Plus rows), and "r2e_gym" (reshapes raw R2E-Gym-Subset rows into
+    # the prompt/metadata layout the mini-swe agent reads).
+    # Set to null to disable pre-processing.
+    data_pre_processor: null
+
+    # ── Buffer (RolloutDataSourceWithBuffer only) ─────────────────────────────
+    # Registered name of buffer-replay-strategy function. Strategies are registered via
+    # @register_buffer_replay_strategy("name") in coda/data_factory/data_source.py. Built-in strategy: "fifo" (pops the
+    # oldest groups). Set to null to use the default "fifo" strategy.
+    buffer_replay_strategy: null
+  agent:
+    name: null  # null = no agent (single_turn); required for multi_turn
+
+  reward:
+    name: ???
+  teacher_name: ""
+  max_response_len_per_trajectory: 32768  # cap on response-area tokens (LLM replies + tool responses) per attempt. Single-turn uses this as request max_tokens; multi-turn agents receive it and choose their own per-call max_tokens.
+  num_prompts_per_step: 64
+  num_trajectories_per_prompt: 8
+  completion_params: {}
+  #  top_p: 1.0
+  #  top_k: -1
+
+data_sources:
+  - ${data_source}
+
+rollout:
+  partial: false
+  mask_offpolicy_in_partial_rollout: false
+  use_fault_tolerance: false
+  retry_limit: 3
+  backend: sglang
+  num_gpus_per_node: 8
+  env_vars: {}
+  sglang_args:                # Dict of SGLang ``ServerArgs`` fields.
+    mem_fraction_static: 0.8
+    disable_cuda_graph: true
+    disable_custom_all_reduce: true
+    load_format: dummy #  dummy/auto
+  sglang_replicas:
+    regular:
+      num_nodes: 1                # Total number of GPUs for this replica group.
+      num_gpus_per_replica: 8     # Total number of GPUs for per replica.
+    prefill:
+      num_nodes: 0                # Total number of GPUs for this replica group.
+      num_gpus_per_replica: 8     # Total number of GPUs for per replica.
+    decode:
+      num_nodes: 0                # Total number of GPUs for this replica group.
+      num_gpus_per_replica: 8     # Total number of GPUs for per replica.
+      sglang_args:                # override rollout.sglang_args
+        disable_cuda_graph: false
+
+  sampler:
+    name: "dynamic"         # dynamic|keeporder sampling
+    num_oversample: 0
+    refill_ratio: 2         # refill prompts = need_refill_number * refill_ratio
+    max_refill_count: 256   # the max number of prompts will refill to rollout
+    timeout: 7200           # wait time for rollout prompt process, if exceeded, will abort current rollout and trigger next rollout
+
+  # Override: same-name key overwrites (e.g. "reward: false" to disable, "reward: {}" dict to enable with params); new keys append.
+  filter:
+    status:              # default enable, drop groups containing any FAILED trajectory
+    # reward: {}         # default disable, drop groups with uniform rewards (no contrastive signal)
+
+  eval:
+    interval: -1        # run eval every N steps; <=0 disables it
+    temperature: null   # eval sampling temperature; null = reuse trainer.temperature
+
+agentflow:
+  dump_trajectory_path: ""
+  router:
+    ip: "" # When empty (default), the router auto-resolves to the local machine's routable IP at runtime.
+    port: 0 # When zero, the router auto-assigns a free port at runtime.
+    accumulate_reasoning: true
+    rollout_worker_load_threshold: 32
+    proxy_timeout_seconds: 1800
+    abort_timeout_seconds: 600
+    max_connections: 512
+    middleware:
+      parser:
+
+  tokenizer:
+    # Path to a Jinja2 chat-template file that overrides the tokenizer's built-in template.
+    # Relative paths resolve against this conf/ directory (e.g. chat_template/my_model.jinja,
+    # a file you add yourself); absolute paths are used as-is.
+    # Null (default): keep the tokenizer's own chat template.
+    custom_chat_template_path: null
+    # Extra kwargs passed to apply_chat_template. Use enable_thinking: true/false to control
+    # thinking mode. Empty (default): keep the tokenizer's own behavior.
+    generation_prompt_kwargs: {}
+    manager:
+      mode: thread
+      num_workers: 8
+  sandbox:
+    type: k8s
+    command_exec_timeout_seconds: 600
+    sandbox_creation_timeout_seconds: 600
+    working_dir: /rl-sandbox
+    kubeconfig: k8s/kubeconfig.yaml
+    pod_manifest_path: k8s/pod_manifest.yaml
+
+tracking:
+  project_name: "default"
+  experiment_name: "default"
+  tracking_backend: "console"
+  mlflow_tracking_uri: ""
+  # wandb backend settings. Most keys are passed verbatim to wandb.Settings() 
+  # (and thus take effect in wandb.init).
+  wandb_args:
+    base_url: null
+    api_key: null
+    # W&B run mode, only two options:
+    #   "shared"  - upload to a W&B server in real-time; multiple processes can
+    #               log to a single run. Requires base_url and api_key, plus
+    #               W&B SDK >= 0.19.9 and W&B Server >= 0.68.
+    #   "offline" - data is stored locally.
+    mode: "shared"
+
+megatron:
+  model:
+    bf16: true
+    fp16: false
+    fp8: null
+    fp8_recipe: null
+    fp8_param: false
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    virtual_pipeline_model_parallel_size: null
+    context_parallel_size: 1
+    cp_partition_mode: zigzag
+    expert_model_parallel_size: 1
+    expert_tensor_parallel_size: null
+    overlap_p2p_comm: false
+    moe_grouped_gemm: true
+    moe_shared_expert_overlap: false
+    #recompute_granularity: full # selective|full
+    #recompute_method: uniform
+    #recompute_num_layers: 1
+  ddp_config:
+    use_distributed_optimizer: true
+    overlap_param_gather: false
+    overlap_grad_reduce: false
+    grad_reduce_in_fp32: true
+  optimizer:
+    lr: 1.0e-6
+    weight_decay: 0.01
+    optimizer_cpu_offload: false
+    optimizer_offload_fraction: 1.0
+  scheduler:
+    lr_warmup_steps: 0
+    lr_decay_steps: 1
+    lr_decay_style: constant
+    wd_incr_steps: 0
+    wd_incr_style: constant
+  keep_fp32_weights: {}
+    # Keys are substrings matched against parameter names (fuzzy match).
+    # Values indicate whether the layer's output should also remain FP32.
+    # output_layer: true
+  optimizer_sharding_type: "dp_reshardable" # dp_reshardable|fully_reshardable
+
+opd:
+  enable: false
+  pg_ratio: 0.0 # L = (1-gkd_ratio)*[A - pg_ratio*KL_token] + gkd_ratio*L_GKD
+  gkd_ratio: 0.0
+  pg_kl_method: k1 # k1|topk_kl|full_kl|topk_jsd|full_jsd
+  gkd_kl_method: topk_kl # k2|k3|topk_kl|full_kl|topk_jsd|full_jsd
+  topk: 256
+  teacher_nodes: 1
+  teacher_gpus_per_node: 8
+  teachers: []
+    #- name: "math_expert"
+    #  # Always required: the Megatron model structure comes from its config.json.
+    #  hf_path: /path/to/math_model
+    #  # Optional. One concrete dist_ckpt dir, preferred over hf_path's weights.
+    #  dist_ckpt_path: /path/to/run/train_step_100/dist_ckpt
+  model:
+    bf16: true
+    fp16: false
+    fp8: null
+    fp8_recipe: null
+    fp8_param: false
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    virtual_pipeline_model_parallel_size: null
+    context_parallel_size: 1
+    cp_partition_mode: zigzag
+    expert_model_parallel_size: 1
+    expert_tensor_parallel_size: null
+    overlap_p2p_comm: false
+    moe_grouped_gemm: true
+  memory_pool:
+    backend: null
+  env_vars: {}
+
+algorithm:
+  advantage_estimator: grpo
+  advantage_norm_mode: group_zscore # none|group_mean|group_zscore|batch_mean|batch_zscore
+  policy_loss: grpo # grpo|gspo
+  loss_agg_mode: token-mean # token-mean|seq-mean-token-mean
+  is_correction:
+    enable: false
+    action: clip # clip|mask
+    level: token # token|sequence|geometric
+    lower_bound: ??? # 0.5 for token-level clipping, 0.9999 for geometric-level clipping
+    upper_bound: ??? # 2 for token-level clipping, 1.0001 for geometric-level clipping
+
+  opsm:
+    enable: false
+    delta: 0.1 # sequence-level KL threshold; drop seq when adv<0 AND seq_kl>delta
+
+  m2po:
+    enable: false
+    threshold: 0.04
+  entropy_coef: 0.0
+  clip_ratio_low: 0.2
+  clip_ratio_high: 0.28
+  clip_ratio_c: 10.0
+  ref_kl:                  # Reference-model KL penalty (KL(π_θ ‖ π_ref)).
+    enable: false
+    coef: 0.001
+    kl_type: k3            # k1|k2|k3
+    use_unbiased_kl: false # multiply per-token KL by IS ratio exp(log_probs - old_log_probs) (DeepSeek-V3.2)
+    update_interval: -1    # N <=0 ref frozen; N=refresh ref from current policy every N steps (ref<-actor)
+
+trainer:
+  backend: megatron
+  num_nodes: 1
+  num_gpus_per_node: 8
+  use_rollout_log_probs: false
+  use_rollout_routing_replay: false
+  use_fp32_lm_head: false
+  temperature: 1.0
+  mini_batch_size: 64    # num_prompts_per_step x num_trajectories_per_prompt / mini_batch_size = num_mini_batch
+  micro_batch_size: 8
+  max_tokens_per_gpu: 16440
+  use_dynamic_batch_size: false
+  # Enable bit-wise reproducible training: forces deterministic NCCL/TransformerEngine/cuBLAS kernels.
+  # Slower; use for debugging / precision alignment, not production.
+  deterministic_mode: false
+  nccl_timeout_minutes: null
+  gloo_timeout_minutes: null
+  save_freq: -1
+  async_save: true
+  save_checkpoint: true   # Save distributed checkpoint.
+  save_hf: false          # Also export HuggingFace-format weights to train_step_{step}/hf_model.
+  env_vars: {}

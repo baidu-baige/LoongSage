@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  namespace: default
+  # Optional pod name prefix (default "rl-sandbox-").
+  # generateName: my-job-
+
+  labels:
+    app: rl-sandbox
+spec:
+  restartPolicy: Never
+  activeDeadlineSeconds: 86400
+  containers:
+  - name: sandbox
+    imagePullPolicy: Always
+    command: ["sleep", "infinity"]
+  topologySpreadConstraints:
+  - maxSkew: 3
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels:
+        app: rl-sandbox

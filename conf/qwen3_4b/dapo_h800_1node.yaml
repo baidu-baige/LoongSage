@@ -1,0 +1,61 @@
+# @package _global_
+# Qwen3-4B + DAPO, single H800 node (8 GPUs).
+# Launch: bash examples/start.sh qwen3_4b/dapo_h800_1node
+# Fill in the two ??? below, or override them on the command line:
+#   hf_model_path                         HF weight dir of Qwen3-4B
+#   data_source.dataset.prompt_data_path  dapo-math-17k.parquet
+defaults:
+  - /default
+  - _self_
+
+checkpoint_path: ./checkpoints
+hf_model_path: ???
+colocate: true
+total_steps: 100
+
+data_source:
+  dataset:
+    prompt_data_path: ???
+    input_key: prompt
+    label_key: reward_model
+  reward:
+    name: dapo_math
+    overlong_penalty_length: 4096
+  num_prompts_per_step: 64
+  num_trajectories_per_prompt: 8
+  max_response_len_per_trajectory: 20480
+
+rollout:
+  num_gpus_per_node: 8
+  sglang_args:
+    mem_fraction_static: 0.7
+    disable_cuda_graph: false
+
+agentflow:
+  dump_trajectory_path: "log/trajectories"
+
+trainer:
+  mini_batch_size: 8
+  max_tokens_per_gpu: 20480
+  use_dynamic_batch_size: true
+
+megatron:
+  model:
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 2
+    virtual_pipeline_model_parallel_size: null
+    context_parallel_size: 1
+    expert_model_parallel_size: 1
+    expert_tensor_parallel_size: 1
+
+algorithm:
+  advantage_estimator: grpo
+  advantage_norm_mode: group_zscore
+  policy_loss: grpo
+  loss_agg_mode: token-mean
+  is_correction:
+    enable: true
+    action: mask
+    level: token
+    lower_bound: 0.5
+    upper_bound: 2

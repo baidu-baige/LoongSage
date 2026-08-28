@@ -1,0 +1,190 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1940" height="1120" viewBox="0 0 1940 1120" role="img" aria-labelledby="title desc">
+  <title id="title">Coda AgentFlow Architecture</title>
+  <desc id="desc">Rollout data flow across the AgentFlow orchestrator, the Router (ParserMiddleware + TrajectoryParser) reverse proxy, single/multi-turn Agents, Sandbox, and the SGLang inference cluster.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#111827"/>
+    </marker>
+    <marker id="d-arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#6b7280"/>
+    </marker>
+    <marker id="b-arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#2563eb"/>
+    </marker>
+    <filter id="shadow" x="-10%" y="-10%" width="125%" height="130%">
+      <feDropShadow dx="4" dy="5" stdDeviation="5" flood-color="#111827" flood-opacity="0.13"/>
+    </filter>
+    <filter id="box-shadow" x="-8%" y="-8%" width="120%" height="125%">
+      <feDropShadow dx="2" dy="3" stdDeviation="3" flood-color="#111827" flood-opacity="0.18"/>
+    </filter>
+    <style>
+      text { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", Arial, sans-serif; fill: #111827; }
+      .group-title { font-size: 27px; font-weight: 700; }
+      .box-title { font-size: 21px; font-weight: 700; }
+      .body { font-size: 17px; }
+      .small { font-size: 14px; fill: #4b5563; }
+      .edge-label { font-size: 16px; font-weight: 600; }
+      .edge-d { font-size: 15px; font-weight: 600; fill: #6b7280; }
+      .edge-b { font-size: 15px; font-weight: 700; fill: #2563eb; }
+      .note { font-size: 16px; }
+    </style>
+  </defs>
+
+  <rect width="1940" height="1120" fill="#ffffff"/>
+  <!-- Capability notes -->
+  <text x="40" y="137" class="note">
+    <tspan x="40" dy="0">- Dispatch prompt batches</tspan>
+    <tspan x="40" dy="26">- Consume final trajectories</tspan>
+    <tspan x="40" dy="26">- Trigger step-boundary sync</tspan>
+  </text>
+
+  <text x="370" y="137" class="note">
+    <tspan x="370" dy="0">- ParserMiddleware: intercept OpenAI requests, messages→token for inference, token→OpenAI on return</tspan>
+    <tspan x="370" dy="26">- TrajectoryParser: tokenize / tool_call / reasoning parsing + logprob alignment</tspan>
+    <tspan x="370" dy="26">- _run_trajectory: single/multi-turn scheduling, retries, final trajectory into TrajQueue</tspan>
+  </text>
+
+  <text x="1252" y="137" class="note">
+    <tspan x="1330" dy="0">- Multi-turn: one Agent instance per trajectory</tspan>
+    <tspan x="1330" dy="26">- ReAct loop: call LLM → run tools</tspan>
+    <tspan x="1330" dy="26">- Tools execute inside the Sandbox</tspan>
+  </text>
+
+  <!-- Trainer group -->
+  <rect x="40" y="220" width="210" height="640" fill="#ffffff" stroke="#626262" stroke-width="1.5" filter="url(#shadow)"/>
+  <text x="145" y="262" text-anchor="middle" class="group-title">Trainer</text>
+  <rect x="55" y="300" width="180" height="90" rx="10" fill="#d6e5fb" stroke="#668fca" stroke-width="1" filter="url(#box-shadow)"/>
+  <text x="145" y="338" text-anchor="middle" class="box-title">RolloutSampler</text>
+  <text x="145" y="362" text-anchor="middle" class="small">send prompts · get trajs</text>
+  <rect x="55" y="448" width="180" height="90" rx="10" fill="#d6e5fb" stroke="#668fca" stroke-width="1" filter="url(#box-shadow)"/>
+  <text x="145" y="486" text-anchor="middle" class="box-title">RolloutManager</text>
+  <text x="145" y="510" text-anchor="middle" class="small">SGLang engine · weight sync</text>
+  <rect x="55" y="596" width="180" height="90" rx="10" fill="#d6e5fb" stroke="#668fca" stroke-width="1" filter="url(#box-shadow)"/>
+  <text x="145" y="634" text-anchor="middle" class="box-title">TrainManager</text>
+  <text x="145" y="658" text-anchor="middle" class="small">Megatron worker · train</text>
+  <rect x="55" y="744" width="180" height="90" rx="10" fill="#d6e5fb" stroke="#668fca" stroke-width="1" stroke-dasharray="7 5" filter="url(#box-shadow)"/>
+  <text x="145" y="776" text-anchor="middle" class="box-title">TeacherManager</text>
+  <text x="145" y="799" text-anchor="middle" class="small">Megatron teacher</text>
+  <text x="145" y="819" text-anchor="middle" class="small">OPD distillation</text>
+  <!-- AgentFlow group -->
+  <rect x="370" y="220" width="840" height="640" fill="#ffffff" stroke="#626262" stroke-width="1.5" filter="url(#shadow)"/>
+  <text x="790" y="262" text-anchor="middle" class="group-title">AgentFlow</text>
+
+  <rect x="402" y="300" width="250" height="80" rx="12" fill="#d9ead3" stroke="#79ad5e" stroke-width="1" filter="url(#box-shadow)"/>
+  <text x="527" y="336" text-anchor="middle" class="box-title">TokenizerManager</text>
+  <text x="527" y="361" text-anchor="middle" class="small">tokenize / chat template</text>
+
+  <rect x="402" y="410" width="250" height="90" rx="12" fill="#d9ead3" stroke="#79ad5e" stroke-width="1" filter="url(#box-shadow)"/>
+  <text x="527" y="448" text-anchor="middle" class="box-title">TrajectoryStore</text>
+  <text x="527" y="475" text-anchor="middle" class="small">single source of truth for rollout</text>
+
+  <rect x="402" y="545" width="250" height="84" rx="12" fill="#d9eee9" stroke="#4c9b8b" stroke-width="1" filter="url(#box-shadow)"/>
+  <text x="527" y="580" text-anchor="middle" class="box-title">_run_trajectory</text>
+  <text x="527" y="606" text-anchor="middle" class="small">single/multi-turn · retry · emit</text>
+
+  <rect x="402" y="685" width="250" height="100" rx="50" fill="#fff1c7" stroke="#ddb43f" stroke-width="1" filter="url(#box-shadow)"/>
+  <rect x="460" y="710" width="34" height="52" rx="6" fill="#d6e5fb" stroke="#668fca" stroke-width="2"/>
+  <rect x="497" y="710" width="34" height="52" rx="6" fill="#d6e5fb" stroke="#668fca" stroke-width="2"/>
+  <rect x="534" y="710" width="34" height="52" rx="6" fill="#d6e5fb" stroke="#668fca" stroke-width="2"/>
+  <text x="630" y="728" text-anchor="middle" class="box-title">TrajQueue</text>
+  <text x="630" y="753" text-anchor="middle" class="small">final trajectory</text>
+  <text x="630" y="772" text-anchor="middle" class="small">output queue</text>
+
+  <!-- Router with ParserMiddleware + TrajectoryParser -->
+  <rect x="820" y="360" width="350" height="400" rx="14" fill="#eef2fb" stroke="#4a6fc0" stroke-width="1.5" filter="url(#box-shadow)"/>
+  <text x="995" y="398" text-anchor="middle" class="box-title">Router</text>
+  <text x="995" y="422" text-anchor="middle" class="small">OpenAI ↔ SGLang reverse proxy (background thread)</text>
+
+  <rect x="842" y="440" width="306" height="130" rx="10" fill="#c9d6f5" stroke="#4a6fc0" stroke-width="1" filter="url(#box-shadow)"/>
+  <text x="995" y="475" text-anchor="middle" class="box-title">ParserMiddleware</text>
+  <text x="995" y="500" text-anchor="middle" class="small">intercepts /v1/chat/completions</text>
+  <text x="995" y="522" text-anchor="middle" class="small">rewrite to /generate: messages → input_ids</text>
+  <text x="995" y="544" text-anchor="middle" class="small">return_logprob=True / rid</text>
+
+  <rect x="842" y="600" width="306" height="130" rx="10" fill="#d9ead3" stroke="#79ad5e" stroke-width="1" filter="url(#box-shadow)"/>
+  <text x="995" y="635" text-anchor="middle" class="box-title">TrajectoryParser</text>
+  <text x="995" y="660" text-anchor="middle" class="small">ToolCallParser · ReasoningParser</text>
+  <text x="995" y="682" text-anchor="middle" class="small">tokenize · logprob / loss_mask alignment</text>
+  <text x="995" y="704" text-anchor="middle" class="small">write back to TrajectoryStore</text>
+  <!-- Agent group -->
+  <rect x="1330" y="220" width="360" height="300" fill="#ffffff" stroke="#626262" stroke-width="1.5" filter="url(#shadow)"/>
+  <text x="1510" y="262" text-anchor="middle" class="group-title">Agent (multi_turn)</text>
+
+  <rect x="1350" y="290" width="72" height="52" rx="10" fill="#fff1c7" stroke="#ddb43f" stroke-width="1" filter="url(#box-shadow)"/>
+  <text x="1386" y="323" text-anchor="middle" class="body">traj 0</text>
+  <rect x="1434" y="290" width="72" height="52" rx="10" fill="#fff1c7" stroke="#ddb43f" stroke-width="1" filter="url(#box-shadow)"/>
+  <text x="1470" y="323" text-anchor="middle" class="body">traj 1</text>
+  <text x="1550" y="325" text-anchor="middle" font-size="26" font-weight="700">…</text>
+  <rect x="1590" y="290" width="82" height="52" rx="10" fill="#fff1c7" stroke="#ddb43f" stroke-width="1" filter="url(#box-shadow)"/>
+  <text x="1631" y="323" text-anchor="middle" class="body">traj N</text>
+
+  <rect x="1355" y="400" width="310" height="90" rx="12" fill="#fff1c7" stroke="#ddb43f" stroke-width="1" filter="url(#box-shadow)"/>
+  <text x="1510" y="438" text-anchor="middle" class="box-title">Agent Loop</text>
+  <text x="1510" y="465" text-anchor="middle" class="small">mini-swe / gsm8k / bcp ...</text>
+
+  <!-- Sandbox group (3 replicas, overlapping) -->
+  <rect x="1330" y="610" width="360" height="250" fill="#ffffff" stroke="#626262" stroke-width="1.5" filter="url(#shadow)"/>
+  <text x="1510" y="648" text-anchor="middle" class="group-title">Sandbox</text>
+  <text x="1510" y="670" text-anchor="middle" class="small">K8s Pod / Docker</text>
+  <!-- Pods drawn back-to-front for overlap effect -->
+  <rect x="1370" y="698" width="290" height="62" rx="10" fill="#fde2c4" stroke="#e08a00" stroke-width="1" filter="url(#box-shadow)"/>
+  <text x="1515" y="736" text-anchor="middle" class="body">Pod 3</text>
+  <rect x="1355" y="720" width="290" height="62" rx="10" fill="#fde2c4" stroke="#e08a00" stroke-width="1" filter="url(#box-shadow)"/>
+  <text x="1500" y="758" text-anchor="middle" class="body">Pod 2</text>
+  <rect x="1340" y="742" width="290" height="62" rx="10" fill="#fde2c4" stroke="#e08a00" stroke-width="1" filter="url(#box-shadow)"/>
+  <text x="1485" y="780" text-anchor="middle" class="body">Sandbox N</text>
+
+  <!-- SGLang cluster -->
+  <rect x="370" y="930" width="840" height="170" fill="#ffffff" stroke="#626262" stroke-width="1.5" filter="url(#shadow)"/>
+  <text x="790" y="970" text-anchor="middle" class="group-title">SGLang Cluster</text>
+  <rect x="400" y="990" width="160" height="80" rx="12" fill="#f7c9c9" stroke="#c05a5a" stroke-width="1" filter="url(#box-shadow)"/>
+  <text x="480" y="1037" text-anchor="middle" class="box-title">worker 1</text>
+  <rect x="630" y="990" width="160" height="80" rx="12" fill="#f7c9c9" stroke="#c05a5a" stroke-width="1" filter="url(#box-shadow)"/>
+  <text x="710" y="1037" text-anchor="middle" class="box-title">worker 2</text>
+  <text x="910" y="1040" text-anchor="middle" font-size="26" font-weight="700">…</text>
+  <rect x="1020" y="990" width="160" height="80" rx="12" fill="#f7c9c9" stroke="#c05a5a" stroke-width="1" filter="url(#box-shadow)"/>
+  <text x="1100" y="1037" text-anchor="middle" class="box-title">worker N</text>
+  <!-- Trainer <-> AgentFlow -->
+  <line x1="250" y1="345" x2="370" y2="345" stroke="#111827" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="310" y="335" text-anchor="middle" class="edge-label">generate</text>
+  <line x1="370" y1="419" x2="250" y2="419" stroke="#111827" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="310" y="409" text-anchor="middle" class="edge-label">traj group</text>
+
+  <!-- _run_trajectory -> TrajQueue -->
+  <line x1="527" y1="629" x2="527" y2="685" stroke="#111827" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="620" y="662" text-anchor="middle" class="edge-label">traj_queue.add()</text>
+
+  <!-- single_turn: _run_trajectory -> ParserMiddleware (arc over crossing) -->
+  <!-- white gap to simulate "over" bridge effect -->
+  <path d="M733,546 Q747,522 761,540" fill="none" stroke="#ffffff" stroke-width="6"/>
+  <path d="M652,585 L733,546 Q747,522 761,540 L842,500" fill="none" stroke="#6b7280" stroke-width="1.5" stroke-dasharray="7 5" marker-end="url(#d-arrow)"/>
+  <text x="747" y="512" text-anchor="middle" class="edge-d"></text>
+
+  <!-- multi_turn: AgentFlow -> Agent -->
+  <line x1="1210" y1="290" x2="1330" y2="290" stroke="#111827" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="1270" y="278" text-anchor="middle" class="edge-label">multi_turn</text>
+
+  <!-- Agent Loop -> Router (LLM call) -->
+  <line x1="1355" y1="420" x2="1170" y2="420" stroke="#111827" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="1263" y="408" text-anchor="middle" class="edge-label">/v1/chat/completions</text>
+
+  <!-- Agent -> AgentFlow reward -->
+  <line x1="1330" y1="480" x2="1210" y2="480" stroke="#111827" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="1270" y="500" text-anchor="middle" class="edge-label">reward</text>
+
+  <!-- TrajectoryParser -> TrajectoryStore -->
+  <line x1="842" y1="610" x2="652" y2="465" stroke="#6b7280" stroke-width="1.5" stroke-dasharray="7 5" marker-end="url(#d-arrow)"/>
+  <text x="747" y="556" text-anchor="middle" class="edge-d"></text>
+
+  <!-- Router <-> SGLang: token in / token out -->
+  <line x1="960" y1="760" x2="960" y2="930" stroke="#2563eb" stroke-width="1.5" marker-end="url(#b-arrow)"/>
+  <text x="870" y="800" class="edge-b">token in (/generate)</text>
+  <text x="870" y="824" class="edge-b">input_ids</text>
+  <line x1="1045" y1="930" x2="1045" y2="762" stroke="#2563eb" stroke-width="1.5" marker-end="url(#b-arrow)"/>
+  <text x="1070" y="882" class="edge-b">token out</text>
+  <text x="1070" y="904" class="edge-b">token_ids / logprobs / routed_experts / ...</text>
+
+  <!-- Agent Loop -> Sandbox -->
+  <line x1="1510" y1="490" x2="1510" y2="610" stroke="#6b7280" stroke-width="1.5" stroke-dasharray="7 5" marker-end="url(#d-arrow)"/>
+  <text x="1560" y="555" text-anchor="middle" class="edge-d">exec shell</text>
+</svg>

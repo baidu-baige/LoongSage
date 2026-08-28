@@ -1,0 +1,114 @@
+# @package _global_
+#
+# mini-swe / R2E-Gym on DeepSeek-V4-Flash-BF16, 8-node H20.
+#
+# Set before launching: checkpoint_path, hf_model_path, data_source.dataset.prompt_data_path.
+# The first two must live on storage reachable by every node. See docs/en/run-guide.md for
+# how to fetch the dataset and convert the FP8 model to BF16 (Task 4).
+#
+# Launch:
+#   bash examples/start_ray_cluster.sh <master-ip>   # on every node first
+#   bash examples/start.sh dsv4_flash_bf16/swe_h20_8node
+
+defaults:
+  - /default
+  - _self_
+
+checkpoint_path: ???
+hf_model_path: ???
+colocate: true
+total_steps: 300
+
+data_source:
+  dataset:
+    prompt_data_path: ???
+    input_key: prompt
+    label_key: label
+    metadata_key: metadata
+    data_pre_processor: r2e_gym
+    max_prompt_len: 16384  # 16K
+  agent:
+    name: mini-swe
+    step_limit: 100
+    request_timeout: 1200
+    max_consecutive_format_errors: 10
+  reward:
+    name: r2e_gym
+  num_trajectories_per_prompt: 16
+  num_prompts_per_step: 32
+  max_response_len_per_trajectory: 147456  # 160K - 16K
+
+rollout:
+  env_vars:
+    SGLANG_RMSNORM_NO_PDL: "1"
+  retry_limit: 5
+  num_gpus_per_node: 8
+  sglang_args:
+    mem_fraction_static: 0.8
+    disable_cuda_graph: false
+    tp_size: 8
+    ep_size: 8
+    enable_hierarchical_cache: true
+    hicache_ratio: 1.0
+    load_format: dummy
+  sglang_replicas:
+    regular:
+      num_nodes: 8
+      num_gpus_per_replica: 8
+  sampler:
+    num_oversample: 0
+    timeout: 144000
+  use_fault_tolerance: true
+
+agentflow:
+  dump_trajectory_path: "log/trajectories"
+  router:
+    proxy_timeout_seconds: 1800
+  tokenizer:
+    generation_prompt_kwargs:
+      thinking: true
+
+trainer:
+  num_gpus_per_node: 8
+  num_nodes: 8
+  mini_batch_size: 128
+  max_tokens_per_gpu: 20480
+  use_dynamic_batch_size: true
+  use_rollout_routing_replay: true
+  use_fp32_lm_head: true
+  save_freq: 5
+  nccl_timeout_minutes: 60
+  gloo_timeout_minutes: 60
+
+megatron:
+  model:
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 8
+    context_parallel_size: 8
+    sequence_packing_scheduler: "default_dynamic_cp"
+    cp_partition_mode: "contiguous"
+    expert_model_parallel_size: 8
+    expert_tensor_parallel_size: 1
+    dsa_indexer_loss_coeff: 0.0
+    dsa_indexer_use_sparse_loss: true
+    apply_dsa_kernel_fusion: true
+    moe_shared_expert_overlap: false
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 1
+  optimizer:
+    lr: 1.0e-6
+    optimizer_cpu_offload: true
+    optimizer_offload_fraction: 1
+
+algorithm:
+  advantage_estimator: grpo
+  advantage_norm_mode: group_zscore
+  policy_loss: grpo
+  loss_agg_mode: token-mean
+  is_correction:
+    enable: true
+    action: mask
+    level: token
+    lower_bound: 0.5
+    upper_bound: 2

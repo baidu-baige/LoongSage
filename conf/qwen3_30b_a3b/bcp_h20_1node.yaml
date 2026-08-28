@@ -1,0 +1,85 @@
+# @package _global_
+# Qwen3-30B-A3B BCP on a single 8-GPU H20 node: R3 + partial rollout + dynamic sampling
+# + status/reward filter.
+# Setup and launch instructions are in docs/en/run-guide.md (Task 2).
+defaults:
+  - /default
+  - _self_
+
+checkpoint_path: "./checkpoints"
+hf_model_path: ???
+colocate: true
+total_steps: 100
+log_level: INFO
+
+data_source:
+  dataset:
+    prompt_data_path: ???
+    data_pre_processor: bcp
+    input_key: prompt
+    label_key: answer
+    shuffle: false
+  num_trajectories_per_prompt: 8
+  num_prompts_per_step: 32
+  agent:
+    name: bcp
+    retrieval_service_url: http://127.0.0.1:9000
+    search_topk: 3
+    max_queries_per_call: 1
+    topk_chunks: 3
+    chunk_size: 512
+    chunk_overlap: 32
+    max_turns: 15
+    tool_timeout: 30.0
+    search_timeout: 300.0
+  reward:
+    name: bcp
+  max_response_len_per_trajectory: 10240
+
+rollout:
+  retry_limit: 5
+  partial: true
+  sglang_args:
+    disable_cuda_graph: false
+    mem_fraction_static: 0.3
+  sglang_replicas:
+    regular:
+      num_nodes: 1
+      num_gpus_per_replica: 8
+  sampler:
+    name: "dynamic"
+    num_oversample: 8
+    refill_ratio: 2
+    max_refill_count: 256
+    timeout: 7200
+
+agentflow:
+  dump_trajectory_path: "log/trajectories"
+  router:
+    proxy_timeout_seconds: 600
+  tokenizer:
+    generation_prompt_kwargs:
+      enable_thinking: true
+
+trainer:
+  num_gpus_per_node: 8
+  num_nodes: 1
+  temperature: 1.0
+  mini_batch_size: 32
+  micro_batch_size: 1
+  max_tokens_per_gpu: 12288
+  use_dynamic_batch_size: true
+  use_rollout_routing_replay: true
+
+megatron:
+  model:
+    tensor_model_parallel_size: 8
+    pipeline_model_parallel_size: 1
+    expert_model_parallel_size: 8
+    expert_tensor_parallel_size: 1
+
+algorithm:
+  advantage_estimator: grpo
+  advantage_norm_mode: group_zscore
+  policy_loss: grpo
+  loss_agg_mode: token-mean

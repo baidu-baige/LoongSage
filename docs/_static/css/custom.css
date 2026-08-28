@@ -1,0 +1,114 @@
+/* Coda docs — theme tweaks on top of sphinx-book-theme / pydata-sphinx-theme.
+   Only pydata CSS variables are used, so light and dark mode both follow. */
+
+/* -- Typography ---------------------------------------------------------- */
+
+html {
+  --pst-font-family-base: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI",
+    "Helvetica Neue", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei",
+    "Noto Sans CJK SC", sans-serif;
+  --pst-font-family-monospace: "SFMono-Regular", Menlo, Consolas,
+    "Liberation Mono", "Noto Sans Mono CJK SC", monospace;
+}
+
+.bd-article p,
+.bd-article li {
+  line-height: 1.72;
+}
+
+/* Config reference pages carry very wide tables — give them some room. */
+.bd-main .bd-content .bd-article-container {
+  max-width: 68rem;
+}
+
+/* -- Logo ---------------------------------------------------------------- */
+
+.navbar-brand img,
+img.logo__image {
+  max-width: 100%;
+  width: auto;
+  height: auto;
+}
+
+/* -- Tables -------------------------------------------------------------- */
+
+.bd-article table.docutils {
+  font-size: 0.86rem;
+  width: 100%;
+}
+
+.bd-article table.docutils thead th {
+  background: var(--pst-color-surface);
+  border-bottom: 2px solid var(--pst-color-border);
+  white-space: nowrap;
+}
+
+.bd-article table.docutils td code,
+.bd-article table.docutils th code {
+  white-space: normal;
+  word-break: break-word;
+}
+
+/* -- Code ---------------------------------------------------------------- */
+
+.bd-article div.highlight pre {
+  font-size: 0.84rem;
+  line-height: 1.55;
+}
+
+.bd-article code.literal {
+  border-radius: 0.25rem;
+}
+
+/* -- Language toggle (see _static/js/lang-toggle.js) --------------------- */
+
+.coda-lang-toggle {
+  display: inline-flex;
+  align-items: stretch;
+  margin-left: 0.4rem;
+  border: 1px solid var(--pst-color-border);
+  border-radius: 999px;
+  overflow: hidden;
+  background: var(--pst-color-on-background);
+}
+
+.coda-lang-toggle__btn {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--pst-color-text-muted);
+  font-family: inherit;
+  font-size: 0.78rem;
+  font-weight: 600;
+  line-height: 1;
+  padding: 0.32rem 0.62rem;
+  cursor: pointer;
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+
+.coda-lang-toggle__btn:hover:not(.is-active) {
+  background: var(--pst-color-surface);
+  color: var(--pst-color-primary);
+}
+
+.coda-lang-toggle__btn:focus-visible {
+  outline: 2px solid var(--pst-color-primary);
+  outline-offset: -2px;
+}
+
+.coda-lang-toggle__btn.is-active {
+  background: var(--pst-color-primary);
+  color: var(--pst-color-background);
+  opacity: 1;
+  cursor: default;
+}
+
+/* Only used if the theme header could not be found at all. */
+.coda-lang-toggle--floating {
+  position: fixed;
+  right: 1rem;
+  bottom: 1rem;
+  z-index: 1050;
+  box-shadow: 0 2px 8px rgb(0 0 0 / 25%);
+  background: var(--pst-color-background);
+}

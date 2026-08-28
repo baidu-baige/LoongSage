@@ -1,0 +1,142 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="900" viewBox="0 0 1800 900" role="img" aria-labelledby="title desc">
+  <title id="title">Coda Fully Async Mode Architecture</title>
+  <desc id="desc">System architecture of Rollout, TrajQueue, Collector, PipelineBuffer, and Trainer, and the pause, cleanup, checkpoint, weight sync, and resume mechanisms at training step boundaries.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#111827"/>
+    </marker>
+    <marker id="orange-arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#f97316"/>
+    </marker>
+    <filter id="shadow" x="-10%" y="-10%" width="125%" height="130%">
+      <feDropShadow dx="4" dy="5" stdDeviation="5" flood-color="#111827" flood-opacity="0.13"/>
+    </filter>
+    <style>
+      text { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", Arial, sans-serif; fill: #111827; }
+      .group-title { font-size: 28px; font-weight: 700; }
+      .box-title { font-size: 21px; font-weight: 700; }
+      .body { font-size: 17px; }
+      .small { font-size: 15px; fill: #4b5563; }
+      .edge-label { font-size: 17px; font-weight: 600; }
+      .note { font-size: 18px; }
+    </style>
+  </defs>
+
+  <rect width="1800" height="900" fill="#ffffff"/>
+
+  <!-- Capability notes -->
+  <rect x="55" y="32" width="390" height="150" fill="#ffffff" stroke="#111827" stroke-width="2.5" stroke-dasharray="13 10"/>
+  <text x="82" y="73" class="note">
+    <tspan x="82" dy="0">- Continuously generate trajectories</tspan>
+    <tspan x="82" dy="34">- sliding-window dispatch</tspan>
+    <tspan x="82" dy="34">- pause / resume</tspan>
+  </text>
+
+  <rect x="615" y="32" width="570" height="150" fill="#ffffff" stroke="#111827" stroke-width="2.5" stroke-dasharray="13 10"/>
+  <text x="642" y="73" class="note">
+    <tspan x="642" dy="0">- Aggregate trajectories by prompt_id</tspan>
+    <tspan x="642" dy="34">- collector handles filter + metrics</tspan>
+    <tspan x="642" dy="34">- Two-level queue decouples generation and training</tspan>
+  </text>
+
+  <rect x="1355" y="32" width="390" height="150" fill="#ffffff" stroke="#111827" stroke-width="2.5" stroke-dasharray="13 10"/>
+  <text x="1382" y="73" class="note">
+    <tspan x="1382" dy="0">- mini-batch training</tspan>
+    <tspan x="1382" dy="34">- optimizer update</tspan>
+    <tspan x="1382" dy="34">- Triggers step-boundary sync</tspan>
+  </text>
+
+  <!-- Rollout -->
+  <rect x="35" y="220" width="430" height="475" fill="#f7f7f7" stroke="#626262" stroke-width="2" filter="url(#shadow)"/>
+  <text x="250" y="265" text-anchor="middle" class="group-title">Rollout</text>
+
+  <rect x="78" y="305" width="130" height="66" rx="10" fill="#d9ead3" stroke="#79ad5e" stroke-width="2.5"/>
+  <text x="143" y="334" text-anchor="middle" class="box-title">Datasource</text>
+  <text x="143" y="357" text-anchor="middle" class="small">prompt groups</text>
+
+  <rect x="250" y="305" width="172" height="66" rx="10" fill="#d9ead3" stroke="#79ad5e" stroke-width="2.5"/>
+  <text x="336" y="334" text-anchor="middle" class="box-title">Producer</text>
+  <text x="336" y="357" text-anchor="middle" class="small">background thread</text>
+  <line x1="208" y1="338" x2="250" y2="338" stroke="#111827" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <rect x="78" y="418" width="344" height="82" rx="12" fill="#d9ead3" stroke="#79ad5e" stroke-width="2.5"/>
+  <text x="250" y="454" text-anchor="middle" class="box-title">AgentFlow / SGLang</text>
+  <text x="250" y="481" text-anchor="middle" class="body">Rollout Worker</text>
+
+  <text x="250" y="546" text-anchor="middle" font-size="30" font-weight="700">…</text>
+
+  <rect x="78" y="582" width="344" height="82" rx="12" fill="#d9ead3" stroke="#79ad5e" stroke-width="2.5"/>
+  <text x="250" y="618" text-anchor="middle" class="box-title">AgentFlow / SGLang</text>
+  <text x="250" y="645" text-anchor="middle" class="body">Rollout Worker</text>
+  <path d="M336 371 V394 H250 V418" fill="none" stroke="#111827" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- Queue + Collector -->
+  <rect x="560" y="220" width="680" height="330" fill="#f7f7f7" stroke="#626262" stroke-width="2" filter="url(#shadow)"/>
+  <text x="900" y="265" text-anchor="middle" class="group-title">Queue + Collector</text>
+
+  <rect x="590" y="330" width="180" height="104" rx="50" fill="#fff1c7" stroke="#ddb43f" stroke-width="2.5"/>
+  <rect x="630" y="354" width="34" height="54" rx="6" fill="#d6e5fb" stroke="#668fca" stroke-width="2"/>
+  <rect x="667" y="354" width="34" height="54" rx="6" fill="#d6e5fb" stroke="#668fca" stroke-width="2"/>
+  <rect x="704" y="354" width="34" height="54" rx="6" fill="#d6e5fb" stroke="#668fca" stroke-width="2"/>
+  <text x="680" y="468" text-anchor="middle" class="box-title">TrajQueue</text>
+  <text x="680" y="493" text-anchor="middle" class="small">terminal trajectory</text>
+
+  <rect x="810" y="320" width="180" height="124" rx="12" fill="#d9eee9" stroke="#4c9b8b" stroke-width="2.5"/>
+  <text x="900" y="360" text-anchor="middle" class="box-title">Collector</text>
+  <text x="900" y="391" text-anchor="middle" class="body">assemble N trajectories</text>
+  <text x="900" y="418" text-anchor="middle" class="body">filter + metrics</text>
+
+  <rect x="1030" y="330" width="180" height="104" rx="50" fill="#fff1c7" stroke="#ddb43f" stroke-width="2.5"/>
+  <rect x="1070" y="354" width="34" height="54" rx="6" fill="#d6e5fb" stroke="#668fca" stroke-width="2"/>
+  <rect x="1107" y="354" width="34" height="54" rx="6" fill="#d6e5fb" stroke="#668fca" stroke-width="2"/>
+  <rect x="1144" y="354" width="34" height="54" rx="6" fill="#d6e5fb" stroke="#668fca" stroke-width="2"/>
+  <text x="1120" y="468" text-anchor="middle" class="box-title">PipelineBuffer</text>
+  <text x="1120" y="493" text-anchor="middle" class="small">TrajectoryGroup</text>
+
+  <line x1="770" y1="382" x2="810" y2="382" stroke="#111827" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="990" y1="382" x2="1030" y2="382" stroke="#111827" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- Trainer -->
+  <rect x="1335" y="220" width="430" height="475" fill="#f7f7f7" stroke="#626262" stroke-width="2" filter="url(#shadow)"/>
+  <text x="1550" y="265" text-anchor="middle" class="group-title">Trainer</text>
+
+  <rect x="1378" y="305" width="344" height="82" rx="12" fill="#d6e5fb" stroke="#668fca" stroke-width="2.5"/>
+  <text x="1550" y="340" text-anchor="middle" class="box-title">Trainer Consumer</text>
+  <text x="1550" y="367" text-anchor="middle" class="body">main thread / process trajectory</text>
+
+  <rect x="1378" y="430" width="344" height="82" rx="12" fill="#d6e5fb" stroke="#668fca" stroke-width="2.5"/>
+  <text x="1550" y="480" text-anchor="middle" class="box-title">Train Worker</text>
+  <text x="1550" y="557" text-anchor="middle" font-size="30" font-weight="700">…</text>
+  <rect x="1378" y="585" width="344" height="82" rx="12" fill="#d6e5fb" stroke="#668fca" stroke-width="2.5"/>
+  <text x="1550" y="635" text-anchor="middle" class="box-title">Train Worker</text>
+  <line x1="1550" y1="387" x2="1550" y2="430" stroke="#111827" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- Inter-component data paths -->
+  <path d="M465 382 H590" fill="none" stroke="#111827" stroke-width="2.5" marker-end="url(#arrow)"/>
+  <rect x="474" y="326" width="116" height="40" fill="#ffffff" stroke="#111827" stroke-width="2" stroke-dasharray="8 6"/>
+  <text x="532" y="352" text-anchor="middle" class="edge-label">put_traj</text>
+
+  <path d="M1210 382 H1335" fill="none" stroke="#111827" stroke-width="2.5" marker-end="url(#arrow)"/>
+  <rect x="1210" y="326" width="125" height="40" fill="#ffffff" stroke="#111827" stroke-width="2" stroke-dasharray="8 6"/>
+  <text x="1272" y="352" text-anchor="middle" class="edge-label">get_group</text>
+
+  <!-- Step-boundary coordinator, analogous to the synchronization plane. -->
+  <rect x="485" y="610" width="830" height="238" rx="30" fill="#fffdf9" stroke="#f97316" stroke-width="4" stroke-dasharray="14 10"/>
+  <text x="900" y="651" text-anchor="middle" class="group-title" fill="#c2410c">Step Boundary Coordinator</text>
+
+  <rect x="525" y="687" width="155" height="58" fill="#ffffff" stroke="#111827" stroke-width="2" stroke-dasharray="8 6"/>
+  <text x="602" y="722" text-anchor="middle" class="box-title">pause</text>
+  <rect x="713" y="687" width="170" height="58" fill="#ffffff" stroke="#111827" stroke-width="2" stroke-dasharray="8 6"/>
+  <text x="798" y="722" text-anchor="middle" class="box-title">cleanup</text>
+  <rect x="916" y="687" width="170" height="58" fill="#ffffff" stroke="#111827" stroke-width="2" stroke-dasharray="8 6"/>
+  <text x="1001" y="722" text-anchor="middle" class="box-title">save_ckpt</text>
+  <rect x="1119" y="687" width="155" height="58" fill="#ffffff" stroke="#111827" stroke-width="2" stroke-dasharray="8 6"/>
+  <text x="1196" y="722" text-anchor="middle" class="box-title">resume</text>
+
+  <rect x="710" y="773" width="380" height="52" fill="#ffffff" stroke="#111827" stroke-width="2" stroke-dasharray="8 6"/>
+  <text x="900" y="806" text-anchor="middle" class="box-title">update_weights + weight_version</text>
+
+  <path d="M1335 840 H465" fill="none" stroke="#111827" stroke-width="2.5" marker-end="url(#arrow)"/>
+  <text x="1387" y="831" text-anchor="middle" class="small">step complete</text>
+  <text x="900" y="873" text-anchor="middle" class="edge-label" fill="#c2410c">pause / cleanup → checkpoint → weight sync → resume</text>
+</svg>

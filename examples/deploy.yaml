@@ -1,0 +1,98 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coda-example
+  namespace: default
+spec:
+  progressDeadlineSeconds: 600
+  replicas: 4
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      workload: coda-example
+  strategy:
+    rollingUpdate:
+      maxSurge: 1%
+      maxUnavailable: 100%
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        workload: coda-example
+    spec:
+      containers:
+      - args:
+        - -c
+        - sleep 999999h
+        command:
+        - /bin/bash
+        env:
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: status.podIP
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: metadata.namespace
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: metadata.name
+        - name: HOST_IP
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: status.hostIP
+        - name: NCCL_DEBUG
+          value: INFO
+        - name: TZ
+          value: Asia/Shanghai
+        image: loongsage/loongsage
+        imagePullPolicy: IfNotPresent
+        name: model-server
+        resources:
+          limits:
+            cpu: "100"
+            memory: 2000Gi
+          requests:
+            cpu: "20"
+            memory: 50Gi
+        securityContext:
+          capabilities:
+            add:
+            - SYS_PTRACE
+            - SYS_ADMIN
+            - NET_ADMIN
+            - IPC_LOCK
+          privileged: true
+          runAsUser: 0
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /dev/shm
+          name: dev-shm
+        - mountPath: /ssd1/models
+          name: ssd1-models
+        workingDir: /sgl-workspace
+      dnsPolicy: ClusterFirst
+      enableServiceLinks: false
+      hostNetwork: true
+      preemptionPolicy: PreemptLowerPriority
+      priority: 0
+      restartPolicy: Always
+      securityContext: {}
+      shareProcessNamespace: true
+      terminationGracePeriodSeconds: 10
+      volumes:
+      - emptyDir:
+          medium: Memory
+          sizeLimit: 2000Gi
+        name: dev-shm
+      - hostPath:
+          path: /ssd1/models
+          type: DirectoryOrCreate
+        name: ssd1-models

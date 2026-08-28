@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit-tests:
+    name: Unit tests (CPU)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12.3"
+          cache: pip
+
+      - name: Install dependencies
+        # The "ci" extra is the CPU-installable subset. The GPU stack
+        # (megatron-core, transformer-engine, sglang) is deliberately absent;
+        # the ~150 tests that need it skip via pytest.importorskip.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -e ".[ci]"
+
+      - name: Run unit tests
+        run: |
+          python -m pytest tests/ut -v \
+            --cov=coda \
+            --cov-branch \
+            --cov-report=term-missing \
+            --cov-report=xml:coverage.xml
+
+      - name: Fail if anything errored during collection
+        # A collection error is reported as an error, not a failure, and can be
+        # easy to miss in a long log; make it explicit.
+        run: python -m pytest tests/ut --collect-only -q
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: coverage.xml
+          if-no-files-found: ignore

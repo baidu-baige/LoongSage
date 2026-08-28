@@ -1,0 +1,78 @@
+# @package _global_
+# Qwen3-30B-A3B DAPO on a single 8-GPU H20 node (colocated rollout + training).
+#
+# 1. Download the model and dataset:
+#      hf download Qwen/Qwen3-30B-A3B --local-dir /root/Qwen3-30B-A3B
+#      hf download Haitao999/DAPO-Math-17k-unique --repo-type=dataset \
+#        --local-dir /root/DAPO-Math-17k-unique
+#
+# 2. Launch with those paths:
+#      bash examples/start.sh qwen3_30b_a3b/dapo_h20_1node \
+#        hf_model_path=/root/Qwen3-30B-A3B \
+#        data_source.dataset.prompt_data_path=/root/DAPO-Math-17k-unique
+defaults:
+  - /default
+  - _self_
+
+checkpoint_path: "./checkpoints"
+hf_model_path: ???
+colocate: true    # must be false in fully-async mode
+total_steps: 100
+
+data_source:
+  dataset:
+    prompt_data_path: "/path/to/prompt-data"
+    input_key: prompt
+    label_key: reward_model
+  reward:
+    name: dapo_math
+    overlong_penalty_length: 4096
+  num_prompts_per_step: 64
+  num_trajectories_per_prompt: 8
+  max_response_len_per_trajectory: 20480
+
+rollout:
+  num_gpus_per_node: 8
+  sglang_args:
+    mem_fraction_static: 0.9
+    disable_cuda_graph: false
+  sglang_replicas:
+    regular:
+      num_nodes: 1
+      num_gpus_per_replica: 4
+
+agentflow:
+  dump_trajectory_path: "log/trajectories"
+  tokenizer:
+    generation_prompt_kwargs:
+      enable_thinking: true
+
+trainer:
+  num_gpus_per_node: 8
+  num_nodes: 1
+  mini_batch_size: 128
+  max_tokens_per_gpu: 20480
+  use_dynamic_batch_size: true
+  use_rollout_routing_replay: false
+  use_fp32_lm_head: false
+
+megatron:
+  model:
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 2
+    virtual_pipeline_model_parallel_size: null
+    context_parallel_size: 1
+    expert_model_parallel_size: 4
+    expert_tensor_parallel_size: 1
+
+algorithm:
+  advantage_estimator: grpo
+  advantage_norm_mode: group_zscore
+  policy_loss: grpo
+  loss_agg_mode: token-mean
+  is_correction:
+    enable: true
+    action: mask
+    level: token
+    lower_bound: 0.5
+    upper_bound: 2
