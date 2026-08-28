@@ -4,11 +4,13 @@
   <strong>中文</strong> | <a href="./README.md">English</a>
 </div>
 
-# LoongSage: the coda of LLM training
+<img src="./docs/_static/image/logo.png" alt="LoongSage" width="420">
 
-**Agentic · Scalable · Lightweight**
+# LoongSage - the coda of LLM training
 
-面向超大模型与智能体的工业级极简强化学习框架
+**Production-Grade · Agentic · Scalable · Lightweight**
+
+面向前沿大模型的工业级高效 Agentic RL 框架，提供经过验证的训练配方
 
 <p>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"></a>

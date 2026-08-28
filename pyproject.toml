@@ -3,15 +3,15 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "coda"
+name = "LoongSage"
 version = "0.1.0"
-description = "Coda: a scalable RL post-training framework for LLMs and agents"
+description = "LoongSage: a scalable RL post-training framework for LLMs and agents"
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "Apache-2.0" }
 
 # Runtime dependencies are currently pinned in docker/Dockerfile and are not
-# duplicated here; Coda is expected to run inside the provided image.
+# duplicated here; LoongSage is expected to run inside the provided image.
 dependencies = []
 
 [project.optional-dependencies]

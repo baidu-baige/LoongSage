@@ -4,11 +4,13 @@
   <a href="./README_zh.md">中文</a> | <strong>English</strong>
 </div>
 
+<img src="./docs/_static/image/logo.png" alt="LoongSage" width="420">
+
 # LoongSage: the coda of LLM training
 
-**Agentic · Scalable · Lightweight**
+**Production-Grade · Agentic · Scalable · Lightweight**
 
-A production-grade, minimalist reinforcement learning framework for ultra-large models and agents.
+A production-grade, high-efficiency Agentic RL framework for frontier LLMs with validated recipes.
 
 <p>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"></a>
