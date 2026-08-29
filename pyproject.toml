@@ -27,7 +27,7 @@ test = [
 # nvidia-resiliency-ext); tests needing those skip via pytest.importorskip.
 # Versions track docker/Dockerfile where it pins them.
 ci = [
-    "coda[test]",
+    "LoongSage[test]",
     "torch>=2.4",
     "numpy>=1.26",
     "omegaconf==2.3.1",

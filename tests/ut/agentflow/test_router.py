@@ -3,6 +3,7 @@
 import asyncio
 import importlib.util
 import json
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -112,9 +113,34 @@ def make_proxy_router(trajectory_store: TrajectoryStore | None = None) -> Router
             "trajectory_store": trajectory_store or TrajectoryStore(),
             "tokenizer_manager": FakeTokenizerManager(),
             "accumulate_reasoning": False,
-            "max_response_len_per_trajectory": 1024,
+            # Keyed by Trajectory.ds_index, which defaults to 0.
+            "ds_configs": {0: OmegaConf.create({"max_response_len_per_trajectory": 1024})},
         },
     )
+
+
+@asynccontextmanager
+async def proxy_client(router: Router, *, upstream_body: dict, **request_kwargs):
+    """Yield ``(asgi_client, generate_request_mock)`` for proxy forwarding tests.
+
+    ``Router.proxy`` builds a throwaway ``httpx.AsyncClient`` per forward, so the
+    seam for tests is the constructor rather than a router attribute. The ASGI
+    test client is created *before* the patch goes live, so it keeps the real
+    httpx implementation and only the proxy's client is mocked.
+
+    Args:
+        router: The router under test.
+        upstream_body: Body injected as ``request.state.upstream_body``.
+        request_kwargs: Forwarded to the ``AsyncMock`` standing in for
+            ``AsyncClient.request`` (e.g. ``return_value`` or ``side_effect``).
+    """
+    async with make_client(router, upstream_body=upstream_body) as client:
+        request_mock = AsyncMock(**request_kwargs)
+        generate_client = MagicMock()
+        generate_client.request = request_mock
+        generate_client.aclose = AsyncMock()
+        with patch.object(httpx, "AsyncClient", return_value=generate_client):
+            yield client, request_mock
 
 
 # ---------------------------------------------------------------------------
@@ -653,8 +679,9 @@ class TestProxyForwarding:
     async def test_proxy_forwards_worker_4xx_unchanged(self):
         """A worker-side rejection must reach the caller with its status and body.
 
-        The router does not validate the payload itself; it only relays whatever
-        the worker decides.
+        The request itself is well-formed so it clears parser-middleware
+        validation and actually reaches the worker; the router adds no judgement
+        of its own and only relays whatever the worker decides.
         """
         router = make_proxy_router(make_store(("req-001", 0)))
         router.worker_request_counts["http://w1:8888"] = 0
@@ -662,20 +689,21 @@ class TestProxyForwarding:
         mock_response = MagicMock()
         mock_response.status_code = status.HTTP_400_BAD_REQUEST
         mock_response.headers = {"content-type": "application/json"}
-        mock_response.aread = AsyncMock(return_value=b'{"error": "missing messages"}')
+        mock_response.aread = AsyncMock(return_value=b'{"error": "worker rejected it"}')
 
-        with patch.object(
-            router.http_client, "request", return_value=mock_response
-        ) as request_mock:
-            async with make_client(router, upstream_body={"prompt": "hello"}) as client:
-                response = await client.post(
-                    "/req-001/0/v1/chat/completions",
-                    json={"prompt": "hello"},
-                )
+        async with proxy_client(
+            router,
+            upstream_body={"messages": [{"role": "user", "content": "hello"}]},
+            return_value=mock_response,
+        ) as (client, request_mock):
+            response = await client.post(
+                "/req-001/0/v1/chat/completions",
+                json={"messages": [{"role": "user", "content": "hello"}]},
+            )
 
         request_mock.assert_awaited_once()
         assert response.status_code == status.HTTP_400_BAD_REQUEST
-        assert response.json() == {"error": "missing messages"}
+        assert response.json() == {"error": "worker rejected it"}
 
     @pytest.mark.asyncio
     async def test_proxy_forwards_request_to_worker(self):
@@ -700,18 +728,21 @@ class TestProxyForwarding:
             ).encode("utf-8")
         )
 
-        with patch.object(router.http_client, "request", return_value=mock_response):
-            async with make_client(router, upstream_body={
+        async with proxy_client(
+            router,
+            upstream_body={
                 "messages": [{"role": "user", "content": "hello"}],
                 "temperature": 0.7,
-            }) as client:
-                response = await client.post(
-                    "/req-001/0/v1/chat/completions",
-                    json={
-                        "messages": [{"role": "user", "content": "hello"}],
-                        "temperature": 0.7,
-                    },
-                )
+            },
+            return_value=mock_response,
+        ) as (client, _):
+            response = await client.post(
+                "/req-001/0/v1/chat/completions",
+                json={
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "temperature": 0.7,
+                },
+            )
 
         assert response.status_code == status.HTTP_200_OK
         # Parser middleware transforms the response to OpenAI format
@@ -735,12 +766,15 @@ class TestProxyForwarding:
                           "weight_version": "0", "output_token_logprobs": [[-0.1, 201]]},
         }).encode())
 
-        with patch.object(router.http_client, "request", return_value=mock_response):
-            async with make_client(router, upstream_body={"messages": [{"role": "user", "content": "hi"}]}) as client:
-                await client.post(
-                    "/traj-abc/0/v1/chat/completions",
-                    json={"messages": [{"role": "user", "content": "hi"}]},
-                )
+        async with proxy_client(
+            router,
+            upstream_body={"messages": [{"role": "user", "content": "hi"}]},
+            return_value=mock_response,
+        ) as (client, _):
+            await client.post(
+                "/traj-abc/0/v1/chat/completions",
+                json={"messages": [{"role": "user", "content": "hi"}]},
+            )
 
         assert router.session_id_to_worker.get(build_request_id("traj-abc", 0)) == "http://w1:8888"
 
@@ -760,18 +794,21 @@ class TestProxyForwarding:
                           "weight_version": "0", "output_token_logprobs": [[-0.1, 201]]},
         }).encode())
 
-        with patch.object(router.http_client, "request", return_value=mock_response):
-            async with make_client(router, upstream_body={"messages": [{"role": "user", "content": "hi"}]}) as client:
-                await client.post(
-                    "/traj-abc/0/v1/chat/completions",
-                    json={"messages": [{"role": "user", "content": "hi"}]},
-                )
-                # Set load above threshold to force the second attempt to use a different worker
-                router.worker_request_counts["http://w1:8888"] = router.rollout_worker_load_threshold + 1
-                await client.post(
-                    "/traj-abc/1/v1/chat/completions",
-                    json={"messages": [{"role": "user", "content": "hi"}]},
-                )
+        async with proxy_client(
+            router,
+            upstream_body={"messages": [{"role": "user", "content": "hi"}]},
+            return_value=mock_response,
+        ) as (client, _):
+            await client.post(
+                "/traj-abc/0/v1/chat/completions",
+                json={"messages": [{"role": "user", "content": "hi"}]},
+            )
+            # Set load above threshold to force the second attempt to use a different worker
+            router.worker_request_counts["http://w1:8888"] = router.rollout_worker_load_threshold + 1
+            await client.post(
+                "/traj-abc/1/v1/chat/completions",
+                json={"messages": [{"role": "user", "content": "hi"}]},
+            )
 
         assert router.session_id_to_worker.get(build_request_id("traj-abc", 0)) == "http://w1:8888"
         assert router.session_id_to_worker.get(build_request_id("traj-abc", 1)) == "http://w2:8888"
@@ -798,12 +835,15 @@ class TestProxyForwarding:
             assert router.inflight_requests.get() == {request_id: 1}
             return mock_response
 
-        with patch.object(router.http_client, "request", side_effect=check_count):
-            async with make_client(router, upstream_body={"messages": [{"role": "user", "content": "hi"}]}) as client:
-                await client.post(
-                    "/req-001/0/v1/chat/completions",
-                    json={"messages": [{"role": "user", "content": "hi"}]},
-                )
+        async with proxy_client(
+            router,
+            upstream_body={"messages": [{"role": "user", "content": "hi"}]},
+            side_effect=check_count,
+        ) as (client, _):
+            await client.post(
+                "/req-001/0/v1/chat/completions",
+                json={"messages": [{"role": "user", "content": "hi"}]},
+            )
 
         assert router.worker_request_counts["http://w1:8888"] == 0  # decremented after
         assert router.inflight_requests.get() == {}
@@ -815,9 +855,8 @@ class TestProxyForwarding:
         router = make_proxy_router(make_store(*[(f"req-{i}", 0) for i in range(5)]))
         router.worker_request_counts["http://w1:8888"] = 0
         router.rollout_worker_load_threshold = 100  # keep routing from blocking admission
-        # Share one semaphore across all shards so the gate bounds total concurrency
-        # regardless of which shard each trajectory hashes to.
-        router._forward_sems = [asyncio.Semaphore(gate)] * len(router._forward_sems)
+        # Shrink the admission gate so saturation is reachable with a handful of requests.
+        router._generate_sem = asyncio.Semaphore(gate)
 
         concurrent = 0
         max_concurrent = 0
@@ -844,21 +883,24 @@ class TestProxyForwarding:
             concurrent -= 1
             return mock_response
 
-        with patch.object(router.http_client, "request", side_effect=blocking_request):
-            async with make_client(router, upstream_body={"messages": [{"role": "user", "content": "hi"}]}) as client:
-                tasks = [
-                    asyncio.create_task(client.post(
-                        f"/req-{i}/0/v1/chat/completions",
-                        json={"messages": [{"role": "user", "content": "hi"}]},
-                    ))
-                    for i in range(5)
-                ]
-                # Wait until the gate saturates, then confirm nothing slips past it.
-                await asyncio.wait_for(saturated.wait(), timeout=2.0)
-                await asyncio.sleep(0.05)
-                assert max_concurrent == gate
-                release.set()
-                responses = await asyncio.gather(*tasks)
+        async with proxy_client(
+            router,
+            upstream_body={"messages": [{"role": "user", "content": "hi"}]},
+            side_effect=blocking_request,
+        ) as (client, _):
+            tasks = [
+                asyncio.create_task(client.post(
+                    f"/req-{i}/0/v1/chat/completions",
+                    json={"messages": [{"role": "user", "content": "hi"}]},
+                ))
+                for i in range(5)
+            ]
+            # Wait until the gate saturates, then confirm nothing slips past it.
+            await asyncio.wait_for(saturated.wait(), timeout=2.0)
+            await asyncio.sleep(0.05)
+            assert max_concurrent == gate
+            release.set()
+            responses = await asyncio.gather(*tasks)
 
         assert max_concurrent == gate  # never exceeded across the whole run
         assert all(r.status_code == status.HTTP_200_OK for r in responses)
@@ -874,12 +916,15 @@ class TestProxyForwarding:
         mock_response.headers = {"content-type": "text/plain"}
         mock_response.aread = AsyncMock(return_value=b"plain text response")
 
-        with patch.object(router.http_client, "request", return_value=mock_response):
-            async with make_client(router, upstream_body={"messages": [{"role": "user", "content": "hi"}]}) as client:
-                response = await client.post(
-                    "/req-001/0/v1/chat/completions",
-                    json={"messages": [{"role": "user", "content": "hi"}]},
-                )
+        async with proxy_client(
+            router,
+            upstream_body={"messages": [{"role": "user", "content": "hi"}]},
+            return_value=mock_response,
+        ) as (client, _):
+            response = await client.post(
+                "/req-001/0/v1/chat/completions",
+                json={"messages": [{"role": "user", "content": "hi"}]},
+            )
 
         assert response.status_code == status.HTTP_200_OK
         assert response.text == "plain text response"
@@ -906,14 +951,13 @@ class TestProxyForwarding:
             "sampling_params": {},
         }
 
-        with patch.object(
-            router.http_client, "request", return_value=mock_response
-        ) as request_mock:
-            async with make_client(router, upstream_body=upstream_body) as client:
-                response = await client.post(
-                    "/req-001/0/v1/chat/completions",
-                    json={"messages": [{"role": "user", "content": "hi"}]},
-                )
+        async with proxy_client(
+            router, upstream_body=upstream_body, return_value=mock_response
+        ) as (client, request_mock):
+            response = await client.post(
+                "/req-001/0/v1/chat/completions",
+                json={"messages": [{"role": "user", "content": "hi"}]},
+            )
 
         request_mock.assert_awaited_once()
         assert response.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
@@ -926,16 +970,15 @@ class TestProxyForwarding:
         router = make_proxy_router(make_store(("req-001", 0)))
         router.worker_request_counts["http://w1:8888"] = 0
 
-        with patch.object(
-            router.http_client,
-            "request",
+        async with proxy_client(
+            router,
+            upstream_body={"messages": [{"role": "user", "content": "hi"}]},
             side_effect=httpx.RequestError("Connection refused"),
-        ):
-            async with make_client(router, upstream_body={"messages": [{"role": "user", "content": "hi"}]}) as client:
-                response = await client.post(
-                    "/req-001/0/v1/chat/completions",
-                    json={"messages": [{"role": "user", "content": "hi"}]},
-                )
+        ) as (client, _):
+            response = await client.post(
+                "/req-001/0/v1/chat/completions",
+                json={"messages": [{"role": "user", "content": "hi"}]},
+            )
 
         assert response.status_code == status.HTTP_502_BAD_GATEWAY
         assert router.worker_request_counts["http://w1:8888"] == 0  # count still released
@@ -955,12 +998,15 @@ class TestProxyForwarding:
                           "weight_version": "0", "output_token_logprobs": [[-0.1, 201]]},
         }).encode())
 
-        with patch.object(router.http_client, "request", return_value=mock_response) as request_mock:
-            async with make_client(router, upstream_body={"messages": [{"role": "user", "content": "hi"}]}) as client:
-                await client.post(
-                    "/req-001/0/v1/chat/completions",
-                    json={"messages": [{"role": "user", "content": "hi"}]},
-                )
+        async with proxy_client(
+            router,
+            upstream_body={"messages": [{"role": "user", "content": "hi"}]},
+            return_value=mock_response,
+        ) as (client, request_mock):
+            await client.post(
+                "/req-001/0/v1/chat/completions",
+                json={"messages": [{"role": "user", "content": "hi"}]},
+            )
 
         assert request_mock.await_args is not None
         assert request_mock.await_args.kwargs["url"] == "http://w1:8888/generate"
@@ -1022,23 +1068,25 @@ class TestChatCompletionIntegration:
             "sampling_params": {"temperature": 0.3, "max_new_tokens": 8},
         }
 
-        with patch.object(router.http_client, "request", return_value=mock_response) as request_mock:
-            async with make_client(router, upstream_body=upstream_body) as client:
-                response = await client.post(
-                    "/traj-1/0/v1/chat/completions",
-                    json={
-                        "model": "default",
-                        "messages": [{"role": "user", "content": "hi"}],
-                        "max_tokens": 8,
-                        "temperature": 0.3,
-                    },
-                )
+        async with proxy_client(
+            router, upstream_body=upstream_body, return_value=mock_response
+        ) as (client, request_mock):
+            response = await client.post(
+                "/traj-1/0/v1/chat/completions",
+                json={
+                    "model": "default",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 8,
+                    "temperature": 0.3,
+                },
+            )
 
         assert response.status_code == status.HTTP_200_OK
         response_json = response.json()
         assert response_json["choices"][0]["message"]["content"] == "ok"
         # The chat-completions path must be rewritten to the worker's /generate.
         assert request_mock.await_args.kwargs["url"] == "http://w1:8888/generate"
+        forwarded = json.loads(request_mock.await_args.kwargs["content"])
         assert "messages" not in forwarded
 
 
