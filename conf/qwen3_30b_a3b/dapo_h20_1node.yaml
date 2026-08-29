@@ -34,7 +34,7 @@ data_source:
 rollout:
   num_gpus_per_node: 8
   sglang_args:
-    mem_fraction_static: 0.9
+    mem_fraction_static: 0.8
     disable_cuda_graph: false
   sglang_replicas:
     regular:
@@ -53,8 +53,8 @@ trainer:
   mini_batch_size: 128
   max_tokens_per_gpu: 20480
   use_dynamic_batch_size: true
-  use_rollout_routing_replay: false
-  use_fp32_lm_head: false
+  use_rollout_routing_replay: true
+  use_fp32_lm_head: true
 
 megatron:
   model:

@@ -591,6 +591,10 @@ def main(config: Optional[DictConfig] = None) -> None:
     normalize_data_sources(config)
     logging_utils.configure_logger(level=config.log_level)
 
+    # Hydra is done parsing; keep a credential passed as an override out of anything
+    # that copies sys.argv (wandb records it in the run's config and metadata).
+    logging_utils.redact_argv()
+
     logger.info("main config: %s", logging_utils.redacted_config_yaml(config))
 
     if not ray.is_initialized():
