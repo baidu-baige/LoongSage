@@ -65,7 +65,7 @@ trainer:
   num_gpus_per_node: 8
   num_nodes: 1
   temperature: 1.0
-  mini_batch_size: 32
+  mini_batch_size: 64
   micro_batch_size: 1
   max_tokens_per_gpu: 12288
   use_dynamic_batch_size: true

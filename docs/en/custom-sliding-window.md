@@ -9,7 +9,7 @@ The strategy implementations live in the `SlidingWindowStrategy` section of [rol
 1. Inherit from `SlidingWindowStrategy` and implement at least `compute_dispatch_count(buf_qsize)`. The base class already maintains `_running_count` through `on_dispatched()` and `on_collected()`.
 2. If the strategy needs to maintain sequence numbers, priorities, or other state, override `on_dispatched()`, `on_collected()`, and `on_reset()`; when overriding the first two, `super()` must be called to keep counts correct.
 3. If the collector's dequeue order needs to be constrained, override `will_collect(group)`. This method is executed inside the `TrajQueue` condition lock and the strategy lock, so it must not perform network or disk I/O, sleep, or other time-consuming computation, nor re-acquire the queue lock or modify the incoming group.
-4. Register the strategy class by decorating it with `@register_sliding_window_strategy("your-name")`, e.g., `@register_sliding_window_strategy("latency-aware")`. `create_strategy()` will automatically add a thread-safe proxy for it.
+4. Register the strategy class by decorating it with `@register_sliding_window_strategy("your-name")`, e.g., `@register_sliding_window_strategy("latency-aware")`. `create_strategy()` will automatically add a thread-safe proxy for it. Place the module in [coda/custom/](../../coda/custom/) so it is imported automatically, see [Custom Extensions](./custom-extensions.md).
 5. Add the new option to the comments in `conf/default.yaml`, and add unit tests for dispatch, collection, reset, unknown prompt, and thread safety behavior.
 
 ## 2. Minimal Example

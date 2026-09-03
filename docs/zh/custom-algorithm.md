@@ -6,10 +6,10 @@
 
 advantage 与 policy loss 通过 [registry.py](../../coda/algorithms/registry.py) 中的装饰器注册，配置项按名字查找实现。推荐流程：
 
-1. 在 `coda/algorithms/` 下新建模块，用 `@register_advantage("name")` 或 `@register_policy_loss("name")` 注册函数；
+1. 在 [coda/custom/](../../coda/custom/) 下新建模块，用 `@register_advantage("name")` 或 `@register_policy_loss("name")` 注册函数；
 2. config文件修改：通过 `algorithm.advantage_estimator` 或 `algorithm.policy_loss` 指向注册名。如需自定义超参，可直接写在 `algorithm` 节内，并通过 `config` 读取。
 
-[algorithms/\_\_init\_\_.py](../../coda/algorithms/__init__.py) 用 `pkgutil.walk_packages` 自动发现本包模块并执行 `@register_*`，无需手动登记。
+`coda/custom/` 下的模块会被自动 import 并执行 `@register_*`，无需手动登记，详见[自定义扩展](./custom-extensions.md)。放在 `coda/algorithms/` 包内同样会被 [algorithms/\_\_init\_\_.py](../../coda/algorithms/__init__.py) 的 `pkgutil.walk_packages` 发现，内置算法就在那里。
 
 ## 2. 自定义 advantage
 

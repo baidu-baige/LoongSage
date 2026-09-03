@@ -60,6 +60,7 @@ Where to start
    :maxdepth: 1
    :caption: Extension Guides
 
+   custom-extensions.md
    custom-agent.md
    custom-reward.md
    custom-sandbox.md

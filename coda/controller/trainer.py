@@ -207,8 +207,13 @@ class Trainer:
                 )
 
     def _init_tracking(self) -> None:
-        """Initialize tracking system."""
-        self.config.tracking.run_id = configure_tracking(self.config)
+        """Initialize tracking system.
+
+        ``configure_tracking`` writes the per-backend run ids back into
+        ``self.config.tracking``, so the workers that later receive this config
+        attach to these runs instead of creating their own.
+        """
+        configure_tracking(self.config)
 
     def _init_channel_meta(self) -> ChannelMeta:
         """Initialize channel metadata for weight synchronization.
@@ -268,7 +273,7 @@ class Trainer:
 
 
     async def train_loop(self) -> None:
-        """training loop."""
+        """training loop: shared setup, then dispatch to the mode-specific loop."""
         # resume_datasource returns the last completed step (0 if fresh);
         # +1 because we are starting a new training round.
         start_step = current_weight_version = self.resume_datasource() + 1
@@ -282,79 +287,98 @@ class Trainer:
 
         self.rollout_manager._health_monitoring_pause()
         channel_meta = self._init_channel_meta()
-        self._update_weights(channel_meta, weight_version=current_weight_version)       
+        self._update_weights(channel_meta, weight_version=current_weight_version)
         self.rollout_manager.health_monitoring_resume()
 
         if self.is_fully_async:
-            self.rollout_sampler.step = start_step
-            rollout_thread = threading.Thread(target=lambda: 
-                asyncio.run(self.rollout_sampler.rollout_loop()), daemon=True)
-            rollout_thread.start()
+            await self._fully_async_train_loop(start_step, current_weight_version)
+        else:
+            await self._sync_train_loop(start_step, current_weight_version)
+
+        self._finalize_training()
+
+    async def _fully_async_train_loop(self, start_step: int, current_weight_version: int) -> None:
+        """Fully-async loop: a background rollout thread feeds mini-batches to the trainer.
+
+        fully_async and colocate are mutually exclusive (see _validate_config),
+        so there is no offload/onload handling here.
+        """
+        self.rollout_sampler.step = start_step
+        rollout_thread = threading.Thread(
+            target=lambda: asyncio.run(self.rollout_sampler.rollout_loop()), daemon=True)
+        rollout_thread.start()
 
         for step in range(start_step, self.config.total_steps + 1):
             with time_marker("step", step=step):
-                if self.is_fully_async:
-                    with TimeMarkerAcc(step=step) as timers:
-                        for mb_idx in range(self.num_mini_batches):
-                            with timers("rollout"):
-                                groups = await self.rollout_sampler(step)
+                with TimeMarkerAcc(step=step) as timers:
+                    for _ in range(self.num_mini_batches):
+                        with timers("rollout"):
+                            groups = await self.rollout_sampler(step)
 
-                            with timers("process_traj"):
-                                refs = self._process_traj_for_train(
-                                    groups, Mode.DEFAULT, step,
-                                    current_weight_version=current_weight_version,
-                                )
+                        with timers("process_traj"):
+                            refs = self._process_traj_for_train(
+                                groups, Mode.DEFAULT, step,
+                                current_weight_version=current_weight_version,
+                            )
 
-                            if self.teacher_manager is not None:
-                                with timers("teacher"):
-                                    refs = self.teacher_manager.compute_teacher(refs)
+                        if self.teacher_manager is not None:
+                            with timers("teacher"):
+                                refs = self.teacher_manager.compute_teacher(refs)
 
-                            with timers.inverse_timer("wait"), timers("train"):
-                                ray.get(self.train_manager.async_train(step, refs))
+                        with timers.inverse_timer("wait"), timers("train"):
+                            ray.get(self.train_manager.async_train(step, refs))
 
-                        # collect train metrics
-                        ray.get(self.train_manager.async_flush_train_metrics())
+                    # collect train metrics
+                    ray.get(self.train_manager.async_flush_train_metrics())
 
-                        with timers("pause_delay"):
-                            self.rollout_sampler.pause()
+                    with timers("pause_delay"):
+                        self.rollout_sampler.pause()
 
-                    # Fraction of the step the trainer spent NOT training (waiting
-                    # for / preparing rollout data, flushing, pausing) vs training.
-                    wait = timers.elapsed("wait")
-                    train = timers.elapsed("train")
-                    if wait + train > 0:
-                        track({"perf/wait_ratio": wait / (wait + train)}, step=step)
-                else:
-                    # Synchronous mode: rollout then train
-                    with time_marker("rollout", step=step):
-                        accepted_traj_group_list = await self.rollout_sampler(step)
+                # Fraction of the step the trainer spent NOT training (waiting
+                # for / preparing rollout data, flushing, pausing) vs training.
+                wait = timers.elapsed("wait")
+                train = timers.elapsed("train")
+                if wait + train > 0:
+                    track({"perf/wait_ratio": wait / (wait + train)}, step=step)
 
-                    with time_marker("process_traj", step=step):
-                        splited_batch_refs = self._process_traj_for_train(
-                            accepted_traj_group_list, Mode.DEFAULT, step,
-                            current_weight_version=current_weight_version,
-                        )
-                    if self.is_colocated:
-                        with time_marker("offload_rollout", step=step):
-                            self.rollout_manager._health_monitoring_pause()
-                            self.rollout_manager.offload()
+                with time_marker("save_ckpt", step=step):
+                    self.save_ckpt(step)
 
-                    if self.teacher_manager is not None:
-                        if self.is_colocated:
-                            with time_marker("onload_teacher", step=step):
-                                self.teacher_manager.onload()
-                        with time_marker("teacher", step=step):
-                            splited_batch_refs = self.teacher_manager.compute_teacher(splited_batch_refs)
-                        if self.is_colocated:
-                            with time_marker("offload_teacher", step=step):
-                                self.teacher_manager.offload()
+                if step == self.config.total_steps:
+                    break
 
-                    if self.is_colocated:
-                        with time_marker("onload_train", step=step):
-                            self.train_manager.onload()
+                current_weight_version = self._sync_weights_after_train(step, current_weight_version)
+                self.rollout_sampler.resume()
 
-                    with time_marker("train", step=step):
-                        ray.get(self.train_manager.async_train(step, splited_batch_refs))
+        self.rollout_sampler.stop()
+        rollout_thread.join(timeout=30)
+
+    async def _sync_train_loop(self, start_step: int, current_weight_version: int) -> None:
+        """Synchronous loop: rollout the whole step, then train on it."""
+        for step in range(start_step, self.config.total_steps + 1):
+            with time_marker("step", step=step):
+                with time_marker("rollout", step=step):
+                    accepted_traj_group_list = await self.rollout_sampler(step)
+
+                with time_marker("process_traj", step=step):
+                    splited_batch_refs = self._process_traj_for_train(
+                        accepted_traj_group_list, Mode.DEFAULT, step,
+                        current_weight_version=current_weight_version,
+                    )
+
+                if self.is_colocated:
+                    with time_marker("offload_rollout", step=step):
+                        self.rollout_manager._health_monitoring_pause()
+                        self.rollout_manager.offload()
+
+                splited_batch_refs = self._compute_teacher(splited_batch_refs, step)
+
+                if self.is_colocated:
+                    with time_marker("onload_train", step=step):
+                        self.train_manager.onload()
+
+                with time_marker("train", step=step):
+                    ray.get(self.train_manager.async_train(step, splited_batch_refs))
 
                 with time_marker("save_ckpt", step=step):
                     self.save_ckpt(step)
@@ -368,24 +392,35 @@ class Trainer:
                     with time_marker("onload_rollout_weights", step=step):
                         self.rollout_manager.onload_weights()
 
-                with time_marker("update_weights", step=step):
-                    channel_meta = self._init_channel_meta()
-                    current_weight_version = self._post_train_weight_version(current_weight_version)
-                    self._update_weights(channel_meta, weight_version=current_weight_version)
+                current_weight_version = self._sync_weights_after_train(step, current_weight_version)
 
                 if self.is_colocated:
                     with time_marker("onload_rollout_kv", step=step):
                         self.rollout_manager.onload_kv()
                         self.rollout_manager.health_monitoring_resume()
 
-                if self.is_fully_async:
-                    self.rollout_sampler.resume()
+    def _sync_weights_after_train(self, step: int, current_weight_version: int) -> int:
+        """Bump the weight version and push the new weights to the rollout engines."""
+        with time_marker("update_weights", step=step):
+            channel_meta = self._init_channel_meta()
+            current_weight_version = self._post_train_weight_version(current_weight_version)
+            self._update_weights(channel_meta, weight_version=current_weight_version)
+        return current_weight_version
 
-        if self.is_fully_async:
-            self.rollout_sampler.stop()
-            rollout_thread.join(timeout=30)
+    def _compute_teacher(self, splited_batch_refs: list, step: int) -> list:
+        """Run teacher inference, onloading/offloading the teacher when colocated."""
+        if self.teacher_manager is None:
+            return splited_batch_refs
 
-        self._finalize_training()
+        if self.is_colocated:
+            with time_marker("onload_teacher", step=step):
+                self.teacher_manager.onload()
+        with time_marker("teacher", step=step):
+            splited_batch_refs = self.teacher_manager.compute_teacher(splited_batch_refs)
+        if self.is_colocated:
+            with time_marker("offload_teacher", step=step):
+                self.teacher_manager.offload()
+        return splited_batch_refs
 
     async def rollout_only_loop(self) -> None:
         """rollout only loop."""
@@ -433,15 +468,7 @@ class Trainer:
                         [], Mode.TRAIN_ONLY, step, current_weight_version)
 
                 # Run teacher inference before training.
-                if self.teacher_manager is not None:
-                    if self.is_colocated:
-                        with time_marker("onload_teacher", step=step):
-                            self.teacher_manager.onload()
-                    with time_marker("teacher", step=step):
-                        splited_batch_refs = self.teacher_manager.compute_teacher(splited_batch_refs)
-                    if self.is_colocated:
-                        with time_marker("offload_teacher", step=step):
-                            self.teacher_manager.offload()
+                splited_batch_refs = self._compute_teacher(splited_batch_refs, step)
 
                 if self.is_colocated:
                     with time_marker("onload_train", step=step):
@@ -590,6 +617,11 @@ def main(config: Optional[DictConfig] = None) -> None:
     OmegaConf.resolve(config)
     normalize_data_sources(config)
     logging_utils.configure_logger(level=config.log_level)
+
+    # Load user extensions from coda/custom/ so their @register_* decorators run
+    # before any registry lookup. Imported here rather than at module scope so a
+    # custom module is free to import any coda module.
+    import coda.custom  # noqa: F401,PLC0415
 
     # Hydra is done parsing; keep a credential passed as an override out of anything
     # that copies sys.argv (wandb records it in the run's config and metadata).

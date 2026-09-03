@@ -1,0 +1,82 @@
+# @package _global_
+# Qwen3.8-27B DAPO on a single 8-GPU H20 node (colocated rollout + training).
+#
+# 1. Download the model and dataset:
+#      hf download Qwen/Qwen3.8-27B --local-dir /root/Qwen3.8-27B
+#      hf download Haitao999/DAPO-Math-17k-unique --repo-type=dataset \
+#        --local-dir /root/DAPO-Math-17k-unique
+#
+# 2. Launch with those paths:
+#      bash examples/start.sh qwen3.8_27b/dapo_h20_1node \
+#        hf_model_path=/root/Qwen3.8-27B \
+#        data_source.dataset.prompt_data_path=/root/DAPO-Math-17k-unique
+defaults:
+  - /default
+  - _self_
+
+checkpoint_path: "./checkpoints"
+hf_model_path: ???
+colocate: true    # must be false in fully-async mode
+total_steps: 100
+
+data_source:
+  dataset:
+    prompt_data_path: ???
+    input_key: prompt
+    label_key: reward_model
+  reward:
+    name: dapo_math
+    overlong_penalty_length: 4096
+  num_prompts_per_step: 64
+  num_trajectories_per_prompt: 8
+  max_response_len_per_trajectory: 20480
+
+rollout:
+  num_gpus_per_node: 8
+  sglang_args:
+    mem_fraction_static: 0.8
+    disable_cuda_graph: false
+  sglang_replicas:
+    regular:
+      num_nodes: 1
+      num_gpus_per_replica: 4
+
+agentflow:
+  dump_trajectory_path: "log/trajectories"
+  tokenizer:
+    generation_prompt_kwargs:
+      enable_thinking: true
+
+trainer:
+  num_gpus_per_node: 8
+  num_nodes: 1
+  mini_batch_size: 128
+  max_tokens_per_gpu: 20480
+  use_dynamic_batch_size: true
+  use_fp32_lm_head: true
+
+megatron:
+  model:
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 2
+    mtp_num_layers: null
+    attention_backend: flash
+    #recompute_granularity: full
+    #recompute_method: uniform
+    #recompute_num_layers: 1
+  optimizer:
+    lr: 1.0e-6
+    optimizer_cpu_offload: true
+    optimizer_offload_fraction: 1
+
+algorithm:
+  advantage_estimator: grpo
+  advantage_norm_mode: group_zscore
+  policy_loss: grpo
+  loss_agg_mode: token-mean
+  is_correction:
+    enable: true
+    action: mask
+    level: token
+    lower_bound: 0.5
+    upper_bound: 2

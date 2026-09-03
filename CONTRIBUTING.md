@@ -97,10 +97,11 @@ Open a pull request from `your-name/LoongSage:feature/xxx` to `baidu-baige/Loong
 
 ## Extending LoongSage
 
-Most contributions should not touch the framework trunk. LoongSage exposes extension points for agents, rewards, sandboxes, advantage estimators, policy losses, divergences, router middleware, data filters, and asynchronous scheduling policies. Adding an implementation to the corresponding directory makes it selectable by name from configuration — no trunk changes and no registration boilerplate.
+Most contributions should not touch the framework trunk. LoongSage exposes extension points for agents, rewards, sandboxes, advantage estimators, policy losses, divergences, router middleware, data filters, and asynchronous scheduling policies. Adding an implementation to `coda/custom/` makes it selectable by name from configuration — no trunk changes and no registration boilerplate.
 
 Start from the extension points listed in the [README](README.md), then follow the relevant tutorial:
 
+- [Custom extensions](docs/en/custom-extensions.md) · [中文](docs/zh/custom-extensions.md)
 - [Custom agent](docs/en/custom-agent.md) · [中文](docs/zh/custom-agent.md)
 - [Custom reward](docs/en/custom-reward.md) · [中文](docs/zh/custom-reward.md)
 - [Custom sandbox](docs/en/custom-sandbox.md) · [中文](docs/zh/custom-sandbox.md)

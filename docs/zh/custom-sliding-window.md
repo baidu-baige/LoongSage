@@ -9,7 +9,7 @@
 1. 继承 `SlidingWindowStrategy`，并至少实现 `compute_dispatch_count(buf_qsize)`。基类已经通过 `on_dispatched()` 和 `on_collected()` 维护 `_running_count`。
 2. 如果策略需要维护序号、优先级或其他状态，请覆写 `on_dispatched()`、`on_collected()` 和 `on_reset()`；覆写前两个方法时必须调用 `super()`，以确保计数正确。
 3. 如果需要限制 collector 的出队顺序，请覆写 `will_collect(group)`。该方法在 `TrajQueue` 条件锁和策略锁内执行，因此不能执行网络或磁盘 I/O、sleep 以及其他耗时计算，也不能再次获取 queue 锁或修改传入的 group。
-4. 使用 `@register_sliding_window_strategy("your-name")` 装饰策略类完成注册，例如 `@register_sliding_window_strategy("latency-aware")`。`create_strategy()` 会自动为其添加线程安全代理。
+4. 使用 `@register_sliding_window_strategy("your-name")` 装饰策略类完成注册，例如 `@register_sliding_window_strategy("latency-aware")`。`create_strategy()` 会自动为其添加线程安全代理。模块放到 [coda/custom/](../../coda/custom/) 下即会被自动 import，详见[自定义扩展](./custom-extensions.md)。
 5. 在 `conf/default.yaml` 的注释中补充新的可选值，并为派发、收集、reset、未知 prompt 以及线程安全行为补充单元测试。
 
 ## 2. 最小示例

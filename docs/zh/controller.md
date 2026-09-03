@@ -279,7 +279,6 @@ Controller 的入口是 `coda.controller.trainer`。启动后，`Trainer` 先完
 #### 当前不支持的场景
 
 - `fully_async.enable=true` 时没有周期性评测。全异步模式的 rollout 在后台线程中执行，不经过 `dynamic_rollout`。
-- `rollout.sampler.name=keeporder` 未实现，也不涉及评测。
 
 ### 全异步流程
 

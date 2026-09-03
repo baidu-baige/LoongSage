@@ -16,7 +16,7 @@ class MyKL(TopkVocabPolicy):        # 或 LogProbKLPolicy / FullVocabPolicy
         ...                        # 返回 (per_token_kl, extra_metrics)
 ```
 
-模块放在 `coda/algorithms/` 下即会被自动发现并完成注册（见[自定义RL算法开发指南](./custom-algorithm.md)），之后即可在配置中引用 `my_kl`。
+模块放在 [coda/custom/](../../coda/custom/) 下即会被自动发现并完成注册（见[自定义扩展](./custom-extensions.md)），之后即可在配置中引用 `my_kl`。
 
 ## 2. 三类基类
 

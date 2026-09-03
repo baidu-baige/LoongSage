@@ -12,14 +12,14 @@ The sandbox base class and built-in implementations live in the [sandbox directo
 
 1. Inherit from [SandboxClient](../../coda/agentflow/sandbox/base.py) and implement `create()`, `execute()`, `delete()`, and `sandbox_id`.
 2. `create()` returns the sandbox ID; `execute()` returns `stdout`, `stderr`, `exit_code`, and `success`; keep `delete()` idempotent. Override `from_config()` only when config fields require extra adaptation.
-3. Register the implementation with `@register_sandbox("your-type")` and place it in the [sandbox directory](../../coda/agentflow/sandbox/); LoongSage discovers it automatically.
+3. Register the implementation with `@register_sandbox("your-type")` and place it in [coda/custom/](../../coda/custom/); LoongSage discovers it automatically, see [Custom Extensions](./custom-extensions.md).
 
 ## 2. Minimal Example
 
 The following example shows the minimum interface for a remote runtime. `_start_runtime`, `_exec_runtime`, and `_destroy_runtime` stand for calls to the target runtime SDK:
 
 ```python
-# coda/agentflow/sandbox/remote_sandbox.py
+# coda/custom/remote_sandbox.py
 from typing import Any
 
 from coda.agentflow.sandbox import register_sandbox

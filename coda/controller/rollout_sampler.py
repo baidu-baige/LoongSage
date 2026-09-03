@@ -212,11 +212,6 @@ class RolloutSampler:
                 self.dynamic_rollout(num_oversample, step),
                 timeout=self.timeout,
             )
-        elif self.config.rollout.sampler.name == "keeporder":
-            return await asyncio.wait_for(
-                self.keeporder_rollout(num_oversample, step),
-                timeout=self.timeout,
-            )
         raise ValueError(f"Unknown sampler: {self.config.rollout.sampler.name}")
 
     def is_paused(self) -> bool:
@@ -661,21 +656,6 @@ class RolloutSampler:
                     logger.warning("preprocess failed by dirty traj: %s", traj.trajectory_id)
                     raise ValueError(f"preprocess failed by dirty traj: {traj.trajectory_id}")
         return processed_traj_group
-
-
-    async def keeporder_rollout(
-        self,
-        num_oversample: int,
-        step: int,
-    ) -> list[TrajectoryGroup]:
-        """
-        keeporder sampling strategy.
-
-        Greedy rollout (first finish first out) may lead to distribution shift.
-        This strategy maintains the original order of trajectories.
-        """
-        # TODO: Implement keep order rollout strategy
-        raise NotImplementedError("keep_order rollout strategy is not yet implemented")
 
 
 """

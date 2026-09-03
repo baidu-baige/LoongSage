@@ -207,24 +207,6 @@ class TestRolloutSamplerCall:
         sampler.dynamic_rollout.assert_called_once_with(5, 0)
 
     @pytest.mark.asyncio
-    async def test_call_keeporder_sampler(self):
-        """Test __call__ with keeporder sampler dispatches to keeporder_rollout."""
-        from coda.controller.rollout_sampler import RolloutSampler
-
-        config = make_minimal_config()
-        config.rollout.sampler.name = "keeporder"
-        sampler = RolloutSampler(config, Mock(), Mock())
-        # Mock the correctly-named method
-        sampler.keeporder_rollout = AsyncMock(
-            side_effect=NotImplementedError("keep_order rollout strategy is not yet implemented")
-        )
-
-        with pytest.raises(NotImplementedError, match="keep_order rollout"):
-            await sampler(step=0)
-
-        sampler.keeporder_rollout.assert_called_once()
-
-    @pytest.mark.asyncio
     async def test_call_unknown_sampler_raises_value_error(self):
         """Test __call__ with unknown sampler raises ValueError."""
         from coda.controller.rollout_sampler import RolloutSampler
@@ -1163,72 +1145,6 @@ class TestDynamicRollout:
 
 
 # ===========================================================================
-# RolloutSampler.keeporder_rollout
-# ===========================================================================
-
-class TestKeepordeRollout:
-    """Tests for RolloutSampler.keeporder_rollout method."""
-
-    @pytest.mark.asyncio
-    async def test_keeporder_rollout_not_implemented(self):
-        """Test keeporder_rollout raises NotImplementedError."""
-        from coda.controller.rollout_sampler import RolloutSampler
-
-        sampler = RolloutSampler(make_minimal_config(), Mock(), Mock())
-
-        with pytest.raises(NotImplementedError, match="keep_order rollout strategy is not yet implemented"):
-            await sampler.keeporder_rollout(5, 0)
-
-    @pytest.mark.asyncio
-    async def test_keeporder_rollout_is_async(self):
-        """Test keeporder_rollout is an async (coroutine) method."""
-        import inspect
-        from coda.controller.rollout_sampler import RolloutSampler
-
-        assert inspect.iscoroutinefunction(RolloutSampler.keeporder_rollout)
-
-    def test_keeporder_rollout_method_exists(self):
-        """Test that keeporder_rollout method exists on RolloutSampler class."""
-        from coda.controller.rollout_sampler import RolloutSampler
-
-        assert hasattr(RolloutSampler, 'keeporder_rollout')
-        assert callable(getattr(RolloutSampler, 'keeporder_rollout'))
-
-    def test_keeporder_rollout_method_signature(self):
-        """Test keeporder_rollout method has correct signature parameters."""
-        import inspect
-        from coda.controller.rollout_sampler import RolloutSampler
-
-        sig = inspect.signature(RolloutSampler.keeporder_rollout)
-        params = list(sig.parameters.keys())
-
-        assert 'num_oversample' in params
-        assert 'step' in params
-
-    @pytest.mark.asyncio
-    async def test_keeporder_rollout_called_via_call_method(self):
-        """Test keeporder_rollout is called when sampler name is 'keeporder'."""
-        from coda.controller.rollout_sampler import RolloutSampler
-
-        config = make_minimal_config()
-        config.rollout.sampler.name = "keeporder"
-        sampler = RolloutSampler(config, Mock(), Mock())
-
-        call_count = [0]
-
-        async def mock_keeporder_rollout(*_args, **_kwargs):
-            call_count[0] += 1
-            raise NotImplementedError("keep_order rollout strategy is not yet implemented")
-
-        sampler.keeporder_rollout = mock_keeporder_rollout
-
-        with pytest.raises(NotImplementedError):
-            await sampler(step=0)
-
-        assert call_count[0] == 1
-
-
-# ===========================================================================
 # Misc / import checks
 # ===========================================================================
 
@@ -1241,7 +1157,6 @@ class TestImport:
 
         assert hasattr(RolloutSampler, '__call__')
         assert hasattr(RolloutSampler, 'dynamic_rollout')
-        assert hasattr(RolloutSampler, 'keeporder_rollout')
         assert hasattr(RolloutSampler, '_pre_process')
         assert hasattr(RolloutSampler, '_cleanup')
         assert hasattr(RolloutSampler, '_trigger_generation')

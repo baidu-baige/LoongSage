@@ -52,6 +52,7 @@ LoongSage 文档
    :maxdepth: 1
    :caption: 扩展开发
 
+   custom-extensions.md
    custom-agent.md
    custom-reward.md
    custom-sandbox.md

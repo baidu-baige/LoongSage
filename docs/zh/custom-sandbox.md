@@ -12,14 +12,14 @@ sandbox 基类和内置实现位于 [sandbox 目录](../../coda/agentflow/sandbo
 
 1. 继承 [SandboxClient](../../coda/agentflow/sandbox/base.py)，实现 `create()`、`execute()`、`delete()` 和 `sandbox_id`。
 2. `create()` 返回 sandbox ID；`execute()` 返回 `stdout`、`stderr`、`exit_code` 和 `success`；`delete()` 保持幂等。只有配置字段需要额外转换时才覆写 `from_config()`。
-3. 使用 `@register_sandbox("your-type")` 注册，并把实现放到 [sandbox 目录](../../coda/agentflow/sandbox/)下，LoongSage 会自动发现。
+3. 使用 `@register_sandbox("your-type")` 注册，并把实现放到 [coda/custom/](../../coda/custom/) 下，LoongSage 会自动发现，详见[自定义扩展](./custom-extensions.md)。
 
 ## 2. 最小示例
 
 以下示例展示一个远程运行时 sandbox 的最小接口。`_start_runtime`、`_exec_runtime` 和 `_destroy_runtime` 代表目标运行时的 SDK 调用：
 
 ```python
-# coda/agentflow/sandbox/remote_sandbox.py
+# coda/custom/remote_sandbox.py
 from typing import Any
 
 from coda.agentflow.sandbox import register_sandbox

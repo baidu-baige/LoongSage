@@ -219,9 +219,9 @@ def _allocate_rollout_engine_addr_and_ports(
                 if local_rank % num_node_per_replica == 0:
                     # this is the first node in the replica, we need to allocate the dist_init_addr port
                     dist_init_addr = f"{host_addr}:{port+3}"
-                    for i in range(num_node_per_replica):
-                        addr_and_ports.setdefault(rank + i, {})
-                        addr_and_ports[rank + i]["dist_init_addr"] = dist_init_addr
+                    for j in range(num_node_per_replica):
+                        addr_and_ports.setdefault(rank + j, {})
+                        addr_and_ports[rank + j]["dist_init_addr"] = dist_init_addr
             # single node
             else:
                 addr_and_ports[current_rank]["dist_init_addr"] = f"{host_addr}:{port+3}"

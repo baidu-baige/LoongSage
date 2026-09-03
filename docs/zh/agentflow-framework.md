@@ -110,7 +110,7 @@ get_trajectory()        # 取出当前 attempt 的 Trajectory
 
 它还集中缓存与训练对齐必需的元数据：`think_start_ids`/`think_end_ids`（token 级裁剪 think 块用）、`model_family`、`think_tags` 等，对 DeepSeek-V4 会通过 `_wrap_deepseek_v4_tokenizer()` 自动包装 tokenizer 并缓存其 `thinking_mode`。**它是"rollout 采样序列"和"训练回放序列"共享的唯一 tokenize 真源**，避免文本二次 tokenize 造成错位。用于续轮裁掉 system 前缀的 `system_prompt_len` 并不在这里缓存，而是由 `TrajectoryParser` 首次用到时延迟计算并缓存（`parser.py:700-721`）。
 
-> **DeepSeek-V4 解析路径**：dsv4 与其他模型走同一套 SGLang parser。由于它的 tokenizer 被 `_wrap_deepseek_v4_tokenizer()` 换成了官方 encoder，没有 Jinja 模板可供自动检测匹配，`parser.py` 会回退到按模型架构检测：当模板匹配无结果时，`_detect_parser_names()` 调用 `_detect_parser_names_from_arch()`，借助 SGLang 的 `_resolve_architecture_auto_parsers` 按 `config.json` 里的模型架构选出 parser key——因此 parser key 始终由 SGLang 定义，我们这侧不硬编码任何映射。请求侧唯一的特殊处理是 `skip_special_tokens=false`（保留 `<think>` 与 DSML 标记），末尾的 EOS 仍由 SGLang 默认的 `no_stop_trim` 行为裁剪。
+> **DeepSeek-V4 解析路径**：dsv4 与其他模型走同一套 SGLang parser。由于它的 tokenizer 被 `_wrap_deepseek_v4_tokenizer()` 换成了官方 encoder，没有 Jinja 模板可供自动检测匹配，`parser.py` 会回退到按模型架构检测：当模板匹配无结果时，`_detect_parser_names()` 调用 `_detect_parser_names_from_arch()`，借助 SGLang 的 `_architecture_auto_parsers` 按 `config.json` 里的模型架构选出 parser key——因此 parser key 始终由 SGLang 定义，我们这侧不硬编码任何映射。请求侧唯一的特殊处理是 `skip_special_tokens=false`（保留 `<think>` 与 DSML 标记），末尾的 EOS 仍由 SGLang 默认的 `no_stop_trim` 行为裁剪。
 
 ### 2.5 TrajectoryStore 与数据模型
 

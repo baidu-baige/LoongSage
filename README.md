@@ -49,7 +49,7 @@ ______________________________________________________________________
 
 ### 🧩 Usability & Extensibility — Lightweight core, changeable anywhere
 
-- **Highly Extensible Plugin System** — Provides up to 12 core extension points (covering agents, reward models, sandboxes, advantage estimation, policy loss, KL divergence, routing middleware, data filtering, asynchronous scheduling strategies, and more). Simply place a new implementation in the corresponding directory and reference it in the configuration to take effect via hot-plugging, without modifying the framework's main trunk.
+- **Highly Extensible Plugin System** — Provides up to 12 core extension points (covering agents, reward models, sandboxes, advantage estimation, policy loss, KL divergence, routing middleware, data filtering, asynchronous scheduling strategies, and more). Simply place a new implementation in the `coda/custom/` directory and reference it in the configuration to take effect via hot-plugging, without modifying the framework's main trunk.
 - **Loosely Coupled Backend Integration** — The core is kept exceptionally lightweight, relying exclusively on Megatron-Core, Megatron-Bridge, and SGLang. Each backend module can be upgraded independently and smoothly while transparently inheriting all upstream training and inference features, with no tedious framework-layer adaptation. The library of supported models likewise expands automatically alongside the Megatron-Bridge ecosystem.
 
 ______________________________________________________________________
@@ -133,6 +133,7 @@ ______________________________________________________________________
 | Document | Content |
 | :--- | :--- |
 | [AgentFlow Framework](docs/en/agentflow-framework.md) | Router, trajectory storage, tokenization service, multi-turn & tool calls |
+| [Custom Extensions](docs/en/custom-extensions.md) | One directory for every extension point, and how it is loaded |
 | [Custom Agent](docs/en/custom-agent.md) · [Reward](docs/en/custom-reward.md) · [Sandbox](docs/en/custom-sandbox.md) | Core extension point tutorials |
 | [Custom RL Algorithm](docs/en/custom-algorithm.md) · [KL Algorithm](docs/en/custom-kl.md) · [Sliding Window Strategy](docs/en/custom-sliding-window.md) | Algorithm-side extension point tutorials |
 | [Fully Asynchronous Training](docs/en/fully-async-mode.md) | Architecture, sliding window strategies, metrics, and tuning |

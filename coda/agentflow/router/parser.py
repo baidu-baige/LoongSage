@@ -19,7 +19,7 @@ from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.parser.template_detection import (
     REASONING_PARSER_RULES,
     TOOL_CALL_PARSER_RULES,
-    _resolve_architecture_auto_parsers,
+    _architecture_auto_parsers,
     build_detection_context,
     detect_reasoning_pattern,
     match_rules,
@@ -61,55 +61,34 @@ _PARSER_DISABLED_VALUES: frozenset[str] = frozenset({"", "none", "false", "null"
 # on SGLANG_FORWARD_UNKNOWN_TOOLS to forward calls whose name is not in the list.
 _SENTINEL_TOOLS: list[Tool] = [Tool(type="function", function={"name": "_"})]
 
-# Sentinel SGLang's server args carry for "not resolved yet"; its architecture-based
-# detection only writes to fields still holding this value.
-_AUTO = "auto"
-
-
-class _ServerArgsStub(SimpleNamespace):
-    """Minimal stand-in for SGLang's ``ServerArgs`` during parser detection."""
-
-    def override(self, source: str | None = None, **kwargs: Any) -> None:
-        """Apply resolved server-arg values, the way ``ServerArgs.override`` does.
-
-        SGLang's detection helpers report their result through this call rather than a
-        return value. *source* is only used for SGLang's own provenance logging, so it
-        is accepted and ignored; each keyword becomes an attribute on this stub.
-        """
-        for key, value in kwargs.items():
-            setattr(self, key, value)
+# Parser fields SGLang's architecture-based detection can fill in.
+_PARSER_ATTRS = ("reasoning_parser", "tool_call_parser")
 
 
 def _detect_parser_names_from_arch(model_path: str | None) -> tuple[str | None, str | None]:
     """Ask SGLang which parsers match the architecture in the model's ``config.json``.
 
     Reuses the fallback SGLang applies to models that ship no Jinja template, so parser
-    keys stay owned by SGLang instead of being hardcoded here. That helper reports its
-    result by calling ``server_args.override()`` on fields still set to ``"auto"``, so
-    drive it with a stub and read the fields back.
+    keys stay owned by SGLang instead of being hardcoded here. The helper only reads the
+    model-location fields off ``server_args``, so a plain namespace is enough.
     """
     if not model_path:
         logger.warning("No model path available for architecture-based parser detection")
         return None, None
-    stub = _ServerArgsStub(
+    stub = SimpleNamespace(
         model_path=model_path,
         trust_remote_code=True,
         revision=None,
-        model_config_parser=_AUTO,
-        reasoning_parser=_AUTO,
-        tool_call_parser=_AUTO,
+        model_config_parser="auto",
     )
     try:
-        _resolve_architecture_auto_parsers(stub)
+        detected = _architecture_auto_parsers(stub, _PARSER_ATTRS)
     except Exception as exc:  # unreadable config.json, unknown model_type, ...
         logger.warning(
             "Architecture-based parser detection failed for %s: %s", model_path, exc
         )
         return None, None
-    return (
-        None if stub.reasoning_parser == _AUTO else stub.reasoning_parser,
-        None if stub.tool_call_parser == _AUTO else stub.tool_call_parser,
-    )
+    return detected.get("reasoning_parser"), detected.get("tool_call_parser")
 
 
 def _needs_detection(config: str | bool | None) -> bool:

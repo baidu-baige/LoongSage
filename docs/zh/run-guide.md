@@ -56,7 +56,7 @@ hf download Tevatron/browsecomp-plus-corpus --repo-type=dataset --local-dir /roo
 hf download Tevatron/browsecomp-plus-indexes --repo-type=dataset --local-dir /root/browsecomp-plus/indexes
 ```
 
-BCP 依赖一个检索服务。先用官方 dense shard 和语料一次性构建 cache，再启动服务，下例的 `--gpu_id 7` 会占用该卡的部分显存：
+BCP 依赖一个检索服务。先用官方 dense shard 和语料一次性构建 cache，再启动服务。构建和服务都跑在 CPU 上，不占用任何 GPU：
 
 ```bash
 python3 examples/bcp/build_dense_cache.py \
@@ -65,10 +65,8 @@ python3 examples/bcp/build_dense_cache.py \
   --output /root/browsecomp-plus/browsecomp_dense_cache.pkl
 
 ./examples/bcp/run_retrieval_server.sh \
-  --data_dir /root/browsecomp-plus/corpus/data \
   --model /root/Qwen3-Embedding-8B \
   --dense_cache /root/browsecomp-plus/browsecomp_dense_cache.pkl \
-  --gpu_id 7 \
   --port 9000
 ```
 
@@ -101,10 +99,8 @@ BCP 数据源仍需检索服务在运行：
 
 ```bash
 ./examples/bcp/run_retrieval_server.sh \
-  --data_dir /root/browsecomp-plus/corpus/data \
   --model /root/Qwen3-Embedding-8B \
   --dense_cache /root/browsecomp-plus/browsecomp_dense_cache.pkl \
-  --gpu_id 7 \
   --port 9000
 ```
 
@@ -203,7 +199,7 @@ tail -f log/trainer_*.log
 多机的集群状态用 `ray status` 查看。需要集中可视化时可改用 MLflow 等后端：`tracking.tracking_backend=mlflow tracking.mlflow_tracking_uri=http://...`。
 
 ### 停止训练
-在启动训练的节点上执行 `pkill -f coda.controller.trainer`（多机时每台节点都要做），之后可用 `ray stop` 清理 Ray 集群。
+在启动训练的节点上执行 `pkill -f coda.controller.trainer`，之后可用 `ray stop` 清理 Ray 集群。
 
 ## 常用 Hydra 配置
 
@@ -390,6 +386,7 @@ checkpoint_path/
 | | `gsm8k_h20_1node` | Qwen3-30B-A3B | GSM8K 数学 | 单机 8xH20 |
 | | `bcp_h20_1node` | Qwen3-30B-A3B | BCP 检索（任务二）| 单机 8xH20 |
 | | `mopd_h20_1node` | Qwen3-30B-A3B | MOPD 多教师蒸馏（任务三）| 单机 8xH20 |
+| `conf/qwen3.8_27b/` | `dapo_h20_1node` | Qwen3.8-27B | DAPO 数学 | 单机 8xH20 |
 | `conf/qwen3_coder_30b_a3b/` | `mini_swe_h20_4node` | Qwen3-Coder-30B-A3B | mini-SWE（R2E-Gym）| 4 节点 xH20 |
 | | `opencode_h20_4node` | Qwen3-Coder-30B-A3B | OpenCode（R2E-Gym）（任务五）| 4 节点 xH20 |
 | `conf/dsv4_flash_bf16/` | `swe_h20_8node` / `swe_gb200_8node` | DeepSeek-V4-Flash-BF16 | SWE（任务四）| 8xH20 / 8xGB200 |

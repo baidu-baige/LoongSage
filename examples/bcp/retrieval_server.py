@@ -1,11 +1,14 @@
 """
-BrowseComp-Plus retrieval server — Qwen3-Embedding dense retrieval.
+BrowseComp-Plus retrieval server — Qwen3-Embedding dense retrieval on CPU.
 
 Usage:
-    python examples/bcp/retrieval_server.py --port 9000
+    python examples/bcp/retrieval_server.py \
+        --model /path/to/Qwen3-Embedding-8B \
+        --dense_cache /path/to/browsecomp_dense_cache.pkl \
+        --port 9000
 
-    # First-time setup (no cache): encodes all documents on GPU, saves cache.
-    # Subsequent runs load the cache and encode every online query on GPU.
+    The dense cache must be built beforehand with examples/bcp/build_dense_cache.py.
+    Both the index and online query encoding live entirely on CPU.
 
 Endpoints:
     POST /retrieve  {"queries": [...], "topk": 3}
@@ -30,192 +33,44 @@ from pydantic import BaseModel
 
 
 # ---------------------------------------------------------------------------
-# Corpus loading
-# ---------------------------------------------------------------------------
-
-def extract_title(text: str, url: str = "") -> str:
-    """Extract the title from a document's YAML front-matter or derive it from the URL."""
-    m = re.search(r"^---\s*\ntitle:\s*(.+?)\n", text, re.MULTILINE)
-    if m:
-        return m.group(1).strip()
-    if url:
-        return url.rstrip("/").split("/")[-1].replace("-", " ").replace("_", " ")
-    return "Unknown"
-
-
-def build_corpus(data_dir: str):
-    """Load all unique documents from parquet files in *data_dir* and return a docid→doc mapping."""
-    import pandas as pd
-
-    print("Loading parquet files ...", flush=True)
-    dfs = []
-    for split in ["train.parquet", "test.parquet"]:
-        path = f"{data_dir}/{split}"
-        try:
-            dfs.append(pd.read_parquet(path))
-        except FileNotFoundError:
-            print(f"  Warning: {path} not found, skipping.", flush=True)
-    if not dfs:
-        raise RuntimeError(f"No parquet files found in {data_dir}")
-    df = pd.concat(dfs, ignore_index=True)
-
-    seen = {}
-    for col in ["gold_docs", "negative_docs", "evidence_docs"]:
-        if col not in df.columns:
-            continue
-        for row_docs in df[col].dropna():
-            if row_docs is None:
-                continue
-            for doc in row_docs:
-                if not isinstance(doc, dict):
-                    continue
-                docid = str(doc.get("docid", ""))
-                if docid and docid not in seen:
-                    seen[docid] = doc
-
-    print(f"  Loaded {len(seen)} unique documents.", flush=True)
-    return seen
-
-
-# ---------------------------------------------------------------------------
 # Dense retriever (Qwen3-Embedding + FAISS)
 # ---------------------------------------------------------------------------
 
 class DenseRetriever:
-    """Dense retriever backed by Qwen3-Embedding and a FAISS flat inner-product index."""
+    """Dense retriever backed by Qwen3-Embedding on CPU and a FAISS flat inner-product index."""
 
     def __init__(
         self,
-        data_dir: str,
+        cache_path: str,
         model_name: str = "Qwen/Qwen3-Embedding-8B",
-        gpu_id: int = 7,
-        cache_path: str | None = None,
         batch_size: int = 4,
-        max_doc_length: int = 8192,
     ):
-        """Initialize the retriever.
+        """Load the embedding model on CPU and build the FAISS index from *cache_path*.
 
-        Loads the embedding model and either reads a pre-built FAISS index from
-        *cache_path* or encodes all documents from scratch on GPU and writes the
-        cache. Online query encoding always runs on the selected GPU.
+        *cache_path* must point to a cache produced by
+        ``examples/bcp/build_dense_cache.py``.
         """
-        self._device_str = f"cuda:{gpu_id}"  # lazy: don't create a CUDA context yet
-        self._model_name = model_name
-        self.batch_size = batch_size
-        self.max_doc_length = max_doc_length
-        self._model_on_gpu = False
-        self.device = None                 # set lazily on first GPU use
-        self.model = None                  # set lazily or eagerly depending on cache
-
-        has_cache = cache_path and os.path.exists(cache_path)
-
-        if has_cache:
-            # Cache exists: stage the model without creating a CUDA context.
-            from transformers import AutoTokenizer, AutoModel
-            import torch
-
-            print(f"Loading embedding model {model_name} on cpu (cache hit) ...", flush=True)
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                model_name, padding_side="left", trust_remote_code=True
-            )
-            self.model = AutoModel.from_pretrained(
-                model_name, dtype=torch.float32, trust_remote_code=True
-            ).to("cpu").eval()
-            print("  Model loaded on CPU.", flush=True)
-
-            print(f"Loading dense index from cache: {cache_path} ...", flush=True)
-            with open(cache_path, "rb") as f:
-                cached = pickle.load(f)
-            self.docids = cached["docids"]
-            self.contents = cached["contents"]
-            embeddings = cached["embeddings"]  # (N, D) float32
-            self._build_faiss(embeddings)
-            print(f"  Loaded {len(self.docids)} documents from cache.", flush=True)
-        else:
-            # No cache: need GPU for document encoding — use ALL GPUs for speed
-            import torch
-            from transformers import AutoTokenizer, AutoModel
-
-            self.device = torch.device(self._device_str)
-
-            print(f"Loading embedding model {model_name} on ALL GPUs for encoding ...", flush=True)
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                model_name, padding_side="left", trust_remote_code=True
-            )
-            self.model = AutoModel.from_pretrained(
-                model_name, dtype=torch.float16, trust_remote_code=True
-            ).eval()
-
-            n_gpus = torch.cuda.device_count()
-            if n_gpus > 1:
-                # Wrapper: only return last_hidden_state to avoid gathering KV cache (OOM)
-                class _HiddenStateOnly(torch.nn.Module):
-                    """Wrap an embedding model and expose only `last_hidden_state`."""
-
-                    def __init__(self, base):
-                        """Store the underlying Hugging Face model."""
-                        super().__init__()
-                        self.base = base
-
-                    def forward(self, **kwargs):
-                        """Run the base model and return only the hidden states tensor."""
-                        return self.base(**kwargs).last_hidden_state
-                self._raw_model = self.model
-                self.model = torch.nn.DataParallel(_HiddenStateOnly(self.model)).cuda()
-                self._dp_device = torch.device("cuda:0")
-                print(f"  Using DataParallel on {n_gpus} GPUs.", flush=True)
-            else:
-                self.model = self.model.to(self.device)
-                self._dp_device = self.device
-                print(f"  Single GPU: {self._device_str}", flush=True)
-            self._model_on_gpu = True
-            # Use larger batch size with multi-GPU
-            self._init_batch_size = batch_size * n_gpus
-
-            doc_map = build_corpus(data_dir)
-            self.docids = list(doc_map.keys())
-            docs = [doc_map[d] for d in self.docids]
-
-            self.contents = []
-            raw_texts = []
-            for doc in docs:
-                title = extract_title(doc.get("text", ""), doc.get("url", ""))
-                body = doc.get("text", "")
-                self.contents.append(f"{title}\n{body}")
-                raw_texts.append(body)
-
-            print(f"Encoding {len(raw_texts)} documents (batch_size={self._init_batch_size}) ...", flush=True)
-            embeddings = self._encode_bulk(raw_texts, max_length=max_doc_length)
-            self._build_faiss(embeddings)
-
-            if cache_path:
-                print(f"Saving dense cache to {cache_path} ...", flush=True)
-                with open(cache_path, "wb") as f:
-                    pickle.dump({
-                        "docids": self.docids,
-                        "contents": self.contents,
-                        "embeddings": embeddings,
-                    }, f)
-
-            # Offload: restore raw model, move to CPU for online queries
-            if hasattr(self, '_raw_model'):
-                self.model = self._raw_model
-                del self._raw_model
-            self.model = self.model.cpu()
-            torch.cuda.empty_cache()
-            self._model_on_gpu = False
-
-        print("Dense retriever ready.", flush=True)
-
-    # ------------------------------------------------------------------
-    def _ensure_model_on_gpu(self):
-        """Move model to GPU if not already there. Lazily creates CUDA device on first call."""
+        from transformers import AutoTokenizer, AutoModel
         import torch
-        if self.device is None:
-            self.device = torch.device(self._device_str)
-        if not self._model_on_gpu:
-            self.model = self.model.half().to(self.device)
-            self._model_on_gpu = True
+
+        self.batch_size = batch_size
+
+        print(f"Loading embedding model {model_name} on CPU ...", flush=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_name, padding_side="left", trust_remote_code=True
+        )
+        self.model = AutoModel.from_pretrained(
+            model_name, dtype=torch.float32, trust_remote_code=True
+        ).eval()
+
+        print(f"Loading dense index from cache: {cache_path} ...", flush=True)
+        with open(cache_path, "rb") as f:
+            cached = pickle.load(f)
+        self.docids = cached["docids"]
+        self.contents = cached["contents"]
+        self._build_faiss(cached["embeddings"])
+        print(f"  Loaded {len(self.docids)} documents from cache.", flush=True)
+        print("Dense retriever ready.", flush=True)
 
     # ------------------------------------------------------------------
     def _last_token_pool(self, last_hidden_states, attention_mask):
@@ -227,41 +82,14 @@ class DenseRetriever:
         return last_hidden_states[torch.arange(batch_size, device=last_hidden_states.device), seq_lens]
 
     # ------------------------------------------------------------------
-    def _encode_bulk(self, texts: List[str], max_length: int = 8192) -> np.ndarray:
-        """Multi-GPU bulk encoding for initial document indexing."""
-        import torch
-        import torch.nn.functional as F
-
-        device = self._dp_device
-        bs = self._init_batch_size
-        all_embs = []
-        for i in range(0, len(texts), bs):
-            batch = texts[i: i + bs]
-            enc = self.tokenizer(
-                batch,
-                max_length=max_length,
-                padding=True,
-                truncation=True,
-                return_tensors="pt",
-            ).to(device)
-            with torch.no_grad():
-                hidden = self.model(**enc)  # wrapper returns last_hidden_state directly
-            emb = self._last_token_pool(hidden, enc["attention_mask"])
-            emb = F.normalize(emb, p=2, dim=1)
-            all_embs.append(emb.cpu().float().numpy())
-            if (i // bs) % 20 == 0:
-                print(f"  Encoded {i + len(batch)}/{len(texts)}", flush=True)
-        return np.vstack(all_embs)
-
     def _encode(self, texts: List[str], instruction: Optional[str], max_length: int = 512) -> np.ndarray:
-        """Encode *texts* on GPU (moved lazily) and return L2-normalized embeddings."""
+        """Encode *texts* on CPU and return L2-normalized embeddings."""
         import torch
         import torch.nn.functional as F
 
         if instruction:
             texts = [f"Instruct: {instruction}\nQuery: {t}" for t in texts]
 
-        self._ensure_model_on_gpu()
         all_embs = []
         for i in range(0, len(texts), self.batch_size):
             batch = texts[i: i + self.batch_size]
@@ -271,16 +99,14 @@ class DenseRetriever:
                 padding=True,
                 truncation=True,
                 return_tensors="pt",
-            ).to(self.device)
+            )
             with torch.no_grad():
                 out = self.model(**enc)
             emb = self._last_token_pool(out.last_hidden_state, enc["attention_mask"])
             emb = F.normalize(emb, p=2, dim=1)
-            all_embs.append(emb.cpu().float().numpy())
+            all_embs.append(emb.numpy())
             if (i // self.batch_size) % 50 == 0:
                 print(f"  Encoded {i + len(batch)}/{len(texts)}", flush=True)
-        # Keep model on GPU after first query for fast subsequent queries.
-        # Model is staged on CPU at startup and stays on GPU after the first query.
         return np.vstack(all_embs)
 
     def _build_faiss(self, embeddings: np.ndarray):
@@ -345,7 +171,7 @@ class EmbedRequest(BaseModel):
 @app.post("/retrieve")
 async def retrieve(req: RetrieveRequest):
     """Run dense retrieval for each query and return ranked document lists."""
-    # Query encoding uses GPU; serialize requests to avoid embedding-model OOM.
+    # Serialize requests: one query encoding at a time through the shared model.
     async with _search_lock:
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
@@ -430,7 +256,7 @@ def _bm25_rank_chunks(query: str, chunks: List[str], topk: int) -> List[tuple]:
     """Rank *chunks* against *query* using BM25.
 
     Returns a list of (chunk_index, score, chunk_text) sorted by score desc.
-    No GPU, no lock, runs in < 10 ms.
+    No model forward, no lock, runs in < 10 ms.
     """
     from math import log
 
@@ -476,7 +302,7 @@ def _bm25_rank_chunks(query: str, chunks: List[str], topk: int) -> List[tuple]:
 @app.post("/get_doc_chunks")
 async def get_doc_chunks(req: GetDocChunksRequest):
     """Sub-document retrieval: split a document into chunks and rank them
-    against *query* using BM25.  No GPU needed — does not block /retrieve.
+    against *query* using BM25.  No model forward — does not block /retrieve.
     """
     if retriever is None:
         return {"error": "retriever not initialized"}
@@ -531,17 +357,14 @@ def main():
     global retriever
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_dir", required=True)
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=9000)
     parser.add_argument("--model", required=True)
-    parser.add_argument("--gpu_id", type=int, default=7)
     parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--dense_cache", required=True)
+    parser.add_argument("--dense_cache", required=True,
+                        help="Cache built by examples/bcp/build_dense_cache.py")
     args = parser.parse_args()
 
-    if not os.path.isdir(args.data_dir):
-        parser.error(f"--data_dir is not a directory: {args.data_dir}")
     if not os.path.isdir(args.model):
         parser.error(f"--model is not a directory: {args.model}")
     if not os.path.isfile(args.dense_cache):
@@ -554,20 +377,9 @@ def main():
         print("  pip install faiss-cpu", flush=True)
         sys.exit(1)
 
-    import torch
-
-    if not torch.cuda.is_available():
-        parser.error("BCP retrieval requires CUDA; no GPU is available")
-    if args.gpu_id < 0 or args.gpu_id >= torch.cuda.device_count():
-        parser.error(
-            f"--gpu_id must be in [0, {torch.cuda.device_count() - 1}], got {args.gpu_id}"
-        )
-
     retriever = DenseRetriever(
-        args.data_dir,
+        args.dense_cache,
         model_name=args.model,
-        gpu_id=args.gpu_id,
-        cache_path=args.dense_cache,
         batch_size=args.batch_size,
     )
 

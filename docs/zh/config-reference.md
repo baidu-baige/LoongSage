@@ -112,7 +112,7 @@
 
 | 参数 | 默认 | 说明 | 约束 |
 | --- | --- | --- | --- |
-| `rollout.sampler.name` | `dynamic` | 采样器实现，`dynamic`（动态采样，允许 oversample+refill）或 `keeporder`（保序、不 oversample）。 | 全异步时 `num_oversample` 必须为 0，见下。 |
+| `rollout.sampler.name` | `dynamic` | 采样器实现，目前仅支持 `dynamic`（动态采样，允许 oversample+refill）。 | 全异步时 `num_oversample` 必须为 0，见下。 |
 | `rollout.sampler.num_oversample` | `0` | 同步动态采样阶段额外派发的 prompt group 数。 | 全异步必须为 `0`；额外容量交由 `fully_async.stale_steps` 控制。 |
 | `rollout.sampler.refill_ratio` | `2` | 从 buffer 补齐 prompt 时的放大系数：`refill_num = need × refill_ratio`。 | `dynamic` 采样器专用。 |
 | `rollout.sampler.max_refill_count` | `256` | 单次 refill 的 prompt 上限。 | `dynamic` 采样器专用。 |
@@ -414,6 +414,7 @@ OPD（On-Policy Distillation）在 RL 流程中额外挂载若干 teacher 模型
 - [训练算法](training-algorithms.md)：算法组件与执行顺序
 - [全异步模式](fully-async-mode.md)：全异步流水线原理与调优
 - [模型加载与保存](model-checkpointing.md)：checkpoint 与异步保存
+- [自定义扩展](custom-extensions.md)：所有扩展点的统一存放目录
 - [自定义 Agent 开发指南](custom-agent.md) / [自定义 Reward 函数开发指南](custom-reward.md) / [自定义 Sandbox 开发指南](custom-sandbox.md)：三大扩展点
 - [自定义RL算法开发指南](custom-algorithm.md) / [自定义KL算法开发指南](custom-kl.md) / [自定义滑动窗口策略开发指南](custom-sliding-window.md)：算法侧扩展点
 - [在线蒸馏 (On-Policy Distillation)](on-policy-distillation.md)：OPD 详细用法

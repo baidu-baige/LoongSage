@@ -281,7 +281,6 @@ Evaluation groups never enter the training path: they are not filtered, do not c
 #### Currently Unsupported Scenarios
 
 - There is no periodic evaluation when `fully_async.enable=true`. In fully asynchronous mode the rollout runs in a background thread and does not go through `dynamic_rollout`.
-- `rollout.sampler.name=keeporder` is not implemented and does not involve evaluation either.
 
 ### Fully Asynchronous Flow
 

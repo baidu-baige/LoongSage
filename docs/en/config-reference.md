@@ -112,7 +112,7 @@ Controls the SGLang inference cluster, the sampler, filters and eval.
 
 | Field | Default | Description | Constraints |
 | --- | --- | --- | --- |
-| `rollout.sampler.name` | `dynamic` | Sampler implementation. `dynamic` (allows oversample + refill) or `keeporder` (preserve order, no oversample). | For fully-async mode `num_oversample` must be 0 (see below). |
+| `rollout.sampler.name` | `dynamic` | Sampler implementation. Only `dynamic` (allows oversample + refill) is supported. | For fully-async mode `num_oversample` must be 0 (see below). |
 | `rollout.sampler.num_oversample` | `0` | Extra prompt groups dispatched during synchronous dynamic sampling. | Must be `0` in fully-async mode; extra capacity is provided by `fully_async.stale_steps`. |
 | `rollout.sampler.refill_ratio` | `2` | Amplification factor when refilling prompts from the buffer: `refill_num = need × refill_ratio`. | `dynamic` sampler only. |
 | `rollout.sampler.max_refill_count` | `256` | Maximum prompts per refill call. | `dynamic` sampler only. |
@@ -412,6 +412,7 @@ With OPD enabled there are four divisibility rules on the teacher side, all vali
 - [Training Algorithms](training-algorithms.md): algorithm components and execution order
 - [Fully Async Mode](fully-async-mode.md): fully-async pipeline design and tuning
 - [Model Loading and Saving](model-checkpointing.md): checkpoints and async saving
+- [Custom Extensions](custom-extensions.md): one directory for every extension point
 - [Custom Agent Development Guide](custom-agent.md) / [Custom Reward Function Development Guide](custom-reward.md) / [Custom Sandbox Development Guide](custom-sandbox.md): the three main extension points
 - [Custom RL Algorithm Development Guide](custom-algorithm.md) / [Custom KL Algorithm Development Guide](custom-kl.md) / [Custom Sliding Window Strategy Development Guide](custom-sliding-window.md): algorithm-side extension points
 - [On-Policy Distillation](on-policy-distillation.md): OPD in detail

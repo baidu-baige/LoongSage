@@ -11,14 +11,14 @@ The agent base class and built-in implementations live in the [agent directory](
 1. Inherit from [BaseAgent](../../coda/agentflow/agent/base_agent.py) and implement the async methods `run_trajectory(trajectory)` and `clear()`. The constructor receives `router_url` and common sampling parameters; keep `**kwargs` for custom fields from the `agent` config block.
 2. Read `prompt`, `label`, and `metadata` in `run_trajectory()`. Send every model request to `router_url` and return a `Reward` when execution finishes.
 3. Accept `sandbox_env_client` and `reward_fn` when needed. Run blocking sandbox calls through `asyncio.to_thread(...)`; `clear()` should release only agent-owned resources.
-4. Register the implementation with `@register_agent("your-name")` and place it in the [agent directory](../../coda/agentflow/agent/); LoongSage discovers it automatically.
+4. Register the implementation with `@register_agent("your-name")` and place it in [coda/custom/](../../coda/custom/); LoongSage discovers it automatically, see [Custom Extensions](./custom-extensions.md).
 
 ## 2. Minimal Example
 
 The following example shows the basic structure of an agent. `_parse_tool_call()` represents task-specific tool-protocol parsing:
 
 ```python
-# coda/agentflow/agent/my_agent.py
+# coda/custom/my_agent.py
 import asyncio
 from typing import Any
 

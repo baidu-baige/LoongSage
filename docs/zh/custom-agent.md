@@ -11,14 +11,14 @@ agent 基类和内置实现位于 [agent 目录](../../coda/agentflow/agent/)。
 1. 继承 [BaseAgent](../../coda/agentflow/agent/base_agent.py)，实现异步方法 `run_trajectory(trajectory)` 和 `clear()`。构造函数接收 `router_url` 及通用采样参数，并保留 `**kwargs` 接收 `agent` 配置块中的自定义字段。
 2. 在 `run_trajectory()` 中读取 `prompt`、`label` 和 `metadata`。所有模型请求都发送到 `router_url`，执行结束后返回 `Reward`。
 3. 按需接收 `sandbox_env_client` 和 `reward_fn`。sandbox 的阻塞调用使用 `asyncio.to_thread(...)`；`clear()` 只清理 agent 自身资源。
-4. 使用 `@register_agent("your-name")` 注册，并把实现放到 [agent 目录](../../coda/agentflow/agent/)下，LoongSage 会自动发现。
+4. 使用 `@register_agent("your-name")` 注册，并把实现放到 [coda/custom/](../../coda/custom/) 下，LoongSage 会自动发现，详见[自定义扩展](./custom-extensions.md)。
 
 ## 2. 最小示例
 
 以下示例展示一个 agent 的基本结构。`_parse_tool_call()` 代表任务自己的工具协议解析逻辑：
 
 ```python
-# coda/agentflow/agent/my_agent.py
+# coda/custom/my_agent.py
 import asyncio
 from typing import Any
 

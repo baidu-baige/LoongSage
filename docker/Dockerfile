@@ -1,4 +1,4 @@
-FROM lmsysorg/sglang:v0.5.16
+FROM lmsysorg/sglang:v0.5.18
 
 WORKDIR /sgl-workspace
 
@@ -18,8 +18,8 @@ RUN pip install wandb==0.28.0 weave==0.53.1
 RUN pip install nvidia-resiliency-ext==0.6.0
 
 # git
-RUN git clone https://github.com/NVIDIA-NeMo/Megatron-Bridge.git && cd Megatron-Bridge && git checkout 8a3462265 && pip install --no-deps --no-build-isolation -e .
-RUN git clone https://github.com/NVIDIA/Megatron-LM.git && cd Megatron-LM && git checkout 43e45e130 && pip install --no-deps --no-build-isolation -e .
+RUN git clone https://github.com/NVIDIA-NeMo/Megatron-Bridge.git && cd Megatron-Bridge && git checkout v0.6.0 && pip install --no-deps --no-build-isolation -e .
+RUN git clone https://github.com/NVIDIA/Megatron-LM.git && cd Megatron-LM && git checkout cd0e795f0 && pip install --no-deps --no-build-isolation -e .
 
 RUN pip install mini-swe-agent==2.4.5 litellm==1.80.0
 RUN ARCH="$(uname -m)" && case "$ARCH" in \
@@ -35,8 +35,11 @@ RUN pip install --no-build-isolation git+https://github.com/Dao-AILab/fast-hadam
 RUN pip install nvidia-cuda-cccl==13.3.3.4.1
 RUN CPATH=/usr/local/lib/python3.12/dist-packages/nvidia/cu13/include/cccl pip install --no-build-isolation git+https://github.com/deepseek-ai/FlashMLA@nv_dev
 
+# for qwen3.8
+RUN pip install flash-linear-attention==0.5.2
+
 # patch
-COPY patch/sglang-0.5.16.patch /tmp/sglang-patch.patch
+COPY patch/sglang-0.5.18.patch /tmp/sglang-patch.patch
 RUN cd /sgl-workspace/sglang && git apply /tmp/sglang-patch.patch && rm /tmp/sglang-patch.patch
 
 # loongsage

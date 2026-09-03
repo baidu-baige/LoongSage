@@ -35,7 +35,7 @@ agentflow:
   dump_trajectory_path: "log/trajectories"
 
 trainer:
-  mini_batch_size: 8
+  mini_batch_size: 128
   max_tokens_per_gpu: 20480
   use_dynamic_batch_size: true
 

@@ -11,7 +11,6 @@ from contextlib import contextmanager
 import torch
 from megatron.core import tensor_parallel
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
-from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer
 
 
 def _patch_distributed_optimizer_init():
@@ -100,45 +99,6 @@ def _patch_fp32_shard_leaf():
         return groups
 
     DistributedOptimizer._build_model_and_main_param_groups = classmethod(_patched_build)
-
-
-def _patch_hdo_update_fp32_params():
-    """Fix KeyError in HybridDeviceOptimizer when a model param is already fp32.
-
-    Root cause:
-      ``HybridDeviceOptimizer._update_fp32_params_by_new_state`` iterates over every
-      param in ``self.state`` and does a *direct* lookup
-      ``fp32_param = self.param_to_fp32_param[param]``.  But ``param_to_fp32_param``
-      is only populated for params whose dtype is NOT fp32 (see
-      ``_get_sub_optimizer_param_groups``: the fp32-master clone is created only under
-      ``param.dtype != torch.float32``).  A param that is *already* fp32 — e.g. the
-      ``output_layer.weight`` kept in fp32 by ``KeepFP32Module`` when
-      ``use_fp32_lm_head`` is set — has no entry, so this raises ``KeyError``.
-
-      This fires on checkpoint load: ``DistributedOptimizer.sharded_state_dict(
-      is_loading=True)`` -> ``load_state_dict(state_dict())`` -> torch post-load hook
-      -> ``_sync_hdo_state_to_sub_optimizers`` -> ``_update_fp32_params_by_new_state``.
-      It only hits the last pipeline stage (the stage that owns ``output_layer``),
-      so those ranks raise while the other ranks proceed into the next collective,
-      deadlocking the whole job (a Ray actor-method exception is swallowed into the
-      ObjectRef and never surfaced, so it looks like a silent hang).
-
-    Fix: use ``self.param_to_fp32_param.get(param, param)`` — for an already-fp32
-      param the master copy IS the param itself, so we copy the new master state
-      back into it.  This mirrors the ``.get(param, param)`` pattern used everywhere
-      else in ``hybrid_optimizer.py`` (pre/post_load_state_dict_hook,
-      _move_new_state_to_right_device); only this one call site used direct indexing.
-    """
-    def _patched_update_fp32_params_by_new_state(self):
-        if not self.param_update_in_fp32:
-            return
-        for param, v in self.state.items():
-            fp32_param = self.param_to_fp32_param.get(param, param)
-            fp32_param.data.copy_(v["master_param"])
-
-    HybridDeviceOptimizer._update_fp32_params_by_new_state = (
-        _patched_update_fp32_params_by_new_state
-    )
 
 
 def _patch_dsa_cudnn_default_stream():
@@ -345,7 +305,6 @@ class _ShapeAgnosticLaunchCache(dict):
 
 _patch_distributed_optimizer_init()
 _patch_fp32_shard_leaf()
-_patch_hdo_update_fp32_params()
 _patch_dsa_cudnn_default_stream()
 _patch_csa_cute_launch_cache()
 

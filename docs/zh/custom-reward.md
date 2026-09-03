@@ -10,14 +10,14 @@ reward 基类和内置实现分别位于 [base.py](../../coda/reward/base.py) �
 
 1. 继承 `RewardFunction`，实现 `__call__(messages, label, **kwargs) -> Reward`。reward 专属配置从 `self.config` 读取。
 2. 返回 [Reward](../../coda/reward/reward.py)，至少填写 `final_reward`。无法打分时设置 `is_valid=False`；正分不代表答案正确时显式填写 `is_correct`。
-3. 使用 `@register_reward("your-name")` 注册，并把实现放到 [reward 函数目录](../../coda/reward/functions/)下，LoongSage 会自动发现。
+3. 使用 `@register_reward("your-name")` 注册，并把实现放到 [coda/custom/](../../coda/custom/) 下，LoongSage 会自动发现，详见[自定义扩展](./custom-extensions.md)。
 
 ## 2. 最小示例
 
 以下示例实现一个大小写不敏感的精确匹配 reward：
 
 ```python
-# coda/reward/functions/exact_match.py
+# coda/custom/exact_match.py
 from omegaconf import DictConfig
 
 from coda.reward import register_reward

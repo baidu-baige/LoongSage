@@ -10,14 +10,14 @@ The reward base class and built-in implementations live in [base.py](../../coda/
 
 1. Inherit from `RewardFunction` and implement `__call__(messages, label, **kwargs) -> Reward`. Read reward-specific options from `self.config`.
 2. Return a [Reward](../../coda/reward/reward.py) with at least `final_reward`. Set `is_valid=False` when scoring is impossible, and set `is_correct` explicitly when a positive score does not mean a correct answer.
-3. Register the class with `@register_reward("your-name")` and place it in the [reward functions directory](../../coda/reward/functions/); LoongSage discovers it automatically.
+3. Register the class with `@register_reward("your-name")` and place it in [coda/custom/](../../coda/custom/); LoongSage discovers it automatically, see [Custom Extensions](./custom-extensions.md).
 
 ## 2. Minimal Example
 
 The following example implements case-insensitive exact matching:
 
 ```python
-# coda/reward/functions/exact_match.py
+# coda/custom/exact_match.py
 from omegaconf import DictConfig
 
 from coda.reward import register_reward

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import random
+from enum import Enum
 from functools import partial
 from typing import Optional, get_type_hints
 
@@ -179,8 +180,10 @@ class MegatronTeacherWorker(BaseTeacherWorker):
 
         self.bridge = AutoBridge.from_hf_pretrained(hf_path)
         provider = self.bridge.to_megatron_provider(load_weights=ckpt_dir is None)
-        self._apply_model_config(provider)
-        provider.finalize()
+        # Apply overrides and finalize via the bridge helper so provider paths
+        # that need post-override setup (e.g. DeepSeek-V4 hash MoE auto-setting
+        # pipeline_model_parallel_layout when PP > 1) run before finalize().
+        provider.apply_overrides_and_finalize(overrides=self._build_model_overrides())
 
         self.model = provider.provide_distributed_model(
             wrap_with_ddp=False,
@@ -212,16 +215,23 @@ class MegatronTeacherWorker(BaseTeacherWorker):
             f"ckpt:{ckpt_dir}" if ckpt_dir else f"hf:{teacher.hf_path}",
         )
 
-    def _apply_model_config(self, provider):
-        model_config_dict = OmegaConf.to_container(self.config.opd.model, resolve=True)
+    def _build_model_overrides(self) -> dict:
+        """Convert ``opd.model`` into provider attribute overrides."""
+        model_config_dict = OmegaConf.to_container(self.config.opd.model)
         hints = get_type_hints(GPTModelProvider)
-        for key, value in model_config_dict.items():
-            if not hasattr(provider, key):
-                raise ValueError(f"Invalid opd.model config key: {key}")
-            hint = hints.get(key)
+        overrides = {}
+        for k, v in model_config_dict.items():
+            # Convert string dtype like "torch.bfloat16" to actual torch.dtype
+            hint = hints.get(k)
             if hint is torch.dtype or hint is Optional[torch.dtype]:
-                value = to_torch_dtype(value)
-            setattr(provider, key, value)
+                v = to_torch_dtype(v)
+            elif isinstance(hint, type) and issubclass(hint, Enum) and isinstance(v, str):
+                # e.g. attention_backend: flash -> AttnBackend.flash. Megatron's enums
+                # are plain Enum (no str mixin), so a raw string silently compares
+                # unequal to every member instead of failing loudly.
+                v = hint[v]
+            overrides[k] = v
+        return overrides
 
     @torch.no_grad()
     def switch(self, teacher_idx):

@@ -97,10 +97,11 @@ git push -u origin feature/your-feature-name
 
 ## 扩展 LoongSage
 
-大多数贡献不需要改动框架主干。LoongSage 为智能体、奖励、沙箱、优势估计、策略损失、散度、路由中间件、数据过滤、异步调度策略等提供了扩展点：把实现放进对应目录，即可在配置中按名称选用，无需改动主干，也不需要额外的注册样板代码。
+大多数贡献不需要改动框架主干。LoongSage 为智能体、奖励、沙箱、优势估计、策略损失、散度、路由中间件、数据过滤、异步调度策略等提供了扩展点：把实现放进 `coda/custom/`，即可在配置中按名称选用，无需改动主干，也不需要额外的注册样板代码。
 
 请先看 [README](README.md) 中列出的扩展点，再参考对应教程：
 
+- [自定义扩展](docs/zh/custom-extensions.md) · [English](docs/en/custom-extensions.md)
 - [自定义智能体](docs/zh/custom-agent.md) · [English](docs/en/custom-agent.md)
 - [自定义奖励](docs/zh/custom-reward.md) · [English](docs/en/custom-reward.md)
 - [自定义沙箱](docs/zh/custom-sandbox.md) · [English](docs/en/custom-sandbox.md)

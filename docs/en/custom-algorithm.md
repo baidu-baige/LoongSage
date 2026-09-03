@@ -6,10 +6,10 @@ This document explains how to add a custom advantage estimator or policy loss in
 
 Advantage and policy loss are registered through the decorators in [registry.py](../../coda/algorithms/registry.py); the configuration items look up implementations by name. The recommended workflow is:
 
-1. Create a new module under `coda/algorithms/` and register a function with `@register_advantage("name")` or `@register_policy_loss("name")`;
+1. Create a new module under [coda/custom/](../../coda/custom/) and register a function with `@register_advantage("name")` or `@register_policy_loss("name")`;
 2. Modify the config file: point `algorithm.advantage_estimator` or `algorithm.policy_loss` to the registered name. If custom hyperparameters are needed, they can be written directly inside the `algorithm` section and read through `config`.
 
-[algorithms/\_\_init\_\_.py](../../coda/algorithms/__init__.py) uses `pkgutil.walk_packages` to automatically discover the modules of this package and execute `@register_*`, so no manual registration is needed.
+Modules under `coda/custom/` are imported automatically so that `@register_*` executes, with no manual registration needed; see [Custom Extensions](./custom-extensions.md). A module placed inside the `coda/algorithms/` package is discovered as well, through the `pkgutil.walk_packages` call in [algorithms/\_\_init\_\_.py](../../coda/algorithms/__init__.py) — that is where the built-in algorithms live.
 
 ## 2. Custom Advantage
 

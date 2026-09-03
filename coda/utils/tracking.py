@@ -34,14 +34,16 @@ MLFLOW_MAX_ATTEMPTS = 3
 MLFLOW_SLEEP_SECONDS = 5
 
 def configure_tracking(config):
-    """Initialize the Tracking singletons from the given config."""
-    Tracking.init(
+    """Initialize the Tracking singletons from the given config.
+    """
+    tracker = Tracking.init(
         config.tracking.project_name,
         config.tracking.experiment_name,
         config.tracking.tracking_backend,
         config=config,
     )
-    return Tracking.get_instance().run_id
+    config.tracking.wandb_run_id = tracker.wandb_run_id
+    config.tracking.mlflow_run_id = tracker.mlflow_run_id
 
 def track(metrics, step):
     """Log a dictionary of metrics to all configured tracking backends.
@@ -254,7 +256,9 @@ class Tracking:
     """
 
     _instance: Optional["Tracking"] = None
-    run_id: Optional[str] = None
+    # Run ids are tracked per backend, never in one shared field
+    wandb_run_id: Optional[str] = None
+    mlflow_run_id: Optional[str] = None
     supported_backend = [
         "wandb",
         "mlflow",
@@ -307,12 +311,16 @@ class Tracking:
                     # Project_name is actually experiment_name in MLFlow
                     # If experiment does not exist, will create a new experiment
                     experiment = mlflow.set_experiment(project_name)
-                    if config_dict["tracking"].get("run_id") is None:
+                    mlflow_run_id = config_dict["tracking"].get("mlflow_run_id")
+                    if mlflow_run_id is None:
                         active_run = mlflow.start_run(experiment_id=experiment.experiment_id, run_name=experiment_name)
                         if active_run:
-                            self.run_id = active_run.info.run_id
-                            logger.info(f"view mlflow run at: "
-                                  f"{mlflow_tracking_uri}#/experiments/{experiment.experiment_id}/runs/{self.run_id}")
+                            self.mlflow_run_id = active_run.info.run_id
+                            logger.info(
+                                f"view mlflow run at: {mlflow_tracking_uri}"
+                                f"#/experiments/{experiment.experiment_id}"
+                                f"/runs/{self.mlflow_run_id}"
+                            )
                             # Log all hyperparameters as Mlflow params at run start
                             # (credentials stripped -- params are visible to all viewers).
                             params = _compute_mlflow_params_from_objects(redact_secrets(config_dict))
@@ -322,14 +330,12 @@ class Tracking:
                                     for k, v in params.items()}
                             mlflow.log_params(params)
                     else:
-                        active_run = mlflow.start_run(
-                            run_id=config_dict["tracking"].get("run_id"),
-                            experiment_id=experiment.experiment_id,
-                            run_name=experiment_name
-                        )
+                        # Attach to the run the driver already created; experiment_id and
+                        # run_name are ignored by MLflow when run_id is given.
+                        active_run = mlflow.start_run(run_id=mlflow_run_id)
                         if active_run:
-                            self.run_id = active_run.info.run_id
-                    self.logger["mlflow"] = _MlflowLoggingAdapter(run_id=self.run_id)
+                            self.mlflow_run_id = active_run.info.run_id
+                    self.logger["mlflow"] = _MlflowLoggingAdapter(run_id=self.mlflow_run_id)
                     break  # Success
                 except Exception as e:
                     logger.warning(
@@ -355,16 +361,18 @@ class Tracking:
         into ``wandb.Settings(**wandb_args)`` and thus take effect in ``wandb.init``. Do not put
         ``x_primary`` in it — this method passes ``x_primary`` itself, and a duplicate would raise.
 
-        ``x_primary`` is derived from ``config.tracking.run_id``:
-        - no run_id: primary (creates a new run)
-        - run_id present: not primary (attach to existing run)
+        ``x_primary`` is derived from ``config.tracking.wandb_run_id``:
+        - no wandb_run_id: primary (creates a new run)
+        - wandb_run_id present: not primary (attach to existing run)
 
-        NOTE: ``run_id`` is not a ``conf/`` key; nothing populates it before this runs, so today the
-        primary branch is always taken. Resuming or assigning a run_id is not supported yet.
+        NOTE: ``wandb_run_id`` must be wandb's own run id, not any other backend's. wandb
+        accepts an arbitrary string as ``id``, so handing it a foreign id (e.g. an MLflow
+        run id) silently creates a *second* run instead of attaching to the driver's. It is
+        not a ``conf/`` key; only ``configure_tracking()`` on the driver populates it.
         """
         tracking = config_dict["tracking"]
-        # run_id is None if this is a new run, otherwise it's the run_id to attach to.
-        run_id = tracking.get("run_id")
+        # wandb_run_id is None if this is a new run, otherwise it's the run_id to attach to.
+        run_id = tracking.get("wandb_run_id")
         wandb_args = dict(tracking.get("wandb_args", {}))
 
         active_run = wandb.init(
@@ -385,7 +393,7 @@ class Tracking:
         wandb.define_metric("step")
         wandb.define_metric("*", step_metric="step")
 
-        self.run_id = active_run.id
+        self.wandb_run_id = active_run.id
         self.logger["wandb"] = wandb
 
     @classmethod

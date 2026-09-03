@@ -3,9 +3,11 @@
 #
 # Usage (run from repo root):
 #   ./examples/bcp/run_retrieval_server.sh \
-#       --data_dir /path/to/corpus \
 #       --model /path/to/Qwen3-Embedding-8B \
 #       --dense_cache /path/to/browsecomp_dense_cache.pkl
+#
+# The dense cache must be built beforehand with examples/bcp/build_dense_cache.py.
+# The server runs entirely on CPU.
 #
 # Once the server is up, launch training separately, e.g.:
 #   bash examples/start.sh qwen3_30b_a3b/bcp_h20_1node

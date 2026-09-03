@@ -16,7 +16,7 @@ class MyKL(TopkVocabPolicy):        # or LogProbKLPolicy / FullVocabPolicy
         ...                        # returns (per_token_kl, extra_metrics)
 ```
 
-Placing the module under `coda/algorithms/` is enough for it to be discovered and registered automatically (see the [Custom RL Algorithm Development Guide](./custom-algorithm.md)), after which `my_kl` can be referenced in the configuration.
+Placing the module under [coda/custom/](../../coda/custom/) is enough for it to be discovered and registered automatically (see [Custom Extensions](./custom-extensions.md)), after which `my_kl` can be referenced in the configuration.
 
 ## 2. The Three Base Classes
 

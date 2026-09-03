@@ -101,7 +101,7 @@ class SglangEngine(RolloutWorker):
         )
 
         self.node_rank = server_args_dict["node_rank"]
-        self.server_host = server_args_dict["host"]  # with [] if ipv6
+        self.server_host = server_args_dict["host"]
         self.server_port = server_args_dict["port"]
 
         self._init_server(server_args_dict)
@@ -364,7 +364,6 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process | 
     from sglang.srt.entrypoints.http_server import launch_server
 
     multiprocessing.set_start_method("spawn", force=True)
-    server_args.host = server_args.host.strip("[]")
     p = multiprocessing.Process(target=launch_server, args=(server_args,))
     p.start()
 

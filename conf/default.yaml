@@ -96,7 +96,7 @@ rollout:
         disable_cuda_graph: false
 
   sampler:
-    name: "dynamic"         # dynamic|keeporder sampling
+    name: "dynamic"         # dynamic sampling (only supported value)
     num_oversample: 0
     refill_ratio: 2         # refill prompts = need_refill_number * refill_ratio
     max_refill_count: 256   # the max number of prompts will refill to rollout

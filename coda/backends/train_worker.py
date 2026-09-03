@@ -20,6 +20,10 @@ class TrainWorker(ABC):
     def __init__(self, world_size, rank):
         self.world_size = world_size
         self.rank = rank
+        # Registries are per-process: this Ray actor resolves algorithm names
+        # (advantage, policy loss, KL policy) itself, so user extensions have to
+        # be loaded here too and not only in the driver entry point.
+        import coda.custom  # noqa: F401,PLC0415
         self._set_numa_affinity()
 
     def _set_numa_affinity(self):

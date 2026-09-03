@@ -205,9 +205,6 @@ def make_minimal_config(**overrides):
                 "context_parallel_size": 1,
             },
         },
-        "tracking": {
-            "run_id": None,
-        },
     }
     cfg = OmegaConf.create(base)
     if overrides:

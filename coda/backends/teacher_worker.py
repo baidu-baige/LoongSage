@@ -23,6 +23,10 @@ class TeacherWorker(ABC):
         self.world_size = world_size
         self.rank = rank
         self.teacher_index_list = teacher_index_list
+        # Registries are per-process: this Ray actor resolves KL policy names
+        # itself, so user extensions have to be loaded here too and not only in
+        # the driver entry point.
+        import coda.custom  # noqa: F401,PLC0415
         self._set_numa_affinity()
 
     def _set_numa_affinity(self):
