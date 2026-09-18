@@ -19,10 +19,14 @@ CPPartitionMode = Literal["zigzag", "contiguous"]
 def _contiguous_align_size(cp_size: int, tp_size: int) -> int:
     """Return per-traj alignment size for contiguous CP.
 
-    ``tp_size * 2 * cp_size`` when CP is enabled, else just ``tp_size``.
+    ``tp_size * 2 * cp_size`` when CP is enabled. With cp=1 there is no CP split,
+    so sequences need no per-traj alignment (returns 1) and are packed raw; the SP
+    tp_size alignment is applied once to the whole buffer in ``slice_cp_packed``.
+    Padding per sequence here would misalign every downstream per-seq slice (which
+    advances by the true ``total_lengths``) for any micro-batch holding >1 sequence.
     """
     if cp_size <= 1:
-        return max(tp_size, 1)
+        return 1
     return max(tp_size, 1) * 2 * cp_size
 
 
@@ -134,6 +138,13 @@ def slice_cp_packed(
             packed = full_packed.narrow(0, cp_rank * local_len, local_len).contiguous()
         else:
             packed = full_packed
+            pad_size = max(tp_size, 1)
+            tail = (pad_size - packed.size(0) % pad_size) % pad_size
+            if tail != 0:
+                if callable(pad_value):
+                    packed = pad_value(packed, tail)
+                else:
+                    packed = _pad_seq_dim(packed, tail, pad_value)
 
     else:
         raise ValueError(f"Unsupported cp_partition_mode: {cp_partition_mode!r}")
@@ -185,8 +196,11 @@ def prepare_packed_seq_params(
         cu_padded = [0]
         for PL in padded_lens:
             cu_padded.append(cu_padded[-1] + PL)
+
+        if packed.size(0) > cu_padded[-1]:
+            cu_padded.append(packed.size(0))
         cu_padded_t = torch.tensor(cu_padded, dtype=torch.int32, device=packed.device)
-        max_seqlen = max(padded_lens) if padded_lens else 0
+        max_seqlen = (cu_padded_t[1:] - cu_padded_t[:-1]).max().item() if padded_lens else 0
         packed_seq_params = PackedSeqParams(
             cu_seqlens_q=cu_padded_t,
             cu_seqlens_kv=cu_padded_t,
@@ -200,6 +214,50 @@ def prepare_packed_seq_params(
         return packed, packed_seq_params
 
     raise ValueError(f"Unsupported cp_partition_mode: {cp_partition_mode!r}")
+
+
+def _pad_positions(tensor: torch.Tensor, pad_len: int) -> torch.Tensor:
+    """Continue a 1-D position arange over padded slots.
+
+    Alignment pad slots live *inside* the trajectory's ``cu_seqlens`` segment, so
+    continuing the arange keeps intra-segment positions monotone instead of aliasing
+    real tokens' positions.
+    """
+    return torch.cat([
+        tensor,
+        torch.arange(
+            tensor.size(0), tensor.size(0) + pad_len,
+            dtype=tensor.dtype, device=tensor.device,
+        ),
+    ])
+
+
+def prepare_packed_mrope_position_ids(
+    tokens_list: list[torch.Tensor],
+    pad_multiplier: int = 128,
+    cp_partition_mode: CPPartitionMode = "zigzag",
+) -> torch.Tensor:
+    """Rank-local text-only 3D MRoPE position ids ``[3, 1, local_len]``.
+
+    Megatron-Bridge's ``Qwen3VLModel.forward`` refuses pre-sharded packed CP inputs
+    without explicit rank-local MRoPE ids, because it cannot recover global positions
+    from one CP shard.
+
+    ``pad_multiplier`` and ``cp_partition_mode`` must match the
+    ``prepare_packed_seq_params`` call for the same micro-batch.
+
+    Text-only: MRoPE degenerates to a per-trajectory arange with identical T/H/W rows.
+    """
+    pos_list = [
+        torch.arange(t.size(0), dtype=torch.long, device=t.device)
+        for t in tokens_list
+    ]
+    packed, _ = slice_cp_packed(
+        pos_list, cp_partition_mode, _pad_positions, pad_multiplier
+    )
+    # [local_len] -> [3, 1, local_len]: dim 0 is MRoPE's temporal/height/width axes
+    # (identical without vision grids), dim 1 is the THD batch of 1.
+    return packed.reshape(1, 1, -1).expand(3, 1, -1).contiguous()
 
 
 def prepare_routing_replay_data(

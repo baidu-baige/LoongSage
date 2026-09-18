@@ -4,7 +4,7 @@ TrainManager — lifecycle manager for distributed Megatron training workers.
 import ray
 from omegaconf import DictConfig
 from coda.backends.megatron import MegatronTrainWorker
-from coda.utils.channel_helper import ChannelMeta
+from coda.transfer_mesh import ChannelMeta
 
 class TrainManager:
     """Manages a pool of ``TrainWorker`` Ray actors."""
@@ -14,8 +14,7 @@ class TrainManager:
         world_size = self.config.trainer.num_nodes * self.config.trainer.num_gpus_per_node
 
         if self.config.trainer.backend == "megatron":
-            env_vars = MegatronTrainWorker.runtime_env_vars()
-            env_vars.update(dict(self.config.trainer.env_vars))
+            env_vars = dict(self.config.trainer.env_vars)
             remote_worker_cls = ray.remote(runtime_env={"env_vars": env_vars})(MegatronTrainWorker)
         else:
             raise ValueError(f"Unsupported backend '{self.config.trainer.backend}'")
@@ -61,6 +60,11 @@ class TrainManager:
         """Onload: move from CPU memory to GPU memory"""
         return ray.get([worker.onload.remote() for worker in self._worker_handlers])
 
-    def offload(self):
-        """Offload: move from GPU memory to CPU memory"""
-        return ray.get([worker.offload.remote() for worker in self._worker_handlers])
+    def offload(self, move_params: bool = False):
+        """Offload: move from GPU memory to CPU memory
+
+        Args:
+            move_params: Also release the model parameters (see
+                ``MegatronTrainWorker.offload``).
+        """
+        return ray.get([worker.offload.remote(move_params) for worker in self._worker_handlers])

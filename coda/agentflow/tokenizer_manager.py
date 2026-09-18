@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import importlib
 import json
 import logging
 import os
@@ -22,6 +23,13 @@ logger = logging.getLogger(__name__)
 _PROCESS_TOKENIZER: Any = None
 DEFAULT_THINK_TAGS = ("<think>", "</think>")
 DEEPSEEK_V4_MODEL_FAMILY = "deepseek_v4"
+DEEPSEEK_V41_MODEL_FAMILY = "deepseek_v41"
+# DeepSeek checkpoints ship no Jinja chat template; SGLang carries an official
+# encoder per family instead. Keyed by the family the checkpoint declares.
+DEEPSEEK_OFFICIAL_ENCODER_MODULES = {
+    DEEPSEEK_V41_MODEL_FAMILY: "sglang.srt.entrypoints.openai.encoding_dsv41",
+    DEEPSEEK_V4_MODEL_FAMILY: "sglang.srt.entrypoints.openai.encoding_dsv4",
+}
 
 
 def _deepseek_v4_thinking_mode(generation_prompt_kwargs: Mapping[str, Any]) -> str:
@@ -32,21 +40,34 @@ def _deepseek_v4_thinking_mode(generation_prompt_kwargs: Mapping[str, Any]) -> s
     return "thinking" if enabled else "chat"
 
 
-def _is_deepseek_v4(model_path: str) -> bool:
+def _deepseek_official_family(model_path: str) -> str | None:
+    """DeepSeek family whose official SGLang encoder renders this checkpoint.
+
+    V4.1 is matched before V4 because it reuses the ``DeepseekV4`` architecture
+    substring (mirrors SGLang's ``is_deepseek_v41_config``).
+    """
     config_path = Path(model_path) / "config.json"
     if not config_path.is_file():
-        return False
+        return None
     with config_path.open(encoding="utf-8") as config_file:
         config = json.load(config_file)
-    return (
-        config.get("model_type") == DEEPSEEK_V4_MODEL_FAMILY
-        or "DeepseekV4ForCausalLM" in config.get("architectures", [])
-    )
+    arch = (config.get("architectures") or [""])[0]
+    model_type = config.get("model_type") or ""
+    if model_type == DEEPSEEK_V41_MODEL_FAMILY or "DeepseekV41" in arch:
+        return DEEPSEEK_V41_MODEL_FAMILY
+    if model_type == DEEPSEEK_V4_MODEL_FAMILY or "DeepseekV4" in arch:
+        return DEEPSEEK_V4_MODEL_FAMILY
+    return None
 
 
-def _wrap_deepseek_v4_tokenizer(tokenizer: Any) -> Any:
-    """Expose the official DeepSeek-V4 encoder through the HF tokenizer API."""
-    from sglang.srt.entrypoints.openai.encoding_dsv4 import encode_messages
+def _wrap_deepseek_v4_tokenizer(tokenizer: Any, family: str) -> Any:
+    """Expose the official DeepSeek encoder through the HF tokenizer API."""
+    # Only V4.1 renders an empty system message as a system token; V4 renders it
+    # to nothing, so only tools justify inserting one there.
+    v41 = family == DEEPSEEK_V41_MODEL_FAMILY
+    encode_messages = importlib.import_module(
+        DEEPSEEK_OFFICIAL_ENCODER_MODULES[family]
+    ).encode_messages
 
     def apply_chat_template(
         self: Any,
@@ -55,6 +76,11 @@ def _wrap_deepseek_v4_tokenizer(tokenizer: Any) -> Any:
         **kwargs: Any,
     ) -> str | list[int]:
         conversation = copy.deepcopy(messages)
+        if v41:
+            # V4.1 consumes OpenAI content parts and requires a string content.
+            for message in conversation:
+                if message.get("content") is None:
+                    message["content"] = ""
         if tools:
             if not conversation or conversation[0].get("role") != "system":
                 conversation.insert(0, {"role": "system", "content": ""})
@@ -67,7 +93,7 @@ def _wrap_deepseek_v4_tokenizer(tokenizer: Any) -> Any:
         return self.encode(prompt, add_special_tokens=False)
 
     tokenizer.apply_chat_template = types.MethodType(apply_chat_template, tokenizer)
-    tokenizer.model_family = DEEPSEEK_V4_MODEL_FAMILY
+    tokenizer.model_family = family
     return tokenizer
 
 
@@ -104,8 +130,10 @@ def load_tokenizer(model_path: str, custom_chat_template: str | None = None) -> 
     )
     if custom_chat_template:
         tokenizer.chat_template = custom_chat_template
-    elif _is_deepseek_v4(model_path):
-        tokenizer = _wrap_deepseek_v4_tokenizer(tokenizer)
+    else:
+        family = _deepseek_official_family(model_path)
+        if family is not None:
+            tokenizer = _wrap_deepseek_v4_tokenizer(tokenizer, family)
     return tokenizer
 
 
@@ -217,7 +245,7 @@ class BaseTokenizerManager(ABC):
         self.mode = mode
         self.num_workers = num_workers
         self.generation_prompt_kwargs: dict[str, Any] = generation_prompt_kwargs or {}
-        if self.model_family == DEEPSEEK_V4_MODEL_FAMILY:
+        if self.model_family in DEEPSEEK_OFFICIAL_ENCODER_MODULES:
             self.thinking_mode = _deepseek_v4_thinking_mode(
                 self.generation_prompt_kwargs
             )

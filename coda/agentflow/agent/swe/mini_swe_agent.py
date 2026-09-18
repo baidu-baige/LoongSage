@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import platform
+import shlex
 import time
 from copy import deepcopy
 from pathlib import Path
@@ -20,9 +21,7 @@ from minisweagent.models.litellm_model import LitellmModel
 from minisweagent.models.utils.retry import retry
 
 from coda.agentflow.agent import BaseAgent, register_agent
-from coda.agentflow.agent.swe.r2e import with_r2e_environment
-from coda.agentflow.sandbox.base import SandboxClient
-from coda.agentflow.utils import CONTEXT_LENGTH_EXCEEDED
+from coda.agentflow.utils import CONTEXT_LENGTH_EXCEEDED, require_docker_image
 from coda.reward.reward import Reward
 
 logger = logging.getLogger(__name__)
@@ -76,17 +75,16 @@ class CodaSandboxEnvironment:
     - get_template_vars() — Jinja2 template variables (cwd, platform info)
     - serialize()        — serializable snapshot for logging
     - config.cwd         — working directory attribute accessed by DefaultAgent
+
+    ``shell_prefix``, when non-empty, is prepended to every command inside a
+    ``bash -c`` wrapper. Benchmarks whose images need extra setup (e.g. putting a
+    testbed virtualenv on ``PATH``) supply it via config; the default is a no-op.
     """
 
-    def __init__(
-        self,
-        sandbox: SandboxClient,
-        cwd: str = "/testbed",
-        use_r2e_environment: bool = False,
-    ) -> None:
-        self._sandbox = sandbox
+    def __init__(self, execute: Any, cwd: str = "/testbed", shell_prefix: str = "") -> None:
+        self._execute = execute
         self._cwd = cwd
-        self._use_r2e_environment = use_r2e_environment
+        self._shell_prefix = shell_prefix
         # mini-swe-agent accesses env.config.cwd
         self.config = type("_Cfg", (), {"cwd": cwd, "to_dict": lambda s: {"cwd": cwd}})()
 
@@ -95,11 +93,11 @@ class CodaSandboxEnvironment:
         from minisweagent.exceptions import Submitted
 
         command = action.get("command", "") if isinstance(action, dict) else action
-        if self._use_r2e_environment:
-            command = with_r2e_environment(command)
+        if self._shell_prefix:
+            command = f"bash -c {shlex.quote(self._shell_prefix + command)}"
         workdir = cwd or self._cwd
         try:
-            result = self._sandbox.execute(command, workdir=workdir)
+            result = self._execute(command, workdir=workdir)
             output: dict[str, Any] = {
                 "output": result.get("stdout", "") + result.get("stderr", ""),
                 "returncode": result.get("exit_code", -1),
@@ -214,35 +212,30 @@ class SWEAgent(BaseAgent):
     model receives correct submission instructions without any manual overrides.
 
     Common AgentFlow parameters come from BaseAgent. SWE-specific config includes
-    step_limit, request_timeout, and max_consecutive_format_errors.
+    step_limit, request_timeout, max_consecutive_format_errors, and shell_prefix.
     """
 
     def __init__(
         self,
-        router_url: str = "http://localhost:8000",
-        sandbox_env_client: Any = None,
-        reward_fn: Any = None,
+        router_url: str,
         step_limit: int = 100,
-        completion_params: dict = None,
         max_response_len_per_trajectory: int = 0,
-        temperature: float = 0.0,
         request_timeout: int = 300,
         max_consecutive_format_errors: int = 3,
+        shell_prefix: str = "",
         **_ignored: Any,
     ) -> None:
         super().__init__(
             router_url,
-            completion_params=completion_params,
             max_response_len_per_trajectory=max_response_len_per_trajectory,
-            temperature=temperature,
             **_ignored,
         )
-        self.sandbox_env_client = sandbox_env_client
-        self.reward_fn = reward_fn
+        if self.sandbox_client is None:
+            raise ValueError("mini-swe agent requires data_source.sandbox")
         self.step_limit = step_limit
         self.request_timeout = request_timeout
         self.max_consecutive_format_errors = max_consecutive_format_errors
-        self._sandbox_created = False
+        self.shell_prefix = shell_prefix
         logger.info(
             "SWEAgent initialized: router_url=%s step_limit=%d "
             "max_response_len_per_trajectory=%d max_consecutive_format_errors=%d",
@@ -268,10 +261,7 @@ class SWEAgent(BaseAgent):
         resume_messages = (
             deepcopy(prompt)
             if isinstance(prompt, list)
-            and any(
-                isinstance(message, dict) and message.get("role") == "assistant"
-                for message in prompt
-            )
+            and any(isinstance(m, dict) and m.get("role") == "assistant" for m in prompt)
             else None
         )
         if isinstance(prompt, str):
@@ -284,14 +274,12 @@ class SWEAgent(BaseAgent):
         else:
             problem_statement = str(prompt)
 
-        image = str(metadata.get("docker_image", ""))
         cwd = str(metadata.get("repo_path", "/testbed"))
-        is_r2e = bool(metadata.get("expected_output_json"))
-
-        if self.sandbox_env_client is None:
-            raise ValueError("sandbox_env_client is required; set agentflow.sandbox in config.")
-        if not image:
-            raise ValueError("metadata['docker_image'] is missing.")
+        if self.sandbox_id is None:
+            self.sandbox_id = await asyncio.to_thread(
+                self.sandbox_client.create, image=require_docker_image(metadata)
+            )
+        execute = lambda command, **kwargs: self.sandbox_client.execute(self.sandbox_id, command, **kwargs)
 
         # Build agent config from swebench.yaml — only override step_limit.
         # Crucially, instance_template is left intact so DefaultAgent renders
@@ -310,7 +298,6 @@ class SWEAgent(BaseAgent):
                 "api_base": f"{self.router_url}/v1",
                 "api_key": "not-needed",
                 "max_tokens": self.max_response_len_per_trajectory,
-                "temperature": self.temperature,
                 "timeout": self.request_timeout,
                 "drop_params": True,
                 "num_retries": 0,  # disable litellm/OpenAI SDK retry to prevent
@@ -321,21 +308,7 @@ class SWEAgent(BaseAgent):
             "MSWEA_MODEL_RETRY_STOP_AFTER_ATTEMPT", "1"
         )  # disable tenacity retry for same reason as num_retries=0
 
-        if getattr(self.sandbox_env_client, "sandbox_id", None):
-            # Pooled sandbox from a partial-rollout abort: reuse it so tool
-            # state from earlier turns is preserved.
-            logger.info(
-                "Reusing existing sandbox pod %s", self.sandbox_env_client.sandbox_id
-            )
-        else:
-            logger.info("Creating sandbox pod (image=%s)", image)
-            await asyncio.to_thread(self.sandbox_env_client.create, image=image)
-        self._sandbox_created = True
-        env = CodaSandboxEnvironment(
-            self.sandbox_env_client,
-            cwd=cwd,
-            use_r2e_environment=is_r2e,
-        )
+        env = CodaSandboxEnvironment(execute, cwd=cwd, shell_prefix=self.shell_prefix)
 
         model = get_model(config=model_cfg)
         agent = FormatErrorLimitedAgent(
@@ -366,19 +339,9 @@ class SWEAgent(BaseAgent):
             "mini-swe-agent done: instance=%s exit=%s steps=%d",
             metadata.get("instance_id", "?"), exit_status, n_steps,
         )
-        reward_meta = {**metadata, "sandbox": self.sandbox_env_client}
-        return (
-            await asyncio.to_thread(
-                self.reward_fn, messages, trajectory.get("label", ""), metadata=reward_meta
-            )
-            if self.reward_fn is not None
-            else Reward(final_reward=0.0)
+        return await asyncio.to_thread(
+            self.reward_fn,
+            messages,
+            trajectory.get("label", ""),
+            {**metadata, "sandbox_client": self.sandbox_client, "sandbox_id": self.sandbox_id},
         )
-
-    async def clear(self) -> None:
-        """Release agent-local resources.
-
-        Sandbox deletion is owned by AgentFlow's sandbox pool (release_sandbox),
-        which keeps the pod alive across partial-rollout aborts for reuse.
-        """
-        self._sandbox_created = False

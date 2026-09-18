@@ -24,7 +24,7 @@ AgentFlow 由一个编排器（`AgentFlow`）和若干协作组件组成。编�
 
 入口类是 [agent_flow.py](../../coda/agentflow/agent_flow.py) 中的 `AgentFlow`。它在 `__init__` 里完成三件初始化：
 
-1. `_init_per_datasource()` —— 按 `data_sources` 逐个数据源初始化 agent 类与 reward 函数。每个数据源可以有独立的 agent、reward、token 配置。是否多轮由 `get_rollout_mode()` 判断：配置了 `agent.name` 即为 `multi_turn`，否则为 `single_turn`。
+1. `_init_per_datasource()` —— 按 `data_sources` 逐个数据源初始化 agent 类、reward 函数和 sandbox 后端配置。每个数据源可以有独立的 agent、reward、sandbox 与 token 配置。是否多轮由 `get_rollout_mode()` 判断：配置了 `agent.name` 即为 `multi_turn`，否则为 `single_turn`。
 2. `_init_tokenizer()` —— 通过 `create_tokenizer_manager()` 构建 `TokenizerManager`。
 3. `_init_router()` —— 构建并在**后台守护线程**中启动 `Router`；`middleware_kwargs` 由 `vars(self)` 中所有非下划线属性组成，从而把 `trajectory_store`、`tokenizer_manager`、`accumulate_reasoning`、`r3_enabled` 等一并注入到中间件构造上下文。
 
@@ -73,13 +73,13 @@ OpenAI 的 chat 接口只收发文本，SGLang 侧会自行套 chat template 并
 
 | 方向 | 内容 |
 | --- | --- |
-| **token in**（`_build_generate_body`） | `input_ids`（由 `TokenizerManager` 套 chat template 后产出，首轮全量 / 续轮增量）、`rid=trajectory_id#attempt_id`（sticky 路由与精确 abort 的依据）、`return_logprob=True`（强制开启）、`sampling_params`（由 OpenAI 顶层字段按 `_SAMPLING_PARAM_MAP` 映射而来，`max_tokens` / `max_completion_tokens` → `max_new_tokens`）；R3 开启时追加 `return_routed_experts` / `routed_experts_start_len` |
+| **token in**（`_build_generate_body`） | `input_ids`（由 `TokenizerManager` 套 chat template 后产出，首轮全量 / 续轮增量）、`rid=trajectory_id#attempt_id`（sticky 路由与精确 abort 的依据）、`return_logprob=True`（强制开启），以及作为原生 SGLang `sampling_params` 使用的数据源 `completion_params`；Router 会覆盖 `temperature` 和 `max_new_tokens`；R3 开启时追加 `return_routed_experts` / `routed_experts_start_len` |
 | **token out**（`build_assistant_message`） | `meta_info.output_token_logprobs` 逐项拆成 `response_ids` 与 `logprobs`、`meta_info.weight_version`（本轮生成所用的权重版本）；R3 开启时还有 base64 编码的 `meta_info.routed_experts` |
 
 几个容易踩的细节：
 
 - **`return_logprob` 是硬编码 `True`**，不受调用方请求体影响——没有逐 token logprob 就无法训练。
-- **`skip_special_tokens` 不是无条件关闭的**：只有 DeepSeek-V4 模型族会被强制设为 `False`（它把 think 与 DSML tool-call 标记标成了 special token，detokenizer 必须保留它们，reasoning / tool_call parser 才看得到）；其他模型族沿用请求体或 server 默认值。
+- **`skip_special_tokens` 不是无条件关闭的**：只有 DeepSeek-V4 模型族会被强制设为 `False`（它把 think 与 DSML tool-call 标记标成了 special token，detokenizer 必须保留它们，reasoning / tool_call parser 才看得到）；其他模型族使用数据源的 `completion_params` 或 server 默认值。
 - **agent 侧完全无感**：Router 最后用 `_to_openai_response()` 把 `/generate` 的返回拼回标准 `chat.completion` 结构（含 `choices[0].message`、`finish_reason`、`usage`），所以 agent 里可以继续用 litellm / openai SDK，不需要知道底层是 token 接口。
 - **上游异常一律原样透传**：非 2xx、非 JSON、以及 `finish_reason.type == "abort"` 的响应都直接回传且**不写 TrajectoryStore**，避免把残缺数据落进训练集。
 - **支持流式响应**：若 agent 请求体带 `"stream": true`，`ParserMiddleware` 内部仍然用非流式方式完整调用 `/generate` 拿到结果（保证 token/logprob 落盘的完整性），再用 `_to_streaming_response()` 把完整的 `chat.completion` 包装成 SSE chunk 序列返回，对 agent 侧伪装成真流式，不需要额外适配。
@@ -130,12 +130,9 @@ get_trajectory()        # 取出当前 attempt 的 Trajectory
 
 ### 2.7 Agent
 
-[agent/base_agent.py](../../coda/agentflow/agent/base_agent.py) 定义抽象基类 `BaseAgent`，agent 只需实现两个方法：
+[agent/base_agent.py](../../coda/agentflow/agent/base_agent.py) 定义抽象基类 `BaseAgent`。agent 只需实现 `async run_trajectory(trajectory: dict) -> Reward`；`call_llm()` 和 `close()` 直接继承基类实现，reward 由 agent 自己调用注入的 `reward_fn`。
 
-- `async run_trajectory(trajectory: dict) -> Any`：跑完一条完整轨迹并返回 reward。AgentFlow 不约束 `trajectory` 的 schema，各 agent 自取所需字段（`prompt` / `label` / `metadata`）。
-- `async clear()`：释放资源。
-
-AgentFlow 统一注入的构造参数有 `router_url`（已带 `/{trajectory_id}/{attempt_id}` 前缀）、`completion_params`、`max_response_len_per_trajectory`、`temperature`，其余 agent 专属参数通过 `**kwargs` 透传（来自数据源的 `agent` 配置块）。
+AgentFlow 注入 `router_url`（带 `/{trajectory_id}/{attempt_id}` 前缀）、`reward_fn`、`max_response_len_per_trajectory`，以及当前 `sandbox_client` 与 `sandbox_id`。sandbox agent 直接调用 client，并把 `sandbox_client` / `sandbox_id` 放进传给 `reward_fn` 的 context，让 reward 在同一个容器里评测；其它 agent 专属参数来自数据源的 `agent` 配置块。采样配置由 Router 管理，不传给 agent。
 
 agent 通过 `Registry` + `@register_agent` 装饰器注册，`agent/__init__.py` 用 `pkgutil.walk_packages` 自动发现内置 agent（单个 agent 的依赖缺失不会影响其他 agent 加载）。内置示例：
 
@@ -143,20 +140,23 @@ agent 通过 `Registry` + `@register_agent` 装饰器注册，`agent/__init__.py
 - `agent/swe/mini_swe_agent.py` —— 基于 mini-swe-agent 的 SWE-bench agent，在沙箱里执行 shell 完成代码修复（注册名 `mini-swe`）。
 - `agent/bcp/bcp_agent.py` —— BCP agent（注册名 `bcp`）。
 - `agent/opencode/opencode_agent.py` —— 黑盒 opencode agent，在沙箱内驱动 OpenCode CLI 完成 SWE 任务（注册名 `opencode`）。`run_trajectory()` 把 Router 地址包装成 OpenAI-compatible provider 写入 `opencode.json`，再以子进程执行 `opencode run` 跑完整个任务；它是 §2.3 中 `request_kind` 机制的实际生产者——通过写入一个 OpenCode 插件文件（`coda-request-kind.js`，运行时以 base64 编码 `printf` 写入沙箱内 `/root/.config/opencode/coda-request-kind.js`，源码内嵌在 `opencode_agent.py` 的 `_REQUEST_KIND_PLUGIN` 字符串常量中），钩住 OpenCode 的 `chat.headers` 生命周期回调：若本次会话存在 `parentID`（说明是子 session）则设置请求头 `request_kind=collab_spawn`；若当前 agent 为 `compaction` 或消息带 compaction 标记，则设置 `request_kind=compaction`。
+- `agent/codex/codex_agent.py` —— 黑盒 Codex agent，在沙箱内驱动 Codex CLI 完成 SWE 任务（注册名 `codex`）。与 opencode agent 不同，它走的是 **OpenAI Responses 协议**（`/v1/responses`，由 `OpenAIResponsesAdapter` 适配），而非 `/v1/chat/completions`。`run_trajectory()` 先把模型指令（内嵌的 `prompt.md`）和 `config.toml` 以 base64 编码 `printf` 写入沙箱内 `/root/.codex/`：`config.toml` 把 `model_provider = "coda"` 的 `base_url` 指向 Router 的 `{router_url}/v1`，并按 `context_length` 设置 `model_context_window` 与 `model_auto_compact_token_limit`（后者取上下文的 90%，用于触发 Codex 自身的自动压缩）；随后以 `codex exec --json --dangerously-bypass-approvals-and-sandbox` 子进程一次性跑完任务，日志重定向到 `/tmp/coda-codex.log`，非 0 退出码时回读末尾 100 行日志并抛错。启动前 `_probe_router()` 会用 `/dev/tcp` 探测沙箱到 Router 的连通性；`close()` 通过 `pkill -INT`（宽限 1s 后 `pkill -KILL`）中断仍在运行的 Codex 进程。Codex 侧的 subagent / compaction 语义由 `OpenAIResponsesAdapter.normalize_headers()` 在 Router 侧翻译成 `request_kind`（`x-openai-subagent` 头 → `collab_spawn`；`x-codex-turn-metadata` 中标记或 legacy `/v1/responses/compact` 路径 → `compaction`），无需像 opencode 那样注入插件文件。
 
 ### 2.8 Sandbox
 
-[sandbox/base.py](../../coda/agentflow/sandbox/base.py) 定义抽象基类 `SandboxClient`，接口为 `create()` / `execute(command, **kwargs)` / `delete()`。同样用 `Registry` + `@register_sandbox` 注册，`create_sandbox_client(config)` 按 `config.type` 工厂化（`type` 为 `none`/空时返回 `None`，即不启用沙箱）。
+[sandbox/base.py](../../coda/agentflow/sandbox/base.py) 定义无实例状态的抽象后端 `SandboxClient`，接口固定为 `create(**kwargs) -> str`、`execute(sandbox_id, command, **kwargs)` 和 `delete(sandbox_id, **kwargs)`。client 可以寻址多个 sandbox，不持有“当前实例”，框架也不提供额外的 `Sandbox` 类。同样用 `Registry` + `@register_sandbox` 注册，`create_sandbox_client(config)` 按 `config.type` 创建后端 client（`type` 为 `none`/空时返回 `None`）。
+
+Sandbox 配置属于数据源。agent 需要时直接通过注入的 client 创建；定义了 `prepare_sandbox()` 的 reward 由 AgentFlow 提前准备。partial 中止保留 client、ID 和 reward 返回的不透明 sandbox 准备状态，终态与普通重试删除实例。
 
 内置两种实现：
 
-- **`K8sSandboxClient`（[sandbox/k8s_sandbox.py](../../coda/agentflow/sandbox/k8s_sandbox.py)）**：每个沙箱一个 K8s Pod，通过 `kubectl apply` 创建、`kubectl exec` 执行命令、`delete()` 删除。默认 `working_dir=/rl-sandbox`，`execute(command, workdir=...)` 支持按调用方指定的目录执行（拼成 `cd {workdir} && ...`）。
+- **`K8sSandboxClient`（[sandbox/k8s_sandbox.py](../../coda/agentflow/sandbox/k8s_sandbox.py)）**：每个返回的 sandbox ID 对应一个 K8s Pod，通过 `kubectl apply` 创建、`kubectl exec` 执行命令、`delete(sandbox_id)` 删除。默认 `working_dir=/rl-sandbox`，`execute(sandbox_id, command, workdir=...)` 支持按调用方指定的目录执行（拼成 `cd {workdir} && ...`）。
 - **`DockerSandboxClient`（[sandbox/docker_sandbox.py](../../coda/agentflow/sandbox/docker_sandbox.py)）**：本地 Docker 容器实现，默认 `working_dir=/testbed`。
 
 > **Pod 泄漏防护（K8s 沙箱清理机制）**：为避免 apiserver 抖动导致 pod 长期残留，删除路径做了多重加固：
 > - `_force_delete()` 用 `kubectl delete --force --grace-period=0`，最多重试 `_FORCE_DELETE_RETRIES`（=3）次并线性退避；`NotFound` / `not found` 视为删除成功；重试耗尽仅打印 "pod may leak" 告警而不阻塞主流程。
 > - `_force_delete()` 的 `kubectl delete` 调用带 `--request-timeout=30s`（`_KUBECTL_REQUEST_TIMEOUT`），防止 apiserver i/o 卡死时删除操作无限期挂起。
-> - `create()` 中 pod readiness 失败时会立即 `_force_delete` 清理，`delete()` 正常退出时同样走 `_force_delete`。
+> - `create()` 中 pod readiness 失败时会立即 `_force_delete` 清理；正常退出时由 AgentFlow 调用 `delete(sandbox_id)`，后者同样走 `_force_delete`。
 > - **服务端兜底**：pod manifest（`conf/k8s/pod_manifest.yaml`）设置 `activeDeadlineSeconds: 86400`，即便客户端彻底失联，pod 也会在 24h 后被 K8s 自动回收。
 
 > SWE-bench 场景下，agent 会显式把 `workdir` 指到仓库根（默认 `/testbed`，SWE-bench 镜像的仓库 checkout 位置，可用 `metadata["repo_path"]` 覆盖），因此每条命令实际运行在仓库目录，而不受沙箱通用默认目录影响。
@@ -167,10 +167,10 @@ agent 通过 `Registry` + `@register_agent` 装饰器注册，`agent/__init__.py
 
 1. `_prepare_attempt_template()` 准备本次提交的可变模板。partial rollout resume 且开启 `mask_offpolicy_in_partial_rollout` 时，会把已有 response token 的 `loss_masks` 全部置 0（旧版本 off-policy 前缀不参与 loss）；同时校验 `loss_masks` / `rollout_weight_versions` 的长度与 `rollout_log_probs` 一致，不一致直接抛 `ValueError`，避免带着损坏的对齐数据续跑。
 2. 每次 attempt 置状态 `GENERATING`，写入 store，然后按模式执行：
-   - **`_execute_single_turn()`**：不建 agent，直接由 AgentFlow 向 Router 的 `/v1/chat/completions` 发一次请求，再从 store 取回 trajectory 交给 reward 函数打分。`context_length_exceeded` 会被当作"用部分响应"而非硬失败。
-   - **`_execute_multi_turn()`**：为该 attempt 创建 agent 实例（`router_url` 带 session 前缀），可选注入 sandbox 与 reward 函数，`await agent.run_trajectory(...)`，`finally` 中 `agent.clear()`。agent 跑完后会立即校验：`completed_attempt.rollout_log_probs` 不能为空，且 `completed_attempt.segments` 中必须至少有一个 `trainable=True`——否则直接抛 `RuntimeError`，走失败重试路径（避免产出一条无法用于训练的空 trajectory）。
-3. 成功：`_post_process_reward()` 写回 reward、置 `COMPLETED`、构造 `token_rewards`（仅最后一位为 `final_reward`；若 reward 带 `completion_rewards` 则按 triplet 逐轮赋值并做数量校验）、写入 `is_correct`（reward 未判定时回退为 `final_reward > 0`），emit 终态 trajectory，并 `DELETE /release_session` 释放 sticky 映射。
-4. 失败：置 `FAILED`，`POST /abort_session` 中止绑定 worker；重试耗尽则 emit 一条 `is_valid=False` 的 reward。
+   - **`_execute_single_turn()`**：不建 agent，也不创建 sandbox；直接由 AgentFlow 向 Router 的 `/v1/chat/completions` 发一次请求，再从 store 取回 trajectory 交给 reward 函数打分。`context_length_exceeded` 会被当作“用部分响应”而非硬失败。
+   - **`_execute_multi_turn()`**：创建 agent，并注入数据源的 sandbox client 与续跑保留的 ID。定义了 `prepare_sandbox()` 的 reward 会在 agent 执行前完成准备。`finally` 先关闭 agent 自有资源，再保留或删除 sandbox。完成的 attempt 必须包含 rollout logprob 和至少一个可训练 segment。
+3. 成功：`_post_process_reward()` 写回 reward、置 `COMPLETED`、构造 `token_rewards`（仅最后一位为 `final_reward`；若 reward 带 `completion_rewards` 则按 triplet 逐轮赋值并做数量校验）、写入 `is_correct`（reward 未判定时回退为 `final_reward > 0`），emit 终态 trajectory，并通过 `DELETE /release_session` 释放 sticky 映射。
+4. 失败：置 `FAILED` 并通过 `POST /abort_session` 中止绑定 worker；重试耗尽则 emit 一条 `is_valid=False` 的 reward。由于命令可能只执行了一部分，重试前会删除 sandbox。只有 `rollout.partial=true` 下的取消会保留 sandbox 及其运行状态供续跑。
 
 终态 trajectory 通过 `_emit_terminal_trajectory()` 写入 `TrajQueue` 并从 store 删除（无论入队成功与否都删，避免残留）。
 
@@ -195,9 +195,9 @@ AgentFlow 的四个主要扩展维度都是"注册表 + 配置驱动"，无需�
 | --- | --- | --- | --- |
 | 自定义 Agent | `BaseAgent` | `@register_agent("name")` | `data_sources[i].agent.name` + 专属参数 |
 | 自定义 Reward | `RewardFunction` | `@register_reward("name")` | `data_sources[i].reward.name` + 专属参数 |
-| 自定义 Sandbox | `SandboxClient` | `@register_sandbox("type")` | `agentflow.sandbox.type` + 专属参数 |
+| 自定义 Sandbox | `SandboxClient` | `@register_sandbox("type")` | `data_source.sandbox.type` / `data_sources[i].sandbox.type` + 专属参数 |
 
-新增 agent 的最小步骤：继承 `BaseAgent`，实现 `run_trajectory` / `clear`，用 `@register_agent` 装饰，放到 `agent/` 下的包内即可被自动发现；通常还需配套一个 reward 函数（继承 `RewardFunction`、用 `@register_reward` 装饰、放到 `coda/reward/functions/` 下），并在数据源的 `reward.name` 中引用（若能复用已有 reward 则无需新写）。
+新增 agent 的最小步骤：继承 `BaseAgent`、实现 `run_trajectory`、使用 `@register_agent` 注册并放入 `agent/` 下的包。只有 agent 持有额外资源时才覆写 `close()`。通常还需配置 reward，已有实现满足需求时直接复用。
 
 详细开发指南：
 
@@ -207,7 +207,7 @@ AgentFlow 的四个主要扩展维度都是"注册表 + 配置驱动"，无需�
 
 ## 6. 关键配置
 
-AgentFlow 相关配置集中在 `agentflow.*`、`rollout.*`、`data_sources[*]` 下，常用项：
+AgentFlow 相关配置集中在 `agentflow.*`、`rollout.*`、`data_sources[*]` 下；sandbox 后端配置属于各数据源，不放在 `agentflow` 下。常用项：
 
 | 配置 | 说明 |
 | --- | --- |
@@ -215,7 +215,11 @@ AgentFlow 相关配置集中在 `agentflow.*`、`rollout.*`、`data_sources[*]` 
 | `data_sources[i].reward.name` | 该数据源的 reward 函数名（rollout 打分必需） |
 | `data_sources[i].max_response_len_per_trajectory` | 每条 trajectory 的 response token 预算 |
 | `data_sources[i].num_trajectories_per_prompt` | 每个 prompt 采样的 trajectory 数（group 大小 `N`） |
-| `data_sources[i].completion_params` | 透传给 LLM 的采样参数（如 `top_p`、`max_tokens` 等） |
+| `data_sources[i].completion_params` | Router 直接应用的原生 SGLang `sampling_params`（如 `top_p`、`top_k`） |
+| `data_sources[i].sandbox.type` | 每数据源的 sandbox 后端（`k8s` / `docker` / `none`） |
+| `data_sources[i].sandbox.working_dir` | sandbox 默认工作目录（k8s 默认 `/rl-sandbox`，可被 agent/metadata 覆盖） |
+| `data_sources[i].sandbox.command_exec_timeout_seconds` / `sandbox_creation_timeout_seconds` | 命令执行 / pod 创建超时 |
+| `data_sources[i].sandbox.kubeconfig` / `pod_manifest_path` | K8s sandbox 的 kubeconfig 与 pod manifest 路径 |
 | `agentflow.tokenizer.manager.mode` / `num_workers` | TokenizerManager 后端（`thread`/`process`）与并发数 |
 | `agentflow.tokenizer.custom_chat_template_path` | 自定义 chat template 文件路径，相对路径按 `conf/` 解析（留空用 tokenizer 默认） |
 | `agentflow.tokenizer.generation_prompt_kwargs` | 生成 prompt 时透传给 chat template 的额外参数 |
@@ -225,12 +229,8 @@ AgentFlow 相关配置集中在 `agentflow.*`、`rollout.*`、`data_sources[*]` 
 | `agentflow.router.proxy_timeout_seconds` / `abort_timeout_seconds` | 转发请求超时 / abort 操作超时 |
 | `agentflow.router.accumulate_reasoning` | 是否在多轮历史中保留 think 块 |
 | `agentflow.router.middleware` | 中间件链配置，映射 `{name: params}`（默认 `{parser: null}`） |
-| `agentflow.sandbox.type` | 沙箱类型（`k8s` / `docker` / `none`） |
-| `agentflow.sandbox.working_dir` | 沙箱默认工作目录（k8s 默认 `/rl-sandbox`，可被 agent/metadata 覆盖） |
-| `agentflow.sandbox.command_exec_timeout_seconds` / `sandbox_creation_timeout_seconds` | 命令执行 / pod 创建超时 |
-| `agentflow.sandbox.kubeconfig` / `pod_manifest_path` | K8s 沙箱的 kubeconfig 与 pod manifest 路径 |
 | `agentflow.dump_trajectory_path` | trajectory 落盘调试路径（留空则不落盘） |
 | `rollout.retry_limit` | 单条 trajectory 的重试次数 |
 | `rollout.partial` / `mask_offpolicy_in_partial_rollout` | partial rollout 及其 off-policy 掩码 |
-| `trainer.temperature` | 采样温度（注入到 agent / 单轮请求） |
+| `trainer.temperature` | Router 写入 `sampling_params` 的采样温度；eval 配置存在时使用 `rollout.eval.temperature` |
 | `trainer.use_rollout_routing_replay` | 是否启用 R3（MoE routed experts 回放） |

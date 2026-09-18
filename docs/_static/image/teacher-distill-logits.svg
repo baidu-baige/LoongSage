@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="660" viewBox="0 0 1080 660" font-family="'Helvetica Neue',Helvetica,Arial,'PingFang SC','Hiragino Sans GB','Microsoft YaHei',sans-serif">
+  <defs>
+    <marker id="aBlack" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#1a1a1a"/>
+    </marker>
+    <marker id="aAmber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#d79b00"/>
+    </marker>
+  </defs>
+  <rect width="1080" height="660" fill="#ffffff"/>
+
+  <rect x="290" y="25" width="300" height="76" rx="12" fill="#d5e8d4" stroke="#82b366" stroke-width="2"/>
+  <text x="440" y="58" font-size="16" font-weight="700" fill="#1a1a1a" text-anchor="middle">teacher_worker</text>
+  <text x="440" y="84" font-size="11" fill="#5a6472" text-anchor="middle">Teacher forward; outputs hidden state only</text>
+
+  <rect x="640" y="108" width="400" height="82" rx="12" fill="#ffffff" stroke="#b85450" stroke-width="2" stroke-dasharray="8 6"/>
+  <text x="664" y="142" font-size="12" font-weight="700" fill="#b85450">If full logits [seq × vocab] were sent:</text>
+  <text x="664" y="166" font-size="12" fill="#b85450">transfer and resident memory cost is prohibitive</text>
+
+  <rect x="40" y="200" width="1000" height="345" rx="6" fill="#f7f8fa" stroke="#9aa1ab" stroke-width="2" stroke-dasharray="8 6"/>
+  <text x="60" y="226" font-size="14" font-weight="700" fill="#1a1a1a">train_worker</text>
+
+  <rect x="70" y="238" width="940" height="285" rx="8" fill="#ffffff" stroke="#b6bdc7" stroke-width="2"/>
+  <text x="90" y="264" font-size="13" font-weight="700" fill="#3d4552">teacher_lm_head · TP-sharded, resident in GPU memory</text>
+
+  <rect x="100" y="278" width="880" height="228" rx="8" fill="#fffaf2" stroke="#d79b00" stroke-width="2" stroke-dasharray="8 6"/>
+  <text x="122" y="301" font-size="11" fill="#9c7200">microbatch scope</text>
+
+  <rect x="150" y="316" width="290" height="62" rx="10" fill="#dae8fc" stroke="#6c8ebf" stroke-width="2"/>
+  <text x="295" y="343" font-size="15" font-weight="700" fill="#1a1a1a" text-anchor="middle">teacher_logits</text>
+  <text x="295" y="364" font-size="11" fill="#5a6472" text-anchor="middle">rebuilt on the fly from hidden state</text>
+
+  <rect x="150" y="396" width="290" height="62" rx="10" fill="#dae8fc" stroke="#6c8ebf" stroke-width="2"/>
+  <text x="295" y="423" font-size="15" font-weight="700" fill="#1a1a1a" text-anchor="middle">student_logits</text>
+  <text x="295" y="444" font-size="11" fill="#5a6472" text-anchor="middle">from the student's own forward pass</text>
+
+  <rect x="540" y="351" width="300" height="72" rx="12" fill="#ffffff" stroke="#6c8ebf" stroke-width="2.5"/>
+  <text x="690" y="381" font-size="15" font-weight="700" fill="#1a1a1a" text-anchor="middle">reverse KL / JSD</text>
+  <text x="690" y="403" font-size="11" fill="#5a6472" text-anchor="middle">full-vocabulary precision, no approximation</text>
+
+  <rect x="70" y="580" width="940" height="60" rx="12" fill="#d5e8d4" stroke="#82b366" stroke-width="2"/>
+  <text x="540" y="616" font-size="13" font-weight="700" fill="#1a1a1a" text-anchor="middle">Measured: Qwen3–30B–A3B multi-teacher full-vocab distillation on 1 node × 8 GPUs — peak per-GPU memory only ~17GB over same-config DAPO</text>
+
+  <path d="M 440 101 L 440 194" fill="none" stroke="#1a1a1a" stroke-width="3" marker-end="url(#aBlack)"/>
+  <text x="456" y="134" font-size="13" font-weight="700" fill="#1a1a1a">hidden state</text>
+  <text x="456" y="155" font-size="11" fill="#5a6472">[seq × hidden]</text>
+
+  <path d="M 440 347 L 534 373" fill="none" stroke="#1a1a1a" stroke-width="3" marker-end="url(#aBlack)"/>
+  <path d="M 440 427 L 534 397" fill="none" stroke="#1a1a1a" stroke-width="3" marker-end="url(#aBlack)"/>
+
+  <path d="M 690 423 L 690 452" fill="none" stroke="#d79b00" stroke-width="2.5" stroke-dasharray="8 6" marker-end="url(#aAmber)"/>
+  <text x="690" y="478" font-size="11" fill="#9c7200" text-anchor="middle">freed when the scope ends; never kept across microbatches</text>
+</svg>

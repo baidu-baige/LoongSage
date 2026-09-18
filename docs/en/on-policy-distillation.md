@@ -60,9 +60,13 @@ To add a custom KL / divergence algorithm, see the [Custom KL Algorithm Developm
 
 Full-vocabulary KL requires the teacher's complete logits, whose size is `[seq × vocab]`; transferring or dumping them directly would consume an enormous amount of memory. LoongSage instead transfers only the compact teacher **hidden state** `[seq × hidden]`, and reconstructs the logits on the student side with a TP-sharded copy of the teacher's `lm_head`. Reconstruction is done at microbatch granularity, computed only once per microbatch and released immediately after use (`TeacherCtx` / `KLCtx` memoization), which greatly reduces memory and transfer overhead without sacrificing full-vocabulary precision. The log-prob and top-k methods likewise forward the teacher only once per microbatch and reuse the result.
 
+![Logits reconstruction and memory optimization for full-vocabulary KL](../_static/image/teacher-distill-logits.svg)
+
 ## Teacher Orchestration: TeacherManager
 
 To uniformly support **single-teacher / multi-teacher** and **same-model / different-model** distillation, LoongSage uses `TeacherManager` to abstract the management of teacher models and GPU resources, decoupled from the training side:
+
+![TeacherManager architecture](../_static/image/teacher-manager-arch.svg)
 
 - **Resource grouping**: the teacher pool is formed by `teacher_nodes × teacher_gpus_per_node`; the world size of a single teacher group is `dp_per_teacher × TP × PP × CP`, and teachers are divided into groups by count.
 - **Multiple teachers of the same model**: when there are enough teacher GPUs (teacher DP count ≥ teacher count) each teacher gets its own group and stays resident on GPU, so no switching is needed; when resources are short several teachers land in the same group and reuse a single model structure, with the inactive teachers' weights backed up in CPU pinned memory and copied back to GPU on demand.

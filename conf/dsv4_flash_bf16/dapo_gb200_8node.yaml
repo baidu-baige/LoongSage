@@ -34,7 +34,6 @@ rollout:
   env_vars:
     SGLANG_OPT_FP8_WO_A_GEMM: "0"
     NCCL_CUMEM_ENABLE: "1"
-    SGLANG_RMSNORM_NO_PDL: "1"
   num_gpus_per_node: 4
   sglang_args:
     mem_fraction_static: 0.85

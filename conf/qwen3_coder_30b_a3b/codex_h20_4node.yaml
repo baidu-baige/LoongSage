@@ -1,0 +1,112 @@
+# @package _global_
+#
+# Codex / R2E-Gym on Qwen3-Coder-30B-A3B-Instruct, 4-node H20.
+#
+# Set before launching: checkpoint_path, hf_model_path, data_source.dataset.prompt_data_path.
+# The first two must live on storage reachable by every node.
+#   hf download Qwen/Qwen3-Coder-30B-A3B-Instruct --local-dir <hf_model_path>
+#   hf download LoongSage/R2E-Gym R2E_Gym_Subset_codex.parquet --repo-type=dataset --local-dir <dir>
+#
+# Launch:
+#   bash examples/start_ray_cluster.sh <master-ip>   # on every node first
+#   bash examples/start.sh qwen3_coder_30b_a3b/codex_h20_4node
+
+defaults:
+  - /default
+  - _self_
+
+checkpoint_path: ???
+hf_model_path: ???
+colocate: true
+total_steps: 300
+
+data_source:
+  sandbox:
+    type: k8s
+    command_exec_timeout_seconds: 3600
+    sandbox_creation_timeout_seconds: 600
+    working_dir: /testbed
+    kubeconfig: k8s/kubeconfig.yaml
+    pod_manifest_path: k8s/pod_manifest.yaml
+  dataset:
+    prompt_data_path: ???
+    data_pre_processor: r2e_gym
+    input_key: prompt
+    label_key: label
+    metadata_key: metadata
+  agent:
+    name: codex
+    context_length: 65536
+  reward:
+    name: r2e_gym
+  num_trajectories_per_prompt: 8
+  num_prompts_per_step: 32
+  max_response_len_per_trajectory: 63488
+
+rollout:
+  retry_limit: 5
+  num_gpus_per_node: 8
+  partial: true
+  mask_offpolicy_in_partial_rollout: true
+  sampler:
+    num_oversample: 4
+  sglang_replicas:
+    regular:
+      num_nodes: 4
+      num_gpus_per_replica: 8
+  sglang_args:
+    tp_size: 8
+    ep_size: 8
+    mem_fraction_static: 0.8
+    disable_cuda_graph: false
+  env_vars:
+    SGLANG_RMSNORM_NO_PDL: "1"
+  use_fault_tolerance: true
+
+agentflow:
+  dump_trajectory_path: "log/trajectories"
+  router:
+    proxy_timeout_seconds: 1800
+  tokenizer:
+    generation_prompt_kwargs: {}
+
+trainer:
+  num_gpus_per_node: 8
+  num_nodes: 4
+  mini_batch_size: 64
+  micro_batch_size: 2
+  max_tokens_per_gpu: 8192
+  use_dynamic_batch_size: true
+  save_freq: 5
+  use_rollout_routing_replay: true
+  use_fp32_lm_head: true
+
+megatron:
+  model:
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 2
+    virtual_pipeline_model_parallel_size: null
+    context_parallel_size: 2
+    expert_model_parallel_size: 8
+    expert_tensor_parallel_size: 1
+    dsa_indexer_loss_coeff: 0.0
+    apply_dsa_kernel_fusion: true
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 1
+  optimizer:
+    lr: 5.0e-7
+    optimizer_cpu_offload: true
+    optimizer_offload_fraction: 1
+
+algorithm:
+  advantage_estimator: grpo
+  advantage_norm_mode: group_zscore
+  policy_loss: grpo
+  loss_agg_mode: token-mean
+  is_correction:
+    enable: false
+    action: mask
+    level: token
+    lower_bound: 0.5
+    upper_bound: 2

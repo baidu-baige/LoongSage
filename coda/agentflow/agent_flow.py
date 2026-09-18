@@ -28,8 +28,8 @@ from coda.agentflow.tokenizer_manager import (
     create_tokenizer_manager,
 )
 from coda.agentflow.agent import get_agent_class
-from coda.agentflow.sandbox import create_sandbox_client
-from coda.agentflow.utils import CONTEXT_LENGTH_EXCEEDED
+from coda.agentflow.sandbox import SandboxClient, create_sandbox_client
+from coda.agentflow.utils import CONTEXT_LENGTH_EXCEEDED, setup_sandbox
 from coda.reward import create_reward_fn
 
 logger = logging.getLogger(__name__)
@@ -85,10 +85,13 @@ class AgentFlow:
         self.partial_rollout_enabled = self.config.rollout.partial
         self.mask_offpolicy_in_partial_rollout = self.config.rollout.mask_offpolicy_in_partial_rollout
         self.trajectory_store = TrajectoryStore()
-        # Sandbox pool: trajectory_id -> live sandbox client. Entries survive a
-        # partial-rollout abort so a resumed trajectory reuses its sandbox (and
-        # the tool state inside) instead of recreating one from scratch.
-        self._sandbox_pool: dict[str, Any] = {}
+        # One stateless backend client per data source, shared by every trajectory
+        # of that source. Live sandbox ids are retained per trajectory across
+        # partial resume, along with the opaque reward-preparation data — when the
+        # reward function has any — produced for that exact container.
+        self.ds_sandbox_clients: dict[int, SandboxClient | None] = {}
+        self._sandbox_ids: dict[str, str] = {}
+        self._sandbox_contexts: dict[str, dict[str, Any]] = {}
         self.router = None
         self.tokenizer_manager: BaseTokenizerManager | None = None
         self._active_tasks: set[asyncio.Task] = set()
@@ -192,6 +195,9 @@ class AgentFlow:
         for idx, ds_cfg in enumerate(self.config.data_sources):
             self.ds_configs[idx] = ds_cfg
             rollout_mode = get_rollout_mode(ds_cfg)
+
+            sandbox_config = ds_cfg.get("sandbox")
+            self.ds_sandbox_clients[idx] = create_sandbox_client(sandbox_config)
 
             # Agent
             if rollout_mode == _ROLLOUT_SINGLE_TURN:
@@ -328,9 +334,11 @@ class AgentFlow:
     async def clear(self) -> None:
         """Release all resources: trajectory store, router, tokenizer."""
         logger.info("[clear] clearing AgentFlow")
-        self.trajectory_store.clear()
-        for trajectory_id in list(self._sandbox_pool.keys()):
+        # Release before clearing the store: _release_sandbox resolves the backend
+        # client through the trajectory's data source.
+        for trajectory_id in list(self._sandbox_ids):
             await self._release_sandbox(trajectory_id)
+        self.trajectory_store.clear()
         await self._resources.aclose()
 
     # -------------------------------------------------------------------------
@@ -439,67 +447,33 @@ class AgentFlow:
         reward_fn = self.ds_reward_fns[ds_index]
         agent_cfg = ds_cfg.agent if hasattr(ds_cfg, 'agent') else ds_cfg.get("agent", {})
 
-        completion_params = dict(ds_cfg.completion_params)  # copy to avoid mutating shared config
         max_response_len_per_trajectory = int(ds_cfg.max_response_len_per_trajectory)
 
-        # Eval rounds use rollout.eval.temperature when set; completion_params still wins.
-        eval_temperature = self.config.rollout.eval.temperature
-        temperature = float(
-            eval_temperature if traj.is_eval and eval_temperature is not None
-            else self.config.trainer.temperature
-        )
-
-        init_kwargs: dict[str, Any] = {
-            "router_url": f"{self.router_url}/{traj.trajectory_id}/{attempt_id}",
-            "completion_params": completion_params,
-            "max_response_len_per_trajectory": max_response_len_per_trajectory,
-            "temperature": temperature,
-            **agent_cfg,
-        }
-        sandbox_client = self._sandbox_pool.get(traj.trajectory_id)
-        if sandbox_client is not None:
-            sandbox_id = getattr(sandbox_client, "sandbox_id", None)
-            if sandbox_id:
-                logger.info(
-                    "[%s] Reusing pooled sandbox %s (partial-rollout resume)",
-                    traj.trajectory_id, sandbox_id,
-                )
-            else:
-                logger.info(
-                    "[%s] Pooled sandbox has no live instance (aborted before "
-                    "creation); a new one will be created (partial-rollout resume)",
-                    traj.trajectory_id,
-                )
-        else:
-            sandbox_client = create_sandbox_client(self.config.agentflow.sandbox)
-
-        if sandbox_client is not None:
-            self._sandbox_pool[traj.trajectory_id] = sandbox_client
-            init_kwargs["sandbox_env_client"] = sandbox_client
-
-        if reward_fn:
-            init_kwargs["reward_fn"] = reward_fn
-
-        agent = agent_class(**init_kwargs)
+        sandbox_client = self.ds_sandbox_clients.get(ds_index)
+        # The preparation result belongs to that exact sandbox instance, so it is
+        # retained with it and never recomputed after a partial resume.
+        sandbox_id = self._sandbox_ids.get(traj.trajectory_id)
+        sandbox_context = self._sandbox_contexts.get(traj.trajectory_id, {})
+        agent = None
         keep_sandbox = False
         try:
             prepare_sandbox = getattr(reward_fn, "prepare_sandbox", None)
-            if sandbox_client is not None and prepare_sandbox is not None:
-                if sandbox_client.sandbox_id is None:
-                    image = str(traj.metadata.get("docker_image") or "")
-                    if not image:
-                        raise ValueError("trajectory metadata['docker_image'] is missing")
-                    await asyncio.to_thread(sandbox_client.create, image=image)
-                await asyncio.to_thread(
-                    prepare_sandbox,
-                    sandbox_client,
-                    metadata=copy.deepcopy(traj.metadata),
-                )
+            if prepare_sandbox is not None and sandbox_id is None:
+                sandbox_id, sandbox_context = await setup_sandbox(
+                    sandbox_client, traj.metadata, prepare_sandbox)
 
+            agent = agent_class(
+                router_url=f"{self.router_url}/{traj.trajectory_id}/{attempt_id}",
+                max_response_len_per_trajectory=max_response_len_per_trajectory,
+                **agent_cfg,
+                reward_fn=reward_fn,
+                sandbox_client=sandbox_client,
+                sandbox_id=sandbox_id,
+            )
             reward = await agent.run_trajectory({
                 "prompt": copy.deepcopy(_active_chat(traj)),
                 "label": copy.deepcopy(traj.label),
-                "metadata": copy.deepcopy(traj.metadata),
+                "metadata": {**copy.deepcopy(traj.metadata), **sandbox_context},
             })
 
             attempts = self.trajectory_store.get(
@@ -519,27 +493,34 @@ class AgentFlow:
 
             return reward
         except asyncio.CancelledError:
-            # Partial-rollout abort: keep the sandbox in the pool so the resumed
-            # trajectory continues with its accumulated tool state.
             keep_sandbox = self.partial_rollout_enabled
             raise
         finally:
-            # Every other exit deletes the sandbox: terminal state (reward
-            # computed), or failed attempt whose sandbox state is untrustworthy
-            # for the retry (commands may have partially executed).
-            if not keep_sandbox:
-                await self._release_sandbox(traj.trajectory_id)
-            await agent.clear()
+            try:
+                if agent is not None:
+                    await agent.close()
+            finally:
+                # The agent creates its own sandbox when no prepare_sandbox exists.
+                if agent is not None:
+                    sandbox_id = agent.sandbox_id
+                if sandbox_id is not None:
+                    self._sandbox_ids[traj.trajectory_id] = sandbox_id
+                    self._sandbox_contexts[traj.trajectory_id] = sandbox_context
+                if not keep_sandbox:
+                    await self._release_sandbox(traj.trajectory_id)
 
     async def _release_sandbox(self, trajectory_id: str) -> None:
-        """Delete and drop the pooled sandbox of a trajectory, if any."""
-        sandbox_client = self._sandbox_pool.pop(trajectory_id, None)
-        if sandbox_client is None:
+        """Delete a sandbox retained for partial resume."""
+        self._sandbox_contexts.pop(trajectory_id, None)
+        sandbox_id = self._sandbox_ids.pop(trajectory_id, None)
+        if sandbox_id is None:
             return
         try:
-            await asyncio.to_thread(sandbox_client.delete)
+            # A trajectory's data source owns the client that created its sandbox.
+            ds_index = self.trajectory_store.trajectory_data[trajectory_id][-1].ds_index
+            await asyncio.to_thread(self.ds_sandbox_clients[ds_index].delete, sandbox_id)
         except Exception as exc:
-            logger.warning("[%s] Failed to delete sandbox: %s", trajectory_id, exc)
+            logger.warning("[%s] Failed to delete sandbox %s: %s", trajectory_id, sandbox_id, exc)
 
     async def _execute_single_turn(self, traj: Trajectory, attempt_id: int) -> Reward:
         """Execute one single-turn attempt directly through the Router (no agent)."""
@@ -549,12 +530,6 @@ class AgentFlow:
 
         async with self._generate_sem:
             messages = copy.deepcopy(_active_chat(traj))  # already normalized to list[dict] by _build_messages
-            # Eval rounds use rollout.eval.temperature when set; completion_params still wins.
-            eval_temperature = self.config.rollout.eval.temperature
-            temperature = float(
-                eval_temperature if traj.is_eval and eval_temperature is not None
-                else self.config.trainer.temperature
-            )
             generate_client = httpx.AsyncClient(timeout=float(self.config.agentflow.router.proxy_timeout_seconds))
             try:
                 response = await generate_client.post(
@@ -562,9 +537,7 @@ class AgentFlow:
                     json={
                         "model": "default",
                         "messages": messages,
-                        "temperature": temperature,
                         "max_tokens": int(ds_cfg.max_response_len_per_trajectory),
-                        **ds_cfg.completion_params,
                     },
                 )
             finally:
@@ -589,7 +562,7 @@ class AgentFlow:
             reward_messages = copy.deepcopy(_active_chat(traj_out) if traj_out else messages)
             return reward_fn(
                 reward_messages, traj.label,
-                trajectory=traj_out.model_dump() if traj_out else {},
+                traj_out.model_dump() if traj_out else {},
                 max_tokens=int(ds_cfg.max_response_len_per_trajectory),
             )
         logger.warning("[%s] No reward_fn configured, defaulting to 0.0", traj.trajectory_id)

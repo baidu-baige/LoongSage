@@ -32,6 +32,7 @@ from megatron.core.distributed import DistributedDataParallel as DDP
 from omegaconf import DictConfig
 
 from coda.backends.megatron.cp_utils import (
+    prepare_packed_mrope_position_ids,
     prepare_packed_seq_params,
     prepare_routing_replay_data,
     gather_and_slice_response,
@@ -161,6 +162,37 @@ def setup_routing_replay(config: DictConfig, batch: dict, model_chunk: torch.nn.
     RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
 
 # ════════════════════════════════════════════════════════════════════════
+# MRoPE position ids
+# ════════════════════════════════════════════════════════════════════════
+
+def _uses_mrope(model_chunk: torch.nn.Module) -> bool:
+    """Whether this model needs explicit 3D MRoPE position_ids (Qwen VL family).
+
+    Plain rope models ignore ``position_ids`` entirely, so they keep passing None.
+    """
+    return getattr(get_model_config(model_chunk), "position_embedding_type", None) == "mrope"
+
+
+def _get_position_ids(
+    model_chunk: torch.nn.Module,
+    tokens_list: list[torch.Tensor],
+    packed_tokens: torch.Tensor,
+    cp_partition_mode: str,
+) -> torch.Tensor | None:
+    """Rank-local 3D MRoPE position ids for this micro-batch, or None when not needed."""
+    if mpu.get_context_parallel_world_size() <= 1 or not _uses_mrope(model_chunk):
+        # Without CP the model derives MRoPE itself from the full input_ids.
+        return None
+    position_ids = prepare_packed_mrope_position_ids(
+        tokens_list, cp_partition_mode=cp_partition_mode,
+    )
+    assert position_ids.size(-1) == packed_tokens.size(0), (
+        f"MRoPE position_ids ({position_ids.size(-1)}) must align token-for-token "
+        f"with CP-local packed tokens ({packed_tokens.size(0)})"
+    )
+    return position_ids
+
+# ════════════════════════════════════════════════════════════════════════
 # Forward-only
 # ════════════════════════════════════════════════════════════════════════
 
@@ -208,6 +240,9 @@ def forward_only(
         packed_targets, _ = prepare_packed_seq_params(
             target_list, cp_partition_mode=cp_partition_mode,
         )
+        position_ids = _get_position_ids(
+            model_chunk, tokens_list, packed_tokens, cp_partition_mode,
+        )
 
         # Handle Routing Replay (Forward Only)
         if config.trainer.use_rollout_routing_replay:
@@ -216,7 +251,7 @@ def forward_only(
         # 3. Model forward
         output = model_chunk(
             input_ids=packed_tokens.unsqueeze(0),
-            position_ids=None,
+            position_ids=position_ids,
             attention_mask=None,
             packed_seq_params=packed_seq_params,
         )
@@ -349,9 +384,13 @@ def train_minibatch(
         tokens_list: list[torch.Tensor] = batch["tokens"]
 
         # 2. CP-slice and pack (partition mode threaded to keep zigzag/contiguous consistent)
+        cp_partition_mode = config.megatron.model.cp_partition_mode
         packed_tokens, packed_seq_params = prepare_packed_seq_params(
             tokens_list,
-            cp_partition_mode=config.megatron.model.cp_partition_mode,
+            cp_partition_mode=cp_partition_mode,
+        )
+        position_ids = _get_position_ids(
+            model_chunk, tokens_list, packed_tokens, cp_partition_mode,
         )
 
         # Handle Routing Replay (Train)
@@ -361,7 +400,7 @@ def train_minibatch(
         # 3. Model forward
         output = model_chunk(
             input_ids=packed_tokens.unsqueeze(0),
-            position_ids=None,
+            position_ids=position_ids,
             attention_mask=None,
             packed_seq_params=packed_seq_params,
         )
@@ -370,6 +409,12 @@ def train_minibatch(
 
         # 4. Loss callback
         return output, partial(loss_function, config, batch, packed_seq_params, gkd_policy)
+
+    # Chunked optimizer-state offload: push fp32 master weights (and any resident
+    # optimizer-state chunks) to CPU before the activation-heavy forward/backward so
+    # they don't occupy GPU memory during compute. ``optimizer.step()`` restores them
+    # (masters + chunk-by-chunk) on its own — see ChunkedOptimizerStateOffloader.step.
+    optimizer.offload_optimizer_state_for_forward()
 
     # Set grad to zero.
     for model_chunk in model:
@@ -464,9 +509,12 @@ def forward_teacher(
         packed_tokens, packed_seq_params = prepare_packed_seq_params(
             tokens_list, cp_partition_mode=cp_partition_mode,
         )
+        position_ids = _get_position_ids(
+            model_chunk, tokens_list, packed_tokens, cp_partition_mode,
+        )
         output = model_chunk(
             input_ids=packed_tokens.unsqueeze(0),
-            position_ids=None,
+            position_ids=position_ids,
             attention_mask=None,
             packed_seq_params=packed_seq_params,
         )

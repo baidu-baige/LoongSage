@@ -22,7 +22,7 @@ from coda.data_factory.data_processor import (
 from coda.controller.train_manager import TrainManager
 from coda.controller.rollout_manager import RolloutManager
 from coda.controller.teacher_manager import TeacherManager
-from coda.utils.channel_helper import ChannelMeta
+from coda.transfer_mesh import ChannelMeta
 from coda.utils.checkpoint_utils import get_tracker_file, resolve_dist_ckpt_dir
 from coda.utils.tracking import configure_tracking, time_marker, TimeMarkerAcc, track
 from coda.utils import logging_utils
@@ -105,7 +105,10 @@ class Trainer:
 
         if self.is_colocated:
             logger.info("[init] colocated mode: offloading train workers ...")
-            self.train_manager.offload()
+            # Release the params too: the rollout engines start after this point and
+            # sglang sizes its KV pool exactly once, from the free memory it observes
+            # then, so anything we still hold shrinks that pool for the whole run.
+            self.train_manager.offload(move_params=True)
             logger.info("[init] train workers offloaded")
 
         self.teacher_manager = None
@@ -285,10 +288,7 @@ class Trainer:
             )
             return
 
-        self.rollout_manager._health_monitoring_pause()
-        channel_meta = self._init_channel_meta()
-        self._update_weights(channel_meta, weight_version=current_weight_version)
-        self.rollout_manager.health_monitoring_resume()
+        self._initial_weight_sync(current_weight_version)
 
         if self.is_fully_async:
             await self._fully_async_train_loop(start_step, current_weight_version)
@@ -422,6 +422,17 @@ class Trainer:
                 self.teacher_manager.offload()
         return splited_batch_refs
 
+    def _initial_weight_sync(self, current_weight_version: int) -> None:
+        """Push the trainer's weights to the rollout engines once, before the first step. """
+        self.rollout_manager._health_monitoring_pause()
+        if self.is_colocated:
+            self.rollout_manager.offload_kv()
+        channel_meta = self._init_channel_meta()
+        self._update_weights(channel_meta, weight_version=current_weight_version)
+        if self.is_colocated:
+            self.rollout_manager.onload_kv()
+        self.rollout_manager.health_monitoring_resume()
+
     async def rollout_only_loop(self) -> None:
         """rollout only loop."""
         start_step = current_weight_version = self.resume_datasource() + 1
@@ -433,8 +444,7 @@ class Trainer:
             )
             return
 
-        channel_meta = self._init_channel_meta()
-        self._update_weights(channel_meta, weight_version=current_weight_version)
+        self._initial_weight_sync(current_weight_version)
 
         for step in range(start_step, self.config.total_steps + 1):
             with time_marker("step", step=step):

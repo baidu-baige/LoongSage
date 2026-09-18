@@ -53,6 +53,9 @@ ci = [
 [tool.setuptools.packages.find]
 include = ["coda*"]
 
+[tool.setuptools.package-data]
+"coda.agentflow.agent" = ["*/*.md"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests/ut"]
 # Async tests are written as bare `async def` with @pytest.mark.asyncio; auto

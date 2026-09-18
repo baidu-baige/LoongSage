@@ -11,7 +11,10 @@ using topology-aware communication strategies.
 from .channel import (
     TransferMeshChannel,
     Role,
+    ChannelMeta,
     create_channel,
+    create_sender_channel,
+    create_receiver_channel,
 )
 from .protocol import (
     TensorSpec,
@@ -28,7 +31,10 @@ __all__ = [
     # Channel
     "TransferMeshChannel",
     "Role",
+    "ChannelMeta",
     "create_channel",
+    "create_sender_channel",
+    "create_receiver_channel",
     # Protocol
     "TensorSpec",
     "MetaFrame",

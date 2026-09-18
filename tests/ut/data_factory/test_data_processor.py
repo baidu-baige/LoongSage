@@ -63,7 +63,7 @@ from coda.data_factory.data_processor import (  # noqa: E402
 # put_dp_shards_to_ray flattens each trajectory into per-trainable-Segment rows.
 _EXPECTED_ROLLOUT_KEYS = {
     "prompt_id",
-    "trajectory_id",
+    "dp_local_traj_idx",
     "tokens",
     "loss_masks",
     "rollout_log_probs",
@@ -181,9 +181,9 @@ class TestPutDpShardsToRay(unittest.TestCase):
                 put_dp_shards_to_ray([[group]], dp_size=1)
         self.assertEqual(captured[0]["token_rewards"][0], [0.0, 0.0, 0.0, 0.0, 0.42])
 
-    # --- per-Segment flatten + trajectory_id ---
+    # --- per-Segment flatten + dp_local_traj_idx ---
 
-    def test_trajectory_id_and_segment_flatten(self):
+    def test_dp_local_traj_idx_and_segment_flatten(self):
         # traj0: 2 trainable Segments; traj1: 1 Segment → 3 rows.
         traj0 = _make_trajectory(n_tokens=10, pid="p0", tid="p0_t0")
         traj0.segments = [
@@ -197,7 +197,7 @@ class TestPutDpShardsToRay(unittest.TestCase):
             with patch("coda.data_factory.data_processor.ray", mock_ray):
                 put_dp_shards_to_ray([[group]], dp_size=1)
         d = captured[0]
-        self.assertEqual(d["trajectory_id"], [0, 0, 1])
+        self.assertEqual(d["dp_local_traj_idx"], [0, 0, 1])
         self.assertEqual(d["total_lengths"], [4, 6, 5])
         self.assertEqual(d["response_lengths"], [4, 6, 5])
         self.assertEqual(len(d["tokens"]), 3)
@@ -216,7 +216,7 @@ class TestPutDpShardsToRay(unittest.TestCase):
             with patch("coda.data_factory.data_processor.ray", mock_ray):
                 put_dp_shards_to_ray([[group]], dp_size=1)
         d = captured[0]
-        self.assertEqual(d["trajectory_id"], [0])
+        self.assertEqual(d["dp_local_traj_idx"], [0])
         self.assertEqual(d["total_lengths"], [4])
         self.assertEqual(set(d.keys()), _EXPECTED_ROLLOUT_KEYS)
 

@@ -36,7 +36,7 @@
 
 ## 3. 数据源（data_source / data_sources）
 
-`data_source` 定义单个数据源的默认字段，`data_sources` 是实际运行时使用的数据源列表。列表中每个元素都会继承 `data_source` 的默认值，并允许在自身内做局部覆盖。当前全异步只支持一个数据源。
+`data_source` 定义单个数据源的默认字段，`data_sources` 是实际运行时使用的数据源列表。列表中每个元素都会继承 `data_source` 的默认值，并允许在自身内做局部覆盖，包括独立的 `sandbox` 后端。当前全异步只支持一个数据源。
 
 ### 3.1 dataset 子节
 
@@ -62,9 +62,24 @@
 | `max_response_len_per_trajectory` | `32768` | 单次 attempt 中「LLM 回复 + tool response」占用的 token 上限。single-turn 时作为请求 `max_tokens`；multi-turn 时下发给 agent，agent 自己决定每次调用的 `max_tokens`。 | 需要小于等于推理引擎允许的 `max_total_tokens - prompt_len`。 |
 | `num_prompts_per_step` | `64` | 每个训练 step 消耗的 prompt group 数量 `B`。 | 需满足 `B × N` 能被 `trainer.mini_batch_size` 整除，`N = num_trajectories_per_prompt`；还需 `B % (dp_size × num_mini_batch) == 0`，详见 [11.9](#119-dp-与-batch-尺寸)。 |
 | `num_trajectories_per_prompt` | `8` | 每个 prompt 采样出的 trajectory 数 `N`，即 GRPO 的 group size。 | 组内 advantage 归一化要求同一组内数量一致。 |
-| `completion_params` | `{}` | 透传给推理引擎的采样参数字典（如 `top_p`、`top_k`、`temperature` 等）。 | 空字典表示走推理引擎默认值；该字典在请求体中**最后展开**，因此其中的 `temperature` 会覆盖 `trainer.temperature`。 |
+| `completion_params` | `{}` | Router 为该数据源应用的原生 SGLang `/generate` `sampling_params`（如 `top_p`、`top_k`、`min_p`）。 | Agent 和协议请求不能覆盖这些值；`temperature`、`max_new_tokens` 由 Router 管理，DeepSeek-V4/V4.1 的 `skip_special_tokens` 也固定为 `false`。 |
 
 `data_sources` 默认展开为 `[${data_source}]`，即整个训练只用一个数据源；如需多数据源，在自己的 experiment yaml 中显式写成 list 即可（各元素会**独立**继承 `data_source` 的默认值）。
+
+### 3.3 sandbox 子节
+
+Sandbox 后端配置属于数据源，可在单数据源模板 `data_source.sandbox` 中设置，也可由各 `data_sources[i].sandbox` 独立覆盖。`type: none` 表示该数据源不使用 sandbox。
+
+| 参数 | 默认 | 说明 | 约束 |
+| --- | --- | --- | --- |
+| `sandbox.type` | `none` | 当前数据源的 sandbox 后端。 | 可选 `none` / `k8s` / `docker` / 已注册的自定义类型；需要 sandbox 的 agent 必须选择非 `none` 后端。 |
+| `sandbox.command_exec_timeout_seconds` | 未设置 | sandbox 内单次命令执行超时（秒）。 | 由后端决定；内置 K8s 后端的兜底值为 120 秒。 |
+| `sandbox.sandbox_creation_timeout_seconds` | 未设置 | sandbox 实例创建超时（秒）。 | 由后端决定；内置 K8s 后端的兜底值为 120 秒。 |
+| `sandbox.working_dir` | 未设置 | sandbox 内默认工作目录。 | K8s 后端默认 `/rl-sandbox`，Docker 后端默认 `/testbed`；agent 调用可按命令覆盖。 |
+| `sandbox.kubeconfig` | 未设置 | K8s 集群 kubeconfig 路径。 | 相对路径按项目 `conf/` 目录解析，绝对路径原样使用；仅 `type: k8s`。 |
+| `sandbox.pod_manifest_path` | 未设置 | K8s sandbox pod 模板路径。 | 相对路径按项目 `conf/` 目录解析，绝对路径原样使用；仅 `type: k8s`。 |
+
+`SandboxClient` 是无实例状态的后端连接器：`create()` 返回 ID，`execute()` / `delete()` 显式接收该 ID。sandbox agent 直接使用注入的 client 和 ID，仅在 ID 为 `None` 时创建；AgentFlow 保留 ID 供 partial resume 使用，并在终态删除。定义了 `prepare_sandbox()` 的 reward 会在 agent 执行前完成准备。
 
 ## 4. Rollout（推理与采样）
 
@@ -124,7 +139,7 @@
 
 ## 5. AgentFlow
 
-Agent 侧的路由、tokenizer 与 sandbox。多轮 agent 通过 `AgentFlow.router` 转发到 SGLang，同时管理 tokenizer 与代码 sandbox。
+Agent 侧的 Router 与 tokenizer，以及 trajectory dump 等框架级能力。Sandbox 后端已移到每个数据源的 `sandbox` 子节，见 [3.3](#33-sandbox-子节)。
 
 ### 5.1 router
 
@@ -148,17 +163,6 @@ Agent 侧的路由、tokenizer 与 sandbox。多轮 agent 通过 `AgentFlow.rout
 | `agentflow.tokenizer.generation_prompt_kwargs` | `{}` | 透传给 tokenizer `apply_chat_template` 的关键字参数。 | 常见用法：开启think `enable_thinking: true`。 |
 | `agentflow.tokenizer.manager.mode` | `thread` | Tokenizer 并发模式。 | 目前主要使用 `thread`。 |
 | `agentflow.tokenizer.manager.num_workers` | `8` | 并发 tokenize 的 worker 数。 | 与 rollout 并发和 CPU 数相关。 |
-
-### 5.3 sandbox
-
-| 参数 | 默认 | 说明 | 约束 |
-| --- | --- | --- | --- |
-| `agentflow.sandbox.type` | `k8s` | 沙箱类型。 | 当前主要支持 `k8s`。 |
-| `agentflow.sandbox.command_exec_timeout_seconds` | `600` | 沙箱内单次命令执行超时（秒）。 | — |
-| `agentflow.sandbox.sandbox_creation_timeout_seconds` | `600` | 沙箱创建超时（秒）。 | — |
-| `agentflow.sandbox.working_dir` | `/rl-sandbox` | 沙箱内工作目录。 | — |
-| `agentflow.sandbox.kubeconfig` | `k8s/kubeconfig.yaml` | k8s 集群 kubeconfig 路径。 | 相对路径按项目 `conf/` 目录解析，绝对路径原样使用。 |
-| `agentflow.sandbox.pod_manifest_path` | `k8s/pod_manifest.yaml` | 沙箱 pod 模板路径。 | 相对路径按项目 `conf/` 目录解析，绝对路径原样使用。 |
 
 ## 6. Tracking（追踪与实验记录）
 
@@ -309,7 +313,7 @@ OPD（On-Policy Distillation）在 RL 流程中额外挂载若干 teacher 模型
 | `trainer.use_rollout_log_probs` | `false` | 使用推理引擎返回的 `rollout_log_probs` 替代训练侧重算的 `old_log_probs`。 | 与 IS correction、M2PO 互斥。 |
 | `trainer.use_rollout_routing_replay` | `false` | 使用推理端记录的 MoE routing 结果做 replay。 | 用于对齐推理/训练 MoE 路由。 |
 | `trainer.use_fp32_lm_head` | `false` | LM head 是否使用 FP32 计算。 | 数值敏感场景可开启。 |
-| `trainer.temperature` | `1.0` | 采样温度。eval 轮次在 `rollout.eval.temperature` 非 `null` 时改用后者。 | 该值会被 `data_source.completion_params.temperature` 覆盖（后者在请求体中最后展开）。 |
+| `trainer.temperature` | `1.0` | 采样温度。eval 轮次在 `rollout.eval.temperature` 非 `null` 时改用后者。 | 由 Router 管理，`completion_params.temperature` 不生效。 |
 | `trainer.mini_batch_size` | `64` | 每次 optimizer step 消费的 trajectory 数 `M`。`num_mini_batch = (B × N) / M`。 | `(B × N) % M == 0`；且每个数据源需满足 `num_prompts_per_step % (dp_size × num_mini_batch) == 0`。两者都启动即校验，满足后 `M % dp_size == 0` 自动成立。详见 [11.9](#119-dp-与-batch-尺寸)。 |
 | `trainer.micro_batch_size` | `8` | 每张 GPU 单次前向的样本数。 | 仅当 `use_dynamic_batch_size: false` 时要求 `mini_batch_size % micro_batch_size == 0`；开启动态 batch 后本项失效。 |
 | `trainer.max_tokens_per_gpu` | `16440` | 动态 batch 时单 GPU 最大 token 数。 | 仅 `use_dynamic_batch_size: true` 时生效。 |
@@ -353,6 +357,7 @@ OPD（On-Policy Distillation）在 RL 流程中额外挂载若干 teacher 模型
 
 - `rollout.mask_offpolicy_in_partial_rollout: true` 仅在 `rollout.partial: true` 时才有意义（否则没有恢复的 partial trajectory 需要 mask）。
 - 长轨迹或多轮 agent 场景推荐 `rollout.partial: true`，可显著缩短 step 边界的长尾等待。
+- 对启用 sandbox 的 trajectory，AgentFlow 在 partial resume 期间保留同一 sandbox ID 和不透明的 sandbox 运行状态，并在终态删除实例。
 
 ### 11.5 SGLang PD 拆分
 

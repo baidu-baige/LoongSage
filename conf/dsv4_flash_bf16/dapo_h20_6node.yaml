@@ -32,8 +32,6 @@ data_source:
   max_response_len_per_trajectory: 20480
 
 rollout:
-  env_vars:
-    SGLANG_RMSNORM_NO_PDL: "1"
   retry_limit: 3
   num_gpus_per_node: 8
   sglang_args:
@@ -42,6 +40,7 @@ rollout:
     tp_size: 8
     ep_size: 8
     load_format: dummy
+    moe_runner_backend: triton
   sglang_replicas:
     regular:
       num_nodes: 6

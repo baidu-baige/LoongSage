@@ -24,7 +24,7 @@ Key points:
 
 The entry class is `AgentFlow` in [agent_flow.py](../../coda/agentflow/agent_flow.py). It completes three initialization steps in `__init__`:
 
-1. `_init_per_datasource()` — initializes the agent class and reward function per data source in `data_sources`. Each data source can have its own agent, reward, and token configuration. Whether it is multi-turn is decided by `get_rollout_mode()`: configuring `agent.name` means `multi_turn`, otherwise `single_turn`.
+1. `_init_per_datasource()` — initializes the agent class, reward function, and sandbox backend configuration per data source in `data_sources`. Each data source can have its own agent, reward, sandbox, and token configuration. Whether it is multi-turn is decided by `get_rollout_mode()`: configuring `agent.name` means `multi_turn`, otherwise `single_turn`.
 2. `_init_tokenizer()` — builds a `TokenizerManager` via `create_tokenizer_manager()`.
 3. `_init_router()` — builds and starts the `Router` in a **background daemon thread**; `middleware_kwargs` is composed of all non-underscore attributes in `vars(self)`, thereby injecting `trajectory_store`, `tokenizer_manager`, `accumulate_reasoning`, `r3_enabled`, etc. into the middleware construction context.
 
@@ -73,13 +73,13 @@ So `ParserMiddleware` drops the request down to SGLang's native `/generate`, cha
 
 | Direction | Contents |
 | --- | --- |
-| **token in** (`_build_generate_body`) | `input_ids` (produced by `TokenizerManager` after applying the chat template; full on the first turn, incremental on follow-up turns), `rid=trajectory_id#attempt_id` (the basis for sticky routing and precise abort), `return_logprob=True` (forced on), `sampling_params` (mapped from top-level OpenAI fields via `_SAMPLING_PARAM_MAP`; `max_tokens` / `max_completion_tokens` → `max_new_tokens`); when R3 is enabled, `return_routed_experts` / `routed_experts_start_len` are appended |
+| **token in** (`_build_generate_body`) | `input_ids` (produced by `TokenizerManager` after applying the chat template; full on the first turn, incremental on follow-up turns), `rid=trajectory_id#attempt_id` (the basis for sticky routing and precise abort), `return_logprob=True` (forced on), and the data source's `completion_params` as native SGLang `sampling_params`; Router overrides `temperature` and `max_new_tokens`; when R3 is enabled, `return_routed_experts` / `routed_experts_start_len` are appended |
 | **token out** (`build_assistant_message`) | `meta_info.output_token_logprobs` unzipped into `response_ids` and `logprobs`, plus `meta_info.weight_version` (the weight version used for this turn); when R3 is enabled, also the base64-encoded `meta_info.routed_experts` |
 
 A few details that are easy to get wrong:
 
 - **`return_logprob` is hard-coded to `True`**, regardless of the caller's request body — without per-token logprobs there is nothing to train on.
-- **`skip_special_tokens` is *not* disabled unconditionally**: only the DeepSeek-V4 model family forces it to `False` (it marks its think and DSML tool-call tags as special tokens, so the detokenizer must keep them for the reasoning / tool_call parsers to see them). Other model families keep whatever the request body or the server default says.
+- **`skip_special_tokens` is *not* disabled unconditionally**: only the DeepSeek-V4 model family forces it to `False` (it marks its think and DSML tool-call tags as special tokens, so the detokenizer must keep them for the reasoning / tool_call parsers to see them). Other model families use the data source's `completion_params` or the server default.
 - **The agent is completely unaware**: the Router finally uses `_to_openai_response()` to reassemble the `/generate` result into a standard `chat.completion` structure (with `choices[0].message`, `finish_reason`, `usage`), so agents can keep using litellm / the openai SDK without knowing a token-level endpoint sits underneath.
 - **Upstream anomalies are passed through verbatim**: non-2xx responses, non-JSON bodies, and responses with `finish_reason.type == "abort"` are returned as-is and **not written to TrajectoryStore**, to avoid landing partial data in the training set.
 - **Streaming response support**: if the agent's request body carries `"stream": true`, `ParserMiddleware` still calls `/generate` non-streaming internally to get a complete result (guaranteeing the completeness of the token/logprob persisted to disk), then uses `_to_streaming_response()` to wrap the complete `chat.completion` into a sequence of SSE chunks, disguising it as real streaming to the agent with no extra adaptation needed.
@@ -130,12 +130,9 @@ It also centrally caches metadata essential for training alignment: `think_start
 
 ### 2.7 Agent
 
-[agent/base_agent.py](../../coda/agentflow/agent/base_agent.py) defines the abstract base class `BaseAgent`. An agent only needs to implement two methods:
+[agent/base_agent.py](../../coda/agentflow/agent/base_agent.py) defines the abstract base class `BaseAgent`. An agent only needs to implement `async run_trajectory(trajectory: dict) -> Reward`; it inherits `call_llm()` and `close()` from the base class and calls the injected `reward_fn` itself.
 
-- `async run_trajectory(trajectory: dict) -> Any`: run a complete trajectory and return the reward. AgentFlow does not constrain the schema of `trajectory`; each agent takes the fields it needs (`prompt` / `label` / `metadata`).
-- `async clear()`: release resources.
-
-The construction parameters uniformly injected by AgentFlow are `router_url` (already with the `/{trajectory_id}/{attempt_id}` prefix), `completion_params`, `max_response_len_per_trajectory`, and `temperature`; other agent-specific parameters are passed through via `**kwargs` (from the data source's `agent` config block).
+AgentFlow injects `router_url` (with the `/{trajectory_id}/{attempt_id}` prefix), `reward_fn`, `max_response_len_per_trajectory`, and the current `sandbox_client` plus `sandbox_id`. Sandbox agents call the client directly and put `sandbox_client` / `sandbox_id` into the context they pass to `reward_fn`, so the reward evaluates inside the same container; other agent-specific parameters come from the data source's `agent` block. Router, rather than agents, owns sampling configuration.
 
 Agents are registered via `Registry` + the `@register_agent` decorator; `agent/__init__.py` auto-discovers built-in agents using `pkgutil.walk_packages` (a missing dependency of a single agent does not affect the loading of others). Built-in examples:
 
@@ -143,20 +140,23 @@ Agents are registered via `Registry` + the `@register_agent` decorator; `agent/_
 - `agent/swe/mini_swe_agent.py` — SWE-bench agent based on mini-swe-agent, executing shell in a sandbox to complete code repair (registered name `mini-swe`).
 - `agent/bcp/bcp_agent.py` — BCP agent (registered name `bcp`).
 - `agent/opencode/opencode_agent.py` — black-box OpenCode agent, driving the OpenCode CLI inside a sandbox to complete SWE tasks (registered name `opencode`). `run_trajectory()` wraps the Router address as an OpenAI-compatible provider written into `opencode.json`, then executes `opencode run` as a subprocess to run the whole task; it is the actual producer of the §2.3 `request_kind` mechanism — by writing an OpenCode plugin file (`coda-request-kind.js`, written at runtime as base64-encoded `printf` into `/root/.config/opencode/coda-request-kind.js` inside the sandbox, with the source embedded in the `_REQUEST_KIND_PLUGIN` string constant in `opencode_agent.py`), it hooks OpenCode's `chat.headers` lifecycle callback: if the current session has a `parentID` (i.e. it's a child session), it sets the request header `request_kind=collab_spawn`; if the current agent is `compaction` or the message carries a compaction marker, it sets `request_kind=compaction`.
+- `agent/codex/codex_agent.py` — black-box Codex agent, driving the Codex CLI inside a sandbox to complete SWE tasks (registered name `codex`). Unlike the opencode agent, it speaks the **OpenAI Responses protocol** (`/v1/responses`, adapted by `OpenAIResponsesAdapter`) rather than `/v1/chat/completions`. `run_trajectory()` first writes the model instructions (the embedded `prompt.md`) and `config.toml` into `/root/.codex/` in the sandbox via base64-encoded `printf`: `config.toml` points the `model_provider = "coda"` `base_url` at the Router's `{router_url}/v1`, and derives `model_context_window` / `model_auto_compact_token_limit` from `context_length` (the latter is 90% of the context, used to trigger Codex's own auto-compaction). It then runs the task in one shot via a `codex exec --json --dangerously-bypass-approvals-and-sandbox` subprocess, redirecting logs to `/tmp/coda-codex.log`, and on a non-zero exit code reads back the last 100 log lines before raising. Before launching, `_probe_router()` checks sandbox-to-Router connectivity via `/dev/tcp`; `close()` interrupts a still-running Codex process with `pkill -INT` (then `pkill -KILL` after a 1s grace period). Codex's subagent / compaction semantics are translated into `request_kind` on the Router side by `OpenAIResponsesAdapter.normalize_headers()` (the `x-openai-subagent` header → `collab_spawn`; a marker in `x-codex-turn-metadata` or the legacy `/v1/responses/compact` path → `compaction`), so no plugin-file injection is needed as it is for opencode.
 
 ### 2.8 Sandbox
 
-[sandbox/base.py](../../coda/agentflow/sandbox/base.py) defines the abstract base class `SandboxClient`, with interface `create()` / `execute(command, **kwargs)` / `delete()`. It is likewise registered via `Registry` + `@register_sandbox`, and `create_sandbox_client(config)` factories by `config.type` (returns `None` when `type` is `none`/empty, i.e. sandbox disabled).
+[sandbox/base.py](../../coda/agentflow/sandbox/base.py) defines the stateless backend abstraction `SandboxClient`, with the fixed interface `create(**kwargs) -> str`, `execute(sandbox_id, command, **kwargs)`, and `delete(sandbox_id, **kwargs)`. A client can address multiple sandboxes and has no "current instance" state; the framework does not add a separate `Sandbox` class. Backends are registered via `Registry` + `@register_sandbox`, and `create_sandbox_client(config)` constructs one from `config.type` (returns `None` when `type` is `none`/empty).
+
+Sandbox configuration belongs to a data source. Agents create directly through the injected client when needed; rewards with `prepare_sandbox()` are prepared by AgentFlow beforehand. Partial cancellation retains the client, ID, and sandbox state; terminal paths and retries delete the instance.
 
 Two built-in implementations:
 
-- **`K8sSandboxClient` ([sandbox/k8s_sandbox.py](../../coda/agentflow/sandbox/k8s_sandbox.py))**: one K8s Pod per sandbox, created via `kubectl apply`, commands executed via `kubectl exec`, and removed via `delete()`. Default `working_dir=/rl-sandbox`; `execute(command, workdir=...)` supports executing in a caller-specified directory (composed as `cd {workdir} && ...`).
+- **`K8sSandboxClient` ([sandbox/k8s_sandbox.py](../../coda/agentflow/sandbox/k8s_sandbox.py))**: one K8s Pod per returned sandbox ID, created via `kubectl apply`, commands executed via `kubectl exec`, and removed via `delete(sandbox_id)`. Default `working_dir=/rl-sandbox`; `execute(sandbox_id, command, workdir=...)` supports executing in a caller-specified directory (composed as `cd {workdir} && ...`).
 - **`DockerSandboxClient` ([sandbox/docker_sandbox.py](../../coda/agentflow/sandbox/docker_sandbox.py))**: local Docker container implementation, default `working_dir=/testbed`.
 
 > **Pod leak protection (K8s sandbox cleanup mechanism)**: to avoid pods lingering long-term due to apiserver jitter, the deletion path is hardened in multiple ways:
 > - `_force_delete()` uses `kubectl delete --force --grace-period=0`, retrying up to `_FORCE_DELETE_RETRIES` (=3) times with linear backoff; `NotFound` / `not found` is treated as a successful deletion; when retries are exhausted, it only prints a "pod may leak" warning without blocking the main flow.
 > - `_force_delete()`'s `kubectl delete` call carries `--request-timeout=30s` (`_KUBECTL_REQUEST_TIMEOUT`), preventing the delete operation from hanging indefinitely when apiserver i/o stalls.
-> - In `create()`, when pod readiness fails, `_force_delete` is invoked immediately to clean up; on a normal exit, `delete()` likewise goes through `_force_delete`.
+> - In `create()`, when pod readiness fails, `_force_delete` is invoked immediately; on a normal exit, AgentFlow calls `delete(sandbox_id)`, which likewise goes through `_force_delete`.
 > - **Server-side fallback**: the pod manifest (`conf/k8s/pod_manifest.yaml`) sets `activeDeadlineSeconds: 86400`, so even if the client is completely disconnected, K8s will automatically reclaim the pod after 24h.
 
 > In the SWE-bench scenario, the agent explicitly points `workdir` to the repository root (default `/testbed`, the repo checkout location in the SWE-bench image, overridable via `metadata["repo_path"]`), so each command actually runs in the repo directory rather than being affected by the sandbox's generic default directory.
@@ -167,10 +167,10 @@ Two built-in implementations:
 
 1. `_prepare_attempt_template()` prepares the mutable template submitted this time. In the partial rollout resume scenario with `mask_offpolicy_in_partial_rollout` enabled, it sets the `loss_masks` of all existing response tokens to 0 (the off-policy prefix from an older version does not participate in loss); it also validates that the lengths of `loss_masks` / `rollout_weight_versions` are consistent with `rollout_log_probs`, raising `ValueError` directly on mismatch, to avoid continuing with corrupted alignment data.
 2. Each attempt sets the status to `GENERATING`, writes to the store, then executes by mode:
-   - **`_execute_single_turn()`**: does not create an agent; AgentFlow sends one request to the Router's `/v1/chat/completions` directly, then fetches the trajectory back from the store and hands it to the reward function for scoring. `context_length_exceeded` is treated as "use the partial response" rather than a hard failure.
-   - **`_execute_multi_turn()`**: creates an agent instance for this attempt (`router_url` carries the session prefix), optionally injects the sandbox and the reward function, `await agent.run_trajectory(...)`, and calls `agent.clear()` in `finally`. Right after the agent returns, it validates that `completed_attempt.rollout_log_probs` is non-empty and that `completed_attempt.segments` contains at least one `trainable=True` segment — otherwise it raises `RuntimeError` directly and goes through the failure-retry path (avoiding producing an empty trajectory that cannot be used for training).
-3. Success: `_post_process_reward()` writes back the reward, sets `COMPLETED`, constructs `token_rewards` (only the last position is `final_reward`; if the reward carries `completion_rewards`, they are assigned per triplet turn by turn with a count check), writes `is_correct` (falling back to `final_reward > 0` when the reward function did not judge it), emits the terminal trajectory, and `DELETE /release_session` to release the sticky mapping.
-4. Failure: sets `FAILED`, `POST /abort_session` to abort the bound worker; when retries are exhausted, emits a `is_valid=False` reward.
+   - **`_execute_single_turn()`**: does not create an agent or sandbox; AgentFlow sends one request to the Router's `/v1/chat/completions` directly, then fetches the trajectory back from the store and hands it to the reward function for scoring. `context_length_exceeded` is treated as "use the partial response" rather than a hard failure.
+   - **`_execute_multi_turn()`**: creates the agent and injects the data source's sandbox client and any retained ID. A reward with `prepare_sandbox()` is prepared before agent execution. The `finally` block closes agent-owned resources and then retains or deletes the sandbox. Completed attempts must contain rollout logprobs and at least one trainable segment.
+3. Success: `_post_process_reward()` writes back the reward, sets `COMPLETED`, constructs `token_rewards` (only the last position is `final_reward`; if the reward carries `completion_rewards`, they are assigned per triplet turn by turn with a count check), writes `is_correct` (falling back to `final_reward > 0` when the reward function did not judge it), emits the terminal trajectory, and `DELETE /release_session` releases the sticky mapping.
+4. Failure: sets `FAILED` and calls `POST /abort_session` for the bound worker; exhausted retries emit an `is_valid=False` reward. A sandbox is deleted before retry because commands may have partially executed. Only cancellation with `rollout.partial=true` retains the sandbox and opaque reward sandbox state for resume.
 
 The terminal trajectory is written into `TrajQueue` via `_emit_terminal_trajectory()` and removed from the store (removed regardless of whether enqueueing succeeds, to avoid leftovers).
 
@@ -195,9 +195,9 @@ All four main extension dimensions of AgentFlow are "registry + config-driven," 
 | --- | --- | --- | --- |
 | Custom Agent | `BaseAgent` | `@register_agent("name")` | `data_sources[i].agent.name` + specific params |
 | Custom Reward | `RewardFunction` | `@register_reward("name")` | `data_sources[i].reward.name` + specific params |
-| Custom Sandbox | `SandboxClient` | `@register_sandbox("type")` | `agentflow.sandbox.type` + specific params |
+| Custom Sandbox | `SandboxClient` | `@register_sandbox("type")` | `data_source.sandbox.type` / `data_sources[i].sandbox.type` + specific params |
 
-Minimal steps to add an agent: inherit `BaseAgent`, implement `run_trajectory` / `clear`, decorate with `@register_agent`, and place it in a package under `agent/` to be auto-discovered; typically you also need a matching reward function (inherit `RewardFunction`, decorate with `@register_reward`, place under `coda/reward/functions/`), and reference it in the data source's `reward.name` (no need to write a new one if an existing reward can be reused).
+Minimal steps to add an agent: inherit `BaseAgent`, implement `run_trajectory`, decorate with `@register_agent`, and place it in a package under `agent/` to be auto-discovered. Override `close()` only when the agent owns extra resources. Typically you also need a matching reward function, unless an existing one can be reused.
 
 Detailed development guides:
 
@@ -207,7 +207,7 @@ Detailed development guides:
 
 ## 6. Key Configuration
 
-AgentFlow-related configuration is concentrated under `agentflow.*`, `rollout.*`, and `data_sources[*]`. Common items:
+AgentFlow-related configuration is concentrated under `agentflow.*`, `rollout.*`, and `data_sources[*]`. Sandbox backend settings are per data source rather than under `agentflow`. Common items:
 
 | Config | Description |
 | --- | --- |
@@ -215,7 +215,11 @@ AgentFlow-related configuration is concentrated under `agentflow.*`, `rollout.*`
 | `data_sources[i].reward.name` | The reward function name of this data source (required for rollout scoring) |
 | `data_sources[i].max_response_len_per_trajectory` | The response token budget per trajectory |
 | `data_sources[i].num_trajectories_per_prompt` | The number of trajectories sampled per prompt (group size `N`) |
-| `data_sources[i].completion_params` | Sampling parameters passed through to the LLM (e.g. `top_p`, `max_tokens`, etc.) |
+| `data_sources[i].completion_params` | Native SGLang `sampling_params` applied directly by Router (e.g. `top_p`, `top_k`) |
+| `data_sources[i].sandbox.type` | Per-data-source sandbox backend (`k8s` / `docker` / `none`) |
+| `data_sources[i].sandbox.working_dir` | Sandbox default working directory (k8s default `/rl-sandbox`, overridable by agent/metadata) |
+| `data_sources[i].sandbox.command_exec_timeout_seconds` / `sandbox_creation_timeout_seconds` | Command execution / pod creation timeout |
+| `data_sources[i].sandbox.kubeconfig` / `pod_manifest_path` | K8s sandbox kubeconfig and pod manifest paths |
 | `agentflow.tokenizer.manager.mode` / `num_workers` | TokenizerManager backend (`thread`/`process`) and concurrency |
 | `agentflow.tokenizer.custom_chat_template_path` | Path to a custom chat-template file, resolved against `conf/` when relative (leave empty to use the tokenizer default) |
 | `agentflow.tokenizer.generation_prompt_kwargs` | Extra parameters passed to the chat template when generating the prompt |
@@ -225,12 +229,8 @@ AgentFlow-related configuration is concentrated under `agentflow.*`, `rollout.*`
 | `agentflow.router.proxy_timeout_seconds` / `abort_timeout_seconds` | Forward request timeout / abort operation timeout |
 | `agentflow.router.accumulate_reasoning` | Whether to keep think blocks in the multi-turn history |
 | `agentflow.router.middleware` | Middleware chain config, a `{name: params}` mapping (default `{parser: null}`) |
-| `agentflow.sandbox.type` | Sandbox type (`k8s` / `docker` / `none`) |
-| `agentflow.sandbox.working_dir` | Sandbox default working directory (k8s default `/rl-sandbox`, overridable by agent/metadata) |
-| `agentflow.sandbox.command_exec_timeout_seconds` / `sandbox_creation_timeout_seconds` | Command execution / pod creation timeout |
-| `agentflow.sandbox.kubeconfig` / `pod_manifest_path` | The kubeconfig and pod manifest paths for the K8s sandbox |
 | `agentflow.dump_trajectory_path` | Trajectory dump-to-disk debug path (leave empty to disable) |
 | `rollout.retry_limit` | Number of retries per trajectory |
 | `rollout.partial` / `mask_offpolicy_in_partial_rollout` | Partial rollout and its off-policy mask |
-| `trainer.temperature` | Sampling temperature (injected into the agent / single-turn request) |
+| `trainer.temperature` | Sampling temperature written into `sampling_params` by Router; eval uses `rollout.eval.temperature` when set |
 | `trainer.use_rollout_routing_replay` | Whether to enable R3 (MoE routed experts replay) |

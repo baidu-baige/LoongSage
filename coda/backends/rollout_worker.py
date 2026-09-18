@@ -100,8 +100,12 @@ class RolloutWorker(ABC):
         """Shutdown the inference engine and clean up resources."""
 
     @abstractmethod
-    def release_memory_occupation(self):
-        """Release memory occupation for offloading."""
+    def release_memory_occupation(self, tags: list[str] = None):
+        """Release memory occupation for offloading.
+
+        Args:
+            tags: Memory tags to release (e.g. kv_cache, cuda_graph). None releases all.
+        """
 
     @abstractmethod
     def resume_memory_occupation(self, tags: list[str] = None):

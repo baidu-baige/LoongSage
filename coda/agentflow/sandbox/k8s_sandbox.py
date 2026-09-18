@@ -60,7 +60,6 @@ class K8sSandboxClient(SandboxClient):
         self.sandbox_creation_timeout_seconds = sandbox_creation_timeout_seconds
         self.kubeconfig = kubeconfig
         self.pod_manifest = pod_manifest or {}
-        self._pod_name: str | None = None
 
     # ------------------------------------------------------------------
     # SandboxClient interface
@@ -90,11 +89,6 @@ class K8sSandboxClient(SandboxClient):
             kubeconfig=kubeconfig,
             pod_manifest=pod_manifest,
         )
-
-    @property
-    def sandbox_id(self) -> str | None:
-        """Name of the live pod, or None when not created."""
-        return self._pod_name
 
     def create(self, image: str | None = None, **kwargs) -> str:
         """Start a pod with the given image.
@@ -157,9 +151,7 @@ class K8sSandboxClient(SandboxClient):
                 f"{wait_result.stderr.strip()}"
             )
 
-        self._pod_name = pod_name
         logger.info("Pod %s is ready", pod_name)
-
         # Create /root/.venv → /opt/miniconda3/envs/testbed
         venv_result = subprocess.run(
             self._kubectl([
@@ -179,7 +171,7 @@ class K8sSandboxClient(SandboxClient):
 
         return pod_name
 
-    def execute(self, command: str, workdir: str | None = None, **kwargs) -> dict[str, Any]:
+    def execute(self, sandbox_id: str, command: str, workdir: str | None = None, **kwargs) -> dict[str, Any]:
         """Run a bash command inside the pod.
 
         Args:
@@ -189,19 +181,11 @@ class K8sSandboxClient(SandboxClient):
         Returns:
             Dict with stdout, stderr, exit_code, success keys.
         """
-        if not self._pod_name:
-            raise RuntimeError("Sandbox not running. Call create() first.")
-
         cwd = workdir or self.working_dir
         cmd = f"cd {shlex.quote(cwd)} && timeout {self.command_exec_timeout_seconds} bash -c {shlex.quote(command)}"
-        logger.debug("[%s] %s", self._pod_name, cmd)
+        logger.debug("[%s] %s", sandbox_id, cmd)
 
-        exec_cmd = self._kubectl([
-            "exec", self._pod_name,
-            "--namespace", self.namespace,
-            "--",
-            "bash", "-c", cmd,
-        ])
+        exec_cmd = self._kubectl(["exec", sandbox_id, "--namespace", self.namespace, "--", "bash", "-c", cmd])
         try:
             result = subprocess.run(
                 exec_cmd,
@@ -224,12 +208,9 @@ class K8sSandboxClient(SandboxClient):
             "success": result.returncode == 0,
         }
 
-    def delete(self, **kwargs) -> None:
-        """Delete the pod."""
-        if not self._pod_name:
-            return
-        self._force_delete(self._pod_name)
-        self._pod_name = None
+    def delete(self, sandbox_id: str, **kwargs) -> None:
+        """Delete the identified pod."""
+        self._force_delete(sandbox_id)
 
     # ------------------------------------------------------------------
     # Helpers

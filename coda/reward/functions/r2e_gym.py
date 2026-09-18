@@ -29,6 +29,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from coda.agentflow.sandbox.base import SandboxClient
 from coda.reward import register_reward
 from coda.reward.base import RewardFunction
 from coda.reward.reward import Reward
@@ -37,6 +38,8 @@ logger = logging.getLogger(__name__)
 
 R2E_ASSET_ARCHIVE = "/root/.coda-r2e-eval-assets.tar"
 _R2E_ASSET_DIGEST_MARKER = "CODA_R2E_ASSET_SHA256="
+_R2E_ASSET_DIGEST_KEY = "_coda_r2e_asset_sha256"
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m|\r")
 _R2E_SHELL_PREFIX = (
     "source /root/.bashrc >/dev/null 2>&1 || true; "
     "export PATH=/testbed/.venv/bin:/opt/miniconda3/envs/testbed/bin:"
@@ -107,9 +110,10 @@ printf 'CODA_R2E_ASSET_SHA256=%s\n' "$(sha256sum /root/.coda-r2e-eval-assets.tar
 """
 
 
-def initialize_r2e_sandbox(sandbox: Any, *, workdir: str = "/testbed") -> str:
+def initialize_r2e_sandbox(sandbox_client: SandboxClient, sandbox_id: str, *, workdir: str = "/testbed") -> str:
     """Create the pristine R2E evaluation archive and return its SHA-256."""
-    result = sandbox.execute(
+    result = sandbox_client.execute(
+        sandbox_id,
         f"bash -c {shlex.quote(_R2E_SHELL_PREFIX + _R2E_SETUP_COMMAND)}",
         workdir=workdir,
     )
@@ -157,9 +161,10 @@ class _SandboxExecutor:
     _CONDA_PYTHON = "/opt/miniconda3/envs/testbed/bin/python"
     python_cmd: str = _CONDA_PYTHON
 
-    def __init__(self, sandbox: Any, workdir: str = "/testbed") -> None:
-        """Initialize with a SandboxClient instance and working directory."""
-        self._sandbox = sandbox
+    def __init__(self, sandbox_client: SandboxClient, sandbox_id: str, workdir: str = "/testbed") -> None:
+        """Initialize with a backend client, instance ID, and working directory."""
+        self._sandbox_client = sandbox_client
+        self._sandbox_id = sandbox_id
         self._workdir = workdir
 
     def run(self, cmd: list[str] | str) -> tuple[int, str, str]:
@@ -169,7 +174,7 @@ class _SandboxExecutor:
             command = subprocess.list2cmdline(cmd)
         else:
             command = cmd
-        result = self._sandbox.execute(command, workdir=self._workdir)
+        result = self._sandbox_client.execute(self._sandbox_id, command, workdir=self._workdir)
         return result.get("exit_code", -1), result.get("stdout", ""), result.get("stderr", "")
 
     def restore_r2e_assets(self, expected_sha256: str) -> tuple[bool, str]:
@@ -207,7 +212,7 @@ def _parse_pytest_log(log: str) -> dict[str, str]:
 
     Strips ANSI colour codes before parsing. Follows SkyRL parse_log_pytest logic.
     """
-    log = re.sub(r"\x1b\[[0-9;]*m|\r", "", log)
+    log = _ANSI_ESCAPE_RE.sub("", log)
     if "short test summary info" not in log:
         return {}
     results: dict[str, str] = {}
@@ -233,49 +238,50 @@ class R2EGymReward(RewardFunction):
     reward = 0.0  otherwise
     """
 
-    def prepare_sandbox(self, sandbox: Any, metadata: dict | None = None) -> None:
-        """Create the trusted evaluation-asset snapshot before the agent runs.
-
-        This hook is called by AgentFlow after the sandbox is created and before
-        the selected agent starts.  Keeping it here means black-box agents do
-        not need to identify or initialize R2E-Gym themselves.
-        """
-        if getattr(sandbox, "_coda_r2e_asset_sha256", None) is not None:
-            return
+    def prepare_sandbox(
+        self,
+        sandbox_client: SandboxClient,
+        sandbox_id: str,
+        metadata: dict | None = None,
+    ) -> dict[str, str]:
+        """Create the trusted evaluation snapshot and return private reward state."""
         metadata = metadata or {}
         digest = initialize_r2e_sandbox(
-            sandbox,
+            sandbox_client,
+            sandbox_id,
             workdir=str(metadata.get("repo_path") or "/testbed"),
         )
-        sandbox._coda_r2e_asset_sha256 = digest
+        return {_R2E_ASSET_DIGEST_KEY: digest}
 
     def __call__(
         self,
         messages: list[dict],
         label: Any,
-        metadata: dict | None = None,
+        context: dict | None = None,
         **kwargs: Any,
     ) -> Reward:
         """Run tests in the current worktree; 1.0 when every expected entry matches."""
-        meta = metadata or {}
+        meta = context or {}
         extra: dict[str, Any] = {"instance_id": meta.get("instance_id", "")}
 
         # 1. parse expected outputs (done first so all early returns can include it)
         expected_json = meta.get("expected_output_json") or ""
         if not expected_json:
             raise RuntimeError("R2EGymReward: expected_output_json missing from metadata")
-        _ansi_re = re.compile(r"\x1b\[[0-9;]*m|\r")
         expected = {
-            _ansi_re.sub("", k).split(" - ")[0]: v
+            _ANSI_ESCAPE_RE.sub("", k).split(" - ")[0]: v
             for k, v in json.loads(expected_json).items()
         }
         extra["expected"] = expected
 
         # 2. Build an executor for the same worktree the agent modified.
-        sandbox = meta.get("sandbox")
-        if sandbox is not None:
+        sandbox_client = meta.get("sandbox_client")
+        sandbox_id = meta.get("sandbox_id")
+        if sandbox_client is not None and sandbox_id:
             executor: _LocalExecutor | _SandboxExecutor = _SandboxExecutor(
-                sandbox, workdir="/testbed"
+                sandbox_client,
+                sandbox_id,
+                workdir=str(meta.get("repo_path") or "/testbed"),
             )
             logger.info("R2EGymReward: using sandbox executor")
         else:
@@ -290,9 +296,7 @@ class R2EGymReward(RewardFunction):
         # 3. R2E images may intentionally ship with dirty tracked files. Test
         # the current worktree directly; checkout/reset corrupts that baseline.
         if isinstance(executor, _SandboxExecutor):
-            expected_asset_sha256 = getattr(
-                sandbox, "_coda_r2e_asset_sha256", None
-            )
+            expected_asset_sha256 = meta.get(_R2E_ASSET_DIGEST_KEY)
             if expected_asset_sha256 is None:
                 raise RuntimeError(
                     "R2EGymReward: sandbox was not prepared before agent execution"

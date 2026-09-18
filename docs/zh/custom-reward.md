@@ -8,7 +8,7 @@ agent 负责执行轨迹并产出对话历史，reward 负责根据对话历史�
 
 reward 基类和内置实现分别位于 [base.py](../../coda/reward/base.py) 与 [reward 函数目录](../../coda/reward/functions/)。新增 reward 时，按以下步骤操作：
 
-1. 继承 `RewardFunction`，实现 `__call__(messages, label, **kwargs) -> Reward`。reward 专属配置从 `self.config` 读取。
+1. 继承 `RewardFunction`，实现 `__call__(messages, label, context, **kwargs) -> Reward`。单轮模式下 `context` 是 trajectory dump，多轮模式下是 agent 传入的 metadata。reward 专属配置从 `self.config` 读取。
 2. 返回 [Reward](../../coda/reward/reward.py)，至少填写 `final_reward`。无法打分时设置 `is_valid=False`；正分不代表答案正确时显式填写 `is_correct`。
 3. 使用 `@register_reward("your-name")` 注册，并把实现放到 [coda/custom/](../../coda/custom/) 下，LoongSage 会自动发现，详见[自定义扩展](./custom-extensions.md)。
 
@@ -31,7 +31,7 @@ class ExactMatchReward(RewardFunction):
         super().__init__(config)
         self.case_sensitive = bool(self.config.get("case_sensitive", False))
 
-    def __call__(self, messages: list[dict], label, **kwargs) -> Reward:
+    def __call__(self, messages: list[dict], label, context: dict, **kwargs) -> Reward:
         expected = label.get("answer") if isinstance(label, dict) else label
         if expected is None:
             return Reward(final_reward=0.0, is_valid=False, is_correct=False)
@@ -53,7 +53,7 @@ class ExactMatchReward(RewardFunction):
         return Reward(final_reward=float(correct), is_correct=correct)
 ```
 
-更复杂的实现可参考 [gsm8k.py](../../coda/reward/functions/gsm8k.py) 的答案解析、[bcp.py](../../coda/reward/functions/bcp.py) 的过程奖励，以及 [r2e_gym.py](../../coda/reward/functions/r2e_gym.py) 的 sandbox 判分流程。
+更复杂的实现可参考 [gsm8k.py](../../coda/reward/functions/gsm8k.py) 的答案解析、[bcp.py](../../coda/reward/functions/bcp.py) 的过程奖励，以及 [r2e_gym.py](../../coda/reward/functions/r2e_gym.py) 的 sandbox 判分流程。依赖 sandbox 的 reward 可以定义 `prepare_sandbox(client, sandbox_id, metadata)`，在 agent 运行前初始化可信状态，并返回供后续 `__call__` 使用的 sandbox 状态字典。AgentFlow 不解释该 dict，只在 partial resume 时随 sandbox 保留，终态时丢弃。
 
 ## 3. 配置启用
 
@@ -66,4 +66,4 @@ data_source:
     case_sensitive: false   # 精确匹配时忽略大小写
 ```
 
-多数据源配置下，每个 `data_sources[i]` 可以选择不同的 reward。`name` 为空时不创建 reward：未配置 agent 时框架返回默认无效的零分，配置了 agent 时则不会注入 `reward_fn`。
+多数据源配置下，每个 `data_sources[i]` 可以选择不同的 reward。

@@ -38,7 +38,7 @@ def _make_rollout(
         "loss_masks": [torch.ones(length) for length in lengths],
         "total_lengths": lengths,
         "response_lengths": lengths,
-        "trajectory_id": list(range(n)),
+        "dp_local_traj_idx": list(range(n)),
     }
     if extra_fields:
         data.update(extra_fields)
@@ -49,20 +49,20 @@ def _make_segment_rollout(traj_seg_lengths: list[list[int]]) -> dict:
     """Per-Segment rollout from per-trajectory Segment lengths.
 
     ``traj_seg_lengths[t]`` lists the token lengths of trajectory ``t``'s Segment
-    rows; those rows share ``trajectory_id == t`` and are emitted contiguously.
+    rows; those rows share ``dp_local_traj_idx == t`` and are emitted contiguously.
     """
     lengths: list[int] = []
-    trajectory_id: list[int] = []
+    dp_local_traj_idx: list[int] = []
     for tid, seg_lengths in enumerate(traj_seg_lengths):
         for length in seg_lengths:
             lengths.append(length)
-            trajectory_id.append(tid)
+            dp_local_traj_idx.append(tid)
     return {
         "tokens": [torch.arange(length) for length in lengths],
         "loss_masks": [torch.ones(length) for length in lengths],
         "total_lengths": lengths,
         "response_lengths": lengths,
-        "trajectory_id": trajectory_id,
+        "dp_local_traj_idx": dp_local_traj_idx,
     }
 
 
@@ -461,7 +461,7 @@ class TestGetDataIteratorStatic:
 
     def test_static_dp_sync_adds_only_noop_rows(self):
         _set_parallel(dp_size=2, cp_size=1, vpp_size=None)
-        # traj0: 2 Segment rows; traj1: 1 row → 3 rows, trajectory_id=[0,0,1].
+        # traj0: 2 Segment rows; traj1: 1 row → 3 rows, dp_local_traj_idx=[0,0,1].
         data = _make_segment_rollout([[2, 3], [5]])
         cfg = self._make_config(mini_batch_size=4, micro_batch_size=2)
 
@@ -481,7 +481,7 @@ class TestGetDataIteratorStatic:
 
     def test_mini_batch_keeps_trajectory_segments_together(self):
         _set_parallel(dp_size=1, cp_size=1, vpp_size=None)
-        # traj0: 2 rows, traj1: 2 rows, traj2/traj3: 1 row → trajectory_id=[0,0,1,1,2,3].
+        # traj0: 2 rows, traj1: 2 rows, traj2/traj3: 1 row → dp_local_traj_idx=[0,0,1,1,2,3].
         data = _make_segment_rollout([[2, 3], [3, 3], [7], [8]])
         cfg = self._make_config(mini_batch_size=2, micro_batch_size=3)
 

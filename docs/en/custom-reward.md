@@ -8,7 +8,7 @@ An agent executes a trajectory and produces conversation history, while a reward
 
 The reward base class and built-in implementations live in [base.py](../../coda/reward/base.py) and the [reward functions directory](../../coda/reward/functions/). Follow these steps to add a reward:
 
-1. Inherit from `RewardFunction` and implement `__call__(messages, label, **kwargs) -> Reward`. Read reward-specific options from `self.config`.
+1. Inherit from `RewardFunction` and implement `__call__(messages, label, context, **kwargs) -> Reward`. `context` is the trajectory dump in single-turn mode and agent-supplied metadata in multi-turn mode. Read reward-specific options from `self.config`.
 2. Return a [Reward](../../coda/reward/reward.py) with at least `final_reward`. Set `is_valid=False` when scoring is impossible, and set `is_correct` explicitly when a positive score does not mean a correct answer.
 3. Register the class with `@register_reward("your-name")` and place it in [coda/custom/](../../coda/custom/); LoongSage discovers it automatically, see [Custom Extensions](./custom-extensions.md).
 
@@ -31,7 +31,7 @@ class ExactMatchReward(RewardFunction):
         super().__init__(config)
         self.case_sensitive = bool(self.config.get("case_sensitive", False))
 
-    def __call__(self, messages: list[dict], label, **kwargs) -> Reward:
+    def __call__(self, messages: list[dict], label, context: dict, **kwargs) -> Reward:
         expected = label.get("answer") if isinstance(label, dict) else label
         if expected is None:
             return Reward(final_reward=0.0, is_valid=False, is_correct=False)
@@ -53,7 +53,7 @@ class ExactMatchReward(RewardFunction):
         return Reward(final_reward=float(correct), is_correct=correct)
 ```
 
-For more involved implementations, see answer parsing in [gsm8k.py](../../coda/reward/functions/gsm8k.py), process reward in [bcp.py](../../coda/reward/functions/bcp.py), and sandbox-based scoring in [r2e_gym.py](../../coda/reward/functions/r2e_gym.py).
+For more involved implementations, see answer parsing in [gsm8k.py](../../coda/reward/functions/gsm8k.py), process reward in [bcp.py](../../coda/reward/functions/bcp.py), and sandbox-based scoring in [r2e_gym.py](../../coda/reward/functions/r2e_gym.py). A sandbox-backed reward may define `prepare_sandbox(client, sandbox_id, metadata)` to initialize trusted state before the agent runs and return a sandbox state for its later `__call__`. AgentFlow treats that dict as opaque, retains it with the sandbox on partial resume, and discards it at terminal state.
 
 ## 3. Config Enablement
 
@@ -66,4 +66,4 @@ data_source:
     case_sensitive: false   # ignore letter case during exact matching
 ```
 
-With multiple data sources, each `data_sources[i]` may select a different reward. An empty `name` disables reward construction: execution without an agent then produces the default invalid zero reward, while a configured agent does not receive `reward_fn`.
+With multiple data sources, each `data_sources[i]` may select a different reward.

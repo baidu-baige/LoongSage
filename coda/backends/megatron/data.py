@@ -296,18 +296,18 @@ def _get_min_num_microbatches(total_lengths: list[int], max_tokens_per_gpu: int)
     return len(batches)
 
 
-def _trajectory_row_ranges(trajectory_ids: list[int]) -> list[tuple[int, int]]:
-    """Group contiguous equal ``trajectory_id`` rows into [start, end) ranges.
+def _trajectory_row_ranges(dp_local_traj_idxs: list[int]) -> list[tuple[int, int]]:
+    """Group contiguous equal ``dp_local_traj_idx`` rows into [start, end) ranges.
 
     Segment rows of one trajectory are emitted contiguously at the data source,
     so each run of equal ids is that trajectory's span of Segment rows.
 
-    e.g. trajectory_ids = [0, 0, 0, 1, 2, 2] -> [(0, 3), (3, 4), (4, 6)]
+    e.g. dp_local_traj_idxs = [0, 0, 0, 1, 2, 2] -> [(0, 3), (3, 4), (4, 6)]
     """
     ranges: list[tuple[int, int]] = []
     start = 0
-    for i in range(1, len(trajectory_ids) + 1):
-        if i == len(trajectory_ids) or trajectory_ids[i] != trajectory_ids[start]:
+    for i in range(1, len(dp_local_traj_idxs) + 1):
+        if i == len(dp_local_traj_idxs) or dp_local_traj_idxs[i] != dp_local_traj_idxs[start]:
             ranges.append((start, i))
             start = i
     return ranges
@@ -343,16 +343,16 @@ def get_data_iterator(
 
     if use_single_mini_batch:
         # Non-flattened data (e.g. teacher forward): one mini-batch over every
-        # row.  ``trajectory_id`` is not needed here — rows are counted from
+        # row.  ``dp_local_traj_idx`` is not needed here — rows are counted from
         # ``tokens`` directly.
         mini_batch_ranges = [(0, len(rollout_data["tokens"]))]
     else:
         # Flattened Segment rows: cut mini-batches on trajectory boundaries so
         # num_mini_batch is equal across DP ranks even when per-trajectory
-        # segment counts differ.  ``trajectory_id`` tags each Segment row with
-        # its parent trajectory (contiguous runs); a trajectory's rows stay in
-        # one mini-batch while micro-batches may split them.
-        trajectory_row_ranges = _trajectory_row_ranges(rollout_data["trajectory_id"])
+        # segment counts differ.  ``dp_local_traj_idx`` tags each Segment row
+        # with its parent trajectory (contiguous runs); a trajectory's rows
+        # stay in one mini-batch while micro-batches may split them.
+        trajectory_row_ranges = _trajectory_row_ranges(rollout_data["dp_local_traj_idx"])
         mini_batch_size_per_dp = config.mini_batch_size // dp_size
         num_mini_batch = len(trajectory_row_ranges) // mini_batch_size_per_dp
         mini_batch_ranges = [

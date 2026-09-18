@@ -76,6 +76,7 @@ output/
 outputs/
 checkpoints/
 *.ckpt
+rollout_data/
 
 # Editor / assistant local state
 .ruff_cache/

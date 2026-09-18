@@ -52,13 +52,6 @@ class MegatronTeacherWorker(BaseTeacherWorker):
         self._cpu_backup: list[tuple[torch.nn.Parameter, torch.Tensor]] = []
 
     @classmethod
-    def runtime_env_vars(cls):
-        """Set runtime environment variables for teacher actors."""
-        return {
-            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-        }
-
-    @classmethod
     def validate_config(cls, config: DictConfig) -> DictConfig:
         """Validate and derive OPD Megatron teacher config."""
         if "opd" not in config:

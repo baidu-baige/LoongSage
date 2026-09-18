@@ -8,16 +8,21 @@ import json
 import logging
 import shlex
 from pathlib import PurePosixPath
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlparse
 
 from coda.agentflow.agent import BaseAgent, register_agent
+from coda.agentflow.utils import require_docker_image
 from coda.reward.reward import Reward
 
 logger = logging.getLogger(__name__)
 
-_PROVIDER_ID = "coda"
 _MODEL_ID = "default"
+_WIRE_PROVIDERS = {
+    "chat_completions": ("coda", "@ai-sdk/openai-compatible"),
+    "responses": ("openai", "@ai-sdk/openai"),
+    "anthropic_messages": ("anthropic", "@ai-sdk/anthropic"),
+}
 _CONFIG_PATH = "/root/.config/opencode/opencode.json"
 _PLUGIN_PATH = "/root/.config/opencode/coda-request-kind.js"
 _OPENCODE_PATH = "/root/.opencode/bin/opencode"
@@ -60,14 +65,12 @@ export const CodaRequestKind = async ({ client, directory }) => ({
 
 def _config(
     router_url: str,
-    temperature: float,
-    completion_params: dict[str, Any],
     context_length: int,
     max_output_tokens: int,
+    wire_api: str,
 ) -> dict[str, Any]:
-    agent = {"temperature": temperature}
-    if completion_params.get("top_p") is not None:
-        agent["top_p"] = completion_params["top_p"]
+    provider_id, provider_npm = _WIRE_PROVIDERS[wire_api]
+    agent = {}
     model: dict[str, Any] = {
         "name": "Coda rollout model",
         "temperature": True,
@@ -90,8 +93,8 @@ def _config(
         "$schema": "https://opencode.ai/config.json",
         "plugin": [f"file://{_PLUGIN_PATH}"],
         "provider": {
-            _PROVIDER_ID: {
-                "npm": "@ai-sdk/openai-compatible",
+            provider_id: {
+                "npm": provider_npm,
                 "name": "Coda Router",
                 "options": {
                     "baseURL": f"{router_url.rstrip('/')}/v1",
@@ -100,8 +103,8 @@ def _config(
                 "models": {_MODEL_ID: model},
             }
         },
-        "model": f"{_PROVIDER_ID}/{_MODEL_ID}",
-        "small_model": f"{_PROVIDER_ID}/{_MODEL_ID}",
+        "model": f"{provider_id}/{_MODEL_ID}",
+        "small_model": f"{provider_id}/{_MODEL_ID}",
         "agent": {"build": agent, "compaction": agent},
         "permission": {
             "*": "allow",
@@ -120,14 +123,14 @@ def _config(
     }
 
 
-def _write_file(sandbox: Any, path: str, content: str) -> None:
+def _write_file(execute: Callable[..., dict], path: str, content: str) -> None:
     encoded = base64.b64encode(content.encode()).decode()
     parent = str(PurePosixPath(path).parent)
     command = (
         f"mkdir -p {shlex.quote(parent)} && "
         f"printf %s {shlex.quote(encoded)} | base64 -d > {shlex.quote(path)}"
     )
-    result = sandbox.execute(command, workdir="/")
+    result = execute(command, workdir="/")
     if result.get("exit_code", -1) != 0:
         output = (result.get("stdout", "") + result.get("stderr", "")).strip()
         raise RuntimeError(f"failed to write {path}: {output[:1000]}")
@@ -154,47 +157,41 @@ class OpenCodeAgent(BaseAgent):
     def __init__(
         self,
         router_url: str,
-        sandbox_env_client: Any = None,
-        reward_fn: Any = None,
-        completion_params: dict | None = None,
+        context_length: int,
         max_response_len_per_trajectory: int = 0,
-        temperature: float = 0.0,
-        context_length: int = 0,
         max_output_tokens: int = 32000,
+        wire_api: str = "chat_completions",
         **kwargs: Any,
     ) -> None:
+        assert context_length > 0, "agent.context_length must be greater than 0"
         super().__init__(
             router_url,
-            completion_params=completion_params,
             max_response_len_per_trajectory=max_response_len_per_trajectory,
-            temperature=temperature,
             **kwargs,
         )
-        self.sandbox_env_client = sandbox_env_client
-        self.reward_fn = reward_fn
+        if self.sandbox_client is None:
+            raise ValueError("opencode agent requires data_source.sandbox")
         self.context_length = context_length
         self.max_output_tokens = max_output_tokens
+        self.wire_api = wire_api
         # True only while the `opencode run` subprocess is in flight; reset on a
-        # clean return (NOT in a finally), so a cancellation leaves it True and
-        # clear() knows a lingering process must be killed.
+        # clean return (NOT in a finally), so cancellation leaves it True and
+        # close() knows a lingering process must be killed.
         self._opencode_running = False
 
     async def run_trajectory(self, trajectory: dict[str, Any]) -> Reward:
         """Run one OpenCode SWE trajectory inside the configured sandbox."""
         metadata = trajectory.get("metadata") or {}
-        image = str(metadata.get("docker_image") or "")
         repo_path = str(metadata.get("repo_path") or "")
-        if self.sandbox_env_client is None:
-            raise ValueError("sandbox_env_client is required; set agentflow.sandbox in config")
-        if not image:
-            raise ValueError("metadata['docker_image'] is missing")
         if not repo_path:
             raise ValueError("metadata['repo_path'] is missing")
+        if self.sandbox_id is None:
+            self.sandbox_id = await asyncio.to_thread(
+                self.sandbox_client.create, image=require_docker_image(metadata)
+            )
+        execute = lambda command, **kwargs: self.sandbox_client.execute(self.sandbox_id, command, **kwargs)
 
-        if not getattr(self.sandbox_env_client, "sandbox_id", None):
-            await asyncio.to_thread(self.sandbox_env_client.create, image=image)
-
-        # A pod can pass k8s readiness yet fail to reach the Router. Probe with a
+        # A pod can pass readiness yet fail to reach the Router. Probe with a
         # raw TCP connect (bypasses http_proxy, like OpenCode's client) so the
         # failure retries with a fresh pod instead of producing an empty trajectory.
         parsed = urlparse(self.router_url)
@@ -205,51 +202,41 @@ class OpenCodeAgent(BaseAgent):
                 f"timeout 5 bash -c '</dev/null >/dev/tcp/{router_host}/{router_port}' "
                 "2>/dev/null && exit 0; sleep 1; done; exit 1"
             )
-            probe = await asyncio.to_thread(
-                self.sandbox_env_client.execute, probe_cmd, workdir=repo_path
-            )
+            probe = await asyncio.to_thread(execute, probe_cmd, workdir=repo_path)
             if probe.get("exit_code", -1) != 0:
                 raise RuntimeError(
                     f"Sandbox cannot reach Router {router_host}:{router_port} "
-                    f"(pod={getattr(self.sandbox_env_client, 'sandbox_id', '?')}, "
-                    f"instance={metadata.get('instance_id', '?')}); "
+                    f"(instance={metadata.get('instance_id', '?')}); "
                     "likely a per-pod network/CNI issue — will retry with a new pod"
                 )
 
         check = await asyncio.to_thread(
-            self.sandbox_env_client.execute,
+            execute,
             f"test -x {shlex.quote(_OPENCODE_PATH)} && test -d .git",
             workdir=repo_path,
         )
         if check.get("exit_code", -1) != 0:
             output = (check.get("stdout", "") + check.get("stderr", "")).strip()
-            raise RuntimeError(
-                f"OpenCode or repository is missing in sandbox image {image}: {output[:1000]}"
-            )
+            raise RuntimeError(f"OpenCode or repository is missing in sandbox: {output[:1000]}")
 
+        await asyncio.to_thread(_write_file, execute, _PLUGIN_PATH, _REQUEST_KIND_PLUGIN)
         await asyncio.to_thread(
             _write_file,
-            self.sandbox_env_client,
-            _PLUGIN_PATH,
-            _REQUEST_KIND_PLUGIN,
-        )
-        await asyncio.to_thread(
-            _write_file,
-            self.sandbox_env_client,
+            execute,
             _CONFIG_PATH,
             json.dumps(
                 _config(
                     self.router_url,
-                    self.temperature,
-                    self.completion_params,
                     self.context_length,
                     self.max_output_tokens,
+                    self.wire_api,
                 ),
                 indent=2,
             ),
         )
 
         instruction = _instruction(trajectory.get("prompt", ""))
+        provider_id = _WIRE_PROVIDERS[self.wire_api][0]
         command = (
             "OPENCODE_DISABLE_MODELS_FETCH=1 "
             "OPENCODE_DISABLE_AUTOUPDATE=1 "
@@ -257,7 +244,7 @@ class OpenCodeAgent(BaseAgent):
             "OPENAI_API_KEY=not-needed "
             f"OPENCODE_CONFIG={shlex.quote(_CONFIG_PATH)} "
             f"{shlex.quote(_OPENCODE_PATH)} "
-            f"--model={_PROVIDER_ID}/{_MODEL_ID} run "
+            f"--model={provider_id}/{_MODEL_ID} run "
             "--title=coda --dangerously-skip-permissions -- "
             f"{shlex.quote(instruction)} </dev/null >{shlex.quote(_LOG_PATH)} 2>&1"
         )
@@ -265,18 +252,10 @@ class OpenCodeAgent(BaseAgent):
         # abort. Reset ONLY on a clean return (below), never in a finally, so a
         # CancelledError leaves the flag True and clear() knows to reap it.
         self._opencode_running = True
-        result = await asyncio.to_thread(
-            self.sandbox_env_client.execute,
-            command,
-            workdir=repo_path,
-        )
+        result = await asyncio.to_thread(execute, command, workdir=repo_path)
         self._opencode_running = False
         if result.get("exit_code", -1) != 0:
-            tail = await asyncio.to_thread(
-                self.sandbox_env_client.execute,
-                f"tail -n 100 {shlex.quote(_LOG_PATH)}",
-                workdir=repo_path,
-            )
+            tail = await asyncio.to_thread(execute, f"tail -n 100 {shlex.quote(_LOG_PATH)}", workdir=repo_path)
             output = (tail.get("stdout", "") + tail.get("stderr", ""))[-5000:]
             logger.warning(
                 "OpenCode exited with code %s for %s:\n%s",
@@ -289,28 +268,17 @@ class OpenCodeAgent(BaseAgent):
                 f"{metadata.get('instance_id', '?')}: {output}"
             )
 
-        if self.reward_fn is None:
-            return Reward(final_reward=0.0, is_valid=False)
-        reward_meta = {**metadata, "sandbox": self.sandbox_env_client}
         return await asyncio.to_thread(
             self.reward_fn,
             [],
             trajectory.get("label"),
-            metadata=reward_meta,
+            {**metadata, "sandbox_client": self.sandbox_client, "sandbox_id": self.sandbox_id},
         )
 
-    async def clear(self) -> None:
-        """Kill a lingering OpenCode process; sandbox lifetime is AgentFlow's.
-
-        A cancelled `opencode run` is not stopped by the task cancellation: it
-        treats the severed LLM stream as a retryable error and keeps retrying,
-        mutating the repo and racing the next resume. `_opencode_running` is
-        True only when cancelled mid-flight, so reap the tree in that case.
-        """
+    async def close(self) -> None:
+        """Kill a lingering OpenCode process and close shared resources."""
+        await super().close()
         if not self._opencode_running:
-            return
-        client = self.sandbox_env_client
-        if client is None or not getattr(client, "sandbox_id", None):
             return
         kill_cmd = (
             f"pkill -INT -f {shlex.quote(_OPENCODE_PATH)} 2>/dev/null || true; "
@@ -318,10 +286,8 @@ class OpenCodeAgent(BaseAgent):
             f"pkill -KILL -f {shlex.quote(_OPENCODE_PATH)} 2>/dev/null || true"
         )
         try:
-            await asyncio.to_thread(client.execute, kill_cmd)
+            await asyncio.to_thread(self.sandbox_client.execute, self.sandbox_id, kill_cmd)
         except Exception as exc:
-            logger.warning(
-                "[opencode] failed to kill lingering process on cleanup: %s", exc
-            )
+            logger.warning("[opencode] failed to kill lingering process on cleanup: %s", exc)
         finally:
             self._opencode_running = False

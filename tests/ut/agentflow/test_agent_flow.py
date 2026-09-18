@@ -36,7 +36,6 @@ def _make_config(rollout_mode: str = "single_turn", retry_limit: int = 1) -> Mag
     cfg.agentflow.agent.name = "dummy_agent" if rollout_mode == "multi_turn" else ""
     cfg.agentflow.tokenizer = MagicMock()
     cfg.agentflow.dump_trajectory_path = ""
-    cfg.agentflow.sandbox = MagicMock()
     cfg.hf_model_path = "/fake/model"
     cfg.trainer.use_rollout_routing_replay = False
     cfg.trainer.temperature = 1.0
@@ -45,6 +44,7 @@ def _make_config(rollout_mode: str = "single_turn", retry_limit: int = 1) -> Mag
     ds = OmegaConf.create({
         "agent": {"name": "dummy_agent" if rollout_mode == "multi_turn" else ""},
         "reward": {},
+        "sandbox": {"type": "none"},
         "max_response_len_per_trajectory": 512,
         "completion_params": {},
         "num_trajectories_per_prompt": 8,
@@ -147,6 +147,28 @@ class TestInit:
         fake_fn = MagicMock()
         af = _make_agent_flow(reward_fn=fake_fn)
         assert af.ds_reward_fns[0] is fake_fn
+
+    def test_sandbox_clients_are_selected_by_data_source(self):
+        cfg = _make_config(rollout_mode="multi_turn")
+        cfg.data_sources = [
+            OmegaConf.create({**dict(cfg.data_sources[0]), "sandbox": {"type": "docker", "host": "one"}}),
+            OmegaConf.create({**dict(cfg.data_sources[0]), "sandbox": {"type": "docker", "host": "two"}}),
+            OmegaConf.create({**dict(cfg.data_sources[0]), "sandbox": {"type": "none"}}),
+        ]
+        first, second = MagicMock(), MagicMock()
+
+        with (
+            patch("coda.agentflow.agent_flow.create_tokenizer_manager") as mock_tok,
+            patch("coda.agentflow.agent_flow.create_reward_fn", return_value=None),
+            patch("coda.agentflow.agent_flow.get_agent_class", return_value=MagicMock()),
+            patch("coda.agentflow.agent_flow.create_sandbox_client", side_effect=[first, second, None]) as create,
+            patch("coda.agentflow.router.router.Router"),
+        ):
+            mock_tok.return_value = MagicMock(mode="sync", num_workers=1)
+            af = AgentFlow(cfg)
+
+        assert af.ds_sandbox_clients == {0: first, 1: second, 2: None}
+        assert create.call_count == 3
 
 
 # ---------------------------------------------------------------------------
@@ -606,6 +628,24 @@ class TestClear:
 
         assert af.trajectory_store.trajectory_data == {}
 
+    @pytest.mark.asyncio
+    async def test_clear_releases_pool(self):
+        af = _make_agent_flow()
+        client = MagicMock()
+        af.ds_sandbox_clients[0] = client
+        af._sandbox_ids["t1"] = "sandbox-1"
+        af.trajectory_store.add("t1", _make_trajectory("t1"))
+
+        with (
+            patch.object(af, "_release_sandbox", wraps=af._release_sandbox) as release_mock,
+            patch.object(af._resources, "aclose", new_callable=AsyncMock),
+        ):
+            await af.clear()
+
+        release_mock.assert_awaited_once_with("t1")
+        client.delete.assert_called_once_with("sandbox-1")
+        assert af._sandbox_ids == {}
+
 
 # ---------------------------------------------------------------------------
 # _post_process_reward()
@@ -776,19 +816,20 @@ class TestReemitExisting:
 
     @pytest.mark.asyncio
     async def test_releases_pooled_sandbox(self):
-        """Re-emitting a terminal trajectory must release any pooled sandbox left by abort()."""
+        """Re-emitting a terminal trajectory releases its retained sandbox ID."""
         af = _make_agent_flow()
         traj = _make_trajectory("t1", TrajectoryStatus.COMPLETED)
         traj.reward = 1.0
-        fake_sandbox = MagicMock()
-        fake_sandbox.delete = MagicMock()
-        af._sandbox_pool[traj.trajectory_id] = fake_sandbox
+        client = MagicMock()
+        af.ds_sandbox_clients[0] = client
+        af.trajectory_store.add(traj.trajectory_id, traj)
+        af._sandbox_ids[traj.trajectory_id] = "sandbox-1"
 
         with patch.object(af, "_emit_terminal_trajectory", new_callable=AsyncMock):
             await af._reemit_existing(traj)
 
-        fake_sandbox.delete.assert_called_once()
-        assert traj.trajectory_id not in af._sandbox_pool
+        client.delete.assert_called_once_with("sandbox-1")
+        assert traj.trajectory_id not in af._sandbox_ids
 
 
 # ---------------------------------------------------------------------------
@@ -851,16 +892,20 @@ class TestExecuteMultiTurn:
         ds = OmegaConf.create({
             "agent": {"name": "dummy_agent"},
             "reward": {},
+            "sandbox": {"type": "none"},
             "max_response_len_per_trajectory": 512,
-            "completion_params": {},
+            "completion_params": {"top_p": 0.9},
         })
         af.ds_configs[0] = ds
         af.ds_reward_fns[0] = None
+        sandbox_client = MagicMock()
+        sandbox_client.create.return_value = "sandbox-1"
+        af.ds_sandbox_clients[0] = sandbox_client
         traj = _make_trajectory("t1", TrajectoryStatus.PENDING)
+        traj.metadata["docker_image"] = "example/image:latest"
         return af, traj
 
-    def _agent_completing(self, af: AgentFlow, traj: Trajectory, attempt_id: int,
-                           reward: Reward, trainable: bool = True):
+    def _agent_completing(self, af: AgentFlow, traj: Trajectory, reward: Reward, trainable: bool = True):
         """Wire af.ds_agent_classes[0] so run_trajectory() stores a valid completed attempt."""
         completed = traj.model_copy(deep=True)
         completed.rollout_log_probs = [-0.1] if trainable is not None else []
@@ -869,145 +914,165 @@ class TestExecuteMultiTurn:
 
         agent_instance = MagicMock()
         agent_instance.run_trajectory = AsyncMock(return_value=reward)
-        agent_instance.clear = AsyncMock()
-        af.ds_agent_classes[0] = MagicMock(return_value=agent_instance)
+        agent_instance.close = AsyncMock()
+
+        def build_agent(**kwargs):
+            agent_instance.sandbox_id = kwargs["sandbox_id"]
+            return agent_instance
+
+        af.ds_agent_classes[0] = MagicMock(side_effect=build_agent)
         return agent_instance
 
     @pytest.mark.asyncio
-    async def test_creates_new_sandbox_when_none_pooled(self):
+    async def test_creates_new_sandbox_and_injects_client_and_id(self):
         af, traj = self._setup()
         expected = Reward(final_reward=1.0, is_valid=True)
-        self._agent_completing(af, traj, 0, expected)
-        fake_sandbox = MagicMock(sandbox_id="sbx-1")
-        fake_sandbox.delete = MagicMock()
+        self._agent_completing(af, traj, expected)
+        client = af.ds_sandbox_clients[0]
 
-        with patch("coda.agentflow.agent_flow.create_sandbox_client", return_value=fake_sandbox) as mock_create:
-            reward = await af._execute_multi_turn(traj, 0)
+        reward = await af._execute_multi_turn(traj, 0)
 
-        mock_create.assert_called_once()
-        # Terminal success releases the sandbox in the finally block.
-        assert traj.trajectory_id not in af._sandbox_pool
+        client.create.assert_not_called()
+        client.delete.assert_not_called()
+        kwargs = af.ds_agent_classes[0].call_args.kwargs
+        assert kwargs["sandbox_client"] is client
+        assert kwargs["sandbox_id"] is None
+        assert "completion_params" not in kwargs
+        assert traj.trajectory_id not in af._sandbox_ids
         assert reward.final_reward == 1.0
 
-    def test_does_not_precreate_sandbox_without_prepare_hook(self):
+    @pytest.mark.asyncio
+    async def test_none_sandbox_configuration_makes_no_backend_calls(self):
         af, traj = self._setup()
-        af.ds_reward_fns[0] = object()
-        self._agent_completing(af, traj, 0, Reward(final_reward=1.0))
-        fake_sandbox = MagicMock(sandbox_id=None)
+        client = af.ds_sandbox_clients[0]
+        af.ds_sandbox_clients[0] = None
+        self._agent_completing(af, traj, Reward(final_reward=1.0))
 
-        with patch(
-            "coda.agentflow.agent_flow.create_sandbox_client",
-            return_value=fake_sandbox,
-        ):
-            asyncio.run(af._execute_multi_turn(traj, 0))
+        await af._execute_multi_turn(traj, 0)
 
-        fake_sandbox.create.assert_not_called()
+        kwargs = af.ds_agent_classes[0].call_args.kwargs
+        assert kwargs["sandbox_client"] is None
+        assert kwargs["sandbox_id"] is None
+        client.create.assert_not_called()
+        client.execute.assert_not_called()
+        client.delete.assert_not_called()
+        assert af._sandbox_ids == {}
 
-    def test_prepares_sandbox_when_reward_defines_prepare_hook(self):
+    @pytest.mark.asyncio
+    async def test_prepares_sandbox_and_passes_reward_metadata(self):
         af, traj = self._setup()
-        traj.metadata["docker_image"] = "example/image:latest"
         reward_fn = MagicMock()
+        reward_fn.prepare_sandbox.return_value = {"asset_digest": "a" * 64}
         af.ds_reward_fns[0] = reward_fn
-        self._agent_completing(af, traj, 0, Reward(final_reward=1.0))
-        fake_sandbox = MagicMock(sandbox_id=None)
+        agent = self._agent_completing(af, traj, Reward(final_reward=1.0))
+        client = af.ds_sandbox_clients[0]
 
-        with patch(
-            "coda.agentflow.agent_flow.create_sandbox_client",
-            return_value=fake_sandbox,
-        ):
-            asyncio.run(af._execute_multi_turn(traj, 0))
+        await af._execute_multi_turn(traj, 0)
 
-        fake_sandbox.create.assert_called_once_with(image="example/image:latest")
         reward_fn.prepare_sandbox.assert_called_once_with(
-            fake_sandbox,
+            client,
+            "sandbox-1",
             metadata={"docker_image": "example/image:latest"},
         )
+        assert af.ds_agent_classes[0].call_args.kwargs["sandbox_id"] == "sandbox-1"
+        passed_metadata = agent.run_trajectory.call_args.args[0]["metadata"]
+        assert passed_metadata["asset_digest"] == "a" * 64
 
     @pytest.mark.asyncio
-    async def test_reuses_pooled_sandbox_without_creating_new_one(self):
+    async def test_partial_resume_reuses_sandbox_state(self):
         af, traj = self._setup()
-        expected = Reward(final_reward=1.0, is_valid=True)
-        self._agent_completing(af, traj, 0, expected)
-        pooled_sandbox = MagicMock(sandbox_id="sbx-pooled")
-        pooled_sandbox.delete = MagicMock()
-        af._sandbox_pool[traj.trajectory_id] = pooled_sandbox
+        reward_fn = MagicMock()
+        af.ds_reward_fns[0] = reward_fn
+        client = af.ds_sandbox_clients[0]
+        digest = {"asset_digest": "trusted"}
+        af._sandbox_ids[traj.trajectory_id] = "sandbox-existing"
+        af._sandbox_contexts[traj.trajectory_id] = digest
+        agent = self._agent_completing(af, traj, Reward(final_reward=1.0))
 
-        with patch("coda.agentflow.agent_flow.create_sandbox_client") as mock_create:
-            await af._execute_multi_turn(traj, 0)
+        await af._execute_multi_turn(traj, 0)
 
-        mock_create.assert_not_called()
-        pooled_sandbox.delete.assert_called_once()
+        reward_fn.prepare_sandbox.assert_not_called()
+        client.create.assert_not_called()
+        metadata = agent.run_trajectory.call_args.args[0]["metadata"]
+        assert metadata["asset_digest"] == "trusted"
 
     @pytest.mark.asyncio
-    async def test_releases_sandbox_on_normal_completion(self):
-        """Terminal success must delete the sandbox and drop it from the pool."""
+    async def test_reuses_pooled_sandbox_id_without_creating(self):
         af, traj = self._setup()
-        expected = Reward(final_reward=1.0, is_valid=True)
-        self._agent_completing(af, traj, 0, expected)
-        fake_sandbox = MagicMock(sandbox_id="sbx-1")
-        fake_sandbox.delete = MagicMock()
+        self._agent_completing(af, traj, Reward(final_reward=1.0))
+        client = af.ds_sandbox_clients[0]
+        af._sandbox_ids[traj.trajectory_id] = "sandbox-existing"
 
-        with patch("coda.agentflow.agent_flow.create_sandbox_client", return_value=fake_sandbox):
-            await af._execute_multi_turn(traj, 0)
+        await af._execute_multi_turn(traj, 0)
 
-        fake_sandbox.delete.assert_called_once()
-        assert traj.trajectory_id not in af._sandbox_pool
+        client.create.assert_not_called()
+        assert af.ds_agent_classes[0].call_args.kwargs["sandbox_id"] == "sandbox-existing"
+        client.delete.assert_called_once_with("sandbox-existing")
 
     @pytest.mark.asyncio
     async def test_releases_sandbox_on_failure(self):
         """A raised exception (e.g. missing rollout_log_probs) must still release the sandbox."""
         af, traj = self._setup()
-        # trainable=None -> _agent_completing stores an attempt with empty rollout_log_probs,
-        # which triggers the "completed without rollout log probs" RuntimeError.
-        self._agent_completing(af, traj, 0, Reward(final_reward=1.0), trainable=None)
-        fake_sandbox = MagicMock(sandbox_id="sbx-1")
-        fake_sandbox.delete = MagicMock()
+        client = af.ds_sandbox_clients[0]
+        client.create.return_value = "sandbox-1"
 
-        with patch("coda.agentflow.agent_flow.create_sandbox_client", return_value=fake_sandbox):
-            with pytest.raises(RuntimeError, match="without rollout log probs"):
-                await af._execute_multi_turn(traj, 0)
+        def build_agent(**kwargs):
+            agent = MagicMock()
+            agent.run_trajectory = AsyncMock(return_value=Reward(final_reward=1.0))
+            agent.close = AsyncMock()
+            agent.sandbox_id = "sandbox-1"
+            client.create(image="example/image:latest")
+            return agent
 
-        fake_sandbox.delete.assert_called_once()
-        assert traj.trajectory_id not in af._sandbox_pool
+        af.ds_agent_classes[0] = MagicMock(side_effect=build_agent)
+        completed = traj.model_copy(deep=True)
+        af.trajectory_store.add(traj.trajectory_id, completed)
+
+        with pytest.raises(RuntimeError, match="without rollout log probs"):
+            await af._execute_multi_turn(traj, 0)
+
+        client.delete.assert_called_once_with("sandbox-1")
+        assert traj.trajectory_id not in af._sandbox_ids
 
     @pytest.mark.asyncio
     async def test_keeps_sandbox_on_cancel_when_partial_rollout_enabled(self):
         """CancelledError with partial_rollout_enabled=True must keep the sandbox pooled."""
         af, traj = self._setup(partial_rollout_enabled=True)
-        fake_sandbox = MagicMock(sandbox_id="sbx-1")
-        fake_sandbox.delete = MagicMock()
-        af._sandbox_pool[traj.trajectory_id] = fake_sandbox
+        client = af.ds_sandbox_clients[0]
+        af._sandbox_ids[traj.trajectory_id] = "sandbox-existing"
 
         agent_instance = MagicMock()
         agent_instance.run_trajectory = AsyncMock(side_effect=asyncio.CancelledError())
-        agent_instance.clear = AsyncMock()
+        agent_instance.close = AsyncMock()
+        agent_instance.sandbox_id = "sandbox-existing"
         af.ds_agent_classes[0] = MagicMock(return_value=agent_instance)
 
         with pytest.raises(asyncio.CancelledError):
             await af._execute_multi_turn(traj, 0)
 
-        fake_sandbox.delete.assert_not_called()
-        assert af._sandbox_pool[traj.trajectory_id] is fake_sandbox
-        agent_instance.clear.assert_awaited_once()
+        client.delete.assert_not_called()
+        assert af._sandbox_ids[traj.trajectory_id] == "sandbox-existing"
+        agent_instance.close.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_releases_sandbox_on_cancel_when_partial_rollout_disabled(self):
         """CancelledError with partial_rollout_enabled=False must still release the sandbox."""
         af, traj = self._setup(partial_rollout_enabled=False)
-        fake_sandbox = MagicMock(sandbox_id="sbx-1")
-        fake_sandbox.delete = MagicMock()
-        af._sandbox_pool[traj.trajectory_id] = fake_sandbox
+        client = af.ds_sandbox_clients[0]
+        af.trajectory_store.add(traj.trajectory_id, traj)
+        af._sandbox_ids[traj.trajectory_id] = "sandbox-existing"
 
         agent_instance = MagicMock()
         agent_instance.run_trajectory = AsyncMock(side_effect=asyncio.CancelledError())
-        agent_instance.clear = AsyncMock()
+        agent_instance.close = AsyncMock()
+        agent_instance.sandbox_id = "sandbox-existing"
         af.ds_agent_classes[0] = MagicMock(return_value=agent_instance)
 
         with pytest.raises(asyncio.CancelledError):
             await af._execute_multi_turn(traj, 0)
 
-        fake_sandbox.delete.assert_called_once()
-        assert traj.trajectory_id not in af._sandbox_pool
+        client.delete.assert_called_once_with("sandbox-existing")
+        assert traj.trajectory_id not in af._sandbox_ids
 
     @pytest.mark.asyncio
     async def test_missing_attempt_in_store_raises(self):
@@ -1015,14 +1080,11 @@ class TestExecuteMultiTurn:
         af, traj = self._setup()
         agent_instance = MagicMock()
         agent_instance.run_trajectory = AsyncMock(return_value=Reward(final_reward=1.0))
-        agent_instance.clear = AsyncMock()
+        agent_instance.close = AsyncMock()
         af.ds_agent_classes[0] = MagicMock(return_value=agent_instance)
-        fake_sandbox = MagicMock(sandbox_id="sbx-1")
-        fake_sandbox.delete = MagicMock()
 
-        with patch("coda.agentflow.agent_flow.create_sandbox_client", return_value=fake_sandbox):
-            with pytest.raises(RuntimeError, match="missing from trajectory store"):
-                await af._execute_multi_turn(traj, 0)
+        with pytest.raises(RuntimeError, match="missing from trajectory store"):
+            await af._execute_multi_turn(traj, 0)
 
     @pytest.mark.asyncio
     async def test_no_trainable_segment_raises(self):
@@ -1035,31 +1097,39 @@ class TestExecuteMultiTurn:
 
         agent_instance = MagicMock()
         agent_instance.run_trajectory = AsyncMock(return_value=Reward(final_reward=1.0))
-        agent_instance.clear = AsyncMock()
+        agent_instance.close = AsyncMock()
         af.ds_agent_classes[0] = MagicMock(return_value=agent_instance)
-        fake_sandbox = MagicMock(sandbox_id="sbx-1")
-        fake_sandbox.delete = MagicMock()
 
-        with patch("coda.agentflow.agent_flow.create_sandbox_client", return_value=fake_sandbox):
-            with pytest.raises(RuntimeError, match="without trainable Segment"):
-                await af._execute_multi_turn(traj, 0)
+        with pytest.raises(RuntimeError, match="without trainable Segment"):
+            await af._execute_multi_turn(traj, 0)
 
     @pytest.mark.asyncio
-    async def test_agent_clear_called_even_on_exception(self):
-        """agent.clear() must run in the finally block regardless of outcome."""
+    async def test_constructor_failure_releases_pooled_sandbox(self):
+        af, traj = self._setup()
+        client = af.ds_sandbox_clients[0]
+        af.trajectory_store.add(traj.trajectory_id, traj)
+        af._sandbox_ids[traj.trajectory_id] = "sandbox-existing"
+        af.ds_agent_classes[0] = MagicMock(side_effect=ValueError("constructor failed"))
+
+        with pytest.raises(ValueError, match="constructor failed"):
+            await af._execute_multi_turn(traj, 0)
+
+        client.delete.assert_called_once_with("sandbox-existing")
+        assert traj.trajectory_id not in af._sandbox_ids
+
+    @pytest.mark.asyncio
+    async def test_agent_close_called_even_on_exception(self):
+        """agent.close() must run in the finally block regardless of outcome."""
         af, traj = self._setup()
         agent_instance = MagicMock()
         agent_instance.run_trajectory = AsyncMock(side_effect=ValueError("boom"))
-        agent_instance.clear = AsyncMock()
+        agent_instance.close = AsyncMock()
         af.ds_agent_classes[0] = MagicMock(return_value=agent_instance)
-        fake_sandbox = MagicMock(sandbox_id="sbx-1")
-        fake_sandbox.delete = MagicMock()
 
-        with patch("coda.agentflow.agent_flow.create_sandbox_client", return_value=fake_sandbox):
-            with pytest.raises(ValueError, match="boom"):
-                await af._execute_multi_turn(traj, 0)
+        with pytest.raises(ValueError, match="boom"):
+            await af._execute_multi_turn(traj, 0)
 
-        agent_instance.clear.assert_awaited_once()
+        agent_instance.close.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
@@ -1067,37 +1137,50 @@ class TestExecuteMultiTurn:
 # ---------------------------------------------------------------------------
 
 class TestReleaseSandbox:
+    def _setup(self):
+        """An AgentFlow whose t1 trajectory has a pooled sandbox on ds 0."""
+        af = _make_agent_flow()
+        client = MagicMock()
+        af.ds_sandbox_clients[0] = client
+        af.trajectory_store.add("t1", _make_trajectory("t1"))
+        af._sandbox_ids["t1"] = "sandbox-1"
+        return af, client
+
     @pytest.mark.asyncio
     async def test_noop_when_no_pooled_sandbox(self):
         af = _make_agent_flow()
-        # Should not raise even though no sandbox was ever pooled for this id.
-        await af._release_sandbox("unknown-traj")
+        assert "unknown-traj" not in af._sandbox_ids
 
     @pytest.mark.asyncio
     async def test_deletes_and_drops_from_pool(self):
-        af = _make_agent_flow()
-        fake_sandbox = MagicMock()
-        fake_sandbox.delete = MagicMock()
-        af._sandbox_pool["t1"] = fake_sandbox
+        af, client = self._setup()
 
         await af._release_sandbox("t1")
 
-        fake_sandbox.delete.assert_called_once()
-        assert "t1" not in af._sandbox_pool
+        client.delete.assert_called_once_with("sandbox-1")
+        assert "t1" not in af._sandbox_ids
+
+    @pytest.mark.asyncio
+    async def test_pool_is_dropped_before_delete(self):
+        af, client = self._setup()
+
+        def assert_cleared(_sandbox_id):
+            assert "t1" not in af._sandbox_ids
+
+        client.delete.side_effect = assert_cleared
+        await af._release_sandbox("t1")
 
     @pytest.mark.asyncio
     async def test_delete_exception_is_logged_not_raised(self, caplog):
         import logging
 
-        af = _make_agent_flow()
-        fake_sandbox = MagicMock()
-        fake_sandbox.delete = MagicMock(side_effect=Exception("delete failed"))
-        af._sandbox_pool["t1"] = fake_sandbox
+        af, client = self._setup()
+        client.delete.side_effect = Exception("delete failed")
 
         with caplog.at_level(logging.WARNING, logger="coda.agentflow.agent_flow"):
             await af._release_sandbox("t1")
 
-        assert "t1" not in af._sandbox_pool
+        assert "t1" not in af._sandbox_ids
         assert any("delete failed" in r.getMessage() for r in caplog.records)
 
 
@@ -1111,6 +1194,7 @@ class TestExecuteSingleTurn:
         ds = OmegaConf.create({
             "agent": {"name": ""},
             "reward": {},
+            "sandbox": {"type": "none"},
             "max_response_len_per_trajectory": 512,
             "completion_params": completion_params if completion_params is not None else {},
         })
@@ -1132,12 +1216,12 @@ class TestExecuteSingleTurn:
             client.post = AsyncMock(return_value=mock_resp)
             await af._execute_single_turn(traj, 0)
             body = client.post.call_args.kwargs["json"]
-        assert set(body.keys()) == {"model", "messages", "temperature", "max_tokens"}
+        assert set(body.keys()) == {"model", "messages", "max_tokens"}
         assert body["max_tokens"] == 512
 
     @pytest.mark.asyncio
-    async def test_completion_params_forwarded(self):
-        """Extra sampling params must appear in the POST body."""
+    async def test_completion_params_not_forwarded(self):
+        """Router reads sampling params from data-source config directly."""
         af, traj = self._setup(completion_params={"top_p": 0.9, "top_k": 50})
         mock_resp = MagicMock()
         mock_resp.raise_for_status = MagicMock()
@@ -1145,33 +1229,7 @@ class TestExecuteSingleTurn:
             client.post = AsyncMock(return_value=mock_resp)
             await af._execute_single_turn(traj, 0)
             body = client.post.call_args.kwargs["json"]
-        assert body["top_p"] == 0.9
-        assert body["top_k"] == 50
-
-    @pytest.mark.asyncio
-    async def test_completion_params_override_temperature(self):
-        """A temperature key inside completion_params should override the default."""
-        af, traj = self._setup(completion_params={"temperature": 0.3})
-        mock_resp = MagicMock()
-        mock_resp.raise_for_status = MagicMock()
-        with _patch_generation_client() as client:
-            client.post = AsyncMock(return_value=mock_resp)
-            await af._execute_single_turn(traj, 0)
-            body = client.post.call_args.kwargs["json"]
-        assert body["temperature"] == 0.3
-
-    @pytest.mark.asyncio
-    async def test_completion_params_none_treated_as_empty(self):
-        """None completion_params must not raise and produce a clean body."""
-        af, traj = self._setup(completion_params=None)
-        mock_resp = MagicMock()
-        mock_resp.raise_for_status = MagicMock()
-        with _patch_generation_client() as client:
-            client.post = AsyncMock(return_value=mock_resp)
-            await af._execute_single_turn(traj, 0)
-            body = client.post.call_args.kwargs["json"]
-        assert "model" in body
-        assert "messages" in body
+        assert set(body) == {"model", "messages", "max_tokens"}
 
     @pytest.mark.asyncio
     async def test_context_length_exceeded_uses_partial_response_for_reward(self):

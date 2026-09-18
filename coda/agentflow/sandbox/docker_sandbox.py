@@ -25,12 +25,12 @@ class DockerSandboxClient(SandboxClient):
             working_dir="/testbed",
             timeout=120,
         )
-        client.create()
+        sandbox_id = client.create()
         try:
-            result = client.execute("ls /testbed")
+            result = client.execute(sandbox_id, "ls /testbed")
             print(result["stdout"])
         finally:
-            client.delete()
+            client.delete(sandbox_id)
     """
 
     def __init__(
@@ -50,7 +50,6 @@ class DockerSandboxClient(SandboxClient):
         self.image = image or None
         self.working_dir = working_dir
         self.timeout = timeout
-        self._container_id: str | None = None
 
     # ------------------------------------------------------------------
     # SandboxClient interface
@@ -66,13 +65,8 @@ class DockerSandboxClient(SandboxClient):
         return cls(
             image=sandbox_config.get("image"),
             working_dir=sandbox_config.get("working_dir", "/testbed"),
-            timeout=sandbox_config.get("timeout", 120),
+            timeout=sandbox_config.get("command_exec_timeout_seconds", sandbox_config.get("timeout", 120)),
         )
-
-    @property
-    def sandbox_id(self) -> str | None:
-        """ID of the live container, or None when not created."""
-        return self._container_id
 
     def create(self, **kwargs) -> str:
         """
@@ -92,8 +86,8 @@ class DockerSandboxClient(SandboxClient):
             text=True,
             check=True,
         )
-        self._container_id = result.stdout.strip()
-        logger.info(f"Container started: {self._container_id[:12]}")
+        sandbox_id = result.stdout.strip()
+        logger.info(f"Container started: {sandbox_id[:12]}")
 
         # Create /root/.venv symlink so tool scripts with #!/root/.venv/bin/python
         # shebang can resolve to the testbed conda environment (which has chardet
@@ -101,7 +95,7 @@ class DockerSandboxClient(SandboxClient):
         # This mirrors the setup step that baidubce performs after pod creation.
         venv_result = subprocess.run(
             [
-                "docker", "exec", self._container_id,
+                "docker", "exec", sandbox_id,
                 "ln", "-sf", "/opt/miniconda3/envs/testbed", "/root/.venv",
             ],
             capture_output=True,
@@ -109,15 +103,15 @@ class DockerSandboxClient(SandboxClient):
         if venv_result.returncode != 0:
             logger.warning(
                 "Could not create /root/.venv symlink in container %s: %s",
-                self._container_id[:12],
+                sandbox_id[:12],
                 venv_result.stderr.decode(errors="replace").strip(),
             )
         else:
-            logger.debug(f"Created /root/.venv symlink in container {self._container_id[:12]}")
+            logger.debug(f"Created /root/.venv symlink in container {sandbox_id[:12]}")
 
-        return self._container_id
+        return sandbox_id
 
-    def execute(self, command: str, workdir: str | None = None, **kwargs) -> dict[str, Any]:
+    def execute(self, sandbox_id: str, command: str, workdir: str | None = None, **kwargs) -> dict[str, Any]:
         """
         Run a bash command inside the container.
 
@@ -128,16 +122,13 @@ class DockerSandboxClient(SandboxClient):
         Returns:
             Dict with stdout, stderr, exit_code, success keys.
         """
-        if not self._container_id:
-            raise RuntimeError("Sandbox not running. Call create() first.")
-
         cwd = workdir or self.working_dir
         full_cmd = f"cd {shlex.quote(cwd)} && timeout {self.timeout} {command}"
-        logger.debug(f"[{self._container_id[:12]}] {full_cmd}")
+        logger.debug(f"[{sandbox_id[:12]}] {full_cmd}")
 
         try:
             result = subprocess.run(
-                ["docker", "exec", self._container_id, "bash", "-c", full_cmd],
+                ["docker", "exec", sandbox_id, "bash", "-c", full_cmd],
                 capture_output=True,
                 text=True,
                 timeout=self.timeout + 10,
@@ -157,13 +148,7 @@ class DockerSandboxClient(SandboxClient):
             "success": result.returncode == 0,
         }
 
-    def delete(self, **kwargs) -> None:
-        """Stop and remove the container."""
-        if not self._container_id:
-            return
-        logger.info(f"Removing container {self._container_id[:12]}")
-        subprocess.run(
-            ["docker", "rm", "-f", self._container_id],
-            capture_output=True,
-        )
-        self._container_id = None
+    def delete(self, sandbox_id: str, **kwargs) -> None:
+        """Stop and remove the identified container."""
+        logger.info(f"Removing container {sandbox_id[:12]}")
+        subprocess.run(["docker", "rm", "-f", sandbox_id], capture_output=True)

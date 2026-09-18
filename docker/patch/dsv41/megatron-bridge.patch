@@ -1,0 +1,233 @@
+diff --git a/src/megatron/bridge/models/deepseek/__init__.py b/src/megatron/bridge/models/deepseek/__init__.py
+index 968868c28..5b6346d98 100644
+--- a/src/megatron/bridge/models/deepseek/__init__.py
++++ b/src/megatron/bridge/models/deepseek/__init__.py
+@@ -15,10 +15,12 @@
+ from megatron.bridge.models.deepseek.deepseek_v2_bridge import DeepSeekV2Bridge  # noqa: F401
+ from megatron.bridge.models.deepseek.deepseek_v3_bridge import DeepSeekV3Bridge  # noqa: F401
+ from megatron.bridge.models.deepseek.deepseek_v4_bridge import DeepSeekV4Bridge  # noqa: F401
++from megatron.bridge.models.deepseek.deepseek_v41_bridge import DeepSeekV41Bridge  # noqa: F401
+ 
+ 
+ __all__ = [
+     "DeepSeekV2Bridge",
+     "DeepSeekV3Bridge",
+     "DeepSeekV4Bridge",
++    "DeepSeekV41Bridge",
+ ]
+diff --git a/src/megatron/bridge/models/deepseek/deepseek_v41_bridge.py b/src/megatron/bridge/models/deepseek/deepseek_v41_bridge.py
+new file mode 100644
+index 000000000..231bf500a
+--- /dev/null
++++ b/src/megatron/bridge/models/deepseek/deepseek_v41_bridge.py
+@@ -0,0 +1,155 @@
++# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++
++"""Bridge for the DeepSeek-V4.1 (Flash) model family.
++
++DeepSeek-V4.1 shares the DeepSeek-V4 checkpoint serialisation (flat ``embed`` /
++``head`` / ``layers.N.attn.*`` / ``layers.N.ffn.*`` / ``layers.N.hc_*`` names)
++but is a distinct attention variant: per-layer compress ratios are {0,1,2}
++(vs V4's {0,4,128}), the sparse retrieval splits into separate KV-source and
++index-source layers with a two-level candidate-block pass, and each of two
++layers carries an additive n-gram "engram" memory. The V4.1 model math lives in
++``megatron.core.transformer.experimental_attention_variant.dsv41`` (registered as
++the ``dsv41_hybrid`` attention variant) and is wired in
++via ``get_dsv41_block_spec``; this bridge only maps the HF config and weight names on
++top of the V4 bridge.
++"""
++
++import logging
++
++from megatron.core.models.gpt.gpt_model import GPTModel
++
++from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
++from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
++from megatron.bridge.models.conversion.param_mapping import AutoMapping, ColumnParallelMapping, ReplicatedMapping
++from megatron.core.transformer.experimental_attention_variant.dsv41.deepseek_v41 import (
++    apply_v41_config,
++    get_dsv41_block_spec,
++)
++from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
++from megatron.bridge.models.mla_provider import MLAModelProvider
++
++from .deepseek_v4_bridge import DeepSeekV4Bridge
++from .deepseek_v41_config import register_deepseek_v41_config
++
++logger = logging.getLogger(__name__)
++
++# Make the checkpoint's `model_type: deepseek_v41` loadable by AutoConfig. This runs at
++# import of the deepseek bridge package, which `AutoBridge` triggers before it calls
++# AutoConfig.from_pretrained, so `AutoBridge.from_hf_pretrained` can dispatch V4.1.
++register_deepseek_v41_config()
++
++
++@MegatronModelBridge.register_bridge(
++    source="DeepseekV41ForCausalLM",
++    target=GPTModel,
++    provider=MLAModelProvider,
++    model_type="deepseek_v41",
++)
++class DeepSeekV41Bridge(DeepSeekV4Bridge):
++    """Megatron Bridge for DeepSeek-V4.1 causal language models.
++
++    Reuses the V4 provider/mapping and overrides only the V4.1 deltas:
++      * the transformer block is built by the V4.1 spec (``get_dsv41_block_spec``),
++        which swaps in the tilelang sparse-MLA attention, the engram gate, the
++        two-level indexer and the hyper-connection stream mixing;
++      * ``apply_v41_config`` copies the V4.1-only HF fields (kv/index source
++        layers, candidate-block params, engram params) onto the provider as
++        ``v41_*`` attributes;
++      * the indexer head count comes from ``index_n_heads`` (32 for V4.1);
++      * hash-MoE is disabled (``moe_n_hash_layers = 0``); V4.1 has no hash layers;
++      * ``v41_hf_checkpoint`` is recorded so the engram tables can be mmapped.
++    """
++
++    def provider_bridge(self, hf_pretrained: PreTrainedCausalLM) -> MLAModelProvider:
++        provider = super().provider_bridge(hf_pretrained)
++        hf_config = hf_pretrained.config
++
++        # V4.1 builds its block spec with the ported plugin, not the stock
++        # experimental-attention-variant builder. get_dsv41_block_spec runs the
++        # standard block scaffolding (the selector now dispatches "dsv41_hybrid" to
++        # the V4.1 attention natively), then swaps in the V4.1 layer / hyper-connection
++        # classes.
++        provider.experimental_attention_variant = "dsv41_hybrid"
++        provider.transformer_layer_spec = get_dsv41_block_spec
++
++        # V4.1-only config fields -> provider.v41_* (read by the ported modules).
++        apply_v41_config(provider, hf_config)
++
++        # Record the checkpoint path for the engram tables (mmapped per layer).
++        ckpt_path = getattr(hf_pretrained, "name_or_path", None) or getattr(
++            hf_pretrained, "model_name_or_path", None
++        )
++        provider.v41_hf_checkpoint = ckpt_path
++
++        # V4.1 indexer uses 32 heads (V4 used 64); the rest of the DSA indexer
++        # geometry (head_dim, topk) already matches via the V4 bridge.
++        provider.dsa_indexer_n_heads = hf_config.index_n_heads  # 32
++
++        # V4.1 has no hash-routed MoE layers (unlike V4-Flash's leading 3).
++        provider.moe_n_hash_layers = 0
++
++        # V4.1 runs its own tilelang sparse-MLA kernels inside the plugin, so it
++        # must NOT go through megatron's cuDNN/tilelang DSA kernel backend.
++        provider.dsa_kernel_backend = "none"
++        provider.apply_dsa_kernel_fusion = None
++
++        # V4.1 clamps the shared-expert activation too.
++        provider.activation_func_clamp_value = getattr(hf_config, "swiglu_limit", provider.activation_func_clamp_value)
++
++        return provider
++
++    def mapping_registry(self) -> MegatronMappingRegistry:
++        """V4 weight-name mapping, with the indexer entries replaced for V4.1 and
++        the engram parameters added.
++
++        V4's indexer has a nested compressor and uses the ``indexer.scorer.weights_proj``
++        name; V4.1's indexer is flat (``wq_b`` / ``weights_proj`` / ``wk`` / ``k_norm``).
++        We drop all inherited ``*.indexer.*`` mappings and supply the V4.1 ones, then add
++        the three engram parameters (the fp8 embed table itself is loaded by the engram
++        module, not as a parameter, so it is not mapped here).
++
++        V4.1 also shards ``linear_o_group_proj`` across TP (dim 0), whereas V4 replicates it,
++        so that mapping is replaced with a column-parallel one.
++        """
++        def _keep(m):
++            mp = m.megatron_param
++            return ".indexer." not in mp and "linear_o_group_proj" not in mp
++
++        base = [m for m in super().mapping_registry().get_all_mappings() if _keep(m)]
++
++        # V4.1 grouped output projection is TP-sharded on dim 0 (n_local_groups = o_groups // TP).
++        o_group_mapping = [
++            ColumnParallelMapping(
++                "decoder.layers.*.self_attention.linear_o_group_proj",
++                "layers.*.attn.wo_a.weight",
++            ),
++        ]
++
++        indexer_prefix = "decoder.layers.*.self_attention.core_attention.indexer"
++        indexer_mappings = [
++            # all replicated in V4.1 (linear_wq_b/weights_proj are parallel_mode="duplicated",
++            # linear_wk is a plain nn.Linear, k_norm is an RMSNorm) -> no TP sharding.
++            ReplicatedMapping(f"{indexer_prefix}.linear_wq_b.weight", "layers.*.attn.indexer.wq_b.weight"),
++            ReplicatedMapping(f"{indexer_prefix}.linear_weights_proj.weight", "layers.*.attn.indexer.weights_proj.weight"),
++            ReplicatedMapping(f"{indexer_prefix}.linear_wk.weight", "layers.*.attn.indexer.wk.weight"),
++            ReplicatedMapping(f"{indexer_prefix}.k_norm.weight", "layers.*.attn.indexer.k_norm.weight"),
++        ]
++
++        # Engram (n-gram memory) params, present only on engram layers. The host FP8
++        # embedding table itself is loaded by the engram module (not a parameter).
++        engram_mappings = [
++            AutoMapping("decoder.layers.*.v41_engram.linear_wkv.weight", "layers.*.engram.wkv.weight"),
++            ReplicatedMapping("decoder.layers.*.v41_engram.q_weight", "layers.*.engram.q_weight"),
++            ReplicatedMapping("decoder.layers.*.v41_engram.k_weight", "layers.*.engram.k_weight"),
++        ]
++        return MegatronMappingRegistry(*base, *o_group_mapping, *indexer_mappings, *engram_mappings)
+diff --git a/src/megatron/bridge/models/deepseek/deepseek_v41_config.py b/src/megatron/bridge/models/deepseek/deepseek_v41_config.py
+new file mode 100644
+index 000000000..d48d535ea
+--- /dev/null
++++ b/src/megatron/bridge/models/deepseek/deepseek_v41_config.py
+@@ -0,0 +1,49 @@
++# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++
++"""HF ``AutoConfig`` registration for DeepSeek-V4.1.
++
++``transformers`` (5.6) knows ``deepseek_v3`` and ``deepseek_v4`` natively but not
++``deepseek_v41``. V4.1's config schema is closest to V3 (a flat DeepSeek config with
++extra V4.1 fields), so we register a compat class based on ``DeepseekV3Config``.
++
++We deliberately do NOT base it on ``DeepseekV4Config``: that class's ``__post_init__``
++maps ``compress_ratios`` -> ``layer_types`` through a table that only knows V4's
++ratios {0,4,128} and raises ``KeyError`` on V4.1's {0,1,2}.
++
++Extra V4.1 fields (index/kv source layers, candidate-block params, engram params,
++compress ratios, o_groups/o_lora_rank, ...) are stored as plain attributes by
++``PretrainedConfig`` and read by the bridge via ``getattr``.
++"""
++
++from transformers import AutoConfig
++from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
++
++
++class DeepseekV41Config(DeepseekV3Config):
++    """DeepSeek-V4.1 HF config (V3 schema + V4.1 fields carried as attributes)."""
++
++    model_type = "deepseek_v41"
++
++    def __init__(self, **kwargs):
++        # DeepseekV3Config.__init__ folds a top-level ``rope_theta`` into
++        # ``rope_scaling``/``rope_parameters`` and drops the standalone attribute,
++        # but the DeepSeek-V4 bridge reads ``hf_config.rope_theta`` eagerly. Preserve it.
++        rope_theta = kwargs.get("rope_theta", 10000.0)
++        super().__init__(**kwargs)
++        if not hasattr(self, "rope_theta") or self.rope_theta is None:
++            self.rope_theta = rope_theta
++
++
++def register_deepseek_v41_config() -> None:
++    """Register the ``deepseek_v41`` model type with ``AutoConfig`` (idempotent)."""
++    AutoConfig.register("deepseek_v41", DeepseekV41Config, exist_ok=True)

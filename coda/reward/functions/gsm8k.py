@@ -98,7 +98,7 @@ class GSM8KReward(RewardFunction):
         super().__init__(config)
         self.tolerance = self.config.get("tolerance", 1e-6)
 
-    def __call__(self, messages: list[dict], label, **kwargs) -> Reward:
+    def __call__(self, messages: list[dict], label, context: dict | None = None, **kwargs) -> Reward:
         """Compute reward by comparing the last assistant answer to the label."""
         logger.info(f"GSM8KReward.__call__ label is : {label}")
         if isinstance(label, dict):

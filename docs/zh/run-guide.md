@@ -128,12 +128,12 @@ opd.teachers的 `hf_path` 始终必填，但只用于按其 `config.json` 建 Me
 hf download sgl-project/DeepSeek-V4-Flash-FP8 --local-dir /root/DeepSeek-V4-Flash-FP8
 hf download R2E-Gym/R2E-Gym-Subset --repo-type=dataset --local-dir /root/R2E-Gym-Subset
 
-python examples/convert_dsv4_fp8_to_bf16.py \
+python examples/convert_dsv4_to_bf16.py \
   --input-fp8-hf-path /root/DeepSeek-V4-Flash-FP8 \
   --output-bf16-hf-path /root/DeepSeek-V4-Flash-BF16
 ```
 
-转换完成后，准备 SWE rollout 使用的 K8s 沙箱所需的 kubeconfig。可将 kubeconfig 放到 `k8s/kubeconfig.yaml`（`agentflow.sandbox.kubeconfig` 的默认路径），或在启动命令中覆盖。然后启动 8 机 H20 预设 [`dsv4_flash_bf16/swe_h20_8node`](../../conf/dsv4_flash_bf16/swe_h20_8node.yaml)：先在所有节点拉起 Ray 集群，再仅从 head 节点提交训练任务。
+转换完成后，准备 SWE rollout 使用的 K8s 沙箱所需的 kubeconfig。可将 kubeconfig 放到 `k8s/kubeconfig.yaml`（该预设配置的路径），或在启动命令中覆盖。然后启动 8 机 H20 预设 [`dsv4_flash_bf16/swe_h20_8node`](../../conf/dsv4_flash_bf16/swe_h20_8node.yaml)：先在所有节点拉起 Ray 集群，再仅从 head 节点提交训练任务。
 
 ```bash
 # 在每台机器上执行同一条命令
@@ -144,7 +144,7 @@ bash examples/start.sh dsv4_flash_bf16/swe_h20_8node \
   checkpoint_path=/root/ckpt/dsv4_swe \
   hf_model_path=/root/DeepSeek-V4-Flash-BF16 \
   data_source.dataset.prompt_data_path=/root/R2E-Gym-Subset \
-  agentflow.sandbox.kubeconfig=/path/to/kubeconfig.yaml
+  data_source.sandbox.kubeconfig=/path/to/kubeconfig.yaml
 ```
 
 `checkpoint_path` 与 `hf_model_path` 需放在所有节点都能通过相同路径访问的存储上。
@@ -172,7 +172,7 @@ bash examples/start.sh qwen3_coder_30b_a3b/opencode_h20_4node \
   checkpoint_path=/root/ckpt/opencode \
   hf_model_path=/root/Qwen3-Coder-30B-A3B-Instruct \
   data_source.dataset.prompt_data_path=/root/R2E-Gym-OpenCode/R2E_Gym_Subset_opencode.parquet \
-  agentflow.sandbox.kubeconfig=/path/to/kubeconfig.yaml
+  data_source.sandbox.kubeconfig=/path/to/kubeconfig.yaml
 ```
 
 提示：各预设继承 [`default.yaml`](../../conf/default.yaml)，[`conf/qwen3_30b_a3b/`](../../conf/qwen3_30b_a3b/) 这类子目录是特定模型与机型的预设。更多可用配置见 [`conf/`](../../conf/)。
@@ -219,12 +219,13 @@ tail -f log/trainer_*.log
 | `data_source.num_trajectories_per_prompt` | `8` | 每个 prompt 组采样的轨迹条数 |
 | `data_source.agent.name` | `null`（单轮） | Agent 实现名，多轮场景必须配置 |
 | `data_source.reward.name` | 必填 | 奖励函数名（参数见各 reward 插件） |
+| `data_source.sandbox.type` | `none` | 每数据源的 sandbox 后端；执行 shell 的 agent 使用 `k8s`/`docker` |
 | `data_source.max_response_len_per_trajectory` | `32768` | 每条轨迹响应区 token 上限 |
 
 `data_source` 是单个数据源的默认值模板，`data_sources` 是实际使用的列表，默认展开为
 `[${data_source}]`（即单数据源）。单数据源用 `data_source.` 前缀覆盖；多数据源用
-`data_sources.<下标>.` 前缀或显式写列表。两种渠道等价：命令行 `key=value`（追加在
-`start.sh` 配置名之后）或 experiment yaml。
+`data_sources.<下标>.` 前缀或显式写列表。agent、reward 与 sandbox 均按数据源选择。两种
+覆盖渠道等价：命令行 `key=value`（追加在 `start.sh` 配置名之后）或 experiment yaml。
 
 **单数据源 · 命令行**
 
@@ -391,6 +392,7 @@ checkpoint_path/
 | | `opencode_h20_4node` | Qwen3-Coder-30B-A3B | OpenCode（R2E-Gym）（任务五）| 4 节点 xH20 |
 | `conf/dsv4_flash_bf16/` | `swe_h20_8node` / `swe_gb200_8node` | DeepSeek-V4-Flash-BF16 | SWE（任务四）| 8xH20 / 8xGB200 |
 | | `dapo_h20_6node` / `dapo_gb200_8node` | DeepSeek-V4-Flash-BF16 | DAPO 数学 | 6xH20 / 8xGB200 |
+| `conf/dsv41_flash_bf16/` | `dapo_b200_5node` | DeepSeek-V4.1-Flash-BF16 | DAPO 数学 | 5 节点 xB200 |
 
 
 ## 相关文档

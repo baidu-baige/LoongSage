@@ -36,7 +36,7 @@ Switches that turn on the "rollout runs concurrently with training" pipeline. Se
 
 ## 3. Data sources (`data_source` / `data_sources`)
 
-`data_source` defines the default fields for a single data source; `data_sources` is the actual list used at runtime. Each list element inherits from `data_source` and may override individual fields. Fully-async mode currently supports exactly one data source.
+`data_source` defines the default fields for a single data source; `data_sources` is the actual list used at runtime. Each list element inherits from `data_source` and may override individual fields, including its own `sandbox` backend. Fully-async mode currently supports exactly one data source.
 
 ### 3.1 `dataset` sub-node
 
@@ -62,9 +62,24 @@ Switches that turn on the "rollout runs concurrently with training" pipeline. Se
 | `max_response_len_per_trajectory` | `32768` | Cap on response-area tokens (LLM replies + tool responses) per attempt. Single-turn uses this as request `max_tokens`; multi-turn agents receive this and pick their own per-call `max_tokens`. | Must be `<= max_total_tokens - prompt_len` on the inference engine. |
 | `num_prompts_per_step` | `64` | Number of prompt groups `B` consumed per training step. | `B × N` must be divisible by `trainer.mini_batch_size`, where `N = num_trajectories_per_prompt`; additionally `B % (dp_size × num_mini_batch) == 0` — see [11.9](#119-dp-and-batch-sizes). |
 | `num_trajectories_per_prompt` | `8` | Trajectories per prompt `N`, i.e. the GRPO group size. | Group-level advantage normalization requires equal group sizes. |
-| `completion_params` | `{}` | Sampling params forwarded to the inference engine (e.g. `top_p`, `top_k`, `temperature`). | Empty dict means use the engine defaults. This dict is spread **last** into the request body, so a `temperature` here overrides `trainer.temperature`. |
+| `completion_params` | `{}` | Native SGLang `/generate` `sampling_params` applied by Router for this data source (e.g. `top_p`, `top_k`, `min_p`). | Agents and protocol requests cannot override these values. Router owns `temperature` and `max_new_tokens`; for DeepSeek-V4/V4.1 it also forces `skip_special_tokens=false`. |
 
 `data_sources` defaults to `[${data_source}]`, i.e. a single data source. For multiple data sources, spell out the list explicitly in your experiment yaml — each element **independently** inherits from `data_source`.
+
+### 3.3 `sandbox` sub-node
+
+Sandbox backend configuration belongs to a data source. Set it on the single-source template as `data_source.sandbox`, or override it independently as `data_sources[i].sandbox`. `type: none` disables sandbox use for that data source.
+
+| Field | Default | Description | Constraints |
+| --- | --- | --- | --- |
+| `sandbox.type` | `none` | Sandbox backend for this data source. | One of `none` / `k8s` / `docker` / a registered custom type. An agent that requires a sandbox needs a non-`none` backend. |
+| `sandbox.command_exec_timeout_seconds` | not set | Timeout for one command inside the sandbox (seconds). | Backend-specific; the built-in K8s fallback is 120 seconds. |
+| `sandbox.sandbox_creation_timeout_seconds` | not set | Sandbox-instance creation timeout (seconds). | Backend-specific; the built-in K8s fallback is 120 seconds. |
+| `sandbox.working_dir` | not set | Default working directory inside the sandbox. | Backend default: `/rl-sandbox` for K8s, `/testbed` for Docker. An agent may override it per command. |
+| `sandbox.kubeconfig` | not set | Path to the K8s kubeconfig. | Relative paths resolve against the project `conf/` directory; absolute paths are used as-is. Applies to `type: k8s`. |
+| `sandbox.pod_manifest_path` | not set | Path to the K8s sandbox pod template. | Relative paths resolve against the project `conf/` directory; absolute paths are used as-is. Applies to `type: k8s`. |
+
+`SandboxClient` is a stateless backend connector: `create()` returns an ID, while `execute()` and `delete()` receive that ID explicitly. Sandbox agents use the injected client and ID directly, creating on first use when the ID is `None`. AgentFlow retains the ID for partial resume and deletes it at terminal state. A reward with `prepare_sandbox()` is prepared before agent execution.
 
 ## 4. Rollout (inference & sampling)
 
@@ -124,7 +139,7 @@ Controls the SGLang inference cluster, the sampler, filters and eval.
 
 ## 5. AgentFlow
 
-Agent-side router, tokenizer and sandbox. Multi-turn agents forward requests to SGLang through `AgentFlow.router`, which also manages the tokenizer and code sandbox.
+Agent-side Router and tokenizer settings, plus framework-level trajectory dumping. Sandbox backends now live under each data source's `sandbox` sub-node; see [3.3](#33-sandbox-sub-node).
 
 ### 5.1 router
 
@@ -148,17 +163,6 @@ Agent-side router, tokenizer and sandbox. Multi-turn agents forward requests to 
 | `agentflow.tokenizer.generation_prompt_kwargs` | `{}` | kwargs forwarded to the tokenizer's `apply_chat_template`. | Common use: enable thinking with `enable_thinking: true`. |
 | `agentflow.tokenizer.manager.mode` | `thread` | Tokenizer concurrency mode. | Currently `thread` is the primary mode. |
 | `agentflow.tokenizer.manager.num_workers` | `8` | Number of concurrent tokenize workers. | Tune with rollout concurrency and CPU count. |
-
-### 5.3 sandbox
-
-| Field | Default | Description | Constraints |
-| --- | --- | --- | --- |
-| `agentflow.sandbox.type` | `k8s` | Sandbox type. | `k8s` is the primary supported backend. |
-| `agentflow.sandbox.command_exec_timeout_seconds` | `600` | Timeout for a single command inside the sandbox (seconds). | — |
-| `agentflow.sandbox.sandbox_creation_timeout_seconds` | `600` | Sandbox creation timeout (seconds). | — |
-| `agentflow.sandbox.working_dir` | `/rl-sandbox` | Working directory inside the sandbox. | — |
-| `agentflow.sandbox.kubeconfig` | `k8s/kubeconfig.yaml` | Path to the k8s kubeconfig. | Relative paths resolve against the project `conf/` directory; absolute paths are used as-is. |
-| `agentflow.sandbox.pod_manifest_path` | `k8s/pod_manifest.yaml` | Path to the sandbox pod template. | Relative paths resolve against the project `conf/` directory; absolute paths are used as-is. |
 
 ## 6. Tracking
 
@@ -307,7 +311,7 @@ The `trainer` node controls batch organization, precision, timeouts and checkpoi
 | `trainer.use_rollout_log_probs` | `false` | Use `rollout_log_probs` returned by the inference engine instead of re-computing `old_log_probs` on the training side. | Mutually exclusive with IS correction and M2PO. |
 | `trainer.use_rollout_routing_replay` | `false` | Replay MoE routing recorded on the inference side. | Used to align rollout / training MoE routing. |
 | `trainer.use_fp32_lm_head` | `false` | Compute the LM head in FP32. | Enable in precision-sensitive settings. |
-| `trainer.temperature` | `1.0` | Sampling temperature. Eval rounds use `rollout.eval.temperature` instead when it is not `null`. | This value is overridden by `data_source.completion_params.temperature`, which is spread last into the request body. |
+| `trainer.temperature` | `1.0` | Sampling temperature. Eval rounds use `rollout.eval.temperature` instead when it is not `null`. | Router owns this value; `completion_params.temperature` is ignored. |
 | `trainer.mini_batch_size` | `64` | Trajectories `M` consumed per optimizer step. `num_mini_batch = (B × N) / M`. | `(B × N) % M == 0`; and every data source must satisfy `num_prompts_per_step % (dp_size × num_mini_batch) == 0`. Both are validated at startup, after which `M % dp_size == 0` holds automatically. See [11.9](#119-dp-and-batch-sizes). |
 | `trainer.micro_batch_size` | `8` | Samples per forward per GPU. | Only when `use_dynamic_batch_size: false` is `mini_batch_size % micro_batch_size == 0` required; with dynamic batching this field is ignored. |
 | `trainer.max_tokens_per_gpu` | `16440` | Per-GPU token cap for dynamic batching. | Only used when `use_dynamic_batch_size: true`. |
@@ -351,6 +355,7 @@ The dependencies below span multiple sections and are the most common pitfalls w
 
 - `rollout.mask_offpolicy_in_partial_rollout: true` is only meaningful when `rollout.partial: true` (otherwise there are no resumed partial trajectories to mask).
 - Long trajectories or multi-turn agents typically benefit from `rollout.partial: true`, which cuts the long-tail wait at step boundaries.
+- For a sandbox-backed trajectory, AgentFlow preserves the same sandbox ID and opaque sandbox state across partial resume, then deletes the instance at terminal state.
 
 ### 11.5 SGLang PD disaggregation
 

@@ -11,7 +11,7 @@ import ray
 import copy
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS 
 from coda.utils.health_monitor import RolloutHealthMonitor
-from coda.utils.channel_helper import ChannelMeta
+from coda.transfer_mesh import ChannelMeta
 from coda.backends.sglang.engine import SglangEngine
 from coda.backends.replica_group import ReplicaGroup
  
@@ -67,6 +67,8 @@ class RolloutManager:
             num_nodes = replica_cfg.num_nodes
             num_gpu_per_engine = min(num_gpus_per_replica, num_gpus_per_node)
             num_engines = num_nodes * num_gpus_per_node // num_gpu_per_engine
+            if num_engines == 0:
+                continue
 
             replica_group = ReplicaGroup(
                 config=self.config,
@@ -115,12 +117,16 @@ class RolloutManager:
         for r in self.replica_groups:
             r.num_new_engines = 0
  
-    def offload(self):
-        """Offload all rollout engines to free memory."""
+    def offload(self, tags: list[str] | None = None):
+        """Offload all rollout engines to free memory.
+
+        Args:
+            tags: Memory tags to release (e.g. kv_cache, cuda_graph). None releases all.
+        """
         self._health_monitoring_pause()
         handles = []
         for g in self.replica_groups:
-            handles.extend(g.offload())
+            handles.extend(g.offload(tags))
         return ray.get(handles) if handles else []
 
     def onload(self, tags: list[str] | None = None):
@@ -135,6 +141,10 @@ class RolloutManager:
         result = ray.get(handles) if handles else []
         return result
  
+    def offload_kv(self):
+        """Release only the KV cache (and the cuda graphs sharing that budget)."""
+        self.offload(tags=[GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH])
+
     def onload_weights(self):
         """Onload only the weights for all rollout engines."""
         self.onload(tags=[GPU_MEMORY_TYPE_WEIGHTS])

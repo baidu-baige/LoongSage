@@ -1,87 +1,41 @@
-"""HTTP Middleware for proxying Chat Completion requests to an LLM worker and saving Trajectories."""
+"""HTTP middleware for adapting client requests to SGLang and saving trajectories."""
 
 import asyncio
 import http
 import json
 import logging
-import re
-import time
 import traceback
 from collections import Counter, defaultdict
 from typing import Any, Callable, cast
 
 from fastapi import status
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 from starlette.types import ASGIApp
 
-from coda.agentflow.tokenizer_manager import DEEPSEEK_V4_MODEL_FAMILY
+from coda.agentflow.tokenizer_manager import DEEPSEEK_OFFICIAL_ENCODER_MODULES
 from coda.agentflow.trajectory_store import TrajectoryStore
 from coda.agentflow.utils import CONTEXT_LENGTH_EXCEEDED, build_request_id
 from .parser import TrajectoryParser, TurnInputContext
+from .protocols import PROTOCOL_ADAPTERS, ProtocolAdapter
 
 logger = logging.getLogger(__name__)
 ParserConfig = str | bool | dict[str, Any] | None
 
-_CHAT_COMPLETIONS_ROUTE_RE = re.compile(
-    r"^/(?P<trajectory_id>[^/]+)/(?P<attempt_id>\d+)/v1/chat/completions$"
-)
-
-# OpenAI chat/completions field → SGLang sampling_params field.
-# Mirrors ChatCompletionRequest.to_sampling_params() in SGLang.
-# None values are dropped to avoid overriding server-side defaults.
-_SAMPLING_PARAM_MAP: tuple[tuple[str, str], ...] = (
-    # ── Standard OpenAI ──────────────────────────────────────────────────
-    ("temperature",        "temperature"),
-    ("top_p",              "top_p"),
-    ("presence_penalty",   "presence_penalty"),
-    ("frequency_penalty",  "frequency_penalty"),
-    ("stop",               "stop"),
-    ("seed",               "sampling_seed"),
-    ("logit_bias",         "logit_bias"),
-    # ── SGLang extensions (present in ChatCompletionRequest) ──────────────
-    ("top_k",              "top_k"),
-    ("min_p",              "min_p"),
-    ("min_tokens",         "min_new_tokens"),
-    ("repetition_penalty", "repetition_penalty"),
-    ("stop_token_ids",     "stop_token_ids"),
-    ("stop_regex",         "stop_regex"),
-    ("no_stop_trim",       "no_stop_trim"),
-    ("ignore_eos",         "ignore_eos"),
-    ("skip_special_tokens", "skip_special_tokens"),
-    ("regex",              "regex"),
-    ("ebnf",               "ebnf"),
-    ("custom_params",      "custom_params"),
-)
-
-# OpenAI chat/completions field → SGLang GenerateReqInput top-level field.
-# These live outside sampling_params in the /generate request body.
-# Uses tuple-of-tuples (same as _SAMPLING_PARAM_MAP) to support field renames.
-_GENERATE_FIELD_MAP: tuple[tuple[str, str], ...] = (
-    ("lora_path",              "lora_path"),
-    ("logprob_start_len",      "logprob_start_len"),
-    ("top_logprobs",           "top_logprobs_num"),    # OpenAI name → SGLang name
-    ("return_hidden_states",   "return_hidden_states"),
-    ("custom_logit_processor", "custom_logit_processor"),
-    ("priority",               "priority"),
-    ("extra_key",              "extra_key"),
-    ("data_parallel_rank",     "data_parallel_rank"),
-    ("bootstrap_host",         "bootstrap_host"),
-    ("bootstrap_port",         "bootstrap_port"),
-    ("bootstrap_room",         "bootstrap_room"),
-)
+_ADAPTERS: tuple[ProtocolAdapter, ...] = PROTOCOL_ADAPTERS
 
 
 class ParserMiddleware(BaseHTTPMiddleware):
-    """Intercept OpenAI chat-completions requests and write training trajectories."""
+    """Adapt supported client protocols and write token-aligned trajectories."""
 
     _filter_headers: Callable[[dict[str, str]], dict[str, str]]
 
     def __init__(
         self,
         app: ASGIApp,
+        config: Any,
         trajectory_store: TrajectoryStore | None = None,
         tokenizer_manager: Any = None,
         accumulate_reasoning: bool = False,
@@ -94,6 +48,8 @@ class ParserMiddleware(BaseHTTPMiddleware):
         super().__init__(app)
         from coda.agentflow.router.router import filter_headers
         self._filter_headers = filter_headers
+        self.train_temperature = config.trainer.temperature
+        self.eval_temperature = config.rollout.eval.temperature
         self.r3_enabled = r3_enabled
         self.inflight_requests = inflight_requests
         self.ds_configs = ds_configs
@@ -109,18 +65,24 @@ class ParserMiddleware(BaseHTTPMiddleware):
         )
 
     async def dispatch(self, request: Request, call_next):
-        """Intercept chat-completions requests; pass all others through."""
-        match = _CHAT_COMPLETIONS_ROUTE_RE.fullmatch(request.url.path)
-        if match is None:
+        """Intercept a recognized-protocol request; pass all others through."""
+        path = request.url.path
+        adapter: ProtocolAdapter | None = None
+        for candidate in _ADAPTERS:
+            if candidate.parse_route(path) is not None:
+                adapter = candidate
+                break
+        if adapter is None:
             return await call_next(request)
-        trajectory_id, attempt_id = match.group("trajectory_id"), int(match.group("attempt_id"))
+
+        trajectory_id, attempt_id = adapter.parse_route(path)
         request_id = build_request_id(trajectory_id, attempt_id)
+        normalized_headers = adapter.normalize_headers(request)
 
         # 1. Parse and validate request
         try:
             request_body = cast(dict[str, Any], json.loads(await request.body()))
-            messages = cast(list[dict[str, Any]], request_body["messages"])
-            tools = request_body.get("tools")
+            messages, tools = adapter.parse_request(request_body)
             if not messages:
                 raise ValueError("messages is empty")
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
@@ -132,8 +94,7 @@ class ParserMiddleware(BaseHTTPMiddleware):
 
         trajectory = self.parser.get_trajectory(trajectory_id, attempt_id)
         assert trajectory is not None, f"trajectory {trajectory_id} not found"
-        # Distinguishes a context-compaction prefix mismatch from a subagent fork;
-        request_kind = request.headers.get("request_kind")
+        request_kind = normalized_headers.get("request_kind")
 
         # Serialize concurrent requests (e.g. litellm retries) for the same trajectory
         # to prevent build_turn_input/prune_think and update_trajectory from racing.
@@ -148,7 +109,6 @@ class ParserMiddleware(BaseHTTPMiddleware):
                 turn_ctx = await self.parser.build_turn_input(
                     trajectory, messages=messages, tools=tools, request_kind=request_kind,
                 )
-
                 # Enforce max_response_len_per_trajectory: compare response-area length against the budget.
                 # response_area = everything after the initial prompt (LLM replies + tool responses).
                 seg = (
@@ -168,44 +128,44 @@ class ParserMiddleware(BaseHTTPMiddleware):
                 ds_config = self.ds_configs[trajectory.ds_index]
                 max_response_len = int(ds_config.max_response_len_per_trajectory)
                 context_length = int(ds_config.get("agent", {}).get("context_length", 0))
-                remaining_response = max_response_len - response_area
-                remaining_context = (
-                    context_length - len(turn_ctx.input_ids) if context_length > 0 else None
+                # Generation is capped by the tighter of the two trajectory budgets.
+                # The message reports both so logs show which one bound it.
+                budget = max_response_len - response_area
+                if context_length > 0:
+                    budget = min(budget, context_length - len(turn_ctx.input_ids))
+                budget_exhausted = (
+                    "generation budget exhausted: "
+                    f"max_response_len_per_trajectory={max_response_len} "
+                    f"(response_area={response_area}), "
+                    f"context_length={context_length} "
+                    f"(input_len={len(turn_ctx.input_ids)})"
                 )
-                remaining = (
-                    min(remaining_response, remaining_context)
-                    if remaining_context is not None
-                    else remaining_response
-                )
-                if remaining <= 0:
-                    if remaining_context is not None and remaining_context <= remaining_response:
-                        message = (
-                            f"context_length={context_length} exhausted "
-                            f"(input_len={len(turn_ctx.input_ids)})"
-                        )
-                    else:
-                        message = (
-                            "max_response_len_per_trajectory="
-                            f"{max_response_len} exhausted "
-                            f"(response_area={response_area})"
-                        )
-                    return JSONResponse(
-                        {"error": {"message": message, "type": CONTEXT_LENGTH_EXCEEDED}},
+                if budget <= 0:
+                    return adapter.build_error_response(
+                        request_body,
+                        error_type=CONTEXT_LENGTH_EXCEEDED,
+                        message=budget_exhausted,
                         status_code=http.HTTPStatus.BAD_REQUEST,
                     )
-                req_max = (request_body.get("max_tokens")
-                           or request_body.get("max_completion_tokens")
-                           or request_body.get("max_new_tokens") or 0)
-                if req_max > remaining:
-                    request_body["max_tokens"] = remaining
-                    request_body.pop("max_completion_tokens", None)
-                    request_body.pop("max_new_tokens", None)
+                # The client's own cap applies only when tighter than the budget.
+                request_max_new_tokens = request_body.get("max_new_tokens")
+                max_new_tokens = (
+                    request_max_new_tokens
+                    if request_max_new_tokens is not None and 0 < request_max_new_tokens < budget
+                    else budget
+                )
+                # A "length" finish is only a failure when the router shrank the cap
+                # below what the client asked for; getting exactly the requested
+                # length back is a normal stop.
+                budget_capped = not request_max_new_tokens or max_new_tokens < request_max_new_tokens
 
                 request.state.upstream_body = self._build_generate_body(
-                    request_body,
                     turn_ctx.input_ids,
-                    request_id=build_request_id(trajectory_id, attempt_id),
+                    completion_params=ds_config.get("completion_params", {}),
+                    request_id=request_id,
+                    max_new_tokens=max_new_tokens,
                     routed_experts_start_len=turn_ctx.routed_experts_start_len,
+                    is_eval=trajectory.is_eval,
                 )
 
                 # 2. Forward to LLM worker and parse response
@@ -217,13 +177,17 @@ class ParserMiddleware(BaseHTTPMiddleware):
                 if isinstance(parsed_response, Response):
                     return parsed_response
                 payload, response_json, assistant_message, finish_reason_override = parsed_response
+                finish_reason = self._finish_reason(
+                    response_json, finish_reason_override
+                )
 
-                final_content = self._to_openai_response(
+                final_content = adapter.build_response(
                     request_body,
-                    response_json,
                     assistant_message,
-                    payload.weight_version,
-                    finish_reason_override,
+                    finish_reason,
+                    self._usage(response_json),
+                    path=path,
+                    upstream_response=response_json,
                 )
 
                 # 3. Persist trajectory state.
@@ -240,6 +204,13 @@ class ParserMiddleware(BaseHTTPMiddleware):
                         "[update] trajectory write failed for %s, state may be inconsistent: %s",
                         trajectory_id, e, exc_info=True,
                     )
+                if finish_reason == "length" and budget_capped:
+                    return adapter.build_error_response(
+                        request_body,
+                        error_type=CONTEXT_LENGTH_EXCEEDED,
+                        message=budget_exhausted,
+                        status_code=http.HTTPStatus.BAD_REQUEST,
+                    )
         finally:
             if self.inflight_requests is not None:
                 # Always remove this request from inflight, even if handling is cancelled.
@@ -248,7 +219,7 @@ class ParserMiddleware(BaseHTTPMiddleware):
             self._release_trajectory_lock(trajectory_id)
 
         if request_body.get("stream") is True:
-            return self._to_streaming_response(final_content)
+            return adapter.build_streaming_response(final_content)
 
         return Response(
             content=json.dumps(final_content).encode("utf-8"),
@@ -258,53 +229,30 @@ class ParserMiddleware(BaseHTTPMiddleware):
         )
 
     @staticmethod
-    def _to_streaming_response(response: dict[str, Any]) -> StreamingResponse:
-        """Wrap one complete chat completion in OpenAI-compatible SSE events."""
-        choice = response["choices"][0]
-        message = choice["message"]
-        delta = {
-            key: message[key]
-            for key in ("content", "reasoning_content")
-            if message.get(key) is not None
-        }
-        if message.get("tool_calls"):
-            delta["tool_calls"] = [
-                {**tool_call, "index": index}
-                for index, tool_call in enumerate(message["tool_calls"])
-            ]
+    def _finish_reason(
+        response_json: dict[str, Any], finish_reason_override: str | None
+    ) -> str:
+        if finish_reason_override:
+            return finish_reason_override
+        meta = response_json.get("meta_info") or {}
+        finish_reason_meta = meta.get("finish_reason") or {}
+        if isinstance(finish_reason_meta, dict):
+            return finish_reason_meta.get("type", "stop")
+        return "stop"
 
-        chunk = {
-            "id": response.get("id", ""),
-            "object": "chat.completion.chunk",
-            "created": response.get("created", int(time.time())),
-            "model": response.get("model", "default"),
+    @staticmethod
+    def _usage(response_json: dict[str, Any]) -> dict[str, Any]:
+        meta = response_json.get("meta_info") or {}
+        usage = response_json.get("usage") or {}
+        prompt_tokens = meta.get("prompt_tokens", usage.get("prompt_tokens", 0))
+        completion_tokens = meta.get(
+            "completion_tokens", usage.get("completion_tokens", 0)
+        )
+        return {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
         }
-        events = [
-            {
-                **chunk,
-                "choices": [
-                    {
-                        "index": choice.get("index", 0),
-                        "delta": delta,
-                        "finish_reason": None,
-                    }
-                ],
-            },
-            {
-                **chunk,
-                "choices": [
-                    {
-                        "index": choice.get("index", 0),
-                        "delta": {},
-                        "finish_reason": choice.get("finish_reason"),
-                    }
-                ],
-                "usage": response.get("usage"),
-            },
-        ]
-        body = [f"data: {json.dumps(event)}\n\n" for event in events]
-        body.append("data: [DONE]\n\n")
-        return StreamingResponse(body, media_type="text/event-stream")
 
     def _release_trajectory_lock(self, trajectory_id: str) -> None:
         """Decrement the per-trajectory lock ref count and remove the lock when no longer needed."""
@@ -315,45 +263,34 @@ class ParserMiddleware(BaseHTTPMiddleware):
 
     def _build_generate_body(
         self,
-        body: dict[str, Any],
         input_ids: list[int],
         *,
+        completion_params: dict[str, Any] | None = None,
         request_id: str,
+        max_new_tokens: int,
         routed_experts_start_len: int = 0,
+        is_eval: bool = False,
     ) -> bytes:
-        # Merge sampling params: explicit sampling_params dict takes precedence,
-        # then top-level OpenAI fields as fallback.
-        sampling_params = dict(body.get("sampling_params") or {})
-        for chat_field, gen_field in _SAMPLING_PARAM_MAP:
-            if chat_field in body and body[chat_field] is not None:
-                sampling_params.setdefault(gen_field, body[chat_field])
-        if self.parser.model_family == DEEPSEEK_V4_MODEL_FAMILY:
-            # DeepSeek-V4 marks its think and DSML tool-call tags as special tokens, so the
-            # detokenizer must keep them for the reasoning / tool-call parsers to see them.
-            # no_stop_trim stays off so SGLang still strips the trailing EOS.
+        sampling_params = dict(completion_params or {})
+        sampling_params["temperature"] = (
+            self.eval_temperature
+            if is_eval and self.eval_temperature is not None
+            else self.train_temperature
+        )
+        if self.parser.model_family in DEEPSEEK_OFFICIAL_ENCODER_MODULES:
+            # DeepSeek-V4/V4.1 mark their think and DSML tool-call tags as special tokens,
+            # so the detokenizer must keep them for the reasoning / tool-call parsers to
+            # see them. no_stop_trim stays off so SGLang still strips the trailing EOS.
             sampling_params["skip_special_tokens"] = False
 
+        # The Router owns the remaining trajectory budget regardless of config.
+        sampling_params["max_new_tokens"] = max_new_tokens
         payload: dict[str, Any] = {
             "input_ids": input_ids,
             "rid": request_id,
             "return_logprob": True,
+            "sampling_params": sampling_params,
         }
-
-        # max_completion_tokens (preferred) / max_tokens (deprecated) / max_new_tokens (native)
-        max_new_tokens = (
-            body.get("max_new_tokens")
-            or body.get("max_completion_tokens")
-            or body.get("max_tokens")
-        )
-        if max_new_tokens is not None:
-            sampling_params["max_new_tokens"] = max_new_tokens
-
-        if sampling_params:
-            payload["sampling_params"] = sampling_params
-
-        for chat_field, gen_field in _GENERATE_FIELD_MAP:
-            if chat_field in body and body[chat_field] is not None:
-                payload[gen_field] = body[chat_field]
 
         if self.r3_enabled:
             payload["return_routed_experts"] = True
@@ -422,51 +359,3 @@ class ParserMiddleware(BaseHTTPMiddleware):
                 response_json["choices"][0]["finish_reason"] = "tool_calls"
 
         return payload, response_json, assistant_message, finish_reason_override
-
-    def _to_openai_response(
-        self,
-        request_body: dict[str, Any],
-        worker_json: dict[str, Any],
-        assistant_message: dict[str, Any],
-        weight_version: int,
-        finish_reason_override: str | None = None,
-    ) -> dict[str, Any]:
-        if "choices" in worker_json:
-            return worker_json
-        meta = worker_json.get("meta_info", {})
-        finish_reason_meta = meta.get("finish_reason") or {}
-        finish_reason = (
-            finish_reason_meta.get("type", "stop")
-            if isinstance(finish_reason_meta, dict)
-            else "stop"
-        )
-        if finish_reason_override:
-            finish_reason = finish_reason_override
-        matched_stop = (
-            finish_reason_meta.get("matched") if isinstance(finish_reason_meta, dict) else None
-        )
-        if finish_reason_override == "tool_calls":
-            matched_stop = None
-        prompt_tokens = meta.get("prompt_tokens", 0)
-        completion_tokens = meta.get("completion_tokens", 0)
-        return {
-            "id": meta.get("id", ""),
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": request_body.get("model", "default"),
-            "choices": [
-                {
-                    "index": 0,
-                    "message": assistant_message,
-                    "logprobs": None,
-                    "finish_reason": finish_reason,
-                    "matched_stop": matched_stop,
-                }
-            ],
-            "usage": {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": prompt_tokens + completion_tokens,
-            },
-            "metadata": {"weight_version": weight_version},
-        }

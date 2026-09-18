@@ -9,7 +9,7 @@ from coda.utils import distributed_utils
 from coda.utils import logging_utils
 from omegaconf import DictConfig
 from datetime import timedelta
-from coda.utils.channel_helper import ChannelMeta
+from coda.transfer_mesh import ChannelMeta
 import logging
 
 logger = logging.getLogger(__name__)
@@ -83,5 +83,10 @@ class TrainWorker(ABC):
         """Load from CPU RAM to VRAM"""
 
     @abstractmethod
-    def offload(self):
-        """Offload from VRAM to CPU RAM"""
+    def offload(self, move_params: bool = False):
+        """Offload from VRAM to CPU RAM
+
+        Args:
+            move_params: Also offload the model parameters, not just the gradients
+                and the optimizer state.
+        """

@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="645" viewBox="0 0 1120 645" font-family="'Helvetica Neue',Helvetica,Arial,'PingFang SC','Hiragino Sans GB','Microsoft YaHei',sans-serif">
+  <defs>
+    <marker id="arrowBlack" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#1a1a1a"/>
+    </marker>
+    <marker id="arrowAmber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#d79b00"/>
+    </marker>
+  </defs>
+  <rect width="1120" height="645" fill="#ffffff"/>
+
+  <text x="40" y="30" font-size="14" font-weight="700" fill="#333333">Data sources (routed by teacher)</text>
+  <text x="40" y="464" font-size="14" font-weight="700" fill="#333333">Resource modes (pick one based on teacher scale)</text>
+
+  <rect x="40" y="50" width="220" height="56" rx="10" fill="#d5e8d4" stroke="#82b366" stroke-width="2"/>
+  <text x="150" y="85" font-size="14" font-weight="700" fill="#1a1a1a" text-anchor="middle">Math data source</text>
+  <rect x="40" y="128" width="220" height="56" rx="10" fill="#d5e8d4" stroke="#82b366" stroke-width="2"/>
+  <text x="150" y="163" font-size="14" font-weight="700" fill="#1a1a1a" text-anchor="middle">Code data source</text>
+  <rect x="40" y="206" width="220" height="56" rx="10" fill="#d5e8d4" stroke="#82b366" stroke-width="2"/>
+  <text x="150" y="241" font-size="14" font-weight="700" fill="#1a1a1a" text-anchor="middle">BCP data source</text>
+  <rect x="40" y="284" width="220" height="56" rx="10" fill="#d5e8d4" stroke="#82b366" stroke-width="2"/>
+  <text x="150" y="319" font-size="14" font-weight="700" fill="#1a1a1a" text-anchor="middle">General chat data source</text>
+
+  <rect x="350" y="30" width="400" height="400" rx="6" fill="#f7f8fa" stroke="#9aa1ab" stroke-width="2" stroke-dasharray="8 6"/>
+  <text x="368" y="55" font-size="15" font-weight="700" fill="#1a1a1a">TeacherManager</text>
+
+  <rect x="370" y="72" width="360" height="154" rx="8" fill="#ffffff" stroke="#b6bdc7" stroke-width="2"/>
+  <text x="384" y="91" font-size="11" fill="#7b838f">Teacher group 0 · shared GPU memory, one active at a time</text>
+  <rect x="390" y="100" width="320" height="46" rx="10" fill="#dae8fc" stroke="#6c8ebf" stroke-width="2"/>
+  <text x="550" y="129" font-size="14" font-weight="700" fill="#1a1a1a" text-anchor="middle">teacher_0 (active · in GPU memory)</text>
+  <rect x="390" y="162" width="320" height="46" rx="10" fill="#fff8ec" stroke="#d79b00" stroke-width="2" stroke-dasharray="8 6"/>
+  <text x="550" y="191" font-size="14" fill="#3d4552" text-anchor="middle">teacher_1 (inactive · weights in host RAM)</text>
+
+  <rect x="370" y="250" width="360" height="154" rx="8" fill="#ffffff" stroke="#b6bdc7" stroke-width="2"/>
+  <text x="384" y="269" font-size="11" fill="#7b838f">Teacher group 1 · shared GPU memory, one active at a time</text>
+  <rect x="390" y="278" width="320" height="46" rx="10" fill="#dae8fc" stroke="#6c8ebf" stroke-width="2"/>
+  <text x="550" y="307" font-size="14" font-weight="700" fill="#1a1a1a" text-anchor="middle">teacher_2 (active · in GPU memory)</text>
+  <rect x="390" y="340" width="320" height="46" rx="10" fill="#fff8ec" stroke="#d79b00" stroke-width="2" stroke-dasharray="8 6"/>
+  <text x="550" y="369" font-size="14" fill="#3d4552" text-anchor="middle">teacher_3 (inactive · weights in host RAM)</text>
+
+  <rect x="830" y="230" width="250" height="120" rx="14" fill="#ffe6cc" stroke="#d79b00" stroke-width="2"/>
+  <text x="955" y="272" font-size="16" font-weight="700" fill="#1a1a1a" text-anchor="middle">Host RAM</text>
+  <text x="955" y="300" font-size="11" fill="#5a6472" text-anchor="middle">Teacher weights backed up at startup</text>
+  <text x="955" y="320" font-size="11" fill="#5a6472" text-anchor="middle">Inactive teachers copied in on demand</text>
+
+  <rect x="830" y="390" width="250" height="110" rx="14" fill="#fff8ec" stroke="#d79b00" stroke-width="2" stroke-dasharray="8 6"/>
+  <text x="955" y="428" font-size="16" font-weight="700" fill="#5a6472" text-anchor="middle">Memory pooling (planned)</text>
+  <text x="955" y="456" font-size="11" fill="#7b838f" text-anchor="middle">Reuse idle host memory on</text>
+  <text x="955" y="476" font-size="11" fill="#7b838f" text-anchor="middle">train / rollout machines</text>
+
+  <rect x="40" y="480" width="280" height="80" rx="12" fill="#ffffff" stroke="#9aa1ab" stroke-width="2"/>
+  <text x="180" y="512" font-size="16" font-weight="700" fill="#1a1a1a" text-anchor="middle">Collocate mode</text>
+  <text x="180" y="538" font-size="11" fill="#5a6472" text-anchor="middle">rollout / teacher / train time-share one GPU set</text>
+
+  <rect x="370" y="480" width="280" height="80" rx="12" fill="#ffffff" stroke="#9aa1ab" stroke-width="2"/>
+  <text x="510" y="512" font-size="16" font-weight="700" fill="#1a1a1a" text-anchor="middle">Dedicated resource pool</text>
+  <text x="510" y="538" font-size="11" fill="#5a6472" text-anchor="middle">Teachers own their GPUs, no training contention</text>
+
+  <text x="40" y="600" font-size="11" fill="#7b838f">Shown: the constrained case — each group hosts two teachers, only one per group holds GPU memory at a time. With enough resources each teacher owns a group, weights resident on GPU.</text>
+  <text x="40" y="622" font-size="11" fill="#7b838f">The teacher count is no longer bounded by how many models fit in GPU memory at once, but by how many weight copies fit in host RAM.</text>
+
+  <path d="M 260 78 L 384 122" fill="none" stroke="#1a1a1a" stroke-width="3" marker-end="url(#arrowBlack)"/>
+  <path d="M 260 156 L 384 184" fill="none" stroke="#1a1a1a" stroke-width="3" marker-end="url(#arrowBlack)"/>
+  <path d="M 260 234 L 384 300" fill="none" stroke="#1a1a1a" stroke-width="3" marker-end="url(#arrowBlack)"/>
+  <path d="M 260 312 L 384 362" fill="none" stroke="#1a1a1a" stroke-width="3" marker-end="url(#arrowBlack)"/>
+
+  <path d="M 830 260 L 780 260 L 780 185 L 716 185" fill="none" stroke="#d79b00" stroke-width="2.5" stroke-dasharray="8 6" marker-end="url(#arrowAmber)"/>
+  <path d="M 830 320 L 780 320 L 780 363 L 716 363" fill="none" stroke="#d79b00" stroke-width="2.5" stroke-dasharray="8 6" marker-end="url(#arrowAmber)"/>
+  <path d="M 955 350 L 955 384" fill="none" stroke="#d79b00" stroke-width="2.5" stroke-dasharray="8 6" marker-end="url(#arrowAmber)"/>
+  <path d="M 510 480 L 510 436" fill="none" stroke="#1a1a1a" stroke-width="3" marker-end="url(#arrowBlack)"/>
+</svg>

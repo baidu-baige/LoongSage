@@ -113,7 +113,8 @@ class SglangEngine(RolloutWorker):
             server_args_dict: Dictionary containing server configuration arguments.
         """
         logger.info(f"Launch HttpServerEngineAdapter at: {self.server_host}:{self.server_port}")
-        self.process = launch_server_process(ServerArgs(**server_args_dict))
+        server_args = ServerArgs(**server_args_dict)
+        self.process = launch_server_process(server_args)
 
         if self.node_rank == 0 and self.router_ip and self.router_port:
             payload = {
@@ -121,6 +122,11 @@ class SglangEngine(RolloutWorker):
             }
             if self.worker_type == "prefill":
                 payload["bootstrap_port"] = server_args_dict["disaggregation_bootstrap_port"]
+            # DP attention: report the attention-DP group count so the router can pin
+            # each request to one via routed_dp_rank, instead of letting SGLang's
+            # internal DataParallelController distribute. 1 = no DP attention.
+            if server_args.enable_dp_attention:
+                payload["dp_size"] = server_args.dp_size
             response = requests.post(
                 f"http://{self.router_ip}:{self.router_port}/add_worker",
                 json=payload,
@@ -252,11 +258,19 @@ class SglangEngine(RolloutWorker):
         return result
 
     @override
-    def release_memory_occupation(self):
-        """Release memory occupation for offloading."""
+    def release_memory_occupation(self, tags: list[str] = None):
+        """Release memory occupation for offloading.
+
+        Args:
+            tags: Memory tags to release (e.g. kv_cache, cuda_graph). None releases all.
+        """
         self._flush_cache()
         self._cache_flushed = True
-        return self._make_request("release_memory_occupation", timeout=180.0)
+        return self._make_request(
+            "release_memory_occupation",
+            {"tags": tags},
+            timeout=180.0,
+        )
 
     @override
     def resume_memory_occupation(self, tags: list[str] = None):
@@ -352,6 +366,23 @@ def _compute_server_args(
 
     return kwargs
 
+def _run_server(server_args: ServerArgs):
+    """Entrypoint of the spawned SGLang server process.
+
+    Args:
+        server_args: ServerArgs containing the server configuration.
+    """
+    from sglang.srt.entrypoints import http_server
+
+    # SGLang posts /freeze_gc from its warmup thread, which runs during FastAPI lifespan
+    # startup, i.e. before uvicorn binds the port. With skip_server_warmup there is no
+    # retry loop ahead of it, so it always fails with ECONNREFUSED. _wait_server_healthy
+    # does it instead, once the server is known to serve.
+    if hasattr(http_server, "_freeze_gc_after_server_warmup"):
+        http_server._freeze_gc_after_server_warmup = lambda *_, **__: None
+
+    http_server.launch_server(server_args)
+
 def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process | None:
     """Launch a SGLang HTTP server in a separate process.
 
@@ -361,10 +392,8 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process | 
     Returns:
         multiprocessing.Process: The server process, or None for non-master nodes.
     """
-    from sglang.srt.entrypoints.http_server import launch_server
-
     multiprocessing.set_start_method("spawn", force=True)
-    p = multiprocessing.Process(target=launch_server, args=(server_args,))
+    p = multiprocessing.Process(target=_run_server, args=(server_args,))
     p.start()
 
     if server_args.node_rank != 0:
@@ -424,3 +453,11 @@ def _wait_server_healthy(base_url, api_key, is_process_alive):
                 raise Exception("Server process terminated unexpectedly.")
 
             time.sleep(2)
+
+        # SGLang's own post-warmup freeze_gc is disabled in _run_server; do it here,
+        # where the server is known to be serving.
+        try:
+            response = session.post(f"{base_url}/freeze_gc", headers=headers, timeout=30)
+            response.raise_for_status()
+        except requests.RequestException as e:
+            logger.warning("freeze_gc failed, GC stays unfrozen: %s", e)

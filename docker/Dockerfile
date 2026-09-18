@@ -37,10 +37,15 @@ RUN CPATH=/usr/local/lib/python3.12/dist-packages/nvidia/cu13/include/cccl pip i
 
 # for qwen3.8
 RUN pip install flash-linear-attention==0.5.2
+RUN MAX_JOBS=16 pip install -v --no-build-isolation "flash-attn-3 @ git+https://github.com/Dao-AILab/flash-attention@main#subdirectory=hopper"
 
-# patch
-COPY patch/sglang-0.5.18.patch /tmp/sglang-patch.patch
-RUN cd /sgl-workspace/sglang && git apply /tmp/sglang-patch.patch && rm /tmp/sglang-patch.patch
+# for dsv41
+RUN rm -rf sglang && git clone https://github.com/sgl-project/sglang.git && cd sglang/python && git checkout 3a42fc5571 && pip install --no-deps --no-build-isolation -e .
+COPY patch/dsv41 /tmp/dsv41
+RUN cd /sgl-workspace/sglang && git apply /tmp/dsv41/sglang.patch
+RUN cd /sgl-workspace/Megatron-LM && git apply /tmp/dsv41/megatron-core.patch
+RUN cd /sgl-workspace/Megatron-Bridge && git apply /tmp/dsv41/megatron-bridge.patch
+RUN rm -rf /tmp/dsv41
 
 # loongsage
 RUN git clone https://github.com/baidu-baige/LoongSage.git && cd LoongSage && pip install --no-deps --no-build-isolation -e .

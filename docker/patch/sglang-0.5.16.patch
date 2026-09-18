@@ -244,11 +244,11 @@ index 8ea10ef04c..a2bba07497 100644
 +    def update_weights_from_channel(self: WeightUpdater, recv_req):
 +        """Receive weights from TransferMesh channel and update model in-place.
 +
-+        Uses channel_helper.create_receiver_channel() to lazily create or reuse a
++        Uses coda.transfer_mesh.create_receiver_channel() to lazily create or reuse a
 +        process-local TransferMeshChannel based on the request parameters.
 +        """
 +        try:
-+            from coda.utils.channel_helper import ChannelMeta, create_receiver_channel
++            from coda.transfer_mesh import ChannelMeta, create_receiver_channel
 +            from sglang.srt.utils.network import get_local_ip_auto
 +
 +            meta = ChannelMeta(

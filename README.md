@@ -151,11 +151,10 @@ Chinese documentation is available in [`docs/zh/`](docs/zh/).
 
 Below are our main plans for upcoming work. Discussions and contributions via Issues are welcome:
 
-- [ ] Claude Code & Codex support
+- [ ] Claude Code support
 - [ ] Low-precision training support
 - [ ] PPO support
 - [ ] MTP / DSpark
-- [ ] Prefill / Decode disaggregated deployment
 - [ ] Multi-data-source and multi-agent support in fully asynchronous mode
 - [ ] SFT support
 - [ ] LORA support
@@ -217,7 +216,7 @@ If LoongSage is helpful to your research, please consider citing our project:
 
 ```bibtex
 @software{loongsage,
-  title  = {LoongSage: An Agent-Native Asynchronous Reinforcement Learning Framework for LLM Post-Training},
+  title  = {LoongSage: A Production-Grade, High-Efficiency Agentic RL Framework for Frontier LLMs with Validated Recipes},
   author = {LoongSage Contributors},
   year   = {2026},
   url    = {https://github.com/baidu-baige/LoongSage/}

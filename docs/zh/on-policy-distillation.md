@@ -60,9 +60,13 @@ $$
 
 全词表 KL 需要教师的完整 logits，其规模为 `[seq × vocab]`，直接传输或落盘会占用巨量显存。LoongSage 改为只传输紧凑的教师 **hidden state** `[seq × hidden]`，在学生侧用一份 TP 切分的教师 `lm_head` 重建 logits。重建按 microbatch 粒度进行、每个 microbatch 只算一次并在用完后立即释放（`TeacherCtx` / `KLCtx` 记忆化），从而在不牺牲全词表精度的前提下大幅降低显存与传输开销。log-prob 与 top-k 方法同样在每个 microbatch 只前向计算一次教师量并复用。
 
+![全词表 KL 的 logits 重建与显存优化](../_static/image/teacher-distill-logits.svg)
+
 ## 教师编排：TeacherManager
 
 为了统一支持**单老师 / 多老师**、**同模型 / 异模型**蒸馏，LoongSage 用 `TeacherManager` 抽象出教师模型与 GPU 资源的管理，与训练侧解耦：
+
+![TeacherManager 架构图](../_static/image/teacher-manager-arch.svg)
 
 - **资源分组**：按 `teacher_nodes × teacher_gpus_per_node` 组成教师池，单个教师组的 world size = `dp_per_teacher × TP × PP × CP`，教师按数量划分到各组。
 - **同模型多老师**：教师 GPU 资源足够时（教师 DP 数 ≥ 教师数）每个教师独占一组、常驻 GPU，不需要切换；资源不足时多个教师落到同一组内，复用同一份模型结构，非激活教师的权重以 CPU pinned 内存备份，前向时按需拷回显存。

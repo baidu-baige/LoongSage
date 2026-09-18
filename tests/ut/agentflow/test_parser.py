@@ -4,10 +4,12 @@ import asyncio
 import copy
 import json
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import torch
+from starlette.requests import Request
+from starlette.responses import Response
 
 # coda.agentflow.router.parser imports six symbols from
 # sglang.srt.parser.template_detection, which only exists in the sglang build the
@@ -22,6 +24,9 @@ from coda.agentflow.router.parser import TrajectoryParser, TurnInputContext
 from coda.agentflow.router.parser_middleware import ParserMiddleware
 from coda.agentflow import tokenizer_manager
 from coda.agentflow.tokenizer_manager import (
+    DEEPSEEK_V4_MODEL_FAMILY,
+    DEEPSEEK_V41_MODEL_FAMILY,
+    _deepseek_official_family,
     _deepseek_v4_thinking_mode,
     _wrap_deepseek_v4_tokenizer,
 )
@@ -51,7 +56,9 @@ class FakeDeepSeekV4Tokenizer:
 
 
 def test_deepseek_v4_tokenizer_uses_official_encoder() -> None:
-    tokenizer = _wrap_deepseek_v4_tokenizer(FakeDeepSeekV4Tokenizer())
+    tokenizer = _wrap_deepseek_v4_tokenizer(
+        FakeDeepSeekV4Tokenizer(), DEEPSEEK_V4_MODEL_FAMILY
+    )
     tools = [{
         "type": "function",
         "function": {
@@ -77,8 +84,50 @@ def test_deepseek_v4_tokenizer_uses_official_encoder() -> None:
     assert prompt.endswith("<｜Assistant｜></think>")
 
 
+@pytest.mark.parametrize(
+    ("model_type", "arch", "expected"),
+    [
+        ("deepseek_v41", "DeepseekV41ForCausalLM", DEEPSEEK_V41_MODEL_FAMILY),
+        ("deepseek_v4", "DeepseekV4ForCausalLM", DEEPSEEK_V4_MODEL_FAMILY),
+        ("qwen3", "Qwen3ForCausalLM", None),
+    ],
+)
+def test_deepseek_official_family_detection(
+    tmp_path, model_type: str, arch: str, expected: str | None
+) -> None:
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": model_type, "architectures": [arch]}), encoding="utf-8"
+    )
+
+    assert _deepseek_official_family(str(tmp_path)) == expected
+
+
+def test_deepseek_v41_tokenizer_uses_official_encoder() -> None:
+    # The V4.1 encoder ships with the DeepSeek-V4.1 SGLang build only.
+    pytest.importorskip(
+        "sglang.srt.entrypoints.openai.encoding_dsv41",
+        reason="the DeepSeek-V4.1 SGLang build is not installed",
+    )
+    tokenizer = _wrap_deepseek_v4_tokenizer(
+        FakeDeepSeekV4Tokenizer(), DEEPSEEK_V41_MODEL_FAMILY
+    )
+
+    assert tokenizer.model_family == DEEPSEEK_V41_MODEL_FAMILY
+    prompt = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "inspect"}],
+        tokenize=False,
+        enable_thinking=True,
+    )
+
+    assert prompt.startswith("<｜begin▁of▁sentence｜>")
+    assert "<｜User｜>inspect" in prompt
+    assert prompt.endswith("<｜Assistant｜><think>")
+
+
 def test_deepseek_v4_empty_system_is_only_bos() -> None:
-    tokenizer = _wrap_deepseek_v4_tokenizer(FakeDeepSeekV4Tokenizer())
+    tokenizer = _wrap_deepseek_v4_tokenizer(
+        FakeDeepSeekV4Tokenizer(), DEEPSEEK_V4_MODEL_FAMILY
+    )
 
     async def apply_chat_template(messages, **kwargs):
         return tokenizer.apply_chat_template(messages, **kwargs)
@@ -98,7 +147,9 @@ def test_deepseek_v4_empty_system_is_only_bos() -> None:
 
 
 def test_deepseek_v4_first_turn_encodes_tools_in_system_prompt() -> None:
-    tokenizer = _wrap_deepseek_v4_tokenizer(FakeDeepSeekV4Tokenizer())
+    tokenizer = _wrap_deepseek_v4_tokenizer(
+        FakeDeepSeekV4Tokenizer(), DEEPSEEK_V4_MODEL_FAMILY
+    )
 
     async def apply_chat_template(messages, **kwargs):
         return tokenizer.apply_chat_template(messages, **kwargs)
@@ -139,7 +190,9 @@ def test_deepseek_v4_first_turn_encodes_tools_in_system_prompt() -> None:
 
 
 def test_deepseek_v4_continuation_strips_only_bos() -> None:
-    tokenizer = _wrap_deepseek_v4_tokenizer(FakeDeepSeekV4Tokenizer())
+    tokenizer = _wrap_deepseek_v4_tokenizer(
+        FakeDeepSeekV4Tokenizer(), DEEPSEEK_V4_MODEL_FAMILY
+    )
     async def apply_chat_template(messages, **kwargs):
         return tokenizer.apply_chat_template(messages, **kwargs)
 
@@ -232,13 +285,7 @@ def make_parser() -> TrajectoryParser:
     )
 
 
-@pytest.mark.parametrize(
-    ("model_family", "expected_skip_special_tokens"),
-    [
-        (None, None),
-        ("deepseek_v4", False),
-    ],
-)
+@pytest.mark.parametrize(("model_family", "expected_skip_special_tokens"), [(None, True), ("deepseek_v4", False)])
 def test_parser_sampling_params_keep_special_tokens_only_for_deepseek_v4(
     model_family, expected_skip_special_tokens
 ) -> None:
@@ -248,15 +295,20 @@ def test_parser_sampling_params_keep_special_tokens_only_for_deepseek_v4(
     )
     middleware = ParserMiddleware(
         MagicMock(),
+        config=SimpleNamespace(
+            trainer=SimpleNamespace(temperature=1.0),
+            rollout=SimpleNamespace(eval=SimpleNamespace(temperature=None)),
+        ),
         trajectory_store=TrajectoryStore(),
         tokenizer_manager=tokenizer_manager,
     )
 
     payload = json.loads(
         middleware._build_generate_body(
-            {},
             [101],
+            completion_params={"skip_special_tokens": True},
             request_id="req-0",
+            max_new_tokens=16,
         )
     )
 
@@ -266,43 +318,137 @@ def test_parser_sampling_params_keep_special_tokens_only_for_deepseek_v4(
     assert sampling_params.get("no_stop_trim") is None
 
 
-def test_complete_response_is_wrapped_as_openai_stream() -> None:
-    response = ParserMiddleware._to_streaming_response({
-        "id": "completion-1",
-        "object": "chat.completion",
-        "created": 123,
+@pytest.mark.parametrize(
+    ("is_eval", "eval_temperature", "expected"),
+    [
+        (False, 0.2, 1.0),
+        (True, None, 1.0),
+        (True, 0.2, 0.2),
+    ],
+)
+def test_parser_owns_temperature(
+    is_eval: bool, eval_temperature: float | None, expected: float
+) -> None:
+    middleware = ParserMiddleware(
+        MagicMock(),
+        config=SimpleNamespace(
+            trainer=SimpleNamespace(temperature=1.0),
+            rollout=SimpleNamespace(
+                eval=SimpleNamespace(temperature=eval_temperature)
+            ),
+        ),
+        trajectory_store=TrajectoryStore(),
+        tokenizer_manager=SimpleNamespace(system_prompt_len=0),
+    )
+    payload = json.loads(
+        middleware._build_generate_body(
+            [101],
+            completion_params={"temperature": 0.4, "max_new_tokens": 999, "top_p": 0.9, "sampling_seed": 7},
+            request_id="req-0",
+            max_new_tokens=16,
+            is_eval=is_eval,
+        )
+    )
+    assert payload["sampling_params"] == {
+        "temperature": expected,
+        "max_new_tokens": 16,
+        "top_p": 0.9,
+        "sampling_seed": 7,
+    }
+
+
+def test_responses_context_limited_length_triggers_compaction_retry() -> None:
+    store = TrajectoryStore()
+    trajectory = Trajectory(trajectory_id="traj-context-limited", prompt_id="prompt-0", attempt_id=0, ds_index=1)
+    store.add(trajectory.trajectory_id, trajectory)
+    ds_config = MagicMock()
+    ds_config.max_response_len_per_trajectory = 1_000
+    ds_config.completion_params = {"top_p": 0.7, "sampling_seed": 42}
+    ds_config.get.side_effect = lambda key, default=None: {
+        "agent": {"context_length": 100, "max_output_tokens": 32},
+        "completion_params": {"top_p": 0.7, "sampling_seed": 42},
+    }.get(key, default)
+    middleware = ParserMiddleware(
+        MagicMock(),
+        config=SimpleNamespace(
+            trainer=SimpleNamespace(temperature=1.0),
+            rollout=SimpleNamespace(eval=SimpleNamespace(temperature=None)),
+        ),
+        trajectory_store=store,
+        tokenizer_manager=SimpleNamespace(system_prompt_len=0),
+        ds_configs={
+            0: SimpleNamespace(max_response_len_per_trajectory=1, completion_params={"top_p": 0.1}),
+            1: ds_config,
+        },
+    )
+    middleware.parser.build_turn_input = AsyncMock(return_value=TurnInputContext(
+        delta_prompt_ids=list(range(90)),
+        input_ids=list(range(90)),
+        start_new_segment=True,
+        raw_new_messages=[],
+        target_segment_id=0,
+    ))
+    middleware.parser.build_assistant_message = MagicMock(return_value=(
+        MagicMock(),
+        {"role": "assistant", "content": "truncated"},
+        None,
+    ))
+    middleware.parser.update_trajectory = MagicMock()
+
+    body = json.dumps({
         "model": "default",
-        "choices": [{
-            "index": 0,
-            "message": {
-                "role": "assistant",
-                "content": None,
-                "reasoning_content": "thinking",
-                "tool_calls": [{
-                    "id": "call-1",
-                    "type": "function",
-                    "function": {"name": "bash", "arguments": '{"cmd":"pwd"}'},
-                }],
+        "stream": True,
+        "input": "hello",
+        "top_p": 0.2,
+        "sampling_params": {"top_p": 0.3, "sampling_seed": 99},
+    }).encode()
+    received = False
+
+    async def receive():
+        nonlocal received
+        if received:
+            return {"type": "http.disconnect"}
+        received = True
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    request = Request({
+        "type": "http",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/traj-context-limited/0/v1/responses",
+        "raw_path": b"/traj-context-limited/0/v1/responses",
+        "query_string": b"",
+        "headers": [(b"content-type", b"application/json")],
+        "client": ("127.0.0.1", 1),
+        "server": ("testserver", 80),
+    }, receive)
+
+    async def call_next(upstream_request):
+        upstream_body = json.loads(upstream_request.state.upstream_body)
+        assert upstream_body["sampling_params"] == {
+            "top_p": 0.7,
+            "sampling_seed": 42,
+            "temperature": 1.0,
+            "max_new_tokens": 10,
+        }
+        return Response(content=json.dumps({
+            "text": "truncated",
+            "meta_info": {
+                "finish_reason": {"type": "length"},
+                "prompt_tokens": 90,
+                "completion_tokens": 10,
             },
-            "finish_reason": "tool_calls",
-        }],
-        "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
-    })
+        }))
 
-    async def read_body() -> str:
-        chunks = []
-        async for chunk in response.body_iterator:
-            chunks.append(chunk.decode() if isinstance(chunk, bytes) else chunk)
-        return "".join(chunks)
+    async def dispatch():
+        response = await middleware.dispatch(request, call_next)
+        return "".join([chunk async for chunk in response.body_iterator])
 
-    events = [
-        json.loads(block.removeprefix("data: "))
-        for block in asyncio.run(read_body()).strip().split("\n\n")[:-1]
-    ]
-    assert events[0]["choices"][0]["delta"]["reasoning_content"] == "thinking"
-    assert events[0]["choices"][0]["delta"]["tool_calls"][0]["index"] == 0
-    assert events[1]["choices"][0]["finish_reason"] == "tool_calls"
-    assert events[1]["usage"]["completion_tokens"] == 2
+    stream = asyncio.run(dispatch())
+
+    assert "event: response.failed" in stream
+    assert '"code": "context_length_exceeded"' in stream
+    middleware.parser.update_trajectory.assert_called_once()
 
 
 def test_append_routed_experts_materializes_terminal_row() -> None:
@@ -405,11 +551,12 @@ def test_build_assistant_message_parses_deepseek_v4_tool_call(deepseek_v4_model_
         "meta_info": {"weight_version": "1", "output_token_logprobs": [[-0.1, 101]]},
     })
 
+    assert message["tool_calls"][0]["id"].startswith("call_")
     assert message == {
         "role": "assistant",
         "content": None,
         "tool_calls": [{
-            "id": "call_0",
+            "id": message["tool_calls"][0]["id"],
             "type": "function",
             "function": {"name": "bash", "arguments": '{"cmd": "pwd"}'},
         }],
@@ -538,14 +685,15 @@ def test_parse_tool_calls_extracts_qwen_markup_with_or_without_schema(tools) -> 
     parser = make_sglang_parser(tool_call_parser="qwen25")
     text = 'ok\n<tool_call>\n{"name": "bash", "arguments": {"command": "ls"}}\n</tool_call>'
 
-    assert parser._parse_tool_calls(text, tools) == (
-        "ok",
-        [{
-            "id": "call_0",
-            "type": "function",
-            "function": {"name": "bash", "arguments": '{"command": "ls"}'},
-        }],
-    )
+    content, tool_calls = parser._parse_tool_calls(text, tools)
+    assert content == "ok"
+    assert tool_calls is not None
+    assert tool_calls[0]["id"].startswith("call_")
+    assert tool_calls == [{
+        "id": tool_calls[0]["id"],
+        "type": "function",
+        "function": {"name": "bash", "arguments": '{"command": "ls"}'},
+    }]
 
 
 def test_parse_tool_calls_extracts_qwen3_coder_markup() -> None:
@@ -555,14 +703,53 @@ def test_parse_tool_calls_extracts_qwen3_coder_markup() -> None:
         "<parameter=command>\nls\n</parameter>\n</function>\n</tool_call>"
     )
 
-    assert parser._parse_tool_calls(text, BASH_TOOLS) == (
-        "ok",
-        [{
-            "id": "call_0",
-            "type": "function",
-            "function": {"name": "bash", "arguments": '{"command": "ls"}'},
-        }],
+    content, tool_calls = parser._parse_tool_calls(text, BASH_TOOLS)
+    assert content == "ok"
+    assert tool_calls is not None
+    assert tool_calls[0]["id"].startswith("call_")
+    assert tool_calls == [{
+        "id": tool_calls[0]["id"],
+        "type": "function",
+        "function": {"name": "bash", "arguments": '{"command": "ls"}'},
+    }]
+
+
+def test_parse_tool_calls_extracts_qwen3_coder_apply_patch_string() -> None:
+    parser = make_sglang_parser(tool_call_parser="qwen3_coder")
+    patch = "*** Begin Patch\n*** Update File: a.py\n@@\n-old\n+new\n*** End Patch"
+    text = (
+        "<tool_call>\n<function=apply_patch>\n"
+        f"<parameter=input>\n{patch}\n</parameter>\n</function>\n</tool_call>"
     )
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "apply_patch",
+            "parameters": {
+                "type": "object",
+                "properties": {"input": {"type": "string"}},
+                "required": ["input"],
+            },
+        },
+    }]
+
+    content, tool_calls = parser._parse_tool_calls(text, tools)
+
+    assert content == ""
+    assert tool_calls is not None
+    assert tool_calls[0]["function"]["name"] == "apply_patch"
+    assert json.loads(tool_calls[0]["function"]["arguments"]) == {"input": patch}
+
+
+def test_parse_tool_calls_assigns_unique_ids_across_turns() -> None:
+    parser = make_sglang_parser(tool_call_parser="qwen25")
+    text = '<tool_call>\n{"name": "bash", "arguments": {"command": "ls"}}\n</tool_call>'
+
+    _, first = parser._parse_tool_calls(text, BASH_TOOLS)
+    _, second = parser._parse_tool_calls(text, BASH_TOOLS)
+
+    assert first is not None and second is not None
+    assert first[0]["id"] != second[0]["id"]
 
 
 def test_parse_tool_calls_without_markup_returns_original_text() -> None:
@@ -613,11 +800,12 @@ def test_build_assistant_message_splits_reasoning_and_tool_calls() -> None:
         BASH_TOOLS,
     )
 
+    assert message["tool_calls"][0]["id"].startswith("call_")
     assert message == {
         "role": "assistant",
         "content": None,
         "tool_calls": [{
-            "id": "call_0",
+            "id": message["tool_calls"][0]["id"],
             "type": "function",
             "function": {"name": "bash", "arguments": '{"command": "ls"}'},
         }],
@@ -800,6 +988,31 @@ def test_build_turn_input_first_turn_sets_root_segment_fields() -> None:
     assert ctx.new_segment_origin == "root"
     assert ctx.new_segment_depth == 0
     assert ctx.is_subagent_placeholder is False
+
+
+def test_build_turn_input_compaction_with_matching_prefix_continues_segment() -> None:
+    parser = make_prefix_parser()
+    history = [{"role": "user", "content": "old history"}]
+    trajectory = Trajectory(
+        trajectory_id="traj-local-compact",
+        prompt_id="prompt-0",
+        tokens=[1, 2, 3],
+        active_segment_id=0,
+        chat_completions={0: copy.deepcopy(history)},
+        segments=[Segment(token_start=0, token_end=3, logprob_start=0, logprob_end=1,
+                          triplets=[Triplet(token_start=0, token_end=3, logprob_start=0, logprob_end=1)],
+                          segment_id=0, origin="root")],
+        metadata={"normalized_history": parser._normalize_messages(history)},
+    )
+
+    ctx = asyncio.run(parser.build_turn_input(
+        trajectory,
+        messages=[*history, {"role": "user", "content": "summarize the conversation"}],
+        request_kind="compaction",
+    ))
+
+    assert ctx.start_new_segment is False
+    assert ctx.target_segment_id == 0
 
 
 def test_build_turn_input_compaction_opens_new_mainline_segment() -> None:

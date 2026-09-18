@@ -38,7 +38,7 @@ class DapoMathReward(RewardFunction):
         super().__init__(config)
         self.overlong_penalty_length = float(self.config.get("overlong_penalty_length", 0.0))
 
-    def __call__(self, messages: list[dict], label, trajectory: dict, **kwargs) -> Reward:
+    def __call__(self, messages: list[dict], label, context: dict, **kwargs) -> Reward:
         """Compute reward by comparing the last assistant message's answer against the label."""
         ground_truth_str = label.get("ground_truth")
         solution_str = ""
@@ -51,7 +51,7 @@ class DapoMathReward(RewardFunction):
         logger.info(f"extract answer text: {solution_str}")
         result = compute_score(solution_str, ground_truth_str)
         score, predicted = result["score"], result["pred"]
-        response_length = len(trajectory["loss_masks"])
+        response_length = len(context["loss_masks"])
         penalty = self._overlong_penalty(response_length, kwargs.get("max_tokens"))
         final_score = score - penalty
         logger.info(f"predicted={predicted}, ground_truth={ground_truth_str}, score={score}, "

@@ -19,6 +19,13 @@ colocate: true
 total_steps: 300
 
 data_source:
+  sandbox:
+    type: k8s
+    command_exec_timeout_seconds: 600
+    sandbox_creation_timeout_seconds: 600
+    working_dir: /rl-sandbox
+    kubeconfig: k8s/kubeconfig.yaml
+    pod_manifest_path: k8s/pod_manifest.yaml
   dataset:
     prompt_data_path: ???
     input_key: prompt
@@ -31,6 +38,9 @@ data_source:
     step_limit: 100
     request_timeout: 1200
     max_consecutive_format_errors: 10
+    # R2E-Gym images keep the testbed Python in a venv/conda env that is not on the
+    # default PATH; prepend it to every agent command.
+    shell_prefix: "source /root/.bashrc >/dev/null 2>&1 || true; export PATH=/testbed/.venv/bin:/opt/miniconda3/envs/testbed/bin:/root/.local/bin:$PATH; "
   reward:
     name: r2e_gym
   num_trajectories_per_prompt: 8
@@ -41,7 +51,6 @@ rollout:
   env_vars:
     SGLANG_OPT_FP8_WO_A_GEMM: "0"
     NCCL_CUMEM_ENABLE: "1"
-    SGLANG_RMSNORM_NO_PDL: "1"
   retry_limit: 3
   num_gpus_per_node: 4
   sglang_args:

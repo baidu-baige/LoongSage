@@ -30,8 +30,7 @@ class TeacherManager:
 
         # Build remote worker class
         if config.trainer.backend == "megatron":
-            env_vars = MegatronTeacherWorker.runtime_env_vars()
-            env_vars.update(dict(config.opd.get("env_vars", {})))
+            env_vars = dict(config.opd.env_vars)
             remote_worker_cls = ray.remote(runtime_env={"env_vars": env_vars})(MegatronTeacherWorker)
         else:
             raise ValueError(f"Unsupported backend '{config.trainer.backend}'")

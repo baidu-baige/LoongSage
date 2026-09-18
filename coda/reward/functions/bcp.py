@@ -59,7 +59,7 @@ class BrowseCompPlusReward(RewardFunction):
     def __init__(self, config: DictConfig):
         super().__init__(config)
 
-    def __call__(self, messages: list[dict], label, trajectory: dict, **kwargs) -> Reward:
+    def __call__(self, messages: list[dict], label, context: dict | None = None, **kwargs) -> Reward:
         queries: list[str] = []
         n_search = n_open_page = n_finish = 0
         predicted_answer: str | None = None

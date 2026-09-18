@@ -11,7 +11,7 @@ TransferMesh is not responsible for aggregating Megatron's TP/PP shards (that pa
 
 ## 1. Key Parameters
 
-A TransferMesh channel is created via [`ChannelMeta`](../../coda/utils/channel_helper.py), which is constructed at runtime by [`Trainer._init_channel_meta`](../../coda/controller/trainer.py). `ChannelMeta` explicitly distinguishes **required fields** (no defaults) from **optional fields** (all with defaults); business code only needs to supply the required ones to bring up a channel.
+A TransferMesh channel is created via [`ChannelMeta`](../../coda/transfer_mesh/channel.py), which is constructed at runtime by [`Trainer._init_channel_meta`](../../coda/controller/trainer.py). `ChannelMeta` explicitly distinguishes **required fields** (no defaults) from **optional fields** (all with defaults); business code only needs to supply the required ones to bring up a channel.
 
 ### 1.1. Required Fields
 
@@ -36,7 +36,7 @@ All of the following fields have defaults in `ChannelMeta` and only need to be o
 | `gloo_port` | `29500` | Gloo TCPStore port. TransferMesh additionally uses `port+1` (NCCL data group, NCCL backend) and `port+2` (NCCL metadata group, Gloo backend, transporting control frames via `broadcast_object_list`) internally. |
 | `local_ip` | `None` | Local IP; when unspecified, resolved in order: `HOST_IP` env var → Ray; raises `RuntimeError` if all methods fail. |
 
-`gpu_id`, `rank`, and `addr` are auto-resolved inside the process by [`channel_helper.py`](../../coda/utils/channel_helper.py) and do not need to be filled in by business code. Senders and receivers only need to provide `Role.SENDER` / `Role.RECEIVER`.
+`gpu_id`, `rank`, and `addr` are auto-resolved inside the process by [`channel.py`](../../coda/transfer_mesh/channel.py) and do not need to be filled in by business code. Senders and receivers only need to provide `Role.SENDER` / `Role.RECEIVER`.
 
 ## 2. Principles
 
@@ -54,7 +54,7 @@ TransferMesh consists of three modules:
 | [`protocol.py`](../../coda/transfer_mesh/protocol.py) | `TensorSpec`, `MetaFrame`, `str_to_dtype` | Bucket-level metadata protocol |
 | [`channel.py`](../../coda/transfer_mesh/channel.py) | `TransferMeshChannel`, `create_channel` | Channel lifecycle, bucket aggregation, send/receive paths |
 
-`TransferMeshChannel` is constructed by `create_channel()`, which invokes `init_groups()` immediately after construction, performing the Gloo group setup, topology gathering, and NCCL group setup in a single call. [`channel_helper.py`](../../coda/utils/channel_helper.py) additionally maintains a module-level `_channel` singleton per process, reused by `create_sender_channel(meta)` / `create_receiver_channel(meta)`.
+`TransferMeshChannel` is constructed by `create_channel()`, which invokes `init_groups()` immediately after construction, performing the Gloo group setup, topology gathering, and NCCL group setup in a single call. The same module, [`channel.py`](../../coda/transfer_mesh/channel.py), additionally maintains a module-level `_channel` singleton per process, reused by `create_sender_channel(meta)` / `create_receiver_channel(meta)`.
 
 ### 2.2. Communication Topology
 
@@ -65,7 +65,7 @@ Topology discovery only takes a single `all_gather_object` round: every rank bro
 - Matches a co-located sender → joins that sender's `ipc_assignments` (same-GPU IPC);
 - No match → falls into `nccl_receivers` (broadcast from `src_rank` via NCCL).
 
-If two senders share the same `(ip, gpu_id)`, `partition_receivers` raises `ValueError` (see [`topology.py:66-70`](../../coda/transfer_mesh/topology.py)), surfacing configuration errors as early as possible during topology construction. Furthermore, the `gpu_id` reported by each process is not `torch.cuda.current_device()` directly; it is resolved by `_get_physical_gpu_id()` in [`channel_helper.py`](../../coda/utils/channel_helper.py) by parsing `CUDA_VISIBLE_DEVICES` (indexing into it with `torch.cuda.current_device()`, and falling back to `torch.cuda.current_device()` when the variable is unset, cannot be parsed, or does not cover that index). This resolution is a prerequisite for correct IPC matching, because inside a Ray actor the local device index is always 0 regardless of physical placement.
+If two senders share the same `(ip, gpu_id)`, `partition_receivers` raises `ValueError` (see [`topology.py:66-70`](../../coda/transfer_mesh/topology.py)), surfacing configuration errors as early as possible during topology construction. Furthermore, the `gpu_id` reported by each process is not `torch.cuda.current_device()` directly; it is resolved by `_get_physical_gpu_id()` in [`channel.py`](../../coda/transfer_mesh/channel.py) by parsing `CUDA_VISIBLE_DEVICES` (indexing into it with `torch.cuda.current_device()`, and falling back to `torch.cuda.current_device()` when the variable is unset, cannot be parsed, or does not cover that index). This resolution is a prerequisite for correct IPC matching, because inside a Ray actor the local device index is always 0 regardless of physical placement.
 
 Two additional groups (each using an independent TCPStore port) are created only when there are cross-GPU receivers:
 
@@ -302,7 +302,7 @@ channel = create_channel(
 - [`TransferMeshChannel`](../../coda/transfer_mesh/channel.py) — Core channel implementation
 - [`partition_receivers`](../../coda/transfer_mesh/topology.py) — Topology partitioning
 - [`MetaFrame` / `TensorSpec`](../../coda/transfer_mesh/protocol.py) — Bucket metadata protocol
-- [`ChannelMeta` / `create_sender_channel` / `create_receiver_channel`](../../coda/utils/channel_helper.py) — In-process channel lifecycle
+- [`ChannelMeta` / `create_sender_channel` / `create_receiver_channel`](../../coda/transfer_mesh/channel.py) — Channel input contract and in-process lifecycle (same `channel.py`)
 - [`Trainer._init_channel_meta` / `Trainer._update_weights`](../../coda/controller/trainer.py) — Top-level orchestration
 - [`MegatronTrainWorker.update_weights`](../../coda/backends/megatron/megatron_train_worker.py) — Training-side send
 - [`SglangEngine.update_weights_from_channel`](../../coda/backends/sglang/engine.py) — Inference-side receive

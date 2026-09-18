@@ -3,6 +3,7 @@
 import base64
 import copy
 import logging
+import uuid
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Literal
@@ -578,11 +579,11 @@ class TrajectoryParser:
 
         tool_calls = [
             {
-                "id": f"call_{index}",
+                "id": f"call_{uuid.uuid4().hex}",
                 "type": "function",
                 "function": {"name": call.name, "arguments": call.parameters},
             }
-            for index, call in enumerate(calls)
+            for call in calls
         ]
         return normal_text or "", tool_calls
 

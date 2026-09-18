@@ -1,0 +1,3262 @@
+diff --git a/megatron/core/models/gpt/experimental_attention_variant_module_specs.py b/megatron/core/models/gpt/experimental_attention_variant_module_specs.py
+index 289c11286..35dc4c0d9 100644
+--- a/megatron/core/models/gpt/experimental_attention_variant_module_specs.py
++++ b/megatron/core/models/gpt/experimental_attention_variant_module_specs.py
+@@ -244,6 +244,14 @@ def get_experimental_attention_variant_module_spec(
+         return get_dsa_module_spec_for_backend(config=config, backend=backend)
+     elif config.experimental_attention_variant == "dsv4_hybrid":
+         return get_dsv4_hybrid_module_spec_for_backend(config=config, backend=backend)
++    elif config.experimental_attention_variant == "dsv41_hybrid":
++        # DeepSeek-V4.1 attention (tilelang sparse-MLA + engram + two-level indexer).
++        # Imported lazily to avoid importing tilelang/TE at module-import time.
++        from megatron.core.transformer.experimental_attention_variant.dsv41.deepseek_v41 import (
++            _dsv41_attention_module_spec,
++        )
++
++        return _dsv41_attention_module_spec(config, backend)
+     else:
+         raise ValueError(
+             f"Invalid experimental attention variant: {config.experimental_attention_variant}"
+diff --git a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py b/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
+index 45bf910f8..5c14957e4 100644
+--- a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
++++ b/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
+@@ -276,6 +276,8 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
+                     cpu_copy = True
+                 if self.param_update_in_fp32 and param.dtype != torch.float32:
+                     param = param.detach().clone().float()
++                    if cpu_copy and self.pin_cpu_params:
++                        param = param.pin_memory()
+                     param_to_fp32_param[orig_param] = param
+ 
+                 if cpu_copy:
+diff --git a/megatron/core/tensor_parallel/mappings.py b/megatron/core/tensor_parallel/mappings.py
+index 1a3daa418..a3e145ec1 100644
+--- a/megatron/core/tensor_parallel/mappings.py
++++ b/megatron/core/tensor_parallel/mappings.py
+@@ -218,6 +218,32 @@ class _CopyToModelParallelRegion(torch.autograd.Function):
+         return _reduce(grad_output, ctx.group), None
+ 
+ 
++class _CopyToModelParallelRegionFp32Grad(torch.autograd.Function):
++    """Pass the input to the model parallel region, all-reducing the gradient in fp32.
++
++    Same forward as ``_CopyToModelParallelRegion``; the backward accumulates the
++    reduction in fp32 and casts back to the gradient dtype. Used where a bf16
++    reduction would lose precision, e.g. DeepSeek-V4.1's replicated KV latent.
++    """
++
++    @staticmethod
++    def symbolic(graph, input_, group):
++        """Symbolic function for tracing."""
++        return input_
++
++    @staticmethod
++    def forward(ctx, input_, group):
++        """Forward function."""
++        ctx.group = group
++        return input_
++
++    @staticmethod
++    def backward(ctx, grad_output):
++        """Backward function."""
++        reduced = _reduce(grad_output.float(), ctx.group)
++        return reduced.to(grad_output.dtype), None
++
++
+ class _ReduceFromModelParallelRegion(torch.autograd.Function):
+     """All-reduce the input from the model parallel region."""
+ 
+@@ -534,9 +560,16 @@ class _AllToAll(torch.autograd.Function):
+ # -----------------
+ 
+ 
+-def copy_to_tensor_model_parallel_region(input_, group=None):
+-    """Wrapper for autograd function: forward: copy, backward allreduce"""
++def copy_to_tensor_model_parallel_region(input_, group=None, *, all_reduce_grad_fp32=False):
++    """Wrapper for autograd function: forward: copy, backward allreduce
++
++    ``all_reduce_grad_fp32`` accumulates the backward all-reduce in fp32 and casts the
++    result back to the gradient dtype. Every existing caller keeps the default bf16
++    reduction.
++    """
+     group = get_tensor_model_parallel_group_if_none(group)
++    if all_reduce_grad_fp32:
++        return _CopyToModelParallelRegionFp32Grad.apply(input_, group)
+     return _CopyToModelParallelRegion.apply(input_, group)
+ 
+ 
+diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/deepseek_v41.py b/megatron/core/transformer/experimental_attention_variant/dsv41/deepseek_v41.py
+new file mode 100644
+index 000000000..15643c188
+--- /dev/null
++++ b/megatron/core/transformer/experimental_attention_variant/dsv41/deepseek_v41.py
+@@ -0,0 +1,686 @@
++import copy
++
++import einops
++import torch
++import torch.nn as nn
++from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TELinear, TENorm, TERowParallelLinear
++from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
++    get_transformer_block_with_experimental_attention_variant_spec,
++)
++from megatron.core.models.gpt.gpt_model import GPTModel
++from megatron.core.process_groups_config import ProcessGroupCollection
++from megatron.core.tensor_parallel.layers import set_tensor_model_parallel_attributes
++from megatron.core.tensor_parallel.mappings import (
++    copy_to_tensor_model_parallel_region,
++    gather_from_sequence_parallel_region,
++    scatter_to_sequence_parallel_region,
++)
++from megatron.core.transformer import transformer_block as _transformer_block
++from megatron.core.transformer.hyper_connection import BroadcastTensorFused, HyperConnectionModule
++from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
++from megatron.core.transformer.spec_utils import ModuleSpec
++from megatron.core.transformer.transformer_block import TransformerBlock, get_num_layers_to_build
++from megatron.core.transformer.transformer_config import TransformerConfig
++from megatron.core.transformer.transformer_layer import HyperConnectionTransformerLayer, get_transformer_layer_offset
++from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
++
++from megatron.core.transformer.experimental_attention_variant.dsv41.engram import DeepSeekV41Engram
++from megatron.core.transformer.experimental_attention_variant.dsv41.ops import hc_mix
++from megatron.core.transformer.experimental_attention_variant.dsv41.ops.compressor import DeepSeekV41Compressor
++from megatron.core.transformer.experimental_attention_variant.dsv41.ops.cp_utils import (
++    all_gather_cp,
++    get_freqs_cis_for_cp,
++    get_q_positions_for_cp,
++    get_window_topk_idxs_cp,
++)
++from megatron.core.transformer.experimental_attention_variant.dsv41.ops.indexer import DeepSeekV41Indexer
++from megatron.core.transformer.experimental_attention_variant.dsv41.ops.kernel.tilelang_sparse_mla import sparse_attn_tilelang
++from megatron.core.transformer.experimental_attention_variant.dsv41.ops.kvnorm import compressed_kv_stored, kv_norm_rope_fp8
++from megatron.core.transformer.experimental_attention_variant.dsv41.ops.quant import fake_quant_compressed_kv
++from megatron.core.transformer.experimental_attention_variant.dsv41.ops.rope import apply_rotary_emb
++from megatron.core.transformer.experimental_attention_variant.dsv41.ops.rope_tables import wrapped_precompute_freqs_cis
++
++V41_CONFIG_FIELDS = (
++    "kv_source_layer_ids",
++    "index_source_layer_ids",
++    "candidate_source_layer_id",
++    "candidate_topk_blocks",
++    "candidate_block_size",
++    "engram_layer_ids",
++    "engram_num_embeddings",
++    "engram_max_ngram_size",
++    "engram_vocab_size",
++    "engram_n_heads",
++    "engram_head_dim",
++    "engram_pad_token_id",
++    "engram_compressed_vocab_size",
++)
++
++V41_LEGACY_CONFIG_FIELDS = {
++    "kv_source_layer_ids": "kv_source_layers",
++    "index_source_layer_ids": "index_source_layers",
++    "candidate_source_layer_id": "candidate_source_layer",
++    "engram_pad_token_id": "engram_pad_id",
++}
++
++
++class V41Runtime:
++    def __init__(self):
++        self.reset()
++
++    def reset(self):
++        self.pre = None
++        self.input_ids = None
++        self.latent = {}
++        self.index_k = {}
++        self.topk = None
++        self.candidates = None
++
++
++def get_runtime(config) -> V41Runtime:
++    return config.v41_runtime
++
++
++def apply_v41_config(config, hf_config):
++    for field in V41_CONFIG_FIELDS:
++        legacy = V41_LEGACY_CONFIG_FIELDS.get(field)
++        if legacy is not None and not hasattr(hf_config, field):
++            value = getattr(hf_config, legacy)
++        else:
++            value = getattr(hf_config, field)
++        setattr(config, f"v41_{field}", tuple(value) if isinstance(value, list) else value)
++
++
++def v41_aggregate(x: torch.Tensor, pre: torch.Tensor | None, n: int) -> torch.Tensor:
++    s, b, nc = x.shape
++    if pre is None:
++        return x.view(s, b, n, nc // n)[:, :, 0].to(x.dtype)
++    if hc_mix.FUSED:
++        return hc_mix.aggregate(x, pre, n)
++    streams = x.view(s, b, n, nc // n).float()
++    return (pre.float().unsqueeze(-1) * streams).sum(dim=2).to(x.dtype)
++
++
++def v41_pack_pre(pre: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
++    hi = pre.to(dtype)
++    lo = (pre - hi.float()).to(dtype)
++    return torch.cat([hi, lo], dim=-1)
++
++
++def v41_unpack_pre(packed: torch.Tensor, n: int) -> torch.Tensor:
++    return packed[..., :n].float() + packed[..., n:].float()
++
++
++def _packed_seq_starts(packed_seq_params, q_positions: torch.Tensor):
++    """Per-query global start position of the query's own packed trajectory.
++
++    coda packs several trajectories into one THD sequence (cu_seqlens in
++    packed_seq_params); without this the sparse window/indexer would let a query
++    attend across trajectory boundaries into a sibling (same-prompt) trajectory
++    and "peek" its continuation -> over-confident train logprobs. Returns None
++    when not packing (single sequence), reproducing the original behavior.
++    """
++    if packed_seq_params is None:
++        return None
++    cu = getattr(packed_seq_params, "cu_seqlens_q_padded", None)
++    if cu is None:
++        cu = getattr(packed_seq_params, "cu_seqlens_q", None)
++    if cu is None:
++        return None
++    cu = cu.to(device=q_positions.device)
++    # cu_seqlens are global positions (already * cp_size in prepare_packed_seq_params);
++    # q_positions from get_q_positions_for_cp are global too.
++    seg = torch.searchsorted(cu, q_positions, right=True) - 1
++    seg = seg.clamp(min=0, max=cu.numel() - 1)
++    return cu[seg]
++
++
++def v41_kv_source_layer(config, layer_id: int):
++    ratio = config.csa_compress_ratios[layer_id]
++    if not ratio:
++        return None
++    return max(
++        layer
++        for layer in config.v41_kv_source_layer_ids
++        if layer <= layer_id and config.csa_compress_ratios[layer] == ratio
++    )
++
++
++def v41_pipeline_bounds(config, vp_stage):
++    pp = config.pipeline_model_parallel_size
++    if pp == 1:
++        return None
++    assert config.virtual_pipeline_model_parallel_size in (None, 1), "DeepSeek-V4.1 plugin: no virtual pipeline"
++    assert config.pipeline_model_parallel_layout is None, "DeepSeek-V4.1 plugin: no explicit pipeline layout"
++    # Layers may be split evenly, or unevenly by declaring the first / last stage sizes
++    # (e.g. 40 layers over PP=3 -> num_layers_in_first_pipeline_stage=14,
++    # num_layers_in_last_pipeline_stage=13). Both cases are handled by the
++    # get_transformer_layer_offset / get_num_layers_to_build calls below; the carry
++    # logic is keyed on absolute layer ids, so it does not require even stages.
++    if (
++        config.num_layers_in_first_pipeline_stage is None
++        and config.num_layers_in_last_pipeline_stage is None
++    ):
++        assert config.num_layers % pp == 0, (
++            f"DeepSeek-V4.1 plugin: num_layers ({config.num_layers}) must be divisible by "
++            f"pp ({pp}); to split unevenly set num_layers_in_first/last_pipeline_stage."
++        )
++    offset = get_transformer_layer_offset(config, vp_stage)
++    return offset + 1, offset + get_num_layers_to_build(config, vp_stage)
++
++
++_CARRY_PRE, _CARRY_IDS, _CARRY_LATENT, _CARRY_INDEX_K, _CARRY_TOPK, _CARRY_CAND = range(6)
++_CARRY_HEADER_INTS = 48
++
++
++def _bits_to_bf16(t: torch.Tensor) -> torch.Tensor:
++    t = t.detach().contiguous().flatten()
++    if t.dtype == torch.bool:
++        t = t.view(torch.uint8)
++    if t.dtype == torch.uint8:
++        if t.numel() % 2:
++            t = torch.nn.functional.pad(t, (0, 1))
++        return t.view(torch.bfloat16)
++    if t.dtype != torch.int32:
++        t = t.to(torch.int32)
++    return t.view(torch.bfloat16)
++
++
++class V41IdsOnlyPlan:
++    input_ids = True
++    latent_keys = ()
++    index_k_keys = ()
++    topk = False
++    candidates = False
++
++
++class V41CarryPlan:
++    def __init__(self, config, layer_id: int):
++        n_layers = config.num_layers
++        ratios = config.csa_compress_ratios
++        later = range(layer_id + 1, n_layers)
++        self.latent_keys = sorted(
++            {v41_kv_source_layer(config, layer) for layer in later if ratios[layer]} & set(range(layer_id + 1))
++        )
++        self.index_k_keys = sorted(
++            {
++                v41_kv_source_layer(config, layer)
++                for layer in later
++                if ratios[layer] and layer in config.v41_index_source_layer_ids
++            }
++            & set(range(layer_id + 1))
++        )
++        nxt = layer_id + 1
++        self.topk = nxt < n_layers and ratios[nxt] > 0 and nxt not in config.v41_index_source_layer_ids
++        cand = config.v41_candidate_source_layer_id
++        self.candidates = 0 <= cand <= layer_id and any(cand < layer and ratios[layer] for layer in later)
++        self.candidate_block_size = config.v41_candidate_block_size
++        self.input_ids = bool(config.v41_engram_layer_ids) and layer_id < max(config.v41_engram_layer_ids)
++
++
++def v41_pack_carry(hidden: torch.Tensor, rt, plan: V41CarryPlan) -> torch.Tensor:
++    s, b, _ = hidden.shape
++    dt = hidden.dtype
++    meta, parts = [], []
++
++    def add(kind, key, shape, flat):
++        meta.append([kind, key, *shape, *([0] * (3 - len(shape)))])
++        parts.append(flat if flat.dtype == dt else flat.to(dt))
++
++    if rt.pre is not None:
++        add(_CARRY_PRE, 0, rt.pre.shape, v41_pack_pre(rt.pre, dt).flatten())
++    if plan.input_ids:
++        add(_CARRY_IDS, 0, rt.input_ids.shape, _bits_to_bf16(rt.input_ids))
++    for k in plan.latent_keys:
++        add(_CARRY_LATENT, k, rt.latent[k].shape, rt.latent[k].flatten())
++    for k in plan.index_k_keys:
++        add(_CARRY_INDEX_K, k, rt.index_k[k].shape, rt.index_k[k].flatten())
++    if plan.topk:
++        add(_CARRY_TOPK, 0, rt.topk.shape, _bits_to_bf16(rt.topk))
++    if plan.candidates:
++        bs = plan.candidate_block_size
++        blocks = rt.candidates[..., ::bs]
++        add(_CARRY_CAND, bs, (*rt.candidates.shape[:-1], rt.candidates.shape[-1]), _bits_to_bf16(blocks))
++    header = torch.zeros(_CARRY_HEADER_INTS, dtype=torch.int32, device=hidden.device)
++    header[0] = len(meta)
++    flat_meta = [v for m in meta for v in m]
++    header[1 : 1 + len(flat_meta)] = torch.tensor(flat_meta, dtype=torch.int32, device=hidden.device)
++    parts.insert(0, header.view(torch.bfloat16))
++    flat = torch.cat(parts)
++    rows = s * b
++    pad = (-flat.numel()) % rows
++    if pad:
++        flat = torch.nn.functional.pad(flat, (0, pad))
++    return torch.cat([hidden, flat.view(s, b, -1)], dim=-1)
++
++
++def v41_unpack_carry(hidden: torch.Tensor, rt, base_cols: int) -> torch.Tensor:
++    rt.reset()
++    if hidden.shape[-1] == base_cols:
++        return hidden
++    carry = hidden[..., base_cols:].contiguous().flatten()
++    hidden = hidden[..., :base_cols].contiguous()
++    header = carry[: 2 * _CARRY_HEADER_INTS].detach().view(torch.int32).tolist()
++    off = 2 * _CARRY_HEADER_INTS
++    for i in range(header[0]):
++        kind, key, d0, d1, d2 = header[1 + 5 * i : 6 + 5 * i]
++        if kind == _CARRY_PRE:
++            n = 2 * d0 * d1 * d2
++            rt.pre = v41_unpack_pre(carry[off : off + n].view(d0, d1, 2 * d2), d2)
++        elif kind == _CARRY_IDS:
++            n = 2 * d0 * d1
++            rt.input_ids = carry[off : off + n].detach().view(torch.int32).view(d0, d1).to(torch.int64)
++        elif kind == _CARRY_LATENT:
++            n = d0 * d1 * d2
++            rt.latent[key] = carry[off : off + n].view(d0, d1, d2)
++        elif kind == _CARRY_INDEX_K:
++            n = d0 * d1 * d2
++            rt.index_k[key] = carry[off : off + n].view(d0, d1, d2)
++        elif kind == _CARRY_TOPK:
++            n = 2 * d0 * d1 * d2
++            rt.topk = carry[off : off + n].detach().view(torch.int32).view(d0, d1, d2).to(torch.int64)
++        elif kind == _CARRY_CAND:
++            bs = key
++            nb = -(-d2 // bs)
++            n = (d0 * d1 * nb + 1) // 2
++            raw = carry[off : off + n].detach().view(torch.uint8)
++            blocks = raw[: d0 * d1 * nb].view(d0, d1, nb).bool()
++            rt.candidates = blocks.repeat_interleave(bs, dim=-1)[..., :d2]
++        else:
++            raise ValueError(f"unknown carry section {kind}")
++        off += n
++    return hidden
++
++
++class V41HyperConnection(HyperConnectionModule):
++    def __init__(self, config: TransformerConfig, layer_number: int):
++        super().__init__(config, layer_number)
++        self.norm_eps = config.layernorm_epsilon
++
++    def forward(self, hidden_states, mhc_recompute_manager=None, output_slot=None):
++        if mhc_recompute_manager is not None or output_slot is not None:
++            raise NotImplementedError("mHC recompute is not supported for the DeepSeek-V4.1 plugin")
++        return self._forward_normal(hidden_states)
++
++    def _forward_normal(self, hidden_states):
++        rt = get_runtime(self.config)
++        s, b, _ = hidden_states.shape
++        hs_for_mappings, hs_for_aggregate, hs_for_residual = BroadcastTensorFused.apply(
++            hidden_states, self._fused_add_3_op
++        )
++        proj, r = self._projection_and_get_norm(hs_for_mappings)
++        h_pre, h_post, h_res = self._compute_h(proj, r)
++        h_res = self._sinkhorn_op(h_res.view(s, b, self.n, self.n), self.sinkhorn_iterations, self.sinkhorn_eps)
++        aggregated = v41_aggregate(hs_for_aggregate, rt.pre, self.n)
++        rt.pre = h_pre
++        return aggregated, h_res, h_post, hs_for_residual
++
++    def fused_h_res_h_post_bda(
++        self, h_res, original_residual, h_post, layer_output_with_bias, dropout_prob, training, fused, manager=None
++    ):
++        x, bias = layer_output_with_bias
++        assert bias is None
++        if hc_mix.FUSED:
++            return hc_mix.hc_mix(x, original_residual, h_res, h_post, self.n)
++        s, b, _ = original_residual.shape
++        residual = original_residual.view(s, b, self.n, self.hidden_size).float()
++        mixed = torch.einsum("sbij,sbid->sbjd", h_res.float(), residual)
++        out = h_post.float().unsqueeze(-1) * x.float().unsqueeze(2) + mixed
++        return out.view(s, b, self.n * self.hidden_size).to(original_residual.dtype)
++
++
++class V41TransformerLayer(HyperConnectionTransformerLayer):
++    def __init__(self, config: TransformerConfig, submodules, layer_number: int = 1, **kwargs):
++        super().__init__(config, submodules, layer_number=layer_number, **kwargs)
++        layer_id = self.layer_number - 1
++        self.v41_engram = None
++        if layer_id in config.v41_engram_layer_ids:
++            self.v41_engram = DeepSeekV41Engram(
++                config, layer_id, self.pg_collection.tp, getattr(self.pg_collection, "cp", None)
++            )
++        self.v41_is_last = self.layer_number == config.num_layers
++        self.v41_carry = getattr(config, "v41_carry_state", False)
++        self.v41_plan = V41CarryPlan(config, layer_id) if self.v41_carry else None
++        self.v41_base_cols = config.hidden_size * config.num_residual_streams
++
++    def forward(self, hidden_states, *args, **kwargs):
++        rt = get_runtime(self.config)
++        if self.v41_carry:
++            hidden_states = v41_unpack_carry(hidden_states, rt, self.v41_base_cols)
++        if self.v41_engram is not None:
++            hidden_states = self.v41_engram(hidden_states, rt.input_ids)
++        output, context = super().forward(hidden_states, *args, **kwargs)
++        if self.v41_is_last:
++            output = v41_aggregate(output, rt.pre, self.config.num_residual_streams)
++        elif self.v41_carry:
++            output = v41_pack_carry(output, rt, self.v41_plan)
++        return output, context
++
++
++class DeepSeekV41Attention(MegatronModule):
++    def __init__(
++        self,
++        config: TransformerConfig,
++        submodules=None,
++        layer_number: int = 1,
++        attn_mask_type=None,
++        attention_type: str = None,
++        cp_comm_type: str = None,
++        pg_collection=None,
++        name: str | None = None,
++    ):
++        torch.backends.cuda.matmul.allow_tf32 = True
++        super().__init__(config=config)
++        if pg_collection is None:
++            pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp"])
++        self.pg_collection = pg_collection
++        self.tp_group = pg_collection.tp
++        self.cp_group = pg_collection.cp if hasattr(pg_collection, "cp") else None
++        self.cp_size = self.cp_group.size() if self.cp_group is not None else 1
++
++        layer_id = layer_number - 1
++        self.layer_id = layer_id
++        self.dim = config.hidden_size
++        self.n_heads = config.num_attention_heads
++        self.n_local_heads = self.n_heads // config.tensor_model_parallel_size
++        self.q_lora_rank = config.q_lora_rank
++        self.o_lora_rank = config.o_lora_rank
++        self.head_dim = config.kv_lora_rank
++        self.rope_head_dim = config.qk_pos_emb_head_dim
++        self.nope_head_dim = self.head_dim - self.rope_head_dim
++        self.n_groups = config.o_groups
++        self.n_local_groups = self.n_groups // config.tensor_model_parallel_size
++        self.window_size = config.csa_window_size
++        self.compress_ratio = config.csa_compress_ratios[layer_id]
++        self.eps = config.layernorm_epsilon
++        self.softmax_scale = self.head_dim**-0.5
++        self.sequence_parallel = config.sequence_parallel
++        assert self.compress_ratio in (0, 1, 2)
++        assert self.head_dim == 512 and self.rope_head_dim == 64 and self.window_size == 128
++
++        self.is_kv_source = layer_id in config.v41_kv_source_layer_ids
++        self.is_index_source = layer_id in config.v41_index_source_layer_ids
++        self.kv_source_layer = None
++        if self.compress_ratio:
++            sources = [
++                layer
++                for layer in config.v41_kv_source_layer_ids
++                if layer <= layer_id and config.csa_compress_ratios[layer] == self.compress_ratio
++            ]
++            assert sources, f"layer {layer_id} has no kv_source layer"
++            self.kv_source_layer = max(sources)
++
++        config_no_sp = copy.copy(config)
++        config_no_sp.sequence_parallel = False
++
++        self.core_attention = nn.Module()
++        self.core_attention.attn_sink = nn.Parameter(
++            torch.empty(self.n_local_heads, dtype=torch.float32, device=torch.cuda.current_device())
++        )
++        mark_keep_in_fp32(self.core_attention.attn_sink)
++        set_tensor_model_parallel_attributes(self.core_attention.attn_sink, is_parallel=True, dim=0, stride=1)
++
++        self.linear_q_down_proj = TELinear(
++            self.dim,
++            self.q_lora_rank,
++            config=config,
++            init_method=config.init_method,
++            bias=False,
++            skip_bias_add=False,
++            skip_weight_param_allocation=False,
++            parallel_mode="duplicated",
++        )
++        self.q_layernorm = TENorm(config_no_sp, self.q_lora_rank, eps=self.eps)
++        self.linear_q_up_proj = TEColumnParallelLinear(
++            self.q_lora_rank,
++            self.n_heads * self.head_dim,
++            config=config_no_sp,
++            init_method=config.init_method,
++            bias=False,
++            gather_output=False,
++            skip_bias_add=False,
++            is_expert=False,
++            tp_group=self.tp_group,
++        )
++        self.linear_kv_proj = TELinear(
++            self.dim,
++            self.head_dim,
++            config=config,
++            init_method=config.init_method,
++            bias=False,
++            skip_bias_add=False,
++            skip_weight_param_allocation=False,
++            parallel_mode="duplicated",
++        )
++        self.kv_layernorm = TENorm(config_no_sp, self.head_dim, eps=self.eps)
++        for p in list(self.linear_q_down_proj.parameters()) + list(self.linear_kv_proj.parameters()):
++            p.sequence_parallel = False
++
++        o_group_proj = torch.empty(
++            self.n_local_groups * self.o_lora_rank,
++            self.n_heads * self.head_dim // self.n_groups,
++            device=torch.cuda.current_device(),
++            dtype=config.params_dtype,
++        )
++        config.init_method(o_group_proj)
++        self.linear_o_group_proj = nn.Parameter(o_group_proj)
++        set_tensor_model_parallel_attributes(self.linear_o_group_proj, is_parallel=True, dim=0, stride=1)
++        self.linear_proj = TERowParallelLinear(
++            self.n_groups * self.o_lora_rank,
++            self.dim,
++            config=config_no_sp,
++            init_method=config.init_method,
++            bias=False,
++            input_is_parallel=True,
++            skip_bias_add=False,
++            is_expert=False,
++            tp_group=self.tp_group,
++        )
++
++        if self.is_kv_source:
++            self.core_attention.compressor = DeepSeekV41Compressor(config, self.head_dim, self.compress_ratio)
++        if self.is_index_source:
++            self.core_attention.indexer = DeepSeekV41Indexer(
++                config,
++                layer_id=layer_id,
++                head_dim=self.head_dim,
++                compress_ratio=self.compress_ratio,
++                owns_k=self.is_kv_source,
++                is_candidate_source=layer_id == config.v41_candidate_source_layer_id,
++                uses_candidates=0 <= config.v41_candidate_source_layer_id < layer_id,
++            )
++
++    def sharded_state_dict(self, prefix: str = "", sharded_offsets: tuple = (), metadata: dict | None = None):
++        ans = super().sharded_state_dict(prefix, sharded_offsets, metadata)
++        ans.update(
++            make_sharded_tensors_for_checkpoint(
++                state_dict={
++                    "core_attention.attn_sink": self.core_attention.attn_sink,
++                    "linear_o_group_proj": self.linear_o_group_proj,
++                },
++                prefix=prefix,
++                tensor_parallel_layers_axis_map={"core_attention.attn_sink": 0, "linear_o_group_proj": 0},
++                sharded_offsets=sharded_offsets,
++                tp_group=self.tp_group,
++                dp_cp_group=metadata["dp_cp_group"],
++            )
++        )
++        return ans
++
++    def forward(
++        self,
++        hidden_states: torch.Tensor,
++        attention_mask=None,
++        inference_context=None,
++        rotary_pos_emb=None,
++        rotary_pos_cos=None,
++        rotary_pos_sin=None,
++        rotary_pos_cos_sin=None,
++        attention_bias=None,
++        packed_seq_params=None,
++        sequence_len_offset=None,
++    ):
++        if self.sequence_parallel:
++            hidden_states = gather_from_sequence_parallel_region(
++                hidden_states, tensor_parallel_output_grad=False, group=self.tp_group
++            )
++        x = einops.rearrange(hidden_states, "s b d -> b s d")
++        bsz, seqlen, _ = x.shape
++        rd = self.rope_head_dim
++        ratio = self.compress_ratio
++        rt = get_runtime(self.config)
++        cp = self.cp_size
++        seqlen_global = seqlen * cp
++        if cp > 1 and ratio:
++            assert (
++                seqlen % ratio == 0
++            ), f"context-parallel chunk {seqlen} must be a multiple of the compress ratio {ratio}"
++
++        rope_base = self.config.csa_compress_rotary_base if ratio else self.config.rotary_base
++        freqs_full = wrapped_precompute_freqs_cis(self.config, rd, rope_base, not ratio, seqlen_global, x.device)[
++            :seqlen_global
++        ]
++        freqs_cis = get_freqs_cis_for_cp(freqs_full, seqlen, cp, self.cp_group)
++
++        qr = self.q_layernorm(self.linear_q_down_proj(x)[0])
++        q = self.linear_q_up_proj(qr)[0].unflatten(-1, (self.n_local_heads, self.head_dim)).clone()
++        apply_rotary_emb(q[..., -rd:], freqs_cis)
++
++        kv = kv_norm_rope_fp8(self.linear_kv_proj(x)[0], self.kv_layernorm.weight, self.eps, freqs_cis, rd)
++
++        q_positions = get_q_positions_for_cp(seqlen, cp_size=cp, cp_group=self.cp_group, device=x.device)
++        seq_starts = _packed_seq_starts(packed_seq_params, q_positions)
++        topk_idxs = get_window_topk_idxs_cp(
++            q_positions, window_size=self.window_size, cp_size=cp, bsz=bsz, seq_starts=seq_starts
++        )
++        if cp > 1:
++            kv = all_gather_cp(kv, dim=1, cp_group=self.cp_group)
++
++        if ratio:
++            offset = seqlen_global
++            compress_lens = (q_positions + 1) // ratio
++            compress_starts = None if seq_starts is None else (seq_starts // ratio).to(torch.int32)
++            if self.is_kv_source:
++                latent = self.core_attention.compressor(hidden_states)
++                latent = einops.rearrange(latent, "n b d -> b n d")
++                n_groups = latent.size(1)
++                freqs_compress = get_freqs_cis_for_cp(freqs_full, seqlen, cp, self.cp_group, stride=ratio)[:n_groups]
++                if self.is_index_source:
++                    index_k = self.core_attention.indexer.index_keys(latent, freqs_compress)
++                    if cp > 1:
++                        index_k = all_gather_cp(index_k, dim=1, cp_group=self.cp_group)
++                    rt.index_k[self.layer_id] = index_k
++                latent = latent.clone(memory_format=torch.contiguous_format)
++                apply_rotary_emb(latent[..., -rd:], freqs_compress)
++                latent = fake_quant_compressed_kv(latent)
++                latent = compressed_kv_stored(latent, rd)
++                if cp > 1:
++                    latent = all_gather_cp(latent, dim=1, cp_group=self.cp_group)
++                rt.latent[self.layer_id] = latent
++            latent = rt.latent[self.kv_source_layer]
++            if self.is_index_source:
++                topk_rel, candidates = self.core_attention.indexer(
++                    x, qr, rt.index_k[self.kv_source_layer], freqs_cis, compress_lens, rt.candidates,
++                    compress_starts,
++                )
++                rt.topk = topk_rel
++                if candidates is not None:
++                    rt.candidates = candidates
++            topk_rel = rt.topk
++            assert topk_rel is not None, f"layer {self.layer_id}: no index_source layer ran before it"
++            compress_idxs = torch.where(topk_rel < 0, -1, topk_rel + offset).int()
++            topk_idxs = torch.cat([topk_idxs, compress_idxs], dim=-1)
++            kv = torch.cat([kv, latent], dim=1)
++
++        topk_idxs = topk_idxs.int()
++        kv = copy_to_tensor_model_parallel_region(kv, group=self.tp_group, all_reduce_grad_fp32=True)
++        o = sparse_attn_tilelang(q, kv, self.core_attention.attn_sink, topk_idxs, self.softmax_scale)
++        apply_rotary_emb(o[..., -rd:], freqs_cis, inverse=True)
++
++        o = o.view(bsz, seqlen, self.n_local_groups, -1)
++        wo_a = self.linear_o_group_proj.view(self.n_local_groups, self.o_lora_rank, -1)
++        o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
++        out, _ = self.linear_proj(o.flatten(2))
++        output = einops.rearrange(out, "b s d -> s b d")
++        if self.sequence_parallel:
++            output = scatter_to_sequence_parallel_region(output, group=self.tp_group)
++        return output, None
++
++
++def _dsv41_attention_module_spec(config, backend=None):
++    return ModuleSpec(module=DeepSeekV41Attention, submodules=None, metainfo={"fuse_input_layernorm": False})
++
++
++def _install_patches(config):
++    if getattr(GPTModel.forward, "v41_patched", False):
++        return
++
++    original_contract = _transformer_block.learned_output_contract
++
++    def output_contract(hidden_states, head_fn, base, scale, n, eps):
++        if hidden_states.shape[-1] == config.hidden_size:
++            return hidden_states
++        return original_contract(hidden_states, head_fn, base, scale, n, eps)
++
++    _transformer_block.learned_output_contract = output_contract
++
++    original_forward = GPTModel.forward
++
++    def forward(self, *args, **kwargs):
++        rt = get_runtime(self.config)
++        rt.reset()
++        rt.input_ids = kwargs.get("input_ids", args[0] if args else None)
++        return original_forward(self, *args, **kwargs)
++
++    forward.v41_patched = True
++    GPTModel.forward = forward
++
++    original_input_expand = HyperConnectionModule.input_expand
++
++    def input_expand(hidden_states, n):
++        expanded = original_input_expand(hidden_states, n)
++        rt = get_runtime(config)
++        if getattr(config, "v41_carry_state", False) and rt.input_ids is not None:
++            expanded = v41_pack_carry(expanded, rt, V41IdsOnlyPlan)
++        return expanded
++
++    HyperConnectionModule.input_expand = staticmethod(input_expand)
++
++    original_block_init = TransformerBlock.__init__
++
++    def block_init(self, *args, **kwargs):
++        original_block_init(self, *args, **kwargs)
++        for name in ("hc_head_fn", "hc_head_base", "hc_head_scale"):
++            if name in self._parameters:
++                self._parameters[name] = None
++
++    TransformerBlock.__init__ = block_init
++
++
++def get_dsv41_block_spec(config, vp_stage=None):
++    """Build the DeepSeek-V4.1 transformer-block spec for Megatron-Bridge.
++
++    This assumes the bridge's ``provider_bridge`` has already populated ``config``:
++      * ``config.experimental_attention_variant == "dsv41_hybrid"`` (so the stock
++        selector returns the V4.1 attention spec natively),
++      * ``apply_v41_config(config, hf_config)`` -> ``config.v41_*`` fields,
++      * ``config.v41_hf_checkpoint`` -> path the engram tables are mmapped from.
++    It builds the block via the standard experimental-attention-variant scaffolding
++    (which now dispatches ``dsv41_hybrid`` to the V4.1 attention) and then swaps the
++    layer + hyper-connection classes to the V4.1 versions.
++    """
++    config.v41_stage_bounds = v41_pipeline_bounds(config, vp_stage)
++    config.v41_carry_state = config.pipeline_model_parallel_size > 1 or config.recompute_granularity == "full"
++    if getattr(config, "v41_runtime", None) is None:
++        config.v41_runtime = V41Runtime()
++    if not hasattr(config, "dsa_topk_backend"):
++        config.dsa_topk_backend = "torch"
++    _install_patches(config)
++
++    block_spec = get_transformer_block_with_experimental_attention_variant_spec(config, vp_stage=vp_stage)
++
++    for layer_spec in block_spec.layer_specs:
++        layer_spec.module = V41TransformerLayer
++        layer_spec.submodules.self_attention_hyper_connection = V41HyperConnection
++        layer_spec.submodules.mlp_hyper_connection = V41HyperConnection
++    return block_spec
+diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/dsa_topk.py b/megatron/core/transformer/experimental_attention_variant/dsv41/dsa_topk.py
+new file mode 100644
+index 000000000..ed1b7c544
+--- /dev/null
++++ b/megatron/core/transformer/experimental_attention_variant/dsv41/dsa_topk.py
+@@ -0,0 +1,59 @@
++import torch
++
++
++_FLASHINFER_TIE_BREAK_VALUES = {
++    "small": 1,
++    "large": 2,
++}
++
++
++def torch_dsa_topk(logits: torch.Tensor, topk: int) -> torch.Tensor:
++    score, indices = torch.topk(logits, topk, dim=-1)
++    indices = indices.to(torch.int32)
++    return indices.masked_fill(score == -torch.inf, -1)
++
++
++def flashinfer_dsa_topk(logits: torch.Tensor, topk: int) -> torch.Tensor:
++    import flashinfer
++    from sglang.srt.environ import envs
++
++    orig_shape = logits.shape
++    if logits.dim() > 2:
++        logits = logits.reshape(-1, logits.shape[-1])
++
++    score, indices = flashinfer.top_k(
++        logits,
++        topk,
++        sorted=False,
++        deterministic=envs.SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC.get(),
++        tie_break=_flashinfer_tie_break_value(),
++        dsa_graph_safe=True,
++    )
++    indices = indices.to(torch.int32)
++    indices = indices.masked_fill(score == -torch.inf, -1)
++    if len(orig_shape) > 2:
++        indices = indices.reshape(*orig_shape[:-1], topk)
++    return indices
++
++
++def get_dsa_topk_fn(topk_backend: str):
++    if topk_backend == "torch":
++        return torch_dsa_topk
++    if topk_backend == "flashinfer":
++        return flashinfer_dsa_topk
++    raise ValueError(f"Unsupported DSA topk backend: {topk_backend}")
++
++
++def _flashinfer_tie_break_value() -> int:
++    from sglang.srt.environ import envs
++
++    mode = envs.SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK.get()
++    if mode is None:
++        return 0
++    mode = mode.lower()
++    if mode not in _FLASHINFER_TIE_BREAK_VALUES:
++        raise RuntimeError(
++            "SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK must be one of "
++            f"{tuple(_FLASHINFER_TIE_BREAK_VALUES)} or unset, got {mode!r}."
++        )
++    return _FLASHINFER_TIE_BREAK_VALUES[mode]
+diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/engram.py b/megatron/core/transformer/experimental_attention_variant/dsv41/engram.py
+new file mode 100644
+index 000000000..768df7614
+--- /dev/null
++++ b/megatron/core/transformer/experimental_attention_variant/dsv41/engram.py
+@@ -0,0 +1,373 @@
++import json
++import logging
++import os
++import warnings
++from dataclasses import dataclass
++
++import numpy as np
++import torch
++import torch.nn as nn
++import torch.utils.checkpoint
++from megatron.core.extensions.transformer_engine import TELinear
++from megatron.core.tensor_parallel.mappings import (
++    gather_from_sequence_parallel_region,
++    scatter_to_sequence_parallel_region,
++)
++from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
++from megatron.core.transformer.transformer_config import TransformerConfig
++
++logger = logging.getLogger(__name__)
++
++_TOKEN_MAP_CACHE: dict[str, tuple[list[int], int]] = {}
++_LAYOUT_CACHE: dict[tuple, "EngramLayout"] = {}
++
++
++def find_next_prime(start: int, seen_primes: set[int]) -> int:
++    from sympy import isprime
++
++    candidate = start + 1
++    while not isprime(candidate) or candidate in seen_primes:
++        candidate += 1
++    return candidate
++
++
++def build_compressed_token_map(tokenizer) -> tuple[list[int], int]:
++    from tokenizers import Regex, normalizers
++
++    sentinel = "\ue000"
++    normalizer = normalizers.Sequence(
++        [
++            normalizers.NFKC(),
++            normalizers.NFD(),
++            normalizers.StripAccents(),
++            normalizers.Lowercase(),
++            normalizers.Replace(Regex(r"[ \t\r\n]+"), " "),
++            normalizers.Replace(Regex(r"^ $"), sentinel),
++            normalizers.Strip(),
++            normalizers.Replace(sentinel, " "),
++        ]
++    )
++    backend = tokenizer.backend_tokenizer
++    key_to_new: dict[str, int] = {}
++    lookup = [0] * len(tokenizer)
++    for token_id in range(len(tokenizer)):
++        text = backend.decode([token_id], skip_special_tokens=False)
++        if "\ufffd" in text:
++            key = backend.id_to_token(token_id)
++        else:
++            normalized = normalizer.normalize_str(text)
++            key = normalized if normalized else text
++        new_id = key_to_new.get(key)
++        if new_id is None:
++            new_id = len(key_to_new)
++            key_to_new[key] = new_id
++        lookup[token_id] = new_id
++    return lookup, len(key_to_new)
++
++
++def get_compressed_token_map(hf_checkpoint: str) -> tuple[list[int], int]:
++    if hf_checkpoint not in _TOKEN_MAP_CACHE:
++        from transformers import AutoTokenizer
++
++        tokenizer = AutoTokenizer.from_pretrained(hf_checkpoint, trust_remote_code=True)
++        _TOKEN_MAP_CACHE[hf_checkpoint] = build_compressed_token_map(tokenizer)
++    return _TOKEN_MAP_CACHE[hf_checkpoint]
++
++
++def compute_hash_multipliers(layer_ids, max_ngram_size: int, vocab_size: int) -> torch.Tensor:
++    max_long = np.iinfo(np.int64).max
++    multiplier_bound = max(1, (max_long // vocab_size) // 2)
++    rows = []
++    for layer_id in layer_ids:
++        generator = np.random.default_rng(10007 * layer_id)
++        values = generator.integers(low=0, high=multiplier_bound, size=(max_ngram_size,), dtype=np.int64)
++        rows.append(torch.tensor(values * 2 + 1))
++    return torch.stack(rows)
++
++
++def _mmap_rows(path: str, name: str, row_start: int, row_end: int, row_bytes: int) -> torch.Tensor:
++    """Rows [row_start, row_end) of a 2-D uint8 safetensors tensor, memory-mapped read-only."""
++    import struct
++
++    import numpy as np
++
++    with open(path, "rb") as f:
++        header_len = struct.unpack("<Q", f.read(8))[0]
++        header = json.loads(f.read(header_len))
++    begin, _ = header[name]["data_offsets"]
++    n = max(0, row_end - row_start)
++    if n == 0:
++        return torch.zeros(0, row_bytes, dtype=torch.uint8)
++    offset = 8 + header_len + begin + row_start * row_bytes
++    mm = np.memmap(path, dtype=np.uint8, mode="r", offset=offset, shape=(n, row_bytes))
++    with warnings.catch_warnings():
++        warnings.simplefilter("ignore")
++        return torch.from_numpy(mm)
++
++
++@dataclass(frozen=True)
++class EngramLayout:
++    max_ngram_size: int
++    layer_ids: tuple
++    num_embeddings: tuple
++    primes: tuple
++    n_heads: int
++    head_dim: int
++
++
++def build_engram_layout(config: TransformerConfig) -> EngramLayout | None:
++    layer_ids = tuple(config.v41_engram_layer_ids)
++    if not layer_ids:
++        return None
++    key = (
++        layer_ids,
++        tuple(config.v41_engram_num_embeddings),
++        config.v41_engram_max_ngram_size,
++        config.v41_engram_n_heads,
++        config.v41_engram_head_dim,
++        config.v41_engram_vocab_size,
++    )
++    if key not in _LAYOUT_CACHE:
++        primes, seen = [], set()
++        for _ in layer_ids:
++            per_ngram = []
++            for _ in range(config.v41_engram_max_ngram_size - 1):
++                sizes, current = [], config.v41_engram_vocab_size - 1
++                for _ in range(config.v41_engram_n_heads):
++                    current = find_next_prime(current, seen)
++                    seen.add(current)
++                    sizes.append(current)
++                per_ngram.append(tuple(sizes))
++            primes.append(tuple(per_ngram))
++        _LAYOUT_CACHE[key] = EngramLayout(
++            max_ngram_size=config.v41_engram_max_ngram_size,
++            layer_ids=layer_ids,
++            num_embeddings=tuple(config.v41_engram_num_embeddings),
++            primes=tuple(primes),
++            n_heads=config.v41_engram_n_heads,
++            head_dim=config.v41_engram_head_dim,
++        )
++    return _LAYOUT_CACHE[key]
++
++
++ENGRAM_GATE_CHUNK = int(os.environ.get("MEGATRON_DSV41_ENGRAM_GATE_CHUNK", "4096"))
++ENGRAM_HOST_TABLE = os.environ.get("MEGATRON_DSV41_ENGRAM_HOST_TABLE", "sharded")
++ENGRAM_GATHER_THREADS = int(os.environ.get("MEGATRON_DSV41_ENGRAM_GATHER_THREADS", "16"))
++# Per-GPU token budget the pinned staging buffers are pre-sized to, so they never
++# re-grow (a re-grow leaks pinned host memory, since torch's host allocator never
++# returns freed pinned blocks to the OS). A forward exceeding it still works via the
++# max() fallback in _staging; 0 restores grow-on-demand.
++ENGRAM_STAGE_MAX_TOKENS = int(os.environ.get("MEGATRON_DSV41_ENGRAM_STAGE_MAX_TOKENS", "40960"))
++assert ENGRAM_HOST_TABLE in ("sharded", "shared"), ENGRAM_HOST_TABLE
++
++
++def engram_gate(x, kv, q_weight, k_weight, eps, clamp_value, chunk: int | None = None):
++    chunk = ENGRAM_GATE_CHUNK if chunk is None else chunk
++    seqlen = x.shape[0]
++    if not chunk or seqlen <= chunk:
++        return _engram_gate(x, kv, q_weight, k_weight, eps, clamp_value)
++    if not torch.is_grad_enabled():
++        out = torch.empty_like(x)
++        for s in range(0, seqlen, chunk):
++            out[s : s + chunk] = _engram_gate(
++                x[s : s + chunk], kv[s : s + chunk], q_weight, k_weight, eps, clamp_value
++            )
++        return out
++    # one fp32 view of each weight for all chunks, so their gradients accumulate in fp32
++    q32, k32 = q_weight.float(), k_weight.float()
++    outs = [
++        torch.utils.checkpoint.checkpoint(
++            _engram_gate, x[s : s + chunk], kv[s : s + chunk], q32, k32, eps, clamp_value, use_reentrant=False
++        )
++        for s in range(0, seqlen, chunk)
++    ]
++    return torch.cat(outs, dim=0)
++
++
++def _engram_gate(x, kv, q_weight, k_weight, eps, clamp_value):
++    hc_mult, dim = x.shape[-2:]
++    key, value = kv.split([hc_mult * dim, dim], dim=-1)
++    key = key.float().unflatten(-1, (hc_mult, dim))
++    weight = q_weight.float() * k_weight.float()
++    h = x.float()
++    rstd = torch.rsqrt(h.square().mean(-1) + eps) * torch.rsqrt(key.square().mean(-1) + eps)
++    dot = (h * weight * key).sum(-1) * rstd * dim**-0.5
++    gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(clamp_value).sqrt(), dot))
++    return (h + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(x.dtype)
++
++
++class DeepSeekV41Engram(MegatronModule):
++    def __init__(self, config: TransformerConfig, layer_id: int, tp_group, cp_group=None):
++        super().__init__(config=config)
++        self.cp_group = cp_group
++        self.cp_size = cp_group.size() if cp_group is not None else 1
++        layout = build_engram_layout(config)
++        self.layer_id = layer_id
++        self.layer_hash_index = layout.layer_ids.index(layer_id)
++        self.hc_mult = config.num_residual_streams
++        self.dim = config.hidden_size
++        self.head_dim = layout.head_dim
++        self.max_ngram_size = layout.max_ngram_size
++        self.eps = config.layernorm_epsilon
++        self.clamp_value = 1e-6
++        self.tp_group = tp_group
++        self.tp_size = tp_group.size() if tp_group is not None else 1
++        tp_rank = tp_group.rank() if tp_group is not None else 0
++        rows = layout.num_embeddings[self.layer_hash_index]
++        self.rows = rows
++        self.shared_table = ENGRAM_HOST_TABLE == "shared"
++        shard_count = 1 if self.shared_table else self.tp_size
++        shard_rank = 0 if self.shared_table else tp_rank
++        self.rows_local = -(-rows // shard_count)
++        self.row_start = shard_rank * self.rows_local
++        self.rows_avail = max(0, min(self.row_start + self.rows_local, rows) - self.row_start)
++        self.table = None
++        self.table_scale = None
++        self._stage = None
++        self._table_loaded = False
++
++        n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads
++        self._hash_cols = n_hash_cols
++        self.linear_wkv = TELinear(
++            n_hash_cols * layout.head_dim,
++            self.dim * (self.hc_mult + 1),
++            config=config,
++            init_method=config.init_method,
++            bias=False,
++            skip_bias_add=False,
++            skip_weight_param_allocation=False,
++            parallel_mode="duplicated",
++        )
++        self.q_weight = nn.Parameter(torch.ones(self.hc_mult, self.dim, dtype=torch.float32))
++        self.k_weight = nn.Parameter(torch.ones(self.hc_mult, self.dim, dtype=torch.float32))
++        mark_keep_in_fp32(self.q_weight)
++        mark_keep_in_fp32(self.k_weight)
++
++        self.sequence_parallel = config.sequence_parallel
++        for p in self.parameters():
++            p.sequence_parallel = False
++        token_map, vocab_size = get_compressed_token_map(config.v41_hf_checkpoint)
++        assert vocab_size == config.v41_engram_compressed_vocab_size, (
++            vocab_size,
++            config.v41_engram_compressed_vocab_size,
++        )
++        self.pad_id = token_map[config.v41_engram_pad_token_id]
++        flat = [p for per_ngram in layout.primes[self.layer_hash_index] for p in per_ngram]
++        offsets = np.cumsum([0, *flat[:-1]])
++        multipliers = compute_hash_multipliers(layout.layer_ids, layout.max_ngram_size, vocab_size)
++        self.register_buffer("token_map", torch.tensor(token_map, dtype=torch.int64), persistent=False)
++        self.register_buffer("multipliers", multipliers[self.layer_hash_index].clone(), persistent=False)
++        self.register_buffer(
++            "primes", torch.tensor(layout.primes[self.layer_hash_index], dtype=torch.int64), persistent=False
++        )
++        self.register_buffer("offsets", torch.tensor(np.array(offsets), dtype=torch.int64), persistent=False)
++        self._load_table()
++
++    def _load_table(self):
++        ckpt = self.config.v41_hf_checkpoint
++        index = json.load(open(os.path.join(ckpt, "model.safetensors.index.json")))["weight_map"]
++        end = self.row_start + self.rows_avail
++        self.table = _mmap_rows(
++            os.path.join(ckpt, index[f"layers.{self.layer_id}.engram.embed.weight"]),
++            f"layers.{self.layer_id}.engram.embed.weight",
++            self.row_start,
++            end,
++            self.head_dim,
++        )
++        self.table_scale = _mmap_rows(
++            os.path.join(ckpt, index[f"layers.{self.layer_id}.engram.embed.scale"]),
++            f"layers.{self.layer_id}.engram.embed.scale",
++            self.row_start,
++            end,
++            self.head_dim // 32,
++        )
++        self._table_loaded = True
++
++    def hash_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
++        batch, seqlen = input_ids.shape
++        compressed = self.token_map[input_ids]
++        positions = torch.arange(seqlen, device=input_ids.device).expand(batch, seqlen)
++        tokens, blocked = [], torch.zeros_like(positions, dtype=torch.bool)
++        for shift in range(self.max_ngram_size):
++            source = compressed.gather(1, (positions - shift).clamp_min(0))
++            blocked = blocked | (positions < shift)
++            tokens.append(torch.where(blocked, self.pad_id, source))
++        tokens = torch.stack(tokens, dim=-1)
++        products = tokens * self.multipliers
++        rolling, hashes = products[..., 0], []
++        for i in range(1, self.max_ngram_size):
++            rolling = torch.bitwise_xor(rolling, products[..., i])
++            hashes.append(rolling.unsqueeze(-1) % self.primes[i - 1])
++        return torch.cat(hashes, dim=-1) + self.offsets
++
++    def _staging(self, n: int):
++        """Pinned buffers the host gather writes into, reused across forwards.
++
++        Pre-sized to ENGRAM_STAGE_MAX_TOKENS (see comment there); max() grows once
++        if a gather ever exceeds that budget.
++        """
++        cap = max(n, ENGRAM_STAGE_MAX_TOKENS * self._hash_cols)
++        if self._stage is None or self._stage[0].shape[0] < cap:
++            self._stage = (
++                torch.empty(cap, self.head_dim, dtype=torch.uint8).pin_memory(),
++                torch.empty(cap, self.head_dim // 32, dtype=torch.uint8).pin_memory(),
++                torch.cuda.Event(),
++            )
++        rows, scales, done = self._stage
++        # the previous forward's copy out of these buffers must have landed before they are refilled
++        done.synchronize()
++        return rows[:n], scales[:n], done
++
++    def lookup(self, ids: torch.Tensor) -> torch.Tensor:
++        if not self._table_loaded:
++            self._load_table()
++        local = ids - self.row_start
++        owned = (local >= 0) & (local < self.rows_avail)
++        local = local.masked_fill(~owned, 0)
++        local_cpu = local.reshape(-1).to("cpu")
++        row_buf, scale_buf, done = self._staging(local_cpu.numel())
++        prev_threads = torch.get_num_threads()
++        # ray gives an actor one intra-op thread, which leaves the GPU idle through this gather
++        torch.set_num_threads(ENGRAM_GATHER_THREADS)
++        try:
++            torch.index_select(self.table, 0, local_cpu, out=row_buf)
++            torch.index_select(self.table_scale, 0, local_cpu, out=scale_buf)
++        finally:
++            torch.set_num_threads(prev_threads)
++        rows = row_buf.to(ids.device, non_blocking=True).view(*ids.shape, -1)
++        scales = scale_buf.to(ids.device, non_blocking=True).view(*ids.shape, -1)
++        done.record()
++        rows = rows.view(torch.float8_e4m3fn).float().unflatten(-1, (-1, 32))
++        scales = scales.view(torch.float8_e8m0fnu).float().unsqueeze(-1)
++        values = (rows * scales).flatten(-2).to(torch.bfloat16)
++        if self.shared_table:
++            return values
++        values = values.masked_fill(~owned.unsqueeze(-1), 0)
++        if self.tp_size > 1:
++            torch.distributed.all_reduce(values, group=self.tp_group)
++        return values
++
++    def forward(self, hidden_states: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
++        if self.sequence_parallel:
++            hidden_states = gather_from_sequence_parallel_region(
++                hidden_states, tensor_parallel_output_grad=False, group=self.tp_group
++            )
++        seqlen, bsz, _ = hidden_states.shape
++        assert input_ids is not None and input_ids.shape[0] == bsz and input_ids.shape[1] == seqlen
++        with torch.no_grad():
++            if self.cp_size > 1:
++                chunks = [torch.empty_like(input_ids) for _ in range(self.cp_size)]
++                torch.distributed.all_gather(chunks, input_ids.contiguous(), group=self.cp_group)
++                start = self.cp_group.rank() * seqlen
++                ids = self.hash_ids(torch.cat(chunks, dim=1))[:, start : start + seqlen].transpose(0, 1)
++            else:
++                ids = self.hash_ids(input_ids).transpose(0, 1)
++            rows = self.lookup(ids)
++        kv, _ = self.linear_wkv(rows.flatten(-2))
++        x = hidden_states.view(seqlen, bsz, self.hc_mult, self.dim)
++        out = engram_gate(x, kv, self.q_weight, self.k_weight, self.eps, self.clamp_value).view(
++            seqlen, bsz, self.hc_mult * self.dim
++        )
++        if self.sequence_parallel:
++            out = scatter_to_sequence_parallel_region(out, group=self.tp_group)
++        return out
+diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/ops/__init__.py b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/__init__.py
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/ops/compressor.py b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/compressor.py
+new file mode 100644
+index 000000000..d3f1a0fb0
+--- /dev/null
++++ b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/compressor.py
+@@ -0,0 +1,35 @@
++import torch
++import torch.nn as nn
++import torch.nn.functional as F
++from megatron.core.transformer.module import mark_keep_in_fp32
++from megatron.core.transformer.transformer_config import TransformerConfig
++
++from megatron.core.transformer.experimental_attention_variant.dsv41.ops.norm import RMSNorm
++
++
++class DeepSeekV41Compressor(nn.Module):
++    def __init__(self, config: TransformerConfig, head_dim: int, compress_ratio: int):
++        super().__init__()
++        assert compress_ratio in (1, 2)
++        self.compress_ratio = compress_ratio
++        self.head_dim = head_dim
++        dim = config.hidden_size
++        self.linear_wkv = nn.Linear(dim, head_dim, bias=False, dtype=torch.bfloat16)
++        if compress_ratio > 1:
++            self.linear_wgate = nn.Linear(dim, head_dim, bias=False, dtype=torch.bfloat16)
++        self.norm = RMSNorm(head_dim, config.layernorm_epsilon)
++        mark_keep_in_fp32(self.norm.weight)
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        seqlen, bsz, _ = x.shape
++        ratio = self.compress_ratio
++        if ratio == 1:
++            return self.norm(F.linear(x, self.linear_wkv.weight))
++        groups = seqlen // ratio
++        x = x[: groups * ratio].float()
++        kv = F.linear(x, self.linear_wkv.weight.float())
++        score = F.linear(x, self.linear_wgate.weight.float())
++        kv = kv.view(groups, ratio, bsz, self.head_dim)
++        score = score.view(groups, ratio, bsz, self.head_dim)
++        kv = (kv * score.softmax(dim=1)).sum(dim=1)
++        return self.norm(kv.to(torch.bfloat16))
+diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/ops/cp_utils.py b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/cp_utils.py
+new file mode 100644
+index 000000000..c718f303f
+--- /dev/null
++++ b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/cp_utils.py
+@@ -0,0 +1,90 @@
++from functools import lru_cache
++
++import torch
++from torch import Tensor
++
++
++@lru_cache(1)
++def all_gather_cp(tensor: Tensor, dim: int, cp_group: torch.distributed.ProcessGroup) -> Tensor:
++    """All-gather tensor across CP ranks on `dim`. Contiguous CP = result already in natural order."""
++    return torch.cat(torch.distributed.nn.functional.all_gather(tensor, group=cp_group), dim=dim)
++
++
++def get_q_positions_for_cp(
++    seqlen_local: int,
++    *,
++    cp_size: int,
++    cp_group: torch.distributed.ProcessGroup,
++    device,
++) -> Tensor:
++    """Get global positions for local q tokens (contiguous CP)."""
++    if cp_size <= 1 or cp_group is None:
++        return torch.arange(0, seqlen_local, device=device)
++    cp_rank = cp_group.rank()
++    start = cp_rank * seqlen_local
++    return torch.arange(start, start + seqlen_local, device=device)
++
++
++def get_window_topk_idxs_cp(
++    q_positions: Tensor,
++    *,
++    window_size: int,
++    cp_size: int,
++    bsz: int,
++    seq_starts: Tensor | None = None,
++) -> Tensor:
++    """Get window topk indices (CP-aware).
++
++    ``seq_starts`` (per-query global start position of the query's own packed
++    trajectory, from packed_seq_params.cu_seqlens) confines the sliding window to
++    within the trajectory: keys before ``seq_starts`` are masked to -1 so a THD
++    query never attends across a sequence boundary into a sibling trajectory.
++    """
++    device = q_positions.device
++    seqlen_local = q_positions.shape[0]
++    seqlen_global = seqlen_local * cp_size
++    base = q_positions.unsqueeze(1)
++    k_pos = (base - window_size + 1).clamp(0) + torch.arange(min(seqlen_global, window_size), device=device)
++    invalid = k_pos > base
++    if seq_starts is not None:
++        invalid = invalid | (k_pos < seq_starts.unsqueeze(1))
++    topk_idxs = torch.where(invalid, -1, k_pos).int()
++    result = topk_idxs.unsqueeze(0).expand(bsz, -1, -1)
++
++    return result
++
++
++def get_compress_topk_idxs_cp(
++    q_positions: Tensor,
++    *,
++    ratio: int,
++    cp_size: int,
++    bsz: int,
++) -> Tensor:
++    """Get static compress topk indices (CP-aware)."""
++    device = q_positions.device
++    seqlen_local = q_positions.shape[0]
++    seqlen_global = seqlen_local * cp_size
++    offset = seqlen_global
++    k_group_idx = torch.arange(seqlen_global // ratio, device=device).repeat(seqlen_local, 1)
++    q_first_invalid_group = (q_positions + 1).unsqueeze(1) // ratio
++    invalid_mask = k_group_idx >= q_first_invalid_group
++    compress_topk_idxs = torch.where(invalid_mask, -1, k_group_idx + offset).int()
++    result = compress_topk_idxs.unsqueeze(0).expand(bsz, -1, -1)
++
++    return result
++
++
++def get_freqs_cis_for_cp(
++    freqs_cis: Tensor,
++    seqlen_local: int,
++    cp_size: int,
++    cp_group: torch.distributed.ProcessGroup,
++    stride: int = 1,
++) -> Tensor:
++    """Get freqs_cis for this CP rank (contiguous slice)."""
++    if cp_size == 1 or cp_group is None:
++        return freqs_cis[:seqlen_local:stride]
++    cp_rank = cp_group.rank()
++    start = cp_rank * seqlen_local
++    return freqs_cis[start : start + seqlen_local : stride]
+diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/ops/hc_mix.py b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/hc_mix.py
+new file mode 100644
+index 000000000..583e622db
+--- /dev/null
++++ b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/hc_mix.py
+@@ -0,0 +1,197 @@
++import os
++
++import torch
++import triton
++import triton.language as tl
++
++FUSED = os.environ.get("MEGATRON_DSV41_HC_FUSED", "0") == "1"
++
++
++@triton.jit
++def _mix_fwd(x_ptr, res_ptr, hres_ptr, hpost_ptr, out_ptr, d, N: tl.constexpr, BLOCK: tl.constexpr):
++    t = tl.program_id(0)
++    off = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
++    mask = off < d
++    x = tl.load(x_ptr + t * d + off, mask=mask, other=0.0).to(tl.float32)
++    for j in tl.static_range(N):
++        acc = tl.zeros([BLOCK], dtype=tl.float32)
++        for i in tl.static_range(N):
++            r = tl.load(res_ptr + (t * N + i) * d + off, mask=mask, other=0.0).to(tl.float32)
++            acc += tl.load(hres_ptr + (t * N + i) * N + j) * r
++        out = tl.load(hpost_ptr + t * N + j) * x + acc
++        tl.store(out_ptr + (t * N + j) * d + off, out.to(out_ptr.dtype.element_ty), mask=mask)
++
++
++@triton.jit
++def _mix_bwd(
++    g_ptr,
++    x_ptr,
++    res_ptr,
++    hres_ptr,
++    hpost_ptr,
++    gx_ptr,
++    gres_ptr,
++    ghres_ptr,
++    ghpost_ptr,
++    d,
++    N: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    t = tl.program_id(0)
++    ghpost = tl.zeros([N], dtype=tl.float32)
++    ghres = tl.zeros([N * N], dtype=tl.float32)
++    for base in range(0, d, BLOCK):
++        off = base + tl.arange(0, BLOCK)
++        mask = off < d
++        x = tl.load(x_ptr + t * d + off, mask=mask, other=0.0).to(tl.float32)
++        gx = tl.zeros([BLOCK], dtype=tl.float32)
++        for j in tl.static_range(N):
++            g = tl.load(g_ptr + (t * N + j) * d + off, mask=mask, other=0.0).to(tl.float32)
++            gx += tl.load(hpost_ptr + t * N + j) * g
++            hits = tl.sum(tl.where(mask, g * x, 0.0))
++            ghpost += tl.where(tl.arange(0, N) == j, hits, 0.0)
++        tl.store(gx_ptr + t * d + off, gx.to(gx_ptr.dtype.element_ty), mask=mask)
++        for i in tl.static_range(N):
++            r = tl.load(res_ptr + (t * N + i) * d + off, mask=mask, other=0.0).to(tl.float32)
++            gres = tl.zeros([BLOCK], dtype=tl.float32)
++            for j in tl.static_range(N):
++                g = tl.load(g_ptr + (t * N + j) * d + off, mask=mask, other=0.0).to(tl.float32)
++                gres += tl.load(hres_ptr + (t * N + i) * N + j) * g
++                hit = tl.sum(tl.where(mask, g * r, 0.0))
++                ghres += tl.where(tl.arange(0, N * N) == i * N + j, hit, 0.0)
++            tl.store(gres_ptr + (t * N + i) * d + off, gres.to(gres_ptr.dtype.element_ty), mask=mask)
++    tl.store(ghpost_ptr + t * N + tl.arange(0, N), ghpost)
++    tl.store(ghres_ptr + t * N * N + tl.arange(0, N * N), ghres)
++
++
++class _HCMix(torch.autograd.Function):
++    @staticmethod
++    def forward(ctx, x, residual, h_res, h_post, n):
++        s, b, d = x.shape
++        t = s * b
++        ctx.dtypes = (x.dtype, residual.dtype, h_res.dtype, h_post.dtype)
++        x = x.contiguous()
++        residual = residual.contiguous()
++        h_res = h_res.contiguous().float()
++        h_post = h_post.contiguous().float()
++        out = torch.empty(t, n, d, dtype=residual.dtype, device=x.device)
++        block = 1024
++        _mix_fwd[(t, triton.cdiv(d, block))](x, residual, h_res, h_post, out, d, N=n, BLOCK=block, num_warps=4)
++        ctx.save_for_backward(x, residual, h_res, h_post)
++        ctx.n, ctx.shape = n, (s, b, d)
++        return out.view(s, b, n * d)
++
++    @staticmethod
++    def backward(ctx, grad_out):
++        x, residual, h_res, h_post = ctx.saved_tensors
++        n = ctx.n
++        s, b, d = ctx.shape
++        t = s * b
++        grad_out = grad_out.contiguous()
++        gx = torch.empty_like(x)
++        gres = torch.empty_like(residual)
++        ghres = torch.empty(t, n, n, dtype=torch.float32, device=x.device)
++        ghpost = torch.empty(t, n, dtype=torch.float32, device=x.device)
++        _mix_bwd[(t,)](
++            grad_out,
++            x,
++            residual,
++            h_res,
++            h_post,
++            gx,
++            gres,
++            ghres,
++            ghpost,
++            d,
++            N=n,
++            BLOCK=1024,
++            num_warps=4,
++        )
++        x_dt, res_dt, hres_dt, hpost_dt = ctx.dtypes
++        return (
++            gx.view(s, b, d).to(x_dt),
++            gres.view(s, b, n * d).to(res_dt),
++            ghres.view(s, b, n, n).to(hres_dt),
++            ghpost.view(s, b, n).to(hpost_dt),
++            None,
++        )
++
++
++def hc_mix(x, original_residual, h_res, h_post, n):
++    """`h_post * x + einsum("sbij,sbid->sbjd", h_res, residual)`, flattened back to [s, b, n*d]."""
++    return _HCMix.apply(x, original_residual, h_res, h_post, n)
++
++
++def hc_mix_reference(x, original_residual, h_res, h_post, n):
++    s, b, _ = original_residual.shape
++    residual = original_residual.view(s, b, n, -1).float()
++    mixed = torch.einsum("sbij,sbid->sbjd", h_res.float(), residual)
++    out = h_post.float().unsqueeze(-1) * x.float().unsqueeze(2) + mixed
++    return out.view(s, b, -1).to(original_residual.dtype)
++
++
++@triton.jit
++def _agg_fwd(x_ptr, pre_ptr, out_ptr, d, N: tl.constexpr, BLOCK: tl.constexpr):
++    t = tl.program_id(0)
++    off = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
++    mask = off < d
++    acc = tl.zeros([BLOCK], dtype=tl.float32)
++    for i in tl.static_range(N):
++        v = tl.load(x_ptr + (t * N + i) * d + off, mask=mask, other=0.0).to(tl.float32)
++        acc += tl.load(pre_ptr + t * N + i) * v
++    tl.store(out_ptr + t * d + off, acc.to(out_ptr.dtype.element_ty), mask=mask)
++
++
++@triton.jit
++def _agg_bwd(g_ptr, x_ptr, pre_ptr, gx_ptr, gpre_ptr, d, N: tl.constexpr, BLOCK: tl.constexpr):
++    t = tl.program_id(0)
++    gpre = tl.zeros([N], dtype=tl.float32)
++    for base in range(0, d, BLOCK):
++        off = base + tl.arange(0, BLOCK)
++        mask = off < d
++        g = tl.load(g_ptr + t * d + off, mask=mask, other=0.0).to(tl.float32)
++        for i in tl.static_range(N):
++            v = tl.load(x_ptr + (t * N + i) * d + off, mask=mask, other=0.0).to(tl.float32)
++            tl.store(
++                gx_ptr + (t * N + i) * d + off,
++                (tl.load(pre_ptr + t * N + i) * g).to(gx_ptr.dtype.element_ty),
++                mask=mask,
++            )
++            hit = tl.sum(tl.where(mask, g * v, 0.0))
++            gpre += tl.where(tl.arange(0, N) == i, hit, 0.0)
++    tl.store(gpre_ptr + t * N + tl.arange(0, N), gpre)
++
++
++class _Aggregate(torch.autograd.Function):
++    @staticmethod
++    def forward(ctx, x, pre, n):
++        s, b, nc = x.shape
++        d = nc // n
++        t = s * b
++        ctx.dtypes = (x.dtype, pre.dtype)
++        x = x.contiguous()
++        pre = pre.contiguous().float()
++        out = torch.empty(t, d, dtype=x.dtype, device=x.device)
++        block = 1024
++        _agg_fwd[(t, triton.cdiv(d, block))](x, pre, out, d, N=n, BLOCK=block, num_warps=4)
++        ctx.save_for_backward(x, pre)
++        ctx.n, ctx.shape = n, (s, b, d)
++        return out.view(s, b, d)
++
++    @staticmethod
++    def backward(ctx, grad_out):
++        x, pre = ctx.saved_tensors
++        n = ctx.n
++        s, b, d = ctx.shape
++        t = s * b
++        grad_out = grad_out.contiguous()
++        gx = torch.empty_like(x)
++        gpre = torch.empty(t, n, dtype=torch.float32, device=x.device)
++        _agg_bwd[(t,)](grad_out, x, pre, gx, gpre, d, N=n, BLOCK=1024, num_warps=4)
++        x_dt, pre_dt = ctx.dtypes
++        return gx.view(s, b, n * d).to(x_dt), gpre.view(s, b, n).to(pre_dt), None
++
++
++def aggregate(x, pre, n):
++    """`(pre.unsqueeze(-1) * x.view(s, b, n, d)).sum(dim=2)` in fp32, without the [s, b, n, d] temporary."""
++    return _Aggregate.apply(x, pre, n)
+diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/ops/indexer.py b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/indexer.py
+new file mode 100644
+index 000000000..eadc78d29
+--- /dev/null
++++ b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/indexer.py
+@@ -0,0 +1,237 @@
++import functools
++import os
++
++import torch
++import torch.nn as nn
++import torch.nn.functional as F
++from megatron.core.extensions.transformer_engine import TELinear
++from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
++from megatron.core.transformer.transformer_config import TransformerConfig
++
++from megatron.core.transformer.experimental_attention_variant.dsv41.ops.kernel.tilelang_indexer_fwd import batched_indexer_fwd
++from megatron.core.transformer.experimental_attention_variant.dsv41.ops.norm import RMSNorm
++from megatron.core.transformer.experimental_attention_variant.dsv41.ops.quant import fake_quant_fp4
++from megatron.core.transformer.experimental_attention_variant.dsv41.ops.rope import apply_rotary_emb
++from megatron.core.transformer.experimental_attention_variant.dsv41.dsa_topk import get_dsa_topk_fn
++from megatron.core.transformer.experimental_attention_variant.dsv41.replay import indexer_replay_manager
++
++
++def select_candidate_blocks(
++    logits: torch.Tensor, compress_lens: torch.Tensor, topk_blocks: int, block_size: int
++) -> torch.Tensor:
++    width = logits.size(-1)
++    scores = F.pad(logits, (0, -width % block_size), value=-torch.inf)
++    scores = scores.unflatten(-1, (-1, block_size)).amax(dim=-1)
++    num_blocks = scores.size(-1)
++    last = (compress_lens - 1) // block_size
++    scores = scores.masked_fill(torch.arange(num_blocks, device=logits.device) == last, torch.inf)
++    top = scores.topk(min(topk_blocks, num_blocks), dim=-1)
++    keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(-1, top.indices, top.values > -torch.inf)
++    return keep.repeat_interleave(block_size, dim=-1)[..., :width]
++
++
++INDEXER_QUERY_CHUNK = int(os.environ.get("MEGATRON_DSV41_INDEXER_QUERY_CHUNK", "8192"))
++
++try:
++    import deep_select
++except ImportError:  # the torch path stays for images without it
++    deep_select = None
++
++
++@functools.lru_cache(maxsize=1)
++def use_deep_select() -> bool:
++    if deep_select is None or os.environ.get("MEGATRON_DSV41_DEEP_SELECT", "1") != "1":
++        return False
++    # the package carries sm100a and sm103a cubins, so anything older keeps torch.topk
++    return torch.cuda.get_device_capability()[0] >= 10
++
++
++def indexer_select(
++    q: torch.Tensor,
++    index_k: torch.Tensor,
++    weights: torch.Tensor,
++    compress_lens: torch.Tensor,
++    candidates: torch.Tensor | None,
++    *,
++    is_candidate_source: bool,
++    uses_candidates: bool,
++    candidate_topk_blocks: int,
++    candidate_block_size: int,
++    topk: int,
++    topk_fn,
++    allow_deep_select: bool,
++    query_chunk: int | None,
++    compress_starts: torch.Tensor | None = None,
++) -> tuple[torch.Tensor, torch.Tensor | None]:
++    bsz, seqlen = q.shape[:2]
++    n_kv = index_k.size(1)
++    k_t = index_k.transpose(0, 1).contiguous()
++    deep_selecting = allow_deep_select and use_deep_select()
++    if deep_selecting:
++        # deep_select requires aligned score rows; the padded columns sit past every query's length
++        align = deep_select.get_stride_requirement()[0] // 4
++        pad_kv = -(-n_kv // align) * align - n_kv
++        if pad_kv:
++            k_t = torch.nn.functional.pad(k_t, (0, 0, 0, 0, 0, pad_kv))
++    chunk = seqlen if not query_chunk or query_chunk >= seqlen else query_chunk
++    idx_parts: list[torch.Tensor] = []
++    cand_parts: list[torch.Tensor] = []
++    for s in range(0, seqlen, chunk):
++        e = min(s + chunk, seqlen)
++        lens = compress_lens[s:e]
++        # ``starts`` = first compressed block of the query's own packed trajectory
++        # (0 when not packing). Passing it as cu_seqlen_ks makes batched_indexer_fwd
++        # write -inf below the trajectory start, so top-k is chosen from the SAME
++        # in-trajectory block set sglang uses — no cross-sequence selection.
++        if compress_starts is not None:
++            starts = compress_starts[s:e].to(torch.int32)
++        else:
++            starts = torch.zeros(e - s, dtype=torch.int32, device=q.device)
++        scores = batched_indexer_fwd(
++            q[:, s:e].transpose(0, 1).contiguous(),
++            k_t,
++            weights[:, s:e].transpose(0, 1).float().contiguous(),
++            starts,
++            lens.to(torch.int32),
++        )
++        # batched_indexer_fwd already wrote -inf outside [starts, lens) for every query
++        if is_candidate_source:
++            cand = select_candidate_blocks(
++                scores[..., :n_kv], lens.unsqueeze(-1), candidate_topk_blocks, candidate_block_size
++            )
++            cand_parts.append(cand)
++        elif uses_candidates:
++            assert candidates is not None
++            scores[..., :n_kv].masked_fill_(~candidates[:, s:e], -torch.inf)
++        if deep_selecting:
++            flat = scores.reshape(bsz * (e - s), scores.size(-1))
++            row_end = lens.to(torch.int32).repeat(bsz)
++            _, idx = deep_select.topk(
++                flat,
++                min(topk, n_kv),
++                end=row_end,
++                indices_type=torch.int64,
++                return_value=False,
++                idx_oob_fill_value=-1,
++            )
++            idx = idx.reshape(bsz, e - s, -1)
++            if n_kv < topk:
++                idx = torch.nn.functional.pad(idx, (0, topk - n_kv), value=-1)
++            idx = idx.sort(dim=-1).values
++            if compress_starts is not None:
++                idx = torch.where(idx >= starts.unsqueeze(0).unsqueeze(-1), idx, -1)
++            idx_parts.append(idx)
++            continue
++        if n_kv < topk:
++            scores = torch.nn.functional.pad(scores, (0, topk - n_kv), value=-torch.inf)
++        idx = topk_fn(scores.reshape(bsz * (e - s), scores.size(-1)), topk)
++        idx = idx.reshape(bsz, e - s, topk).sort(dim=-1).values.to(torch.int64)
++        keep = idx < lens.unsqueeze(-1)
++        if compress_starts is not None:
++            keep = keep & (idx >= starts.unsqueeze(0).unsqueeze(-1))
++        idx_parts.append(torch.where(keep, idx, -1))
++    idx = idx_parts[0] if len(idx_parts) == 1 else torch.cat(idx_parts, dim=1)
++    if is_candidate_source:
++        candidates = cand_parts[0] if len(cand_parts) == 1 else torch.cat(cand_parts, dim=1)
++    return idx, candidates
++
++
++class DeepSeekV41Indexer(MegatronModule):
++    def __init__(
++        self,
++        config: TransformerConfig,
++        layer_id: int,
++        head_dim: int,
++        compress_ratio: int,
++        owns_k: bool,
++        is_candidate_source: bool,
++        uses_candidates: bool,
++    ):
++        super().__init__(config=config)
++        self.layer_id = layer_id
++        self.compress_ratio = compress_ratio
++        self.owns_k = owns_k
++        self.is_candidate_source = is_candidate_source
++        self.uses_candidates = uses_candidates
++        self.candidate_topk_blocks = config.v41_candidate_topk_blocks
++        self.candidate_block_size = config.v41_candidate_block_size
++        self.index_n_heads = config.dsa_indexer_n_heads
++        self.index_head_dim = config.dsa_indexer_head_dim
++        self.index_topk = config.dsa_indexer_topk
++        self.rope_head_dim = config.qk_pos_emb_head_dim
++        self.softmax_scale = self.index_head_dim**-0.5
++        q_lora_rank = config.q_lora_rank if config.q_lora_rank is not None else config.hidden_size
++
++        self.linear_wq_b = TELinear(
++            q_lora_rank,
++            self.index_n_heads * self.index_head_dim,
++            config=config,
++            init_method=config.init_method,
++            bias=False,
++            skip_bias_add=False,
++            skip_weight_param_allocation=False,
++            parallel_mode="duplicated",
++        )
++        self.linear_weights_proj = TELinear(
++            config.hidden_size,
++            self.index_n_heads,
++            config=config,
++            init_method=config.init_method,
++            bias=False,
++            skip_bias_add=False,
++            skip_weight_param_allocation=False,
++            parallel_mode="duplicated",
++        )
++        if owns_k:
++            self.linear_wk = nn.Linear(head_dim, self.index_head_dim, bias=False, dtype=torch.bfloat16)
++            self.k_norm = RMSNorm(self.index_head_dim, config.layernorm_epsilon)
++            mark_keep_in_fp32(self.k_norm.weight)
++        indexer_replay_manager.register_to_module(
++            self, "indexer_replay", stream_idx=sorted(config.v41_index_source_layer_ids).index(layer_id)
++        )
++
++    @torch.no_grad()
++    def index_keys(self, latent: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
++        k = self.k_norm(F.linear(latent, self.linear_wk.weight)).clone()
++        apply_rotary_emb(k[..., -self.rope_head_dim :], freqs_cis)
++        return fake_quant_fp4(k)
++
++    @torch.no_grad()
++    def forward(
++        self,
++        x: torch.Tensor,
++        qr: torch.Tensor,
++        index_k: torch.Tensor,
++        freqs_cis: torch.Tensor,
++        compress_lens: torch.Tensor,
++        candidates: torch.Tensor | None,
++        compress_starts: torch.Tensor | None = None,
++    ):
++        bsz, seqlen, _ = x.shape
++        rd = self.rope_head_dim
++        q, _ = self.linear_wq_b(qr)
++        q = q.view(bsz, seqlen, self.index_n_heads, self.index_head_dim).clone()
++        apply_rotary_emb(q[..., -rd:], freqs_cis)
++        q = fake_quant_fp4(q)
++        weights, _ = self.linear_weights_proj(x)
++        weights = weights * (self.softmax_scale * self.index_n_heads**-0.5)
++
++        base_topk_fn = get_dsa_topk_fn("torch")
++        topk_fn = indexer_replay_manager.get_topk_fn(base_topk_fn, return_probs=False)
++        idx, candidates = indexer_select(
++            q,
++            index_k,
++            weights,
++            compress_lens,
++            candidates,
++            is_candidate_source=self.is_candidate_source,
++            uses_candidates=self.uses_candidates,
++            candidate_topk_blocks=self.candidate_topk_blocks,
++            candidate_block_size=self.candidate_block_size,
++            topk=self.index_topk,
++            topk_fn=topk_fn,
++            allow_deep_select=topk_fn is base_topk_fn,
++            query_chunk=INDEXER_QUERY_CHUNK,
++            compress_starts=compress_starts,
++        )
++        return idx, candidates
+diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/__init__.py b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/__init__.py
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/act_quant.py b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/act_quant.py
+new file mode 100644
+index 000000000..eb6526bf2
+--- /dev/null
++++ b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/act_quant.py
+@@ -0,0 +1,137 @@
++"""Block-wise FP8 activation quantization for DeepSeek-V4.
++
++Ported verbatim from deepseek-ai/DeepSeek-V4-Pro/inference/kernel.py to keep
++bit-exact parity with the upstream inference kernel. Keep this file in sync
++when DeepSeek updates the reference implementation.
++
++Source: https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/blob/main/inference/kernel.py
++"""
++
++import tilelang
++import tilelang.language as T
++import torch
++
++tilelang.set_log_level("WARNING")
++
++pass_configs = {
++    tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
++    tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
++}
++
++FP8 = "float8_e4m3"
++FP4 = "float4_e2m1fn"
++FE8M0 = "float8_e8m0fnu"
++BF16 = "bfloat16"
++FP32 = "float32"
++INT32 = "int32"
++
++
++def fast_log2_ceil(x):
++    """Compute ceil(log2(x)) via IEEE 754 bit manipulation. Avoids slow log/ceil intrinsics."""
++    bits_x = T.reinterpret("uint32", x)
++    exp_x = (bits_x >> 23) & 0xFF
++    man_bits = bits_x & ((1 << 23) - 1)
++    return T.Cast("int32", exp_x - 127 + T.if_then_else(man_bits != 0, 1, 0))
++
++
++def fast_pow2(x):
++    """Compute 2^x for integer x via IEEE 754 bit manipulation."""
++    bits_x = (x + 127) << 23
++    return T.reinterpret("float32", bits_x)
++
++
++def fast_round_scale(amax, fp8_max_inv):
++    return fast_pow2(fast_log2_ceil(amax * fp8_max_inv))
++
++
++@tilelang.jit(pass_configs=pass_configs)
++def act_quant_kernel(
++    N, block_size=128, in_dtype=BF16, out_dtype=FP8, scale_dtype=FP32, round_scale=False, inplace=False
++):
++    """Block-wise FP8 quantization. inplace=True does fused quant+dequant back to BF16."""
++    M = T.symbolic("M")
++    fp8_min = -448.0
++    fp8_max = 448.0
++    fp8_max_inv = 1 / fp8_max
++    num_stages = 0 if round_scale or inplace else 2
++    blk_m = 32
++    group_size = block_size
++    # Internal computation in FP32; scale_dtype controls output storage format.
++    compute_dtype = FP32
++    out_dtype = in_dtype if inplace else out_dtype
++
++    @T.prim_func
++    def act_quant_kernel_(
++        X: T.Tensor[(M, N), in_dtype],
++        Y: T.Tensor[(M, N), out_dtype],
++        S: T.Tensor[(M, T.ceildiv(N, group_size)), scale_dtype],
++    ):
++        with T.Kernel(T.ceildiv(M, blk_m), T.ceildiv(N, group_size), threads=128) as (
++            pid_m,
++            pid_n,
++        ):
++            x_shared = T.alloc_shared((blk_m, group_size), in_dtype)
++            x_local = T.alloc_fragment((blk_m, group_size), in_dtype)
++            amax_local = T.alloc_fragment((blk_m,), compute_dtype)
++            s_local = T.alloc_fragment((blk_m,), compute_dtype)
++            y_local = T.alloc_fragment((blk_m, group_size), out_dtype)
++            y_shared = T.alloc_shared((blk_m, group_size), out_dtype)
++
++            for _ in T.Pipelined(1, num_stages=num_stages):
++                T.copy(X[pid_m * blk_m, pid_n * group_size], x_shared)
++                T.copy(x_shared, x_local)
++                T.reduce_absmax(x_local, amax_local, dim=1)
++                for i in T.Parallel(blk_m):
++                    amax_local[i] = T.max(amax_local[i], 1e-4)
++                    if round_scale:
++                        s_local[i] = fast_round_scale(amax_local[i], fp8_max_inv)
++                    else:
++                        s_local[i] = amax_local[i] * fp8_max_inv
++                if inplace:
++                    for i, j in T.Parallel(blk_m, group_size):
++                        y_local[i, j] = T.Cast(
++                            out_dtype,
++                            T.Cast(
++                                compute_dtype, T.Cast(out_dtype, T.clamp(x_local[i, j] / s_local[i], fp8_min, fp8_max))
++                            )
++                            * s_local[i],
++                        )
++                else:
++                    for i, j in T.Parallel(blk_m, group_size):
++                        y_local[i, j] = T.clamp(x_local[i, j] / s_local[i], fp8_min, fp8_max)
++                for i in T.Parallel(blk_m):
++                    S[pid_m * blk_m + i, pid_n] = T.Cast(scale_dtype, s_local[i])
++                T.copy(y_local, y_shared)
++                T.copy(y_shared, Y[pid_m * blk_m, pid_n * group_size])
++
++    return act_quant_kernel_
++
++
++def act_quant(
++    x: torch.Tensor,
++    block_size: int = 128,
++    scale_fmt: str | None = None,
++    scale_dtype: torch.dtype = torch.float32,
++    inplace: bool = False,
++) -> torch.Tensor:
++    """Block-wise FP8 quantization. inplace=True does fused quant+dequant back to BF16.
++    When scale_fmt is set, scales are rounded to power-of-2 (MXFP).
++    """
++    N = x.size(-1)
++    assert N % block_size == 0
++    tl_dtype = FE8M0 if scale_dtype == torch.float8_e8m0fnu else FP32
++    z = x.contiguous()
++    y = torch.empty_like(z) if inplace else torch.empty_like(z, dtype=torch.float8_e4m3fn)
++    s = z.new_empty(*z.size()[:-1], N // block_size, dtype=scale_dtype)
++    kernel = act_quant_kernel(
++        N,
++        block_size,
++        scale_dtype=tl_dtype,
++        round_scale=scale_fmt is not None,
++        inplace=inplace,
++    )
++    kernel(z.view(-1, N), y.view(-1, N), s.view(-1, N // block_size))
++    if inplace:
++        x.copy_(y)
++        return x
++    return y, s
+diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/tilelang_indexer_fwd.py b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/tilelang_indexer_fwd.py
+new file mode 100644
+index 000000000..5e0efe5f8
+--- /dev/null
++++ b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/tilelang_indexer_fwd.py
+@@ -0,0 +1,187 @@
++# ruff: noqa
++import tilelang
++import torch
++from tilelang import language as T
++
++
++@tilelang.jit(
++    pass_configs={
++        tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
++    },
++)
++def tl_indexer_fwd_impl(
++    heads,
++    index_dim,
++    block_N=128,
++    num_stages=4,
++    threads=512,
++    block_Q=8,
++):
++    dtype = T.bfloat16
++    accum_dtype = T.float32
++    index_dtype = T.int32
++
++    seq_len = T.dynamic("seq_len")
++    seq_len_kv = T.dynamic("seq_len_kv")
++
++    index_q_shape = [seq_len * heads, index_dim]
++    index_k_shape = [seq_len_kv, index_dim]
++    logits_shape = [seq_len, seq_len_kv]
++
++    @T.prim_func
++    def tl_indexer_fwd_kernel(
++        IndexQ: T.Tensor(index_q_shape, dtype),  # type: ignore
++        IndexK: T.Tensor(index_k_shape, dtype),  # type: ignore
++        Logits: T.Tensor(logits_shape, accum_dtype),  # type: ignore
++        Weights: T.Tensor([seq_len, heads], accum_dtype),  # type: ignore
++        CuSeqLenKS: T.Tensor([seq_len], index_dtype),  # type: ignore
++        CuSeqLenKE: T.Tensor([seq_len], index_dtype),  # type: ignore
++    ):
++        with T.Kernel(T.ceildiv(seq_len, block_Q), threads=threads) as bx:
++            index_q_shared = T.alloc_shared([block_Q * heads, index_dim], dtype)
++            index_k_shared = T.alloc_shared([block_N, index_dim], dtype)
++            s = T.alloc_fragment([block_N, block_Q * heads], accum_dtype)
++            s_reshaped = T.reshape(s, (block_N, block_Q, heads))
++            logits = T.alloc_fragment([block_N, block_Q], accum_dtype)
++            weights = T.alloc_fragment([block_Q, heads], accum_dtype)
++
++            seq_len_i = bx * block_Q
++
++            cu_k_s_min = T.alloc_var(index_dtype)
++            cu_k_e_max = T.alloc_var(index_dtype)
++
++            cu_k_s_min = 2147483647
++            cu_k_e_max = -2147483648
++
++            for bq_i in T.serial(block_Q):
++                cu_k_s_min = T.min(cu_k_s_min, T.min(CuSeqLenKS[seq_len_i + bq_i], seq_len_kv))
++            for bq_i in T.serial(block_Q):
++                cu_k_e_max = T.max(cu_k_e_max, T.min(CuSeqLenKE[seq_len_i + bq_i], seq_len_kv))
++
++            T.copy(IndexQ[seq_len_i * heads, 0], index_q_shared)
++            T.copy(Weights[seq_len_i, 0], weights)
++
++            for nbn_i in T.Pipelined(T.ceildiv(cu_k_e_max - cu_k_s_min, block_N), num_stages=num_stages):
++                T.copy(IndexK[cu_k_s_min + nbn_i * block_N, 0], index_k_shared)
++
++                T.gemm(
++                    index_k_shared,
++                    index_q_shared,
++                    s,
++                    transpose_B=True,
++                    clear_accum=True,
++                    policy=T.GemmWarpPolicy.FullCol,
++                )
++
++                for bn_i, bq_i, h_i in T.Parallel(block_N, block_Q, heads):
++                    s_reshaped[bn_i, bq_i, h_i] = T.max(s_reshaped[bn_i, bq_i, h_i], 0) * weights[bq_i, h_i]
++
++                T.reduce_sum(s_reshaped, logits, dim=-1, clear=True)
++
++                for bq_i, bn_i in T.Parallel(block_Q, block_N):
++                    Logits[seq_len_i + bq_i, cu_k_s_min + nbn_i * block_N + bn_i] = logits[bn_i, bq_i]
++
++    return tl_indexer_fwd_kernel
++
++
++@tilelang.jit
++def clean_logits_(
++    threads: int = 512,
++    block_K: int = 4096,
++):
++    seq_len = T.dynamic("seq_len")
++    seq_len_kv = T.dynamic("seq_len_kv")
++
++    dtype = T.float
++    indices_dtype = T.int32
++
++    @T.prim_func
++    def clean_logits_kernel(
++        Logits: T.Tensor([seq_len, seq_len_kv], dtype),  # type: ignore
++        CuSeqLenKS: T.Tensor([seq_len], indices_dtype),  # type: ignore
++        CuSeqLenKE: T.Tensor([seq_len], indices_dtype),  # type: ignore
++    ):
++        with T.Kernel(seq_len, threads=threads) as bx:
++            tx = T.thread_binding(0, threads, thread="threadIdx.x")
++            cu_k_s = CuSeqLenKS[bx]
++            cu_k_e = CuSeqLenKE[bx]
++
++            for n_i in T.Pipelined(T.ceildiv(seq_len_kv, block_K)):
++                for k_i in T.serial(block_K // threads):
++                    idx = n_i * block_K + k_i * threads + tx
++                    if idx < cu_k_s or idx >= cu_k_e:
++                        Logits[bx, idx] = -T.infinity(dtype)
++
++    return clean_logits_kernel
++
++
++def _make_causal_cu_seqlens(seq_len_q, seq_len_kv, compress_ratio, device):
++    """Generate cu_seqlens for causal masking on compressed KV positions.
++
++    For query at position p, valid compressed groups are [0, (p+1) // compress_ratio).
++    """
++    positions = torch.arange(seq_len_q, device=device, dtype=torch.int32)
++    cu_seqlen_ks = torch.zeros(seq_len_q, device=device, dtype=torch.int32)
++    cu_seqlen_ke = ((positions + 1) // compress_ratio).to(torch.int32)
++    return cu_seqlen_ks, cu_seqlen_ke
++
++
++def indexer_fwd_interface(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logits=True):
++    """Forward interface matching GLM-5's API but for a single batch element.
++
++    Args:
++        q: [seq_len, heads, index_dim] bf16
++        kv: [seq_len_kv, index_dim] bf16
++        weights: [seq_len, heads] fp32
++        cu_seqlen_ks: [seq_len] int32 — start of valid KV range per query
++        cu_seqlen_ke: [seq_len] int32 — end of valid KV range per query
++
++    Returns:
++        logits: [seq_len, seq_len_kv] fp32
++    """
++    seq_len, heads, index_dim = q.shape
++    seq_len_kv = kv.shape[0]
++
++    clean_logits_kernel = clean_logits_()
++    tl_indexer_fwd_kernel = tl_indexer_fwd_impl(heads=heads, index_dim=index_dim)
++
++    logits = torch.empty([seq_len, seq_len_kv], device=q.device, dtype=torch.float32)
++    tl_indexer_fwd_kernel(
++        q.view(seq_len * heads, index_dim),
++        kv,
++        logits,
++        weights.float(),
++        cu_seqlen_ks,
++        cu_seqlen_ke,
++    )
++    if clean_logits:
++        clean_logits_kernel(logits, cu_seqlen_ks, cu_seqlen_ke)
++    return logits
++
++
++def batched_indexer_fwd(q, k, weights, cu_seqlen_ks, cu_seqlen_ke):
++    """Batched forward: loops over batch dim.
++
++    Args:
++        q: [seqlen, batch, heads, dim] bf16
++        k: [seqlen_kv, batch, dim] bf16
++        weights: [seqlen, batch, heads] fp32
++        cu_seqlen_ks: [seqlen] int32
++        cu_seqlen_ke: [seqlen] int32
++
++    Returns:
++        logits: [batch, seqlen, seqlen_kv] fp32
++    """
++    seqlen, batch, heads, dim = q.shape
++    seq_len_kv = k.shape[0]
++
++    all_logits = torch.empty([batch, seqlen, seq_len_kv], device=q.device, dtype=torch.float32)
++    for b in range(batch):
++        all_logits[b] = indexer_fwd_interface(
++            q[:, b, :, :].contiguous(),
++            k[:, b, :].contiguous(),
++            weights[:, b, :].contiguous(),
++            cu_seqlen_ks,
++            cu_seqlen_ke,
++        )
++    return all_logits
+diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/tilelang_sparse_mla.py b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/tilelang_sparse_mla.py
+new file mode 100644
+index 000000000..44e352437
+--- /dev/null
++++ b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/tilelang_sparse_mla.py
+@@ -0,0 +1,31 @@
++import torch
++
++from megatron.core.transformer.experimental_attention_variant.dsv41.ops.kernel import tilelang_sparse_mla_bwd as sparse_mla_bwd
++from megatron.core.transformer.experimental_attention_variant.dsv41.ops.kernel import tilelang_sparse_mla_fwd as sparse_mla_fwd
++
++
++class DeepSeekV4SparseAttention(torch.autograd.Function):
++
++    @staticmethod
++    def forward(ctx, q, kv, attn_sink, topk_idxs, sm_scale=None):
++        o, lse = sparse_mla_fwd.sparse_mqa_fwd_interface(q, kv, attn_sink, topk_idxs, sm_scale=sm_scale)
++
++        ctx.save_for_backward(q, kv, attn_sink, topk_idxs, o.clone(), lse)
++        ctx.sm_scale = sm_scale
++
++        return o
++
++    @staticmethod
++    def backward(ctx, do):
++        q, kv, attn_sink, topk_idxs, o, lse = ctx.saved_tensors
++        sm_scale = ctx.sm_scale
++
++        dq, dkv, d_attn_sink = sparse_mla_bwd.sparse_mqa_bwd_interface(
++            q, kv, attn_sink, o, do, topk_idxs, lse, sm_scale=sm_scale
++        )
++
++        return dq, dkv, d_attn_sink, None, None
++
++
++def sparse_attn_tilelang(q, kv, attn_sink, topk_idxs, sm_scale=None):
++    return DeepSeekV4SparseAttention.apply(q, kv, attn_sink, topk_idxs, sm_scale)
+diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/tilelang_sparse_mla_bwd.py b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/tilelang_sparse_mla_bwd.py
+new file mode 100644
+index 000000000..b3b2d9c3d
+--- /dev/null
++++ b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/tilelang_sparse_mla_bwd.py
+@@ -0,0 +1,282 @@
++# ruff: noqa
++import tilelang
++import torch
++from tilelang import language as T
++
++
++@tilelang.jit(out_idx=[-1])
++def preprocess(
++    B,
++    S,
++    H,
++    D,
++    block_ND=32,
++    num_stages=5,
++    dtype=T.bfloat16,
++    accum_dtype=T.float32,
++):
++    assert dtype == T.bfloat16
++    assert accum_dtype == T.float32
++    shape = [B, S, H, D]
++
++    @T.prim_func
++    def preprocess_kernel(
++        O: T.Tensor(shape, dtype),
++        dO: T.Tensor(shape, dtype),
++        Delta: T.Tensor([B, S, H], accum_dtype),
++    ):
++        with T.Kernel(H, T.ceildiv(S, block_ND), B) as (bx, by, bz):
++            o = T.alloc_fragment([block_ND, block_ND], accum_dtype)
++            do = T.alloc_fragment([block_ND, block_ND], accum_dtype)
++            delta = T.alloc_fragment([block_ND], accum_dtype)
++            acc = T.alloc_fragment([block_ND, block_ND], accum_dtype)
++            T.clear(acc)
++            for k in T.Pipelined(T.ceildiv(D, block_ND), num_stages=num_stages):
++                T.copy(O[bz, by * block_ND : (by + 1) * block_ND, bx, k * block_ND : (k + 1) * block_ND], o)
++                T.copy(dO[bz, by * block_ND : (by + 1) * block_ND, bx, k * block_ND : (k + 1) * block_ND], do)
++                for i, j in T.Parallel(block_ND, block_ND):
++                    acc[i, j] += o[i, j] * do[i, j]
++            T.reduce_sum(acc, delta, 1)
++            T.copy(delta, Delta[bz, by * block_ND : (by + 1) * block_ND, bx])
++
++    return preprocess_kernel
++
++
++@tilelang.jit(out_idx=[-1])
++def postprocess(
++    B,
++    S_kv,
++    D,
++    block_N=64,
++    threads=128,
++    dtype=T.bfloat16,
++    accum_dtype=T.float32,
++):
++    assert dtype == T.bfloat16
++    assert accum_dtype == T.float32
++    dkv_shape = [B, S_kv, D]
++
++    @T.prim_func
++    def postprocess_kernel(
++        dKV: T.Tensor(dkv_shape, accum_dtype),
++        dKV_out: T.Tensor(dkv_shape, dtype),
++    ):
++        with T.Kernel(T.ceildiv(S_kv, block_N), B, threads=threads) as (bx, by):
++            T.copy(
++                dKV[by, bx * block_N : (bx + 1) * block_N, :],
++                dKV_out[by, bx * block_N : (bx + 1) * block_N, :],
++            )
++
++    return postprocess_kernel
++
++
++@tilelang.jit(
++    out_idx=[-3],
++    pass_configs={
++        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
++        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
++        tilelang.PassConfigKey.TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE: False,
++    },
++)
++def bwd(
++    B,
++    S,
++    S_kv,
++    H,
++    D,
++    topk,
++    sm_scale=None,
++    block_size=32,
++    num_stages=1,
++    threads=128,
++    indices_dtype=T.int32,
++    dtype=T.bfloat16,
++    accum_dtype=T.float32,
++):
++    assert topk % block_size == 0, f"topk ({topk}) must be divisible by block_size ({block_size})"
++    assert dtype == T.bfloat16
++    assert accum_dtype == T.float32
++
++    if sm_scale is None:
++        sm_scale = D ** (-0.5)
++    sm_scale_mul_reciprocal_log2 = sm_scale * 1.44269504  # log2(e)
++
++    q_shape = [B, S, H, D]
++    kv_shape = [B, S_kv, D]
++    o_shape = [B, S, H, D]
++    indices_shape = [B, S, topk]
++    delta_shape = [B, S, H]
++    lse_shape = [B, S, H]
++    attn_sink_shape = [H]
++
++    padded_H = max(tilelang.math.next_power_of_2(H), 16)
++    is_hip = getattr(torch.version, "hip", None)
++    if is_hip:
++        # Split large HIP head tiles to reduce LDS use.
++        max_block_H = 32 if padded_H >= 64 else 64
++    else:
++        max_block_H = 64
++    block_H = min(max_block_H, padded_H)
++    assert padded_H % block_H == 0
++    NH = padded_H // block_H
++    BS = block_size
++    NS = tilelang.cdiv(topk, block_size)
++
++    split_store = 4  # 8 heads leave the accumulator small; more splits free registers
++
++    @T.prim_func
++    def sparse_mqa_bwd_kernel(
++        Q: T.Tensor(q_shape, dtype),
++        KV: T.Tensor(kv_shape, dtype),
++        dO: T.Tensor(o_shape, dtype),
++        AttnSink: T.Tensor(attn_sink_shape, accum_dtype),
++        Indices: T.Tensor(indices_shape, indices_dtype),
++        Lse: T.Tensor(lse_shape, accum_dtype),
++        Delta: T.Tensor(delta_shape, accum_dtype),
++        dQ: T.Tensor(q_shape, dtype),
++        dKV: T.Tensor(kv_shape, accum_dtype),
++        dAttnSink: T.Tensor(attn_sink_shape, accum_dtype),
++    ):
++        with T.Kernel(S, B, NH, threads=threads) as (s_i, by, bz):
++            Q_shared = T.alloc_shared([block_H, D], dtype)
++            KV_shared = T.alloc_shared([BS, D], dtype)
++            dO_shared = T.alloc_shared([block_H, D], dtype)
++            mask = T.alloc_fragment([BS], "bool")
++
++            P_shared_cast = T.alloc_shared([block_H, BS], dtype)
++            dP_shared_cast = T.alloc_shared([block_H, BS], dtype)
++            dQ_shared = T.alloc_shared([block_H, D], dtype)
++
++            acc_p = T.alloc_fragment([block_H, BS], accum_dtype)
++            acc_dp = T.alloc_fragment([block_H, BS], accum_dtype)
++            acc_dq = T.alloc_fragment([block_H, D], accum_dtype)
++            acc_dkv = T.alloc_fragment([BS, D], accum_dtype)
++            acc_dkv_shared = T.alloc_shared([BS // split_store, D], accum_dtype)
++
++            T.copy(Q[by, s_i, bz * block_H : (bz + 1) * block_H, :D], Q_shared)
++            T.copy(dO[by, s_i, bz * block_H : (bz + 1) * block_H, :D], dO_shared)
++
++            T.clear(acc_dq)
++
++            for i_i in T.Pipelined(NS, num_stages=num_stages):
++                for bi_i in T.Parallel(BS):
++                    mask[bi_i] = Indices[by, s_i, i_i * BS + bi_i] != -1
++
++                for h_i, bi_i in T.Parallel(block_H, BS):
++                    acc_p[h_i, bi_i] = T.if_then_else(mask[bi_i], 0, -T.infinity(acc_p.dtype))
++
++                for bi_i, d_i in T.Parallel(BS, D):
++                    KV_shared[bi_i, d_i] = KV[by, Indices[by, s_i, i_i * BS + bi_i], d_i]
++
++                T.gemm(Q_shared, KV_shared, acc_p, transpose_B=True, policy=T.GemmWarpPolicy.FullCol)
++
++                # P = exp2(scores * sm_scale_log2e - LSE)
++                for h_i, bi_i in T.Parallel(block_H, BS):
++                    acc_p[h_i, bi_i] = T.exp2(
++                        acc_p[h_i, bi_i] * sm_scale_mul_reciprocal_log2 - Lse[by, s_i, bz * block_H + h_i]
++                    )
++
++                T.copy(acc_p, P_shared_cast)
++
++                # dP = P * (dO @ KV^T - Delta)
++                T.gemm(
++                    dO_shared, KV_shared, acc_dp, transpose_B=True, policy=T.GemmWarpPolicy.FullCol, clear_accum=True
++                )
++
++                for h_i, bi_i in T.Parallel(block_H, BS):
++                    acc_dp[h_i, bi_i] = (
++                        acc_p[h_i, bi_i] * (acc_dp[h_i, bi_i] - Delta[by, s_i, bz * block_H + h_i]) * sm_scale
++                    )
++
++                T.copy(acc_dp, dP_shared_cast)
++
++                # dQ += dP @ KV
++                T.gemm(dP_shared_cast, KV_shared, acc_dq, policy=T.GemmWarpPolicy.FullCol)
++
++                # dKV += dP^T @ Q + P^T @ dO
++                T.gemm(
++                    dP_shared_cast,
++                    Q_shared,
++                    acc_dkv,
++                    transpose_A=True,
++                    policy=T.GemmWarpPolicy.FullCol,
++                    clear_accum=True,
++                )
++                T.gemm(P_shared_cast, dO_shared, acc_dkv, transpose_A=True, policy=T.GemmWarpPolicy.FullCol)
++
++                # Atomic store dKV with split to reduce register pressure
++                for s in range(split_store):
++                    for bi_i, d_i in T.Parallel(BS, D):
++                        if bi_i < BS // split_store:
++                            acc_dkv_shared[bi_i, d_i] = acc_dkv[bi_i + s * (BS // split_store), d_i]
++
++                    for bi_i, d_i in T.Parallel(BS // split_store, D // 4):
++                        T.atomic_addx4(
++                            dKV[
++                                by,
++                                Indices[by, s_i, i_i * BS + bi_i + s * (BS // split_store)],
++                                d_i * 4,
++                            ],
++                            acc_dkv_shared[bi_i, d_i * 4],
++                        )
++
++            # Store dQ
++            T.copy(acc_dq, dQ_shared)
++            T.copy(dQ_shared, dQ[by, s_i, bz * block_H : (bz + 1) * block_H, :D])
++
++            # dAttnSink[h] = -sum_{b,s}( Delta[b,s,h] * p_sink[b,s,h] )
++            # where p_sink = exp(attn_sink[h]) / Z = exp2(attn_sink[h]*log2e - LSE)
++            # attn_sink is a pre-scaled logit, so only convert to log2 base (no sm_scale)
++            for h_i in T.Parallel(block_H):
++                T.atomic_add(
++                    dAttnSink[bz * block_H + h_i],
++                    -Delta[by, s_i, bz * block_H + h_i]
++                    * T.exp2(AttnSink[bz * block_H + h_i] * 1.44269504 - Lse[by, s_i, bz * block_H + h_i]),
++                )
++
++    return sparse_mqa_bwd_kernel
++
++
++def sparse_mqa_bwd_interface(q, kv, attn_sink, o, do, topk_idxs, lse, sm_scale=None):
++    """Backward interface for V4 sparse MQA attention.
++
++    Args:
++        q:         [B, S, H, D] bf16
++        kv:        [B, S_kv, D] bf16
++        attn_sink: [H] fp32
++        o:         [B, S, H, D] bf16 (forward output)
++        do:        [B, S, H, D] bf16 (grad of output)
++        topk_idxs: [B, S, topk] int32
++        lse:       [B, S, H] fp32 (log-sum-exp from forward)
++        sm_scale:  float or None
++
++    Returns:
++        dq:         [B, S, H, D] bf16
++        dkv:        [B, S_kv, D] bf16
++        d_attn_sink: [H] fp32
++    """
++    assert q.is_contiguous() and kv.is_contiguous()
++    assert topk_idxs.is_contiguous() and lse.is_contiguous()
++    B, S, H, D = q.shape
++    _, S_kv, _ = kv.shape
++    topk = topk_idxs.shape[-1]
++
++    # Pad topk to next multiple of block_size (kernel requires divisibility)
++    block_size = 32
++    padded_topk = (topk + block_size - 1) // block_size * block_size
++    if padded_topk != topk:
++        pad = torch.full((B, S, padded_topk - topk), -1, device=topk_idxs.device, dtype=topk_idxs.dtype)
++        topk_idxs = torch.cat([topk_idxs, pad], dim=-1).contiguous()
++        topk = padded_topk
++
++    preprocess_kernel = preprocess(B, S, H, D)
++    bwd_kernel = bwd(B, S, S_kv, H, D, topk, sm_scale)
++    postprocess_kernel = postprocess(B, S_kv, D)
++
++    delta = preprocess_kernel(o, do)
++    dkv = torch.zeros_like(kv, dtype=torch.float32)
++    d_attn_sink = torch.zeros_like(attn_sink)
++    dq = bwd_kernel(q, kv, do, attn_sink, topk_idxs, lse, delta, dkv, d_attn_sink)
++    dkv = postprocess_kernel(dkv)
++
++    return dq, dkv, d_attn_sink
+diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/tilelang_sparse_mla_fwd.py b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/tilelang_sparse_mla_fwd.py
+new file mode 100644
+index 000000000..643e4343a
+--- /dev/null
++++ b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/tilelang_sparse_mla_fwd.py
+@@ -0,0 +1,190 @@
++# ruff: noqa
++import tilelang
++import torch
++from tilelang import language as T
++
++
++@tilelang.jit(
++    out_idx=[-2, -1],
++    pass_configs={
++        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
++        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
++    },
++)
++def sparse_mqa_fwd(
++    heads,
++    dim,
++    topk,
++    sm_scale=None,
++    block_I=64,
++    num_stages=1,
++    threads=128,
++):
++    assert dim == tilelang.math.next_power_of_2(dim), f"dim must be power of 2, got {dim}"
++    assert topk % block_I == 0, f"topk ({topk}) must be divisible by block_I ({block_I})"
++    if sm_scale is None:
++        sm_scale = (1.0 / dim) ** 0.5 * 1.44269504  # log2(e)
++    else:
++        sm_scale = sm_scale * 1.44269504  # log2(e)
++
++    batch = T.dynamic("batch")
++    seq_len = T.dynamic("seq_len")
++    seq_len_kv = T.dynamic("seq_len_kv")
++
++    q_shape = [batch, seq_len, heads, dim]
++    kv_shape = [batch, seq_len_kv, dim]
++    o_shape = [batch, seq_len, heads, dim]
++    indices_shape = [batch, seq_len, topk]
++    lse_shape = [batch, seq_len, heads]
++    attn_sink_shape = [heads]
++    indices_dtype = T.int32
++    dtype = T.bfloat16
++    accum_dtype = T.float32
++
++    H = heads
++    padded_H = max(tilelang.math.next_power_of_2(heads), 16)
++    BI = block_I
++    NI = tilelang.cdiv(topk, block_I)
++    D = dim
++
++    if heads > 64:
++        assert heads % 64 == 0, "heads should be a multiple of 64"
++        REPLICATE_H = heads // 64
++    else:
++        REPLICATE_H = 1
++
++    H_per_block = padded_H if REPLICATE_H == 1 else 64
++
++    is_hip = getattr(torch.version, "hip", None)
++    if is_hip:
++        # Limit pipeline buffering for 64-head HIP tiles to reduce LDS use.
++        kernel_num_stages = min(num_stages, 1) if H_per_block == 64 else num_stages
++    else:
++        kernel_num_stages = num_stages
++
++    @T.prim_func
++    def main(
++        Q: T.Tensor(q_shape, dtype),  # type: ignore
++        KV: T.Tensor(kv_shape, dtype),  # type: ignore
++        AttnSink: T.Tensor(attn_sink_shape, accum_dtype),  # type: ignore
++        Indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore
++        Output: T.Tensor(o_shape, dtype),  # type: ignore
++        Lse: T.Tensor(lse_shape, accum_dtype),  # type: ignore
++    ):
++        with T.Kernel(seq_len * REPLICATE_H, batch, threads=threads) as (bx, by):
++            Q_shared = T.alloc_shared([H_per_block, D], dtype)
++            KV_shared = T.alloc_shared([BI, D], dtype)
++            O_shared = T.alloc_shared([H_per_block, D], dtype)
++            Lse_shared = T.alloc_shared([H_per_block], accum_dtype)
++            mask = T.alloc_fragment([BI], "bool")
++
++            acc_o = T.alloc_fragment([H_per_block, D], accum_dtype)
++            acc_s = T.alloc_fragment([H_per_block, BI], accum_dtype)
++            S_shared = T.alloc_shared([H_per_block, BI], dtype)
++            sumexp = T.alloc_fragment([H_per_block], accum_dtype)
++            sumexp_i = T.alloc_fragment([H_per_block], accum_dtype)
++            alpha = T.alloc_fragment([H_per_block], accum_dtype)
++            m_i = T.alloc_fragment([H_per_block], accum_dtype)
++            m_i_prev = T.alloc_fragment([H_per_block], accum_dtype)
++
++            T.fill(acc_o, 0)
++            T.fill(sumexp, 0)
++            T.fill(m_i, -(2**30))
++
++            b_i = by
++            s_i = bx if REPLICATE_H == 1 else (bx // REPLICATE_H)
++
++            H0 = 0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * 64
++            H1 = H0 + H_per_block
++
++            T.copy(Q[b_i, s_i, H0:H1, :D], Q_shared)
++
++            for i_i in T.Pipelined(NI, num_stages=kernel_num_stages):
++                for bi_i in T.Parallel(BI):
++                    mask[bi_i] = Indices[b_i, s_i, i_i * BI + bi_i] != -1
++
++                for bi_i, d_i in T.Parallel(BI, D):
++                    KV_shared[bi_i, d_i] = KV[b_i, Indices[b_i, s_i, i_i * BI + bi_i], d_i]
++
++                for h_i, bi_i in T.Parallel(H_per_block, BI):
++                    acc_s[h_i, bi_i] = T.if_then_else(mask[bi_i], 0, -T.infinity(acc_s.dtype))
++                T.gemm(
++                    Q_shared,
++                    KV_shared,
++                    acc_s,
++                    transpose_B=True,
++                    policy=T.GemmWarpPolicy.FullRow,
++                )
++                T.copy(m_i, m_i_prev)
++                T.reduce_max(acc_s, m_i, dim=1, clear=False)
++                for h_i in T.Parallel(H_per_block):
++                    m_i[h_i] = T.max(m_i[h_i], m_i_prev[h_i])
++                for h_i in T.Parallel(H_per_block):
++                    alpha[h_i] = T.exp2((m_i_prev[h_i] - m_i[h_i]) * sm_scale)
++                for h_i, bi_i in T.Parallel(H_per_block, BI):
++                    acc_s[h_i, bi_i] = T.exp2(acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale)
++                T.reduce_sum(acc_s, sumexp_i, dim=1)
++                for h_i in T.Parallel(H_per_block):
++                    sumexp[h_i] = sumexp[h_i] * alpha[h_i] + sumexp_i[h_i]
++                for h_i, d_i in T.Parallel(H_per_block, D):
++                    acc_o[h_i, d_i] = acc_o[h_i, d_i] * alpha[h_i]
++
++                T.copy(acc_s, S_shared)
++                T.gemm(S_shared, KV_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
++
++            # attn_sink: add exp(attn_sink[h] - max_scaled) to softmax denominator
++            # attn_sink is a pre-scaled logit (same space as scores*sm_scale), so only convert to log2 base
++            for h_i in T.Parallel(H_per_block):
++                sumexp[h_i] += T.exp2(AttnSink[H0 + h_i] * 1.44269504 - m_i[h_i] * sm_scale)
++
++            # Rescale output
++            for h_i, d_i in T.Parallel(H_per_block, D):
++                acc_o[h_i, d_i] /= sumexp[h_i]
++            # LSE = log2(sumexp) + m_i * sm_scale (in log2 space)
++            for h_i in T.Parallel(H_per_block):
++                sumexp[h_i] = T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale
++
++            T.copy(acc_o, Output[b_i, s_i, H0:H1, :])
++            T.copy(sumexp, Lse[b_i, s_i, H0:H1])
++
++    return main
++
++
++def sparse_mqa_fwd_interface(q, kv, attn_sink, topk_idxs, sm_scale=None, block_I=64, num_stages=1, threads=128):
++    """Forward interface for V4 sparse MQA attention.
++
++    Args:
++        q:         [B, S, H, D] bf16
++        kv:        [B, S_kv, D] bf16
++        attn_sink: [H] fp32
++        topk_idxs: [B, S, topk] int32
++        sm_scale:  float or None (defaults to 1/sqrt(D))
++
++    Returns:
++        out: [B, S, H, D] bf16
++        lse: [B, S, H] fp32
++    """
++    assert q.is_contiguous() and kv.is_contiguous() and topk_idxs.is_contiguous()
++    batch, seq_len, heads, dim = q.shape
++    _, seq_len_kv, kv_dim = kv.shape
++    assert kv_dim == dim
++    _, _, topk = topk_idxs.shape
++
++    # Pad topk to next multiple of block_I (kernel requires divisibility)
++    padded_topk = (topk + block_I - 1) // block_I * block_I
++    if padded_topk != topk:
++        pad = torch.full((batch, seq_len, padded_topk - topk), -1, device=topk_idxs.device, dtype=topk_idxs.dtype)
++        topk_idxs = torch.cat([topk_idxs, pad], dim=-1).contiguous()
++        topk = padded_topk
++
++    kernel = sparse_mqa_fwd(
++        heads,
++        dim,
++        topk,
++        sm_scale,
++        block_I=block_I,
++        num_stages=num_stages,
++        threads=threads,
++    )
++    out, lse = kernel(q, kv, attn_sink, topk_idxs)
++    return out, lse
+diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kvnorm.py b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kvnorm.py
+new file mode 100644
+index 000000000..b098eca83
+--- /dev/null
++++ b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kvnorm.py
+@@ -0,0 +1,74 @@
++import torch
++
++from megatron.core.transformer.experimental_attention_variant.dsv41.ops.qat import fp8_simulate_qat
++from megatron.core.transformer.experimental_attention_variant.dsv41.ops.rope import apply_rotary_emb
++
++_PAGE_SIZE = 64
++_BYTES_PER_TOKEN = 584
++_ROW_BYTES = 576
++
++
++def kv_norm_rope(
++    kv: torch.Tensor, weight: torch.Tensor, eps: float, freqs_cis: torch.Tensor, rope_dim: int
++) -> torch.Tensor:
++    x = kv.float()
++    data = (x * torch.rsqrt(x.square().mean(-1, keepdim=True) + eps) * weight.float()).contiguous()
++    apply_rotary_emb(data[..., -rope_dim:], freqs_cis)
++    return data.to(kv.dtype)
++
++
++@torch.no_grad()
++def kv_cache_roundtrip(kv: torch.Tensor, weight: torch.Tensor, eps: float, freqs_cis: torch.Tensor) -> torch.Tensor:
++    from sglang.kernels.ops.attention.dsv4.dequant_k_cache import dequantize_k_cache_paged
++    from sglang.kernels.ops.attention.dsv4.elementwise import fused_k_norm_rope_flashmla
++
++    bsz, seqlen, dim = kv.shape
++    flat = kv.reshape(bsz * seqlen, dim).contiguous()
++    positions = torch.arange(seqlen, device=kv.device, dtype=torch.int32).repeat(bsz)
++    loc = torch.arange(bsz * seqlen, device=kv.device, dtype=torch.int32)
++    pages = (bsz * seqlen + _PAGE_SIZE) // _PAGE_SIZE + 1
++    page_bytes = -(-(_BYTES_PER_TOKEN * _PAGE_SIZE) // _ROW_BYTES) * _ROW_BYTES
++    cache = torch.zeros(pages, page_bytes, dtype=torch.uint8, device=kv.device)
++    fused_k_norm_rope_flashmla(
++        kv=flat,
++        kv_weight=weight.to(kv.dtype).contiguous(),
++        eps=eps,
++        freqs_cis=freqs_cis.contiguous(),
++        positions=positions,
++        out_loc=loc,
++        kvcache=cache,
++        page_size=_PAGE_SIZE,
++    )
++    return dequantize_k_cache_paged(cache, loc, _PAGE_SIZE).reshape(bsz, seqlen, dim).to(kv.dtype)
++
++
++def kv_norm_rope_fp8(
++    kv: torch.Tensor, weight: torch.Tensor, eps: float, freqs_cis: torch.Tensor, rope_dim: int
++) -> torch.Tensor:
++    soft = kv_norm_rope(kv, weight, eps, freqs_cis, rope_dim).clone()
++    soft[..., :-rope_dim] = fp8_simulate_qat(soft[..., :-rope_dim], 64)
++    hard = kv_cache_roundtrip(kv, weight, eps, freqs_cis)
++    return soft + (hard - soft).detach()
++
++
++@torch.no_grad()
++def compressed_kv_cache_roundtrip(latent: torch.Tensor) -> torch.Tensor:
++    from sglang.kernels.ops.attention.dsv4.attn import fused_store_cache
++    from sglang.kernels.ops.attention.dsv4.dequant_k_cache import dequantize_k_cache_paged
++
++    bsz, seqlen, dim = latent.shape
++    flat = latent.reshape(bsz * seqlen, dim).contiguous()
++    loc = torch.arange(bsz * seqlen, device=latent.device, dtype=torch.int64)
++    pages = (bsz * seqlen + _PAGE_SIZE) // _PAGE_SIZE + 1
++    page_bytes = -(-(_BYTES_PER_TOKEN * _PAGE_SIZE) // _ROW_BYTES) * _ROW_BYTES
++    cache = torch.zeros(pages, page_bytes, dtype=torch.uint8, device=latent.device)
++    fused_store_cache(input=flat, cache=cache, indices=loc, page_size=_PAGE_SIZE, type="flashmla")
++    return dequantize_k_cache_paged(cache, loc, _PAGE_SIZE).reshape(bsz, seqlen, dim).to(latent.dtype)
++
++
++def compressed_kv_stored(latent: torch.Tensor, rope_dim: int) -> torch.Tensor:
++    """The compressed latent as the engine's fp8 pool returns it: the fp4/E4M3 values are requantized to fp8 per 64."""
++    soft = latent.clone()
++    soft[..., :-rope_dim] = fp8_simulate_qat(soft[..., :-rope_dim], 64)
++    hard = compressed_kv_cache_roundtrip(latent)
++    return soft + (hard - soft).detach()
+diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/ops/norm.py b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/norm.py
+new file mode 100644
+index 000000000..613b017fb
+--- /dev/null
++++ b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/norm.py
+@@ -0,0 +1,25 @@
++import torch
++import torch.nn as nn
++
++
++class RMSNorm(nn.Module):
++    """
++    Kept in pure PyTorch with FP32 weights to match SGLang's compressor norm.
++
++    Args:
++        dim: Dimension of the input tensor.
++        eps: Epsilon for numerical stability. Defaults to ``1e-6``.
++    """
++
++    def __init__(self, dim: int, eps: float = 1e-6):
++        super().__init__()
++        self.dim = dim
++        self.eps = eps
++        self.weight = nn.Parameter(torch.ones(dim, dtype=torch.float32))
++
++    def forward(self, x: torch.Tensor):
++        dtype = x.dtype
++        x = x.float()
++        var = x.square().mean(-1, keepdim=True)
++        x = x * torch.rsqrt(var + self.eps)
++        return (self.weight * x).to(dtype)
+diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/ops/qat.py b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/qat.py
+new file mode 100644
+index 000000000..64726ed18
+--- /dev/null
++++ b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/qat.py
+@@ -0,0 +1,51 @@
++import torch
++
++from .kernel.act_quant import act_quant
++
++
++def per_token_cast_back(x_fp8_and_scale, out_dtype: str, block_size: int) -> torch.Tensor:
++    """Pure-torch inverse of the block-wise FP8 cast (no tile_kernels dependency).
++
++    ``x_fp8_and_scale`` is ``(y, scale)`` where ``y`` holds the FP8 (E4M3) values
++    of shape ``[M, N]`` and ``scale`` the per-block UE8M0 scale of shape
++    ``[M, N // block_size]``. Returns the dequantized ``y * scale`` broadcast per
++    block. This is a bit-exact inverse of ``act_quant`` (the cast-back adds no
++    rounding), so it matches ``tile_kernels.quant.per_token_cast_back`` for the
++    ue8m0 path used here.
++    """
++    y, scale = x_fp8_and_scale
++    M, N = y.shape
++    y = y.float().view(M, N // block_size, block_size)
++    out = (y * scale.float().unsqueeze(-1)).view(M, N)
++    return out.to(torch.bfloat16 if out_dtype == "bf16" else torch.float32)
++
++
++def fp8_simulate(x: torch.Tensor, block_size: int):
++    """Simulate per-token FP8 (E4M3) cast + dequant with UE8M0 scaling.
++
++    Both the cast (via :func:`act_quant`) and the cast-back step are routed
++    through ``deepseek-ai/TileKernels`` so we share the same FP8 kernels with
++    the rest of the DeepSeek stack.
++    """
++    x_c = x.contiguous()
++    y, scale = act_quant(x_c, block_size, "ue8m0")
++
++    N = x_c.size(-1)
++    y_flat = y.view(-1, N)
++    scale_flat = scale.reshape(y_flat.size(0), N // block_size).contiguous()
++
++    out_flat = per_token_cast_back((y_flat, scale_flat), "bf16" if x.dtype == torch.bfloat16 else "fp32", block_size)
++    return out_flat.view_as(x_c).to(x.dtype)
++
++
++class DeepSeekV4LinearQATFunc(torch.autograd.Function):
++    @staticmethod
++    def forward(ctx, kv, block_size=128):
++        return fp8_simulate(kv, block_size)
++
++    @staticmethod
++    def backward(ctx, grad_kv):
++        return grad_kv, None
++
++
++fp8_simulate_qat = DeepSeekV4LinearQATFunc.apply
+diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/ops/quant.py b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/quant.py
+new file mode 100644
+index 000000000..353561604
+--- /dev/null
++++ b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/quant.py
+@@ -0,0 +1,124 @@
++import torch
++import triton
++import triton.language as tl
++from triton.language.extra import libdevice
++
++FP8_MAX = 448.0
++FP4_MAX = 6.0
++BLOCK_SIZE = 32
++COMPRESSED_KV_BLOCK_SIZE = 16
++FP8_AMAX_FLOOR = 1e-4
++FP4_AMAX_FLOOR = 6 * 2.0**-126
++COMPRESSED_KV_SCALE_MIN = 2.0**-9
++
++
++@triton.jit
++def _ceil_pow2(v):
++    bits = v.to(tl.int32, bitcast=True)
++    exponent = ((bits >> 23) & 0xFF) - 127
++    has_mantissa = (bits & 0x7FFFFF) != 0
++    exponent = exponent + has_mantissa.to(tl.int32)
++    return ((exponent + 127) << 23).to(tl.float32, bitcast=True)
++
++
++@triton.jit
++def _fake_quant_kernel(
++    x_ptr,
++    out_ptr,
++    n_rows,
++    FMAX: tl.constexpr,
++    INV_FMAX: tl.constexpr,
++    AMAX_FLOOR: tl.constexpr,
++    SCALE_MAX: tl.constexpr,
++    FP4: tl.constexpr,
++    E4M3_SCALE: tl.constexpr,
++    BLOCK: tl.constexpr,
++    ROWS: tl.constexpr,
++):
++    pid = tl.program_id(0)
++    rows = pid * ROWS + tl.arange(0, ROWS)
++    cols = tl.arange(0, BLOCK)
++    mask = (rows < n_rows)[:, None]
++    offs = rows[:, None] * BLOCK + cols[None, :]
++    x = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
++    amax = tl.max(tl.abs(x), axis=1)
++    if E4M3_SCALE:
++        scale = tl.minimum(tl.maximum(amax * INV_FMAX, AMAX_FLOOR), SCALE_MAX)
++        scale = scale.to(tl.float8e4nv).to(tl.float32)
++        scaled = tl.div_rn(x, scale[:, None])
++    else:
++        amax = tl.maximum(amax, AMAX_FLOOR)
++        scale = _ceil_pow2(amax * INV_FMAX)
++        scaled = x / scale[:, None]
++    scaled = tl.minimum(tl.maximum(scaled, -FMAX), FMAX)
++    if FP4:
++        mag = tl.abs(scaled)
++        step = tl.where(mag < 2.0, 0.5, tl.where(mag < 4.0, 1.0, 2.0))
++        sign = tl.where(scaled > 0, 1.0, tl.where(scaled < 0, -1.0, 0.0))
++        q = libdevice.rint(mag / step) * step * sign
++    else:
++        q = scaled.to(tl.float8e4nv).to(tl.float32)
++    out = q * scale[:, None]
++    tl.store(out_ptr + offs, out.to(out_ptr.dtype.element_ty), mask=mask)
++
++
++def _fake_quant(x: torch.Tensor, fp4: bool, compressed_kv: bool = False) -> torch.Tensor:
++    block = COMPRESSED_KV_BLOCK_SIZE if compressed_kv else BLOCK_SIZE
++    assert x.shape[-1] % block == 0
++    xc = x.contiguous()
++    out = torch.empty_like(xc)
++    n_rows = xc.numel() // block
++    rows_per_prog = 64
++    grid = (triton.cdiv(n_rows, rows_per_prog),)
++    if compressed_kv:
++        fmax, floor = FP4_MAX, COMPRESSED_KV_SCALE_MIN
++    else:
++        fmax, floor = (FP4_MAX, FP4_AMAX_FLOOR) if fp4 else (FP8_MAX, FP8_AMAX_FLOOR)
++    _fake_quant_kernel[grid](
++        xc,
++        out,
++        n_rows,
++        FMAX=fmax,
++        INV_FMAX=1.0 / fmax,
++        AMAX_FLOOR=floor,
++        SCALE_MAX=FP8_MAX,
++        FP4=fp4,
++        E4M3_SCALE=compressed_kv,
++        BLOCK=block,
++        ROWS=rows_per_prog,
++    )
++    return out
++
++
++def fake_quant_compressed_kv_forward(x: torch.Tensor) -> torch.Tensor:
++    return _fake_quant(x, True, compressed_kv=True)
++
++
++def fake_quant_fp4_forward(x: torch.Tensor) -> torch.Tensor:
++    return _fake_quant(x, True)
++
++
++def fake_quant_fp8_forward(x: torch.Tensor) -> torch.Tensor:
++    return _fake_quant(x, False)
++
++
++class _StraightThrough(torch.autograd.Function):
++    @staticmethod
++    def forward(ctx, x, fn):
++        return fn(x)
++
++    @staticmethod
++    def backward(ctx, grad):
++        return grad, None
++
++
++def fake_quant_fp8(x: torch.Tensor) -> torch.Tensor:
++    return _StraightThrough.apply(x, fake_quant_fp8_forward)
++
++
++def fake_quant_fp4(x: torch.Tensor) -> torch.Tensor:
++    return _StraightThrough.apply(x, fake_quant_fp4_forward)
++
++
++def fake_quant_compressed_kv(x: torch.Tensor) -> torch.Tensor:
++    return _StraightThrough.apply(x, fake_quant_compressed_kv_forward)
+diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/ops/rope.py b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/rope.py
+new file mode 100644
+index 000000000..b20bf5c3c
+--- /dev/null
++++ b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/rope.py
+@@ -0,0 +1,62 @@
++import torch
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def _rope_kernel(
++    x_ptr, f_ptr, n_rows, seqlen, inner, row_stride, HALF: tl.constexpr, INVERSE: tl.constexpr, ROWS: tl.constexpr
++):
++    pid = tl.program_id(0)
++    rows = pid * ROWS + tl.arange(0, ROWS)
++    rmask = rows < n_rows
++    pos = (rows // inner) % seqlen
++    k = tl.arange(0, HALF)
++    x_offs = rows[:, None] * row_stride + 2 * k[None, :]
++    mask = rmask[:, None] & (k[None, :] < HALF)
++    xr = tl.load(x_ptr + x_offs, mask=mask, other=0.0).to(tl.float32)
++    xi = tl.load(x_ptr + x_offs + 1, mask=mask, other=0.0).to(tl.float32)
++    f_offs = pos[:, None] * (2 * HALF) + 2 * k[None, :]
++    fr = tl.load(f_ptr + f_offs, mask=mask, other=0.0)
++    fi = tl.load(f_ptr + f_offs + 1, mask=mask, other=0.0)
++    if INVERSE:
++        fi = -fi
++    outr = xr * fr - xi * fi
++    outi = xr * fi + xi * fr
++    tl.store(x_ptr + x_offs, outr.to(x_ptr.dtype.element_ty), mask=mask)
++    tl.store(x_ptr + x_offs + 1, outi.to(x_ptr.dtype.element_ty), mask=mask)
++
++
++def row_stride_or_none(x: torch.Tensor):
++    """Row stride of a contiguous tensor or a last-dim slice of one, else None."""
++    if x.stride(-1) != 1:
++        return None
++    if x.ndim == 1:
++        return x.shape[-1]
++    row_stride = x.stride(-2)
++    expected = row_stride
++    for d in range(x.ndim - 3, -1, -1):
++        expected *= x.shape[d + 1]
++        if x.stride(d) != expected:
++            return None
++    return row_stride
++
++
++def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False) -> torch.Tensor:
++    """In-place RoPE on the last dim of x ([b, s, d] or [b, s, h, d]); `freqs_cis` is complex [s, d/2]."""
++    dim = x.shape[-1]
++    half = dim // 2
++    assert freqs_cis.shape[-1] == half
++    row_stride = row_stride_or_none(x)
++    if row_stride is None:
++        # rows of a permuted view have no single stride: rotate a contiguous copy, then write it back in place
++        x.copy_(apply_rotary_emb(x.contiguous(), freqs_cis, inverse))
++        return x
++    seqlen = x.shape[1]
++    inner = x.shape[2] if x.ndim == 4 else 1
++    f = torch.view_as_real(freqs_cis.contiguous()).contiguous()
++    n_rows = x.numel() // dim
++    rows_per_prog = 32
++    grid = (triton.cdiv(n_rows, rows_per_prog),)
++    _rope_kernel[grid](x, f, n_rows, seqlen, inner, row_stride, HALF=half, INVERSE=inverse, ROWS=rows_per_prog)
++    return x
+diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/ops/rope_tables.py b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/rope_tables.py
+new file mode 100644
+index 000000000..97f8f56ad
+--- /dev/null
++++ b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/rope_tables.py
+@@ -0,0 +1,97 @@
++import math
++from functools import lru_cache
++
++import torch
++from megatron.core.transformer import TransformerConfig
++
++
++@lru_cache(maxsize=32)
++def precompute_freqs_cis(
++    dim, seqlen, original_seq_len, base, factor, beta_fast, beta_slow, device=None
++) -> torch.Tensor:
++    """Precompute the complex rotary frequencies for RoPE, with optional YaRN smoothing.
++
++    When ``original_seq_len > 0``, applies YaRN factor rescaling interpolated
++    by a linear ramp between ``beta_fast`` and ``beta_slow``. Otherwise the
++    base frequencies are used verbatim.
++    """
++
++    def find_correction_dim(num_rotations, dim, base, max_seq_len):
++        return dim * math.log(max_seq_len / (num_rotations * 2 * math.pi)) / (2 * math.log(base))
++
++    def find_correction_range(low_rot, high_rot, dim, base, max_seq_len):
++        low = math.floor(find_correction_dim(low_rot, dim, base, max_seq_len))
++        high = math.ceil(find_correction_dim(high_rot, dim, base, max_seq_len))
++        return max(low, 0), min(high, dim - 1)
++
++    def linear_ramp_factor(min, max, dim):
++        if min == max:
++            max += 0.001
++        linear_func = (torch.arange(dim, dtype=torch.float32) - min) / (max - min)
++        ramp_func = torch.clamp(linear_func, 0, 1)
++        return ramp_func
++
++    freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
++    if original_seq_len > 0:
++        low, high = find_correction_range(beta_fast, beta_slow, dim, base, original_seq_len)
++        smooth = 1 - linear_ramp_factor(low, high, dim // 2)
++        freqs = freqs / factor * (1 - smooth) + freqs * smooth
++
++    t = torch.arange(seqlen)
++    freqs = torch.outer(t, freqs)
++    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
++    # Cache on `device` so repeated lengths are GPU cache hits; values bit-identical to CPU build.
++    return freqs_cis.to(device) if device is not None else freqs_cis
++
++
++def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False) -> torch.Tensor:
++    """Apply RoPE in-place to the last dim of ``x``.
++
++    ``x`` has shape ``[..., dim]`` where ``dim`` is even; the last-dim pairs are
++    treated as complex numbers multiplied by ``freqs_cis``. When ``inverse=True``
++    the conjugate rotation is applied (used for the indexer's inverse rope).
++    """
++    y = x
++    x = torch.view_as_complex(x.float().unflatten(-1, (-1, 2)))
++    if inverse:
++        freqs_cis = freqs_cis.conj()
++    if x.ndim == 3:
++        freqs_cis = freqs_cis.view(1, x.size(1), x.size(-1))
++    else:
++        freqs_cis = freqs_cis.view(1, x.size(1), 1, x.size(-1))
++    x = torch.view_as_real(x * freqs_cis).flatten(-2)
++    y.copy_(x)
++    return y
++
++
++def wrapped_precompute_freqs_cis(
++    config: TransformerConfig, rope_head_dim: int, base: float, yarn_disabled: bool, max_seq_len: int, device
++):
++    # max_seq_len = global length (cp_size * seqlen_local); table rebuilt per call, lru-cached.
++    # yarn_disabled=True → original_seq_len=0, which makes precompute_freqs_cis skip the YaRN
++    # correction-range interpolation. Used by 0415 for pure-window (compress_ratio==0) layers.
++    original_seq_len = 0 if yarn_disabled else config.original_max_position_embeddings
++
++    inputs = dict(
++        dim=rope_head_dim,
++        seqlen=max_seq_len,
++        original_seq_len=original_seq_len,
++        base=base,
++        factor=config.rotary_scaling_factor,
++        beta_fast=config.beta_fast,
++        beta_slow=config.beta_slow,
++    )
++
++    assert config.rotary_scaling_factor in (4, 16), f"Unexpected rotary_scaling_factor: {config.rotary_scaling_factor}"
++    expected_original = 0 if yarn_disabled else 65536
++    assert inputs == dict(
++        dim=rope_head_dim,
++        seqlen=max_seq_len,
++        original_seq_len=expected_original,
++        base=base,
++        factor=config.rotary_scaling_factor,
++        beta_fast=32,
++        beta_slow=1,
++    )
++
++    return precompute_freqs_cis(**inputs, device=device)
+diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/replay.py b/megatron/core/transformer/experimental_attention_variant/dsv41/replay.py
+new file mode 100644
+index 000000000..bcda5dfa2
+--- /dev/null
++++ b/megatron/core/transformer/experimental_attention_variant/dsv41/replay.py
+@@ -0,0 +1,22 @@
++"""Minimal stubs for the indexer-replay subsystem.
++
++Indexer replay threads the sparse-indexer top-k selection through an RL
++"replay" manager so the trainer can replay the exact indices the rollout
++engine chose. That capture is OFF by default and yields no measurable parity
++gain, so this port ships the disabled/no-op behavior: the top-k function is
++used as-is and nothing is registered on the module.
++
++If indexer replay parity is needed later, port the full replay manager here.
++"""
++
++
++class _NoopIndexerReplayManager:
++    def register_to_module(self, module, attr_name: str, stream_idx: int | None = None) -> None:
++        return
++
++    def get_topk_fn(self, old_topk_fn, return_probs: bool):
++        # replay disabled -> use the underlying top-k function unchanged
++        return old_topk_fn
++
++
++indexer_replay_manager = _NoopIndexerReplayManager()
+diff --git a/megatron/core/transformer/transformer_config.py b/megatron/core/transformer/transformer_config.py
+index 80b3ecf4f..b4b351d7b 100644
+--- a/megatron/core/transformer/transformer_config.py
++++ b/megatron/core/transformer/transformer_config.py
+@@ -313,7 +313,7 @@ class TransformerConfig(ModelParallelConfig):
+     # attention variant
+     ####################
+     experimental_attention_variant: Optional[
+-        Literal['gdn', 'kda', 'gated_delta_net', 'dsa', 'dsv4_hybrid']
++        Literal['gdn', 'kda', 'gated_delta_net', 'dsa', 'dsv4_hybrid', 'dsv41_hybrid']
+     ] = None
+     """Type of experimental attention variant to use.
+ 
+@@ -1663,13 +1663,13 @@ class TransformerConfig(ModelParallelConfig):
+             if self.cp_partition_mode == "contiguous":
+                 if (
+                     self.multi_latent_attention
+-                    and self.experimental_attention_variant != "dsv4_hybrid"
++                    and self.experimental_attention_variant not in ("dsv4_hybrid", "dsv41_hybrid")
+                 ):
+                     raise ValueError(
+                         "cp_partition_mode='contiguous' is not supported with "
+                         "multi_latent_attention outside dsv4_hybrid."
+                     )
+-                if self.experimental_attention_variant != "dsv4_hybrid" and not (
++                if self.experimental_attention_variant not in ("dsv4_hybrid", "dsv41_hybrid") and not (
+                     is_gated_delta_net_variant(self.experimental_attention_variant)
+                 ):
+                     raise ValueError(
+@@ -1686,7 +1686,7 @@ class TransformerConfig(ModelParallelConfig):
+                         "GDN-family linear_cp_mode='headwise'."
+                     )
+             elif self.cp_partition_mode == "zigzag":
+-                if self.experimental_attention_variant == "dsv4_hybrid":
++                if self.experimental_attention_variant in ("dsv4_hybrid", "dsv41_hybrid"):
+                     raise ValueError(
+                         "DSv4 Hybrid with context parallelism requires "
+                         "cp_partition_mode='contiguous'."
+@@ -1934,6 +1934,27 @@ class TransformerConfig(ModelParallelConfig):
+                             "build or set dsa_kernel_backend='none'."
+                         )
+ 
++        elif self.experimental_attention_variant == "dsv41_hybrid":
++            # DeepSeek-V4.1: reuses the dsv4_hybrid layer / MoE / hyper-connection
++            # scaffolding but supplies its own tensor-parallel tilelang sparse-MLA
++            # attention (see megatron.core.transformer.experimental_attention_variant.dsv41).
++            # Differences from dsv4_hybrid: per-layer compress ratios are {0,1,2},
++            # tensor parallelism IS supported, and it does not go through megatron's
++            # cuDNN/tilelang DSA kernel backend (the plugin calls its own kernels).
++            assert self.multi_latent_attention, "DSv4.1 Hybrid requires multi_latent_attention."
++            assert self.csa_compress_ratios is not None, "csa_compress_ratios must be set"
++            mtp_layers = self.mtp_num_layers or 0
++            expected_len = self.num_layers + mtp_layers
++            assert len(self.csa_compress_ratios) >= expected_len, (
++                f"csa_compress_ratios length ({len(self.csa_compress_ratios)}) must be at least "
++                f"num_layers + mtp_num_layers ({self.num_layers} + {mtp_layers} = {expected_len})"
++            )
++            assert all(
++                ratio in [0, 1, 2] for ratio in self.csa_compress_ratios
++            ), "csa_compress_ratios must be 0, 1, or 2 for dsv41_hybrid"
++            assert not self.qk_clip, "QK clipping is not supported with DSv4.1 Hybrid Attention."
++            self.hetereogenous_dist_checkpoint = True
++
+         if self.gdn_pre_gated_delta_rule_fusion and self.experimental_attention_variant == "kda":
+             raise NotImplementedError(
+                 "gdn_pre_gated_delta_rule_fusion is not implemented for KDA yet."
+@@ -3964,7 +3985,7 @@ class MLATransformerConfig(TransformerConfig):
+             )
+ 
+         # DSv4 hybrid: derive qk_head_dim and kv_lora_rank from v_head_dim and qk_pos_emb_head_dim
+-        if self.experimental_attention_variant == "dsv4_hybrid":
++        if self.experimental_attention_variant in ("dsv4_hybrid", "dsv41_hybrid"):
+             assert (
+                 not self.mla_down_proj_fusion
+             ), "MLA down projection fusion must be disabled for DSv4 hybrid mode."
+@@ -3974,9 +3995,16 @@ class MLATransformerConfig(TransformerConfig):
+                 f"DSv4 hybrid mode is enabled, deriving qk_head_dim and kv_lora_rank from "
+                 f"v_head_dim and qk_pos_emb_head_dim",
+             )
+-            derived = self.v_head_dim - self.qk_pos_emb_head_dim
+-            self.qk_head_dim = derived
+-            self.kv_lora_rank = derived
++            if self.experimental_attention_variant == "dsv41_hybrid":
++                # V4.1 treats kv_lora_rank as the FULL per-head latent (nope+rope=512);
++                # its attention derives nope_head_dim = kv_lora_rank - qk_pos_emb_head_dim
++                # internally. (dsv4_hybrid instead stores kv_lora_rank as the nope part.)
++                self.kv_lora_rank = self.v_head_dim
++                self.qk_head_dim = self.v_head_dim
++            else:
++                derived = self.v_head_dim - self.qk_pos_emb_head_dim
++                self.qk_head_dim = derived
++                self.kv_lora_rank = derived
+ 
+         if self.cache_mla_latents:
+             assert (

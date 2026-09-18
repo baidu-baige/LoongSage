@@ -11,7 +11,7 @@ TransferMesh 不负责 Megatron 的 TP/PP 分片聚合（该部分交给 `megatr
 
 ## 1. 关键参数
 
-TransferMesh 通道通过 [`ChannelMeta`](../../coda/utils/channel_helper.py) 创建，运行时由 [`Trainer._init_channel_meta`](../../coda/controller/trainer.py) 统一构造。`ChannelMeta` 在代码中显式区分了 **必填字段（Required）** 与 **可选字段（Optional，均带默认值）**，业务代码只需要提供必填字段即可拉起通道。
+TransferMesh 通道通过 [`ChannelMeta`](../../coda/transfer_mesh/channel.py) 创建，运行时由 [`Trainer._init_channel_meta`](../../coda/controller/trainer.py) 统一构造。`ChannelMeta` 在代码中显式区分了 **必填字段（Required）** 与 **可选字段（Optional，均带默认值）**，业务代码只需要提供必填字段即可拉起通道。
 
 ### 1.1. 必填字段（Required）
 
@@ -36,7 +36,7 @@ TransferMesh 通道通过 [`ChannelMeta`](../../coda/utils/channel_helper.py) �
 | `gloo_port` | `29500` | Gloo TCPStore 端口。TransferMesh 内部还会使用 `port+1`（NCCL 数据组，NCCL 后端）和 `port+2`（NCCL 元数据组，Gloo 后端，通过 `broadcast_object_list` 传输控制帧）。 |
 | `local_ip` | `None` | 本地 IP；未指定时按 `HOST_IP` 环境变量 → Ray 的顺序自动解析；若都失败则抛 `RuntimeError`。 |
 
-`gpu_id`、`rank` 与 `addr` 由 [`channel_helper.py`](../../coda/utils/channel_helper.py) 在进程内自动解析，无需业务代码填写。发送方与接收方仅提供 `Role.SENDER` / `Role.RECEIVER` 即可。
+`gpu_id`、`rank` 与 `addr` 由 [`channel.py`](../../coda/transfer_mesh/channel.py) 在进程内自动解析，无需业务代码填写。发送方与接收方仅提供 `Role.SENDER` / `Role.RECEIVER` 即可。
 
 ## 2. 原理
 
@@ -54,7 +54,7 @@ TransferMesh 由三个模块组成：
 | [`protocol.py`](../../coda/transfer_mesh/protocol.py) | `TensorSpec`、`MetaFrame`、`str_to_dtype` | 桶级元数据协议 |
 | [`channel.py`](../../coda/transfer_mesh/channel.py) | `TransferMeshChannel`、`create_channel` | 通道生命周期、桶聚合、发送/接收路径 |
 
-`TransferMeshChannel` 由 `create_channel()` 构造，在构造函数返回后自动调用 `init_groups()`，一次性完成 Gloo 组建立、拓扑收集、NCCL 组建立三步；[`channel_helper.py`](../../coda/utils/channel_helper.py) 并在每个进程内保存一个 module-level `_channel` 单例，供 `create_sender_channel(meta)` / `create_receiver_channel(meta)` 复用。
+`TransferMeshChannel` 由 `create_channel()` 构造，在构造函数返回后自动调用 `init_groups()`，一次性完成 Gloo 组建立、拓扑收集、NCCL 组建立三步；同一模块 [`channel.py`](../../coda/transfer_mesh/channel.py) 并在每个进程内保存一个 module-level `_channel` 单例，供 `create_sender_channel(meta)` / `create_receiver_channel(meta)` 复用。
 
 ### 2.2. 通信拓扑
 
@@ -65,7 +65,7 @@ TransferMesh 由三个模块组成：
 - 命中一个同位置的发送方 → 加入该发送方的 `ipc_assignments`（同卡 IPC）；
 - 未命中 → 归入 `nccl_receivers`（由 `src_rank` 通过 NCCL 广播）。
 
-若两个发送方共享相同的 `(ip, gpu_id)`，`partition_receivers` 会抛出 `ValueError`（见 [`topology.py:66-70`](../../coda/transfer_mesh/topology.py)），用于在拓扑构造阶段尽早暴露配置错误。此外，进程侧的 `gpu_id` 并非直接使用 `torch.cuda.current_device()`，而是由 [`channel_helper.py`](../../coda/utils/channel_helper.py) 中的 `_get_physical_gpu_id()` 通过解析 `CUDA_VISIBLE_DEVICES`（以 `torch.cuda.current_device()` 为下标取出对应的物理 id；该变量为空、解析失败或下标越界时回退为 `torch.cuda.current_device()` 返回的逻辑设备索引）还原为物理 GPU 索引；这一步是 IPC 路径能够正确匹配的前提，因为 Ray Actor 内可见的本地 device index 始终为 0，与物理拓扑无关。
+若两个发送方共享相同的 `(ip, gpu_id)`，`partition_receivers` 会抛出 `ValueError`（见 [`topology.py:66-70`](../../coda/transfer_mesh/topology.py)），用于在拓扑构造阶段尽早暴露配置错误。此外，进程侧的 `gpu_id` 并非直接使用 `torch.cuda.current_device()`，而是由 [`channel.py`](../../coda/transfer_mesh/channel.py) 中的 `_get_physical_gpu_id()` 通过解析 `CUDA_VISIBLE_DEVICES`（以 `torch.cuda.current_device()` 为下标取出对应的物理 id；该变量为空、解析失败或下标越界时回退为 `torch.cuda.current_device()` 返回的逻辑设备索引）还原为物理 GPU 索引；这一步是 IPC 路径能够正确匹配的前提，因为 Ray Actor 内可见的本地 device index 始终为 0，与物理拓扑无关。
 
 只有存在跨卡接收方时才会额外创建两个组（各自使用独立的 TCPStore 端口）：
 
@@ -302,7 +302,7 @@ channel = create_channel(
 - [`TransferMeshChannel`](../../coda/transfer_mesh/channel.py) — 通道核心实现
 - [`partition_receivers`](../../coda/transfer_mesh/topology.py) — 拓扑分区
 - [`MetaFrame` / `TensorSpec`](../../coda/transfer_mesh/protocol.py) — 桶元数据协议
-- [`ChannelMeta` / `create_sender_channel` / `create_receiver_channel`](../../coda/utils/channel_helper.py) — 进程内通道生命周期
+- [`ChannelMeta` / `create_sender_channel` / `create_receiver_channel`](../../coda/transfer_mesh/channel.py) — 通道入参与进程内生命周期（同在 `channel.py`）
 - [`Trainer._init_channel_meta` / `Trainer._update_weights`](../../coda/controller/trainer.py) — 顶层编排
 - [`MegatronTrainWorker.update_weights`](../../coda/backends/megatron/megatron_train_worker.py) — 训练侧发送
 - [`SglangEngine.update_weights_from_channel`](../../coda/backends/sglang/engine.py) — 推理侧接收

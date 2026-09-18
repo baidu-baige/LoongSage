@@ -94,19 +94,24 @@ def apply_is_correction(
     num_tokens = torch.tensor(0.0, device=loss_masks[0].device)
     num_seqs = torch.tensor(0.0, device=loss_masks[0].device)
     is_approx_k3_kl = torch.tensor(0.0, device=loss_masks[0].device)
+    logprob_abs_diff = torch.tensor(0.0, device=loss_masks[0].device)
     for mask_i, old_lp, rollout_lp in zip(loss_masks, old_log_probs, rollout_log_probs):
         num_tokens += mask_i.sum()
         if mask_i.any():
             num_seqs += 1
         ratio = old_lp - rollout_lp
+        sum_abs_log_prob_diff = (ratio.abs() * mask_i).sum()
         per_token_kl = (torch.exp(ratio) - ratio - 1.0) * mask_i
         if loss_agg_mode == "seq-mean-token-mean":
             is_approx_k3_kl += per_token_kl.sum() / torch.clamp_min(mask_i.sum(), 1)
+            logprob_abs_diff += sum_abs_log_prob_diff / torch.clamp_min(mask_i.sum(), 1)
         else:
             is_approx_k3_kl += per_token_kl.sum()
+            logprob_abs_diff += sum_abs_log_prob_diff
 
     metrics: dict[str, float] = {
         "train/is_approx_k3_kl": is_approx_k3_kl.item(),
+        "train/is_logprob_abs_diff": logprob_abs_diff.item(),
         "num_tokens": num_tokens.item(),
         "num_seqs": num_seqs.item(),
     }

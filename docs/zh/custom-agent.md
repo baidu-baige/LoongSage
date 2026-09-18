@@ -2,27 +2,26 @@
 
 本文说明如何在 LoongSage 中新增自定义 agent。agent 扩展同样是 **“注册表 + 配置驱动”**：继承基类、添加注册装饰器，即可通过 `data_source.agent.name` 引用，无需修改调度代码。
 
-如果一条样本只需请求模型一次即可完成，例如普通问答或数学题，就不需要 agent，将 `agent.name` 留空即可。只有任务需要模型与工具反复交互，例如执行代码、检索资料或驱动外部 CLI，才需要自定义 agent。开始开发前可先查看内置的 `gsm8k`、`mini-swe`、`bcp` 和 `opencode` 是否能够复用。
+如果一条样本只需请求模型一次即可完成，就不需要 agent，将 `agent.name` 留空即可。只有任务需要模型与工具反复交互时才需要自定义 agent；开始开发前先检查 [agent 目录](../../coda/agentflow/agent/) 中是否已有可复用实现。
 
 ## 1. 开发步骤
 
 agent 基类和内置实现位于 [agent 目录](../../coda/agentflow/agent/)。新增 agent 时，按以下步骤操作：
 
-1. 继承 [BaseAgent](../../coda/agentflow/agent/base_agent.py)，实现异步方法 `run_trajectory(trajectory)` 和 `clear()`。构造函数接收 `router_url` 及通用采样参数，并保留 `**kwargs` 接收 `agent` 配置块中的自定义字段。
-2. 在 `run_trajectory()` 中读取 `prompt`、`label` 和 `metadata`。所有模型请求都发送到 `router_url`，执行结束后返回 `Reward`。
-3. 按需接收 `sandbox_env_client` 和 `reward_fn`。sandbox 的阻塞调用使用 `asyncio.to_thread(...)`；`clear()` 只清理 agent 自身资源。
+1. 继承 [BaseAgent](../../coda/agentflow/agent/base_agent.py)，实现异步方法 `run_trajectory(trajectory)`。构造函数由 AgentFlow 注入 `router_url`、`reward_fn`、`sandbox_client`、`sandbox_id` 和 `max_response_len_per_trajectory`，并保留 `**kwargs` 接收 `agent` 配置块中的自定义字段。采样参数由 Router 直接读取数据源配置，不传给 agent。
+2. 在 `run_trajectory()` 中读取 `prompt`、`label` 和 `metadata`。所有模型请求都发送到 `router_url`，执行结束后调用注入的 `reward_fn` 并返回 `Reward`。`reward_fn` 是同步的，用 `asyncio.to_thread` 调用以免阻塞事件循环。
+3. agent 使用 sandbox 时，直接使用注入的 `sandbox_client` 和 `sandbox_id`；同时要把这两个值放进传给 `reward_fn` 的第三个参数（context）里，reward 才能在同一个容器里评测。
 4. 使用 `@register_agent("your-name")` 注册，并把实现放到 [coda/custom/](../../coda/custom/) 下，LoongSage 会自动发现，详见[自定义扩展](./custom-extensions.md)。
 
 ## 2. 最小示例
 
-以下示例展示一个 agent 的基本结构。`_parse_tool_call()` 代表任务自己的工具协议解析逻辑：
+以下示例展示一个**用 sandbox** 的工具 agent。工具协议、以及怎么从模型回复里解析工具调用，都由 agent 自己决定，框架不提供解析器。这里用 Chat Completions 的 `tool_calls` 字段：
 
 ```python
 # coda/custom/my_agent.py
 import asyncio
+import json
 from typing import Any
-
-import httpx
 
 from coda.agentflow.agent import register_agent
 from coda.agentflow.agent.base_agent import BaseAgent
@@ -31,89 +30,44 @@ from coda.reward.reward import Reward
 
 @register_agent("my-agent")
 class MyAgent(BaseAgent):
-    def __init__(
-        self,
-        router_url: str,
-        completion_params: dict | None = None,
-        max_response_len_per_trajectory: int = 0,
-        temperature: float = 1.0,
-        sandbox_env_client: Any = None,
-        reward_fn: Any = None,
-        max_turns: int = 5,
-        **kwargs: Any,
-    ) -> None:
-        super().__init__(
-            router_url=router_url,
-            completion_params=completion_params,
-            max_response_len_per_trajectory=max_response_len_per_trajectory,
-            temperature=temperature,
-            **kwargs,
-        )
-        self.sandbox = sandbox_env_client
-        self.reward_fn = reward_fn
+    def __init__(self, *args: Any, max_turns: int = 5, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
         self.max_turns = max_turns
-        self.client = httpx.AsyncClient(timeout=120.0)
-        self._closed = False
 
     async def run_trajectory(self, trajectory: dict[str, Any]) -> Reward:
-        prompt = trajectory["prompt"]
         label = trajectory.get("label")
         metadata = trajectory.get("metadata") or {}
-        messages = prompt if isinstance(prompt, list) else [
-            {"role": "user", "content": str(prompt)}
-        ]
-
-        if self.sandbox is not None and not self.sandbox.sandbox_id:
-            await asyncio.to_thread(
-                self.sandbox.create,
-                image=metadata.get("docker_image"),
-            )
+        messages = list(trajectory["prompt"])
+        if self.sandbox_id is None:
+            self.sandbox_id = await asyncio.to_thread(self.sandbox_client.create, image=metadata["docker_image"])
 
         for _ in range(self.max_turns):
-            assistant = await self._complete(messages)
+            response = await self.call_llm(messages)
+            assistant = response["choices"][0]["message"]
             messages.append(assistant)
-            tool_call = _parse_tool_call(assistant)
-            if tool_call is None:
+            tool_calls = assistant.get("tool_calls") or []
+            if not tool_calls:
                 break
-            if self.sandbox is None:
-                raise RuntimeError("this agent requires a sandbox")
-            result = await asyncio.to_thread(
-                self.sandbox.execute,
-                tool_call["command"],
-                workdir=tool_call.get("workdir"),
-            )
-            messages.append({
-                "role": "user",
-                "content": f"Tool result:\n{result['stdout']}\n{result['stderr']}",
-            })
+            for tc in tool_calls:
+                # 本示例只注册了一个 shell 工具；有多个就按 tc["function"]["name"] 分派。
+                arguments = json.loads(tc["function"]["arguments"])
+                result = await asyncio.to_thread(
+                    self.sandbox_client.execute, self.sandbox_id, arguments["command"])
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "content": f"{result['stdout']}{result['stderr']}",
+                })
 
-        if self.reward_fn is None:
-            return Reward(final_reward=0.0, is_valid=False)
-        return self.reward_fn(messages, label)
-
-    async def _complete(self, messages: list[dict]) -> dict:
-        payload = {
-            "model": "default",
-            "messages": messages,
-            "temperature": self.temperature,
-            "max_tokens": self.max_response_len_per_trajectory,
-            **self.completion_params,
-        }
-        response = await self.client.post(
-            f"{self.router_url}/v1/chat/completions",
-            json=payload,
+        return await asyncio.to_thread(
+            self.reward_fn,
+            messages,
+            label,
+            {**metadata, "sandbox_client": self.sandbox_client, "sandbox_id": self.sandbox_id},
         )
-        response.raise_for_status()
-        return response.json()["choices"][0]["message"]
-
-    async def clear(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        await self.client.aclose()
 ```
 
-简单工具循环可参考 [gsm8k_agent.py](../../coda/agentflow/agent/gsm8k/gsm8k_agent.py)，代码修复任务可参考 [mini_swe_agent.py](../../coda/agentflow/agent/swe/mini_swe_agent.py)，外部 CLI 驱动可参考 [opencode_agent.py](../../coda/agentflow/agent/opencode/opencode_agent.py)。
+数据源配 `sandbox: {type: none}` 时不注入 sandbox，工具在本地执行（`asyncio.to_thread(your_tool, ...)`），reward 的 context 直接传 `metadata`。这类 agent 可参考 [gsm8k_agent.py](../../coda/agentflow/agent/gsm8k/gsm8k_agent.py)（计算器工具）和 [bcp_agent.py](../../coda/agentflow/agent/bcp/bcp_agent.py)（HTTP 工具）。
 
 ## 3. 配置启用
 
@@ -128,12 +82,9 @@ data_source:
   reward:
     name: exact-match      # ← 注入为 reward_fn
   max_response_len_per_trajectory: 32768  # 整个任务中回复与工具结果的累计 token 预算
-
-agentflow:
-  sandbox:
-    type: remote           # ← 注入为 sandbox_env_client；none 表示禁用
+  sandbox: {type: remote}  # ← AgentFlow 注入 client + id；none 表示禁用
 ```
 
 `agent.context_length` 用于配置 agent 完成一个任务时可使用的上下文窗口。Router 会保证当前上下文和本次生成不超过该值，支持上下文压缩的 agent 也会据此管理上下文；省略或设为 `0` 表示不额外限制。它与 `max_response_len_per_trajectory` 不同，后者控制回复与工具结果的累计 token 预算。
 
-配置生效后，每条使用 agent 的 trajectory 都会创建一个 agent 实例。多数据源配置下，各 `data_sources[i]` 可以使用不同 agent 和 reward，但 `agentflow.sandbox` 是全局配置。
+配置生效后，每条使用 agent 的 trajectory 都会创建一个 agent 实例。各 `data_sources[i]` 可以独立选择 agent、reward 与 sandbox 后端。

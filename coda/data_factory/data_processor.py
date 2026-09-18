@@ -121,7 +121,7 @@ def put_dp_shards_to_ray(dp_traj_groups_list: list[list[TrajectoryGroup]], dp_si
 
     for dp_traj_groups in dp_traj_groups_list:
         prompt_id: list[str] = []
-        trajectory_id: list[int] = []
+        dp_local_traj_idx: list[int] = []
         tokens: list[torch.Tensor] = []
         loss_masks: list[torch.Tensor] = []
         rollout_log_probs: list[torch.Tensor] = []
@@ -156,7 +156,7 @@ def put_dp_shards_to_ray(dp_traj_groups_list: list[list[TrajectoryGroup]], dp_si
                     ts, te = seg.token_start, seg.token_end
                     ls, le = seg.logprob_start, seg.logprob_end
                     prompt_id.append(traj.prompt_id)
-                    trajectory_id.append(local_tid)
+                    dp_local_traj_idx.append(local_tid)
                     tokens.append(traj_tokens[ts:te])
                     loss_masks.append(traj_loss_masks[ls:le])
                     rollout_log_probs.append(traj_log_probs[ls:le])
@@ -174,7 +174,7 @@ def put_dp_shards_to_ray(dp_traj_groups_list: list[list[TrajectoryGroup]], dp_si
 
         rollout_data = {
             "prompt_id": prompt_id,
-            "trajectory_id": trajectory_id,
+            "dp_local_traj_idx": dp_local_traj_idx,
             "tokens": tokens,
             "loss_masks": loss_masks,
             "rollout_log_probs": rollout_log_probs,

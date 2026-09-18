@@ -16,9 +16,12 @@ import torch
 #   total_lengths   : list[int]            – total sequence length per Segment
 #   prompt_id       : list[str]            – prompt group key for advantage norm,
 #                                             replicated across a trajectory's Segments
-#   trajectory_id   : list[int]            – trajectory id (local per shard,
-#                                             contiguous), used to re-aggregate Segments
-#                                             into their trajectory for advantage and
+#   dp_local_traj_idx: list[int]          – index of each Segment's parent
+#                                             trajectory, local to the DP shard
+#                                             (contiguous, 0-based; not a global
+#                                             trajectory identity), used to
+#                                             re-aggregate Segments into their
+#                                             trajectory for advantage and
 #                                             mini-batch cutting
 #   rewards         : list[float]          – scalar trajectory reward, replicated per Segment
 #

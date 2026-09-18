@@ -24,7 +24,7 @@ class RewardFunction(ABC):
         self,
         messages: list[dict],
         label: Any,
-        trajectory: dict,
+        context: dict,
         **kwargs: Any,
     ) -> Reward:
-        """Compute reward from conversation history and label."""
+        """Compute reward from conversation history, label, and rollout context."""

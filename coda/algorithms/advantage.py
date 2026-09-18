@@ -112,8 +112,8 @@ def grpo_advantage(
     * ``"batch_zscore"``:   global z-score across all DP ranks ((x - mean) / std).
 
     Rows are per-Segment. Advantage is trajectory-level, so rows are first
-    deduplicated to their parent trajectory (via ``trajectory_id``, which is a
-    dense 0-based index assigned in trajectory order by ``put_dp_shards_to_ray``),
+    deduplicated to their parent trajectory (via ``dp_local_traj_idx``, which is
+    a dense 0-based index assigned in trajectory order by ``put_dp_shards_to_ray``),
     normalised at trajectory granularity, then the per-trajectory scalar is
     broadcast back to every Segment row's response tokens.
 
@@ -122,16 +122,16 @@ def grpo_advantage(
     """
     rewards = rollout_data["rewards"]
     prompt_ids = rollout_data["prompt_id"]
-    trajectory_ids = rollout_data["trajectory_id"]
+    dp_local_traj_idxs = rollout_data["dp_local_traj_idx"]
     response_lengths = rollout_data["response_lengths"]
 
-    # Deduplicate Segment rows to their trajectory. trajectory_id is a
+    # Deduplicate Segment rows to their trajectory. dp_local_traj_idx is a
     # dense 0-based index (see put_dp_shards_to_ray), so it doubles as the
     # position in the deduplicated traj_rewards/traj_prompt_ids arrays.
-    num_traj = trajectory_ids[-1] + 1
+    num_traj = dp_local_traj_idxs[-1] + 1
     traj_rewards: list[float] = [None] * num_traj
     traj_prompt_ids: list[str] = [None] * num_traj
-    for row, tid in enumerate(trajectory_ids):
+    for row, tid in enumerate(dp_local_traj_idxs):
         if traj_rewards[tid] is None:
             traj_rewards[tid] = rewards[row]
             traj_prompt_ids[tid] = prompt_ids[row]
@@ -153,7 +153,7 @@ def grpo_advantage(
             traj_scalar = _group_normalize(reward_tensor, traj_prompt_ids, divide_std)
 
     # Broadcast each trajectory's scalar back to its Segment rows, then to tokens.
-    row_scalar = [traj_scalar[tid] for tid in trajectory_ids]
+    row_scalar = [traj_scalar[tid] for tid in dp_local_traj_idxs]
     device = torch.cuda.current_device()
     adv_tensor = torch.tensor(row_scalar, dtype=torch.float32, device=device)
     lengths_tensor = torch.tensor(response_lengths, dtype=torch.long, device=device)

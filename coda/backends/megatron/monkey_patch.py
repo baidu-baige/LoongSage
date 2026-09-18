@@ -101,6 +101,56 @@ def _patch_fp32_shard_leaf():
     DistributedOptimizer._build_model_and_main_param_groups = classmethod(_patched_build)
 
 
+def _patch_fused_adam_fp32_master_remainder():
+    """Fix int16-vs-fp32 ``master_param`` mismatch when store_param_remainders meets fp32 params.
+
+    Root cause:
+      TE ``FusedAdam.initialize_state(param, store_param_remainders)`` forwards the
+      raw ``store_param_remainders`` flag straight to the ``master_param`` buffer
+      allocation, so it creates an **int16** remainder buffer for *every* param when
+      the flag is on -- regardless of the param's dtype.  But the state accessors
+      ``get_unscaled_state`` / ``set_scaled_state`` only treat ``master_param`` as an
+      int16 remainder when ``param.dtype == torch.bfloat16``; for any other dtype they
+      assert the state is fp32 (``fused_adam.py``: ``assert ... == torch.float32``).
+
+      The two paths disagree for fp32 params.  ``chunked_optimizer_state_offload``
+      (and ``optimizer_cpu_offload``) force ``use_precision_aware_optimizer`` ->
+      ``store_param_remainders``, while ``use_fp32_lm_head`` keeps ``output_layer`` in
+      fp32 (via ``keep_fp32_weights``).  That fp32 param then gets an int16
+      ``master_param`` at init.
+
+      It only bites on **resume**: ``optimizer.sharded_state_dict(is_loading=True)``
+      (checkpoint.py) runs Megatron's ``init_state_fn`` ->
+      ``FusedAdam.initialize_state`` to build the load template, then ``state_dict()``
+      -> ``get_unscaled_state`` asserts the fp32 param's ``master_param`` is fp32 and
+      crashes.  Saving never calls ``initialize_state`` (the state is already trained
+      fp32), which is why the assertion fires only when loading a checkpoint.
+
+    Fix: gate ``store_param_remainders`` on ``param.dtype == torch.bfloat16`` inside
+      ``initialize_state`` -- exactly the condition the accessors use -- so fp32 params
+      get a real fp32 ``master_param`` while bf16 params keep the int16 remainder trick.
+    """
+    try:
+        from transformer_engine.pytorch.optimizers.fused_adam import FusedAdam
+    except ImportError:
+        # TE not available (non-Megatron build); nothing to patch.
+        return
+
+    _original_initialize_state = FusedAdam.initialize_state
+    if getattr(_original_initialize_state, "_coda_fp32_remainder_safe", False):
+        return
+
+    def _patched_initialize_state(self, param, store_param_remainders):
+        # Only bf16 params use the int16 remainder representation; matching the
+        # gating in get_unscaled_state / set_scaled_state keeps init consistent
+        # with (de)serialization so fp32 params get an fp32 master_param.
+        effective = store_param_remainders and param.dtype == torch.bfloat16
+        return _original_initialize_state(self, param, effective)
+
+    _patched_initialize_state._coda_fp32_remainder_safe = True
+    FusedAdam.initialize_state = _patched_initialize_state
+
+
 def _patch_dsa_cudnn_default_stream():
     """Fix cuDNN DSA silently dropping half the rows of its fp32 score matrix.
 
@@ -305,6 +355,7 @@ class _ShapeAgnosticLaunchCache(dict):
 
 _patch_distributed_optimizer_init()
 _patch_fp32_shard_leaf()
+_patch_fused_adam_fp32_master_remainder()
 _patch_dsa_cudnn_default_stream()
 _patch_csa_cute_launch_cache()
 

@@ -145,12 +145,16 @@ class ReplicaGroup:
                 logger.info(f"Engine at index {i} is already None")
             self.all_engines[i] = None
 
-    def offload(self):
+    def offload(self, tags: list[str] | None = None):
         """Fire release_memory_occupation on all engines (non-blocking).
 
         Returns a list of Ray ObjectRefs.
         """
-        return [engine.release_memory_occupation.remote() for engine in self.engines if engine is not None]
+        return [
+            engine.release_memory_occupation.remote(tags=tags)
+            for engine in self.engines
+            if engine is not None
+        ]
 
     def onload(self, tags: list[str] | None = None):
         """Fire resume_memory_occupation on all engines (non-blocking).

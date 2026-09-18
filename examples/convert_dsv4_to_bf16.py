@@ -1,6 +1,6 @@
 """Convert DeepSeek-V4 FP8/MXFP4 HuggingFace checkpoint to BF16.
 Usage:
-    python tools/convert_dsv4_fp8_to_bf16.py \
+    python examples/convert_dsv4_to_bf16.py \
         --input-fp8-hf-path /path/to/DeepSeek-V4-Flash \
         --output-bf16-hf-path /path/to/DeepSeek-V4-Flash-BF16
 """

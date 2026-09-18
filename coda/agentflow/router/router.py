@@ -2,10 +2,12 @@
 
 import asyncio
 import inspect
+import json
 import logging
 import threading
 import time
 from collections import Counter
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -21,6 +23,27 @@ from coda.agentflow.utils import build_request_id
 class WorkerPayload(PydanticModel):
     """Worker management payload."""
     worker_url: str
+    # Number of attention-DP groups inside the worker (SGLang ``--dp-size`` when
+    # ``--enable-dp-attention`` is on). The router uses it to assign each request to
+    # a specific DP group via ``routed_dp_rank`` instead of SGLang load-balancing
+    # internally. 1 means "no DP attention" (nothing to route).
+    dp_size: int = 1
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerSlot:
+    """One dispatch target: a single attention-DP group of one SGLang worker.
+
+    ``dp_rank`` is the DP group inside the worker (always 0 when the worker does
+    not run DP attention). Worker selection, sticky sessions and in-flight
+    accounting are all keyed on this one structure.
+    """
+
+    worker_url: str
+    dp_rank: int = 0
+
+    def __str__(self) -> str:
+        return f"{self.worker_url}:{self.dp_rank}"
 
 
 logger = logging.getLogger("Router")
@@ -36,6 +59,16 @@ HOP_BY_HOP = {
     "trailers",
     "upgrade",
 }
+
+# FastAPI needs concrete paths at startup. Protocol selection and request-kind
+# detection remain in the adapters through ProtocolAdapter.match().
+SESSION_PROXY_ROUTES = (
+    "/v1/chat/completions",
+    "/v1/messages",
+    "/v1/messages/count_tokens",
+    "/v1/responses",
+    "/v1/responses/compact",
+)
 
 
 def filter_headers(headers: dict[str, str]) -> dict[str, str]:
@@ -89,12 +122,14 @@ class Router:
         self.rollout_worker_load_threshold = config.rollout_worker_load_threshold
         self.accumulate_reasoning = config.accumulate_reasoning
 
-        # URL -> in-flight request count
-        self.worker_request_counts: dict[str, int] = {}
-        # Workers quarantined from the routing pool
+        # WorkerSlot -> in-flight request count (worker + attention-DP group)
+        self.slot_request_counts: dict[WorkerSlot, int] = {}
+        # Worker URLs quarantined from the routing pool (URL granularity)
         self.dead_workers: set[str] = set()
-        # request_id (trajectory_id#attempt_id) -> target worker URL for sticky routing
-        self.session_id_to_worker: dict[str, str] = {}
+        # request_id (trajectory_id#attempt_id) -> pinned WorkerSlot (sticky routing)
+        self.session_id_to_slot: dict[str, WorkerSlot] = {}
+        # URL -> attention-DP group count reported by the worker
+        self.worker_dp_size: dict[str, int] = {}
         self.inflight_requests = InflightRequests()
 
         self._max_connections = int(config.max_connections)
@@ -146,10 +181,8 @@ class Router:
 
         # ``/{trajectory_id}/{attempt_id}`` is treated as the session-scoped base URL.
         session_router = APIRouter(prefix="/{trajectory_id}/{attempt_id}")
-        session_router.post(
-            "/v1/chat/completions",
-            response_model=None,
-        )(self.proxy)
+        for route in SESSION_PROXY_ROUTES:
+            session_router.post(route, response_model=None)(self.proxy)
 
         self.app.include_router(management_router)
         self.app.include_router(session_router)
@@ -196,67 +229,88 @@ class Router:
     # Worker lifecycle (synchronous — no await, safe in single asyncio loop)
     # -------------------------------------------------------------------------
 
-    def _select_worker(self, request_id: str) -> str:
-        """Pick a healthy worker and increment its in-flight count."""
-        if request_id in self.session_id_to_worker:
-            target = self.session_id_to_worker[request_id]
-            load = self.worker_request_counts.get(target, 0)
-            if target not in self.dead_workers and load <= self.rollout_worker_load_threshold:
-                logger.info("[route] sticky %s -> %s (load=%d)", request_id, target, load)
-                self.worker_request_counts[target] = load + 1
-                return target
+    def _slots_of(self, worker_url: str) -> list[WorkerSlot]:
+        """All DP-group slots of a worker (a single slot when DP attention is off)."""
+        return [WorkerSlot(worker_url, dp) for dp in range(self.worker_dp_size.get(worker_url, 1))]
 
-        available = [w for w in self.worker_request_counts if w not in self.dead_workers]
+    def _select_slot(self, request_id: str) -> WorkerSlot:
+        """Pick a (worker, DP group) slot and increment its in-flight count.
+
+        Sticky per session first — the same slot for every turn of a trajectory
+        attempt, which keeps SGLang's prefix cache on one DP group — else the
+        least-loaded healthy slot.
+        """
+        pinned = self.session_id_to_slot.get(request_id)
+        if (
+            pinned is not None
+            and pinned.worker_url not in self.dead_workers
+            and self.slot_request_counts.get(pinned, 0) <= self.rollout_worker_load_threshold
+        ):
+            self.slot_request_counts[pinned] = self.slot_request_counts.get(pinned, 0) + 1
+            logger.info("[route] sticky %s -> %s", request_id, pinned)
+            return pinned
+
+        available = [s for s in self.slot_request_counts if s.worker_url not in self.dead_workers]
         if not available:
             raise RuntimeError("No healthy workers available")
-        target = min(available, key=self.worker_request_counts.__getitem__)
+        slot = min(available, key=self.slot_request_counts.__getitem__)
 
-        self.session_id_to_worker[request_id] = target
-        logger.info("[route] new %s -> %s", request_id, target)
-        self.worker_request_counts[target] += 1
-        return target
+        self.session_id_to_slot[request_id] = slot
+        self.slot_request_counts[slot] += 1
+        logger.info("[route] new %s -> %s", request_id, slot)
+        return slot
 
-    def _finish_worker(self, worker_url: str) -> None:
-        """Decrement worker in-flight count after request completion."""
-        if worker_url not in self.worker_request_counts:
-            logger.error("[worker] _finish_worker: unknown worker %s — skipping decrement", worker_url)
+    def _finish_slot(self, slot: WorkerSlot) -> None:
+        """Decrement a slot's in-flight count after request completion."""
+        if slot not in self.slot_request_counts:
+            logger.error("[worker] _finish_slot: unknown slot %s — skipping decrement", slot)
             return
-        self.worker_request_counts[worker_url] = max(0, self.worker_request_counts[worker_url] - 1)
+        self.slot_request_counts[slot] = max(0, self.slot_request_counts[slot] - 1)
 
     # -------------------------------------------------------------------------
     # Management API
     # -------------------------------------------------------------------------
 
     async def add_worker(self, payload: WorkerPayload) -> JSONResponse:
-        """Register a worker URL for future routing."""
+        """Register a worker URL (and its attention-DP group count) for routing."""
         worker_url = payload.worker_url
-        if worker_url in self.worker_request_counts:
+        if worker_url in self.worker_dp_size:
             return JSONResponse(
                 status_code=status.HTTP_409_CONFLICT,
                 content={"error": "Worker already exists", "worker": worker_url},
             )
-        self.worker_request_counts[worker_url] = 0
-        logger.info("[worker] added %s", worker_url)
+        dp_size = max(1, int(payload.dp_size or 1))
+        self.worker_dp_size[worker_url] = dp_size
+        for slot in self._slots_of(worker_url):
+            self.slot_request_counts[slot] = 0
+        logger.info("[worker] added %s (dp_size=%d)", worker_url, dp_size)
         return JSONResponse(
             status_code=status.HTTP_200_OK,
             content={"status": "success", "worker": worker_url},
         )
 
     async def list_workers(self) -> JSONResponse:
-        """Return active, dead, and per-worker load state."""
+        """Return active, dead, and per-slot load state."""
+        urls = list(dict.fromkeys(s.worker_url for s in self.slot_request_counts))
+        active_workers = [w for w in urls if w not in self.dead_workers]
+        slot_load = {
+            url: [self.slot_request_counts[WorkerSlot(url, dp)] for dp in range(self.worker_dp_size.get(url, 1))]
+            for url in urls
+        }
         return JSONResponse(
             status_code=status.HTTP_200_OK,
             content={
-                "active_workers": [w for w in self.worker_request_counts if w not in self.dead_workers],
+                "active_workers": active_workers,
                 "dead_workers": list(self.dead_workers),
-                "load_stats": dict(self.worker_request_counts),
+                "load_stats": {url: sum(counts) for url, counts in slot_load.items()},
+                "slot_load_stats": slot_load,
             },
         )
 
     async def exclude_worker(self, payload: WorkerPayload) -> JSONResponse:
         """Remove a worker from the active routing pool."""
         worker_url = payload.worker_url
-        if worker_url not in self.worker_request_counts:
+        if worker_url not in self.worker_dp_size:
             return JSONResponse(
                 status_code=status.HTTP_404_NOT_FOUND,
                 content={"error": "Worker not found"},
@@ -276,7 +330,7 @@ class Router:
     async def include_worker(self, payload: WorkerPayload) -> JSONResponse:
         """Restore an excluded worker to the active pool."""
         worker_url = payload.worker_url
-        if worker_url not in self.worker_request_counts:
+        if worker_url not in self.worker_dp_size:
             return JSONResponse(
                 status_code=status.HTTP_404_NOT_FOUND,
                 content={"error": "Worker not found (never registered)"},
@@ -296,7 +350,7 @@ class Router:
     async def release_session(self, trajectory_id: str, attempt_id: int) -> JSONResponse:
         """Release sticky routing state for one trajectory attempt."""
         request_id = build_request_id(trajectory_id, attempt_id)
-        released = self.session_id_to_worker.pop(request_id, None) is not None
+        released = self.session_id_to_slot.pop(request_id, None) is not None
         if released:
             logger.info("[session] released %s", request_id)
             return JSONResponse(
@@ -369,8 +423,8 @@ class Router:
     async def abort_session(self, trajectory_id: str, attempt_id: int) -> JSONResponse:
         """Abort the worker request pinned to one failed trajectory attempt."""
         request_id = build_request_id(trajectory_id, attempt_id)
-        worker_url = self.session_id_to_worker.get(request_id)
-        if worker_url is None:
+        slot = self.session_id_to_slot.get(request_id)
+        if slot is None:
             return JSONResponse(
                 status_code=status.HTTP_404_NOT_FOUND,
                 content={
@@ -379,6 +433,7 @@ class Router:
                     "attempt_id": attempt_id,
                 },
             )
+        worker_url = slot.worker_url
         failure = await self._send_worker_abort_request(
             worker_url,
             {"rid": request_id, "abort_all": False},
@@ -394,7 +449,7 @@ class Router:
                     "error": failure,
                 },
             )
-        self.session_id_to_worker.pop(request_id, None)
+        self.session_id_to_slot.pop(request_id, None)
         logger.info("[session] aborted failed attempt %s (worker=%s)", request_id, worker_url)
         return JSONResponse(
             status_code=status.HTTP_200_OK,
@@ -408,7 +463,9 @@ class Router:
     async def abort_all_workers(self) -> JSONResponse:
         """Abort all active workers and clear sticky session state."""
         active_workers = [
-            w for w in self.worker_request_counts if w not in self.dead_workers
+            w
+            for w in dict.fromkeys(s.worker_url for s in self.slot_request_counts)
+            if w not in self.dead_workers
         ]
         if not active_workers:
             logger.info("[abort] no active workers")
@@ -443,11 +500,11 @@ class Router:
                 },
             )
 
-        sessions_cleared = len(self.session_id_to_worker)
-        self.session_id_to_worker.clear()
+        sessions_cleared = len(self.session_id_to_slot)
+        self.session_id_to_slot.clear()
 
-        for w in self.worker_request_counts:
-            self.worker_request_counts[w] = 0
+        for slot in self.slot_request_counts:
+            self.slot_request_counts[slot] = 0
 
         logger.info(
             "[abort] workers=%d/%d sessions_cleared=%d",
@@ -500,11 +557,12 @@ class Router:
             )
 
         headers = {k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")}
-        worker_url = None
+        slot = None
         async with self._generate_sem:
             try:
-                worker_url = self._select_worker(request_id)
-                target_url = f"{worker_url.rstrip('/')}/generate"
+                slot = self._select_slot(request_id)
+                body_bytes = self._set_routed_dp_rank(body_bytes, slot)
+                target_url = f"{slot.worker_url.rstrip('/')}/generate"
 
                 generate_client = httpx.AsyncClient(timeout=self.config.proxy_timeout_seconds)
                 try:
@@ -530,14 +588,33 @@ class Router:
                     content={"error": str(exc)},
                 )
             except httpx.RequestError as exc:
-                logger.error("[proxy] %s -> %s: %s", request_id, worker_url, exc)
+                logger.error("[proxy] %s -> %s: %s", request_id, slot, exc)
                 return JSONResponse(
                     status_code=status.HTTP_502_BAD_GATEWAY,
                     content={"error": f"Upstream request failed: {exc}"},
                 )
             finally:
-                if worker_url is not None:
-                    self._finish_worker(worker_url)
+                if slot is not None:
+                    self._finish_slot(slot)
+
+    def _set_routed_dp_rank(self, body_bytes: bytes, slot: WorkerSlot) -> bytes:
+        """Add ``routed_dp_rank`` to the /generate body so SGLang routes the request
+        to ``slot``'s DP group instead of load-balancing internally.
+
+        No-op when the worker has a single DP group, so non-DP-attention runs are
+        unaffected.
+        """
+        if self.worker_dp_size.get(slot.worker_url, 1) <= 1:
+            return body_bytes
+        try:
+            payload = json.loads(body_bytes)
+        except (TypeError, ValueError):
+            logger.warning(
+                "[route] cannot parse upstream body to set routed_dp_rank (worker=%s)", slot.worker_url
+            )
+            return body_bytes
+        payload["routed_dp_rank"] = slot.dp_rank
+        return json.dumps(payload).encode("utf-8")
 
     # -------------------------------------------------------------------------
     # Server lifecycle

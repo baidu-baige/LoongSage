@@ -1,5 +1,4 @@
-"""BrowseComp-Plus multi-turn retrieval agent.
-"""
+"""BrowseComp-Plus white-box agent using native tool calls."""
 
 from __future__ import annotations
 
@@ -12,7 +11,7 @@ import httpx
 
 from coda.agentflow.agent import register_agent
 from coda.agentflow.agent.base_agent import BaseAgent
-from coda.agentflow.utils import CONTEXT_LENGTH_EXCEEDED
+from coda.agentflow.utils import ContextLengthExceededError
 from coda.reward.reward import Reward
 
 logger = logging.getLogger(__name__)
@@ -169,7 +168,7 @@ class BCPAgent(BaseAgent):
     4. Computes reward via the injected reward_fn.
 
     Config keys (injected via ``data_source.agent`` / ``data_sources[].agent``):
-        retrieval_service_url (str): Base URL of the retrieval server.
+        retrieval_service_url (str, required): Base URL of the retrieval server.
         search_topk (int): Documents returned per search call (default: 3).
         max_queries_per_call (int): Max queries sent per search call (default: 1).
         topk_chunks (int): Chunks returned per open_page call (default: 3).
@@ -203,13 +202,10 @@ Always use the finish tool to submit your final answer."""
 
     def __init__(
         self,
-        router_url: str = "http://localhost:8000",
-        reward_fn: Any = None,
-        completion_params: dict = None,
+        router_url: str,
+        retrieval_service_url: str,
         max_response_len_per_trajectory: int = 0,
-        temperature: float = 0.7,
         max_turns: int = 20,
-        retrieval_service_url: str = "http://127.0.0.1:9000",
         search_topk: int = 3,
         max_queries_per_call: int = 1,
         topk_chunks: int = 3,
@@ -221,12 +217,9 @@ Always use the finish tool to submit your final answer."""
     ) -> None:
         super().__init__(
             router_url,
-            completion_params=completion_params,
             max_response_len_per_trajectory=max_response_len_per_trajectory,
-            temperature=temperature,
             **kwargs,
         )
-        self.reward_fn = reward_fn
         self.max_turns = max_turns
         self.retrieval_service_url = retrieval_service_url.rstrip("/")
         self.search_topk = search_topk
@@ -234,9 +227,8 @@ Always use the finish tool to submit your final answer."""
         self.topk_chunks = topk_chunks
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
-        self._closed = False
-        # Separate clients: LLM (very slow), open_page, search (tight timeout)
-        self.llm_client = httpx.AsyncClient(timeout=httpx.Timeout(600.0))
+        # Separate clients for the retrieval endpoints (tight timeouts);
+        # the LLM client is owned by BaseAgent.
         self.tool_client = httpx.AsyncClient(timeout=httpx.Timeout(tool_timeout))
         self.search_client = httpx.AsyncClient(timeout=httpx.Timeout(search_timeout))
         logger.info(
@@ -274,27 +266,19 @@ Always use the finish tool to submit your final answer."""
         else:
             messages: list[dict] = [{"role": "user", "content": str(prompt)}]
 
-        completed_turns = sum(message.get("role") == "assistant" for message in messages)
-        for turn in range(completed_turns, self.max_turns):
+        completed_turns = sum(1 for m in messages if m.get("role") == "assistant")
+        for _ in range(completed_turns, self.max_turns):
             try:
                 # The Router owns the trajectory-wide token budget and clamps
                 # this request to the true remaining response length.
-                response = await self._call_llm(
-                    messages, self.max_response_len_per_trajectory
+                response = await self.call_llm(
+                    messages,
+                    max_tokens=self.max_response_len_per_trajectory,
+                    extra_body={"tools": _TOOL_SCHEMAS, "tool_choice": "auto"},
                 )
-            except httpx.HTTPStatusError as e:
-                if e.response.status_code == httpx.codes.BAD_REQUEST:
-                    try:
-                        err = e.response.json().get("error", {})
-                    except Exception:
-                        err = {}
-                    if err.get("type") == CONTEXT_LENGTH_EXCEEDED:
-                        logger.warning(
-                            "BCPAgent: max_response_len_per_trajectory exhausted (router): %s",
-                            err.get("message", ""),
-                        )
-                        break
-                raise
+            except ContextLengthExceededError as e:
+                logger.warning("BCPAgent: max_response_len_per_trajectory exhausted (router): %s", e)
+                break
 
             choice = response["choices"][0]
             msg = choice["message"]
@@ -313,76 +297,33 @@ Always use the finish tool to submit your final answer."""
                 "tool_calls": tool_calls,
             })
 
-            # Execute all tool calls uniformly — including finish.
-            # Mirror ref/rl: append every tool response first, then check for
-            # finish/budget termination (ref/rl _handle_processing_tools_state).
             finished = False
-            turn_tool_results: list[str] = []
             for tc in tool_calls:
                 fn = tc["function"]
-                name = fn["name"]
                 try:
-                    arguments = json.loads(fn["arguments"])
+                    arguments = json.loads(fn.get("arguments") or "{}")
                 except (json.JSONDecodeError, TypeError):
                     arguments = {}
-
-                tool_result = await self._execute_tool(name, arguments)
-                turn_tool_results.append(tool_result)
-
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.get("id", ""),
-                    "content": tool_result,
+                    "content": await self._execute_tool(fn["name"], arguments),
                 })
-                logger.debug(
-                    "tool=%s result_len=%d",
-                    name, len(tool_result),
-                )
-
-                # Terminate after finish tool response is appended (mirrors ref/rl).
-                if name == "finish":
-                    logger.debug("tool=finish answer=%s", arguments.get("answer", "")[:80])
+                if fn["name"] == "finish":
                     finished = True
                     break
-
             if finished:
                 break
         else:
             logger.warning("BCPAgent: max_turns=%d reached without finish call", self.max_turns)
 
-        if self.reward_fn is not None:
-            return self.reward_fn(messages, label, {})
-        return Reward(final_reward=0.0)
+        return await asyncio.to_thread(self.reward_fn, messages, label, {})
 
-    async def clear(self) -> None:
-        """Release HTTP clients. Safe to call multiple times."""
-        if self._closed:
-            return
-        self._closed = True
-        await self.llm_client.aclose()
+    async def close(self) -> None:
+        """Close HTTP clients."""
+        await super().close()
         await self.tool_client.aclose()
         await self.search_client.aclose()
-        logger.info("BCPAgent resources cleared")
-
-    # ------------------------------------------------------------------
-    # LLM call
-    # ------------------------------------------------------------------
-
-    async def _call_llm(self, messages: list[dict], turn_max_tokens: int) -> dict:
-        body = {
-            "model": "default",
-            "messages": messages,
-            "tools": _TOOL_SCHEMAS,
-            "tool_choice": "auto",
-            "temperature": self.temperature,
-            **self.completion_params,
-        }
-        body["max_tokens"] = turn_max_tokens
-        resp = await self.llm_client.post(
-            f"{self.router_url}/v1/chat/completions", json=body
-        )
-        resp.raise_for_status()
-        return resp.json()
 
     # ------------------------------------------------------------------
     # Tool execution

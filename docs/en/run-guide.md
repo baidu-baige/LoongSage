@@ -134,12 +134,12 @@ Download the FP8 model and dataset first, then convert the model to BF16 weights
 hf download sgl-project/DeepSeek-V4-Flash-FP8 --local-dir /root/DeepSeek-V4-Flash-FP8
 hf download R2E-Gym/R2E-Gym-Subset --repo-type=dataset --local-dir /root/R2E-Gym-Subset
 
-python examples/convert_dsv4_fp8_to_bf16.py \
+python examples/convert_dsv4_to_bf16.py \
   --input-fp8-hf-path /root/DeepSeek-V4-Flash-FP8 \
   --output-bf16-hf-path /root/DeepSeek-V4-Flash-BF16
 ```
 
-After conversion, prepare the kubeconfig required by the K8s sandbox used for SWE rollouts. Place the kubeconfig at `k8s/kubeconfig.yaml` (the default `agentflow.sandbox.kubeconfig` path), or override it on the command line. Then launch the 8-node H20 preset [`dsv4_flash_bf16/swe_h20_8node`](../../conf/dsv4_flash_bf16/swe_h20_8node.yaml): bring up the Ray cluster on every node and submit the training job from the head node only.
+After conversion, prepare the kubeconfig required by the K8s sandbox used for SWE rollouts. Place the kubeconfig at `k8s/kubeconfig.yaml` (the path configured by this preset), or override it on the command line. Then launch the 8-node H20 preset [`dsv4_flash_bf16/swe_h20_8node`](../../conf/dsv4_flash_bf16/swe_h20_8node.yaml): bring up the Ray cluster on every node and submit the training job from the head node only.
 
 ```bash
 # Run the same command on every machine
@@ -150,7 +150,7 @@ bash examples/start.sh dsv4_flash_bf16/swe_h20_8node \
   checkpoint_path=/root/ckpt/dsv4_swe \
   hf_model_path=/root/DeepSeek-V4-Flash-BF16 \
   data_source.dataset.prompt_data_path=/root/R2E-Gym-Subset \
-  agentflow.sandbox.kubeconfig=/path/to/kubeconfig.yaml
+  data_source.sandbox.kubeconfig=/path/to/kubeconfig.yaml
 ```
 
 `checkpoint_path` and `hf_model_path` must live on storage that every node can reach through the same path.
@@ -178,7 +178,7 @@ bash examples/start.sh qwen3_coder_30b_a3b/opencode_h20_4node \
   checkpoint_path=/root/ckpt/opencode \
   hf_model_path=/root/Qwen3-Coder-30B-A3B-Instruct \
   data_source.dataset.prompt_data_path=/root/R2E-Gym-OpenCode/R2E_Gym_Subset_opencode.parquet \
-  agentflow.sandbox.kubeconfig=/path/to/kubeconfig.yaml
+  data_source.sandbox.kubeconfig=/path/to/kubeconfig.yaml
 ```
 
 Tip: Each preset inherits from [`conf/default.yaml`](../../conf/default.yaml), and subdirectories such as [`conf/qwen3_30b_a3b/`](../../conf/qwen3_30b_a3b/) hold presets for a specific model and machine type. For more available configurations, see [`conf/`](../../conf/).
@@ -226,13 +226,15 @@ Fields covered in this section:
 | `data_source.num_trajectories_per_prompt` | `8` | trajectories sampled per prompt group |
 | `data_source.agent.name` | `null` (single-turn) | agent implementation; required for multi-turn |
 | `data_source.reward.name` | required | reward function (parameters per reward plugin) |
+| `data_source.sandbox.type` | `none` | per-source sandbox backend; use `k8s`/`docker` for agents that execute shell commands |
 | `data_source.max_response_len_per_trajectory` | `32768` | response-area token cap per trajectory |
 
 `data_source` is the default-value template for one source, and `data_sources` is the list
 actually used, expanding to `[${data_source}]` (a single source) by default. Override a single
 source with the `data_source.` prefix; for multiple sources use `data_sources.<index>.` or an
-explicit list. Both channels are equivalent: `key=value` on the command line (after the config
-name of `start.sh`) or in an experiment yaml.
+explicit list. Agent, reward, and sandbox selection are all per source. Both override channels are
+equivalent: `key=value` on the command line (after the config name of `start.sh`) or in an
+experiment yaml.
 
 **Single source, on the command line**
 
@@ -418,6 +420,7 @@ Besides the presets used in the tasks above, `conf/` ships the following ready-t
 | | `opencode_h20_4node` | Qwen3-Coder-30B-A3B | OpenCode (R2E-Gym) (Task 5) | 4 nodes × H20 |
 | `conf/dsv4_flash_bf16/` | `swe_h20_8node` / `swe_gb200_8node` | DeepSeek-V4-Flash-BF16 | SWE (Task 4) | 8×H20 / 8×GB200 |
 | | `dapo_h20_6node` / `dapo_gb200_8node` | DeepSeek-V4-Flash-BF16 | DAPO math | 6×H20 / 8×GB200 |
+| `conf/dsv41_flash_bf16/` | `dapo_b200_5node` | DeepSeek-V4.1-Flash-BF16 | DAPO math | 5 nodes × B200 |
 
 ## Related documents
 

@@ -74,6 +74,7 @@ slice_cp_with_zigzag = _cp_utils.slice_cp_with_zigzag
 slice_cp_packed = _cp_utils.slice_cp_packed
 gather_and_reconstruct_cp = _cp_utils.gather_and_reconstruct_cp
 prepare_packed_seq_params = _cp_utils.prepare_packed_seq_params
+prepare_packed_mrope_position_ids = _cp_utils.prepare_packed_mrope_position_ids
 _contiguous_padded_length = _cp_utils._contiguous_padded_length
 
 
@@ -707,6 +708,35 @@ class TestSliceCpPackedContiguous:
         assert torch.equal(packed[:7], t1)
         assert torch.equal(packed[7:12], t2)
 
+    def test_cp1_tp8_multi_seq_raw_pack_with_tail_pad(self):
+        """cp=1, tp>1, >1 sequence: sequences are packed RAW (no per-traj pad),
+        with a single tail-pad making the buffer divisible by tp_size.
+
+        Regression for the train/infer KL blow-up under use_dynamic_batch_size:
+        per-sequence padding to tp_size used to shift every sequence after the
+        first, so ``gather_and_slice_response`` (which advances by the true
+        ``total_lengths``) read log-probs from misaligned offsets.
+        """
+        _set_cp(rank=0, size=1)
+        _set_tp(size=8)
+        t1 = _tok(7)
+        t2 = _tok(5, offset=10)
+        packed, padded_lens = slice_cp_packed(
+            [t1, t2], "contiguous", 0, pad_multiplier=8
+        )
+        # No per-sequence padding: real tokens stay contiguous by raw length.
+        assert padded_lens == [7, 5]
+        assert torch.equal(packed[:7], t1)
+        assert torch.equal(packed[7:12], t2)
+        # Tail-padded once to the next multiple of tp_size (12 -> 16) for SP scatter.
+        assert packed.size(0) == 16
+        assert packed.size(0) % 8 == 0
+        assert torch.equal(packed[12:], torch.zeros(4, dtype=packed.dtype))
+        # Slicing by cumulative raw lengths (what downstream consumers do) lands
+        # exactly on each sequence's real tokens.
+        assert torch.equal(packed[0:7], t1)
+        assert torch.equal(packed[7:12], t2)
+
     def test_cp2_per_traj_pad(self):
         """cp_size=2, tp=1: per-traj padded to tp*2*cp=4."""
         _set_cp(rank=0, size=2)
@@ -846,6 +876,24 @@ class TestPreparePackedSeqParamsContiguous:
         )
         assert params.max_seqlen_q == 8
 
+    def test_cp1_tp8_multi_seq_cu_seqlens_span_tail_pad(self):
+        """cp=1, tp>1, >1 sequence: cu_seqlens follow raw boundaries and gain a
+        trailing segment covering the SP tail-pad (mirrors the zigzag branch)."""
+        _set_cp(rank=0, size=1)
+        _set_tp(size=8)
+        t1 = _tok(7)
+        t2 = _tok(5, offset=10)
+        packed, params = prepare_packed_seq_params(
+            [t1, t2], pad_token_id=0, pad_multiplier=8, cp_partition_mode="contiguous"
+        )
+        # 12 real tokens -> tail-padded to 16.
+        assert packed.size(0) == 16
+        # Raw per-seq boundaries [0,7,12] plus the tail-pad segment [.,16].
+        assert torch.equal(
+            params.cu_seqlens_q, torch.tensor([0, 7, 12, 16], dtype=torch.int32)
+        )
+        assert params.max_seqlen_q == 7
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Contiguous round-trip: slice_cp_packed → gather_and_reconstruct_cp
@@ -935,3 +983,202 @@ class TestContiguousRoundTrip:
         loss.backward()
         assert rank0.grad is not None
         assert (rank0.grad != 0).any()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# prepare_packed_mrope_position_ids
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _pack_tokens_and_positions(
+    tokens_list, cp_partition_mode="zigzag", pad_multiplier=0
+):
+    """Pack tokens and MRoPE positions for the same micro-batch, then cross-check.
+
+    ``_tok(L)`` is ``arange(0, L)``, so a token's *value equals its position within
+    its trajectory* -- which is exactly what text-only MRoPE ids must be. Padding with
+    -1 marks the pad slots, since tokens pad with ``pad_token_id`` while positions pad
+    with a continuing arange.
+    """
+    packed, params = prepare_packed_seq_params(
+        tokens_list,
+        pad_token_id=-1,
+        pad_multiplier=pad_multiplier,
+        cp_partition_mode=cp_partition_mode,
+    )
+    pos = prepare_packed_mrope_position_ids(
+        tokens_list,
+        pad_multiplier=pad_multiplier,
+        cp_partition_mode=cp_partition_mode,
+    )
+    assert pos.shape == (3, 1, packed.size(0))
+    real = packed >= 0
+    assert torch.equal(pos[0, 0][real], packed[real])
+    return packed, pos, params
+
+
+class TestPreparePackedMropePositionIds:
+    """Rank-local 3D MRoPE ids must align token-for-token with the packed tokens.
+
+    Megatron-Bridge's Qwen3VLModel consumes them untouched and applies the rotary
+    freqs elementwise, so a wrong *order* would silently corrupt training.
+    """
+
+    def test_shape_dtype_and_rows_identical(self):
+        _set_cp(rank=0, size=2)
+        _set_tp(size=1)
+
+        pos = prepare_packed_mrope_position_ids(
+            [_tok(6), _tok(10)], pad_multiplier=0
+        )
+
+        assert pos.shape == (3, 1, 10)
+        assert pos.dtype is torch.int64
+        assert pos.is_contiguous()
+        # Text-only: the temporal/height/width axes carry identical positions.
+        assert torch.equal(pos[0], pos[1])
+        assert torch.equal(pos[1], pos[2])
+
+    # ── zigzag: exact expected values ─────────────────────────────────────
+
+    def test_zigzag_rank0_expected_values(self):
+        # traj 6 -> chunk 2, padded to 8; traj 10 -> chunk 3, padded to 12.
+        # rank 0 takes chunks 0 and 2*cp-1 of each trajectory.
+        _set_cp(rank=0, size=2)
+        _set_tp(size=1)
+
+        packed, pos, _ = _pack_tokens_and_positions([_tok(6), _tok(10)])
+
+        assert pos[0, 0].tolist() == [0, 1, 6, 7, 0, 1, 2, 9, 10, 11]
+        assert packed.tolist() == [0, 1, -1, -1, 0, 1, 2, 9, -1, -1]
+
+    def test_zigzag_rank1_expected_values(self):
+        _set_cp(rank=1, size=2)
+        _set_tp(size=1)
+
+        packed, pos, _ = _pack_tokens_and_positions([_tok(6), _tok(10)])
+
+        assert pos[0, 0].tolist() == [2, 3, 4, 5, 3, 4, 5, 6, 7, 8]
+        # The inner chunks hold only real tokens, so tokens == positions exactly.
+        assert torch.equal(packed, pos[0, 0])
+
+    @pytest.mark.parametrize("cp_rank", [0, 1])
+    @pytest.mark.parametrize("pad_multiplier", [0, 128])
+    def test_matches_packed_tokens_zigzag(self, cp_rank, pad_multiplier):
+        _set_cp(rank=cp_rank, size=2)
+        _set_tp(size=1)
+
+        _pack_tokens_and_positions(
+            [_tok(6), _tok(10)], pad_multiplier=pad_multiplier
+        )
+
+    @pytest.mark.parametrize("cp_rank", [0, 1, 2, 3])
+    def test_cp4_matches_packed_tokens(self, cp_rank):
+        # Uneven chunking: 7 -> chunk 1 (padded 8), 13 -> chunk 2 (padded 16).
+        _set_cp(rank=cp_rank, size=4)
+        _set_tp(size=1)
+
+        _, pos, _ = _pack_tokens_and_positions([_tok(7), _tok(13)])
+
+        assert pos.size(-1) == 6
+
+    def test_short_traj_chunk_size_one(self):
+        # 3 tokens, cp=2 -> chunk 1, padded to 4.
+        _set_tp(size=1)
+
+        _set_cp(rank=0, size=2)
+        packed, pos, _ = _pack_tokens_and_positions([_tok(3)])
+        assert pos[0, 0].tolist() == [0, 3]
+        assert packed.tolist() == [0, -1]
+
+        _set_cp(rank=1, size=2)
+        packed, pos, _ = _pack_tokens_and_positions([_tok(3)])
+        assert pos[0, 0].tolist() == [1, 2]
+        assert packed.tolist() == [1, 2]
+
+    # ── padding ───────────────────────────────────────────────────────────
+
+    def test_per_traj_pad_continues_arange(self):
+        # Positions 6 and 7 are this trajectory's alignment pad. They continue the
+        # arange rather than resetting, so they never alias a real token's position.
+        _set_cp(rank=0, size=2)
+        _set_tp(size=1)
+
+        pos = prepare_packed_mrope_position_ids([_tok(6)], pad_multiplier=0)
+
+        assert pos[0, 0].tolist() == [0, 1, 6, 7]
+
+    def test_tail_pad_continues_and_length_matches(self):
+        _set_cp(rank=0, size=2)
+        _set_tp(size=1)
+
+        packed, pos, _ = _pack_tokens_and_positions(
+            [_tok(6), _tok(10)], pad_multiplier=128
+        )
+
+        assert packed.size(0) == 128
+        assert torch.equal(pos[0, 0, 10:], torch.arange(10, 128))
+
+    def test_tp_affects_tail_pad_length(self):
+        _set_cp(rank=0, size=2)
+        _set_tp(size=4)
+
+        packed, pos, _ = _pack_tokens_and_positions(
+            [_tok(6), _tok(10)], pad_multiplier=8
+        )
+
+        assert packed.size(0) % 32 == 0  # tp_size * pad_multiplier
+        assert pos.size(-1) == packed.size(0)
+
+    # ── the contract Megatron-Bridge checks ───────────────────────────────
+
+    def test_bridge_pre_sharded_contract(self):
+        """``_is_packed_input_pre_sharded`` requirements must all hold."""
+        _set_cp(rank=0, size=2)
+        _set_tp(size=1)
+
+        _, pos, params = _pack_tokens_and_positions(
+            [_tok(6), _tok(10)], pad_multiplier=128
+        )
+        cu_seqlens = params.cu_seqlens_q
+
+        assert cu_seqlens.tolist() == [0, 8, 20, 256]
+        assert cu_seqlens[0].item() == 0
+        # cu_seqlens[-1] == cp_size * local_tokens is how Bridge detects pre-sharding.
+        assert cu_seqlens[-1].item() == 2 * pos.size(-1)
+        segment_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+        assert (segment_lengths % 4 == 0).all()  # 2 * cp_size
+
+    # ── cp_size == 1 and contiguous mode ──────────────────────────────────
+
+    def test_cp1_matches_tokens(self):
+        _set_cp(rank=0, size=1)
+        _set_tp(size=1)
+
+        packed, pos, _ = _pack_tokens_and_positions([_tok(6), _tok(10)])
+        assert pos.shape == (3, 1, 16)
+        assert torch.equal(pos[0, 0], packed)  # no padding at all at cp=1
+
+        packed, pos, _ = _pack_tokens_and_positions(
+            [_tok(6), _tok(10)], pad_multiplier=128
+        )
+        assert packed.size(0) == 128
+        assert torch.equal(pos[0, 0, 16:], torch.arange(16, 128))
+
+    @pytest.mark.parametrize("cp_rank", [0, 1])
+    def test_contiguous_matches_packed_tokens(self, cp_rank):
+        # align = tp * 2 * cp = 4, so padded lens are [8, 12] and each rank holds a
+        # flat 10-token slab of the 20-token global buffer.
+        _set_cp(rank=cp_rank, size=2)
+        _set_tp(size=1)
+
+        packed, pos, _ = _pack_tokens_and_positions(
+            [_tok(6), _tok(10)], cp_partition_mode="contiguous"
+        )
+
+        if cp_rank == 0:
+            assert pos[0, 0].tolist() == [0, 1, 2, 3, 4, 5, 6, 7, 0, 1]
+            assert packed.tolist() == [0, 1, 2, 3, 4, 5, -1, -1, 0, 1]
+        else:
+            assert pos[0, 0].tolist() == [2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+            assert packed.tolist() == [2, 3, 4, 5, 6, 7, 8, 9, -1, -1]

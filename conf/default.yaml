@@ -20,6 +20,7 @@ fully_async:
 # Default values for each entry in data_sources below. Every data_source_unit
 # inherits these defaults; per-unit overrides take precedence.
 data_source:
+  sandbox: {type: none}
   dataset:
     # Path to the prompt dataset file (.jsonl or .parquet), or to a directory containing such files
     # (all of them are read, in sorted path order).
@@ -63,8 +64,16 @@ data_source:
   num_prompts_per_step: 64
   num_trajectories_per_prompt: 8
   completion_params: {}
-  #  top_p: 1.0
-  #  top_k: -1
+  # Optional per-data-source SGLang /generate sampling_params.
+  # Common overrides (uncomment only when needed):
+  #   top_p: 0.9
+  #   top_k: 50  # -1 disables top-k filtering
+  #   min_p: 0.05
+  #   repetition_penalty: 1.05
+  #   stop: ["<stop sequence>"]
+  # Router owns temperature and max_new_tokens. For DeepSeek-V4/V4.1,
+  # skip_special_tokens is also forced to false; do not set them here.
+  # Complete version-specific schema: sglang.srt.sampling.sampling_params.SamplingParams.
 
 data_sources:
   - ${data_source}
@@ -136,13 +145,6 @@ agentflow:
     manager:
       mode: thread
       num_workers: 8
-  sandbox:
-    type: k8s
-    command_exec_timeout_seconds: 600
-    sandbox_creation_timeout_seconds: 600
-    working_dir: /rl-sandbox
-    kubeconfig: k8s/kubeconfig.yaml
-    pod_manifest_path: k8s/pod_manifest.yaml
 
 tracking:
   project_name: "default"
@@ -191,6 +193,10 @@ megatron:
     weight_decay: 0.01
     optimizer_cpu_offload: false
     optimizer_offload_fraction: 1.0
+    # chunked optimizer state offload
+    chunked_optimizer_state_offload: false
+    optimizer_state_offload_fraction: 1.0
+    optimizer_state_offload_chunk_size_mb: 1024
   scheduler:
     lr_warmup_steps: 0
     lr_decay_steps: 1
@@ -235,7 +241,9 @@ opd:
     moe_grouped_gemm: true
   memory_pool:
     backend: null
-  env_vars: {}
+  env_vars:
+    # Inject per-rank env vars into the teacher worker Ray actors (runtime_env).
+    PYTORCH_ALLOC_CONF: expandable_segments:True
 
 algorithm:
   advantage_estimator: grpo
@@ -288,4 +296,6 @@ trainer:
   async_save: true
   save_checkpoint: true   # Save distributed checkpoint.
   save_hf: false          # Also export HuggingFace-format weights to train_step_{step}/hf_model.
-  env_vars: {}
+  env_vars:
+    # Inject per-rank env vars into the train worker Ray actors (runtime_env).
+    PYTORCH_ALLOC_CONF: expandable_segments:True

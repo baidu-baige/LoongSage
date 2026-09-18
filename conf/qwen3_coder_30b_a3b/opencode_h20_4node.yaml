@@ -22,8 +22,17 @@ total_steps: 300
 # log_level: DEBUG  # DEBUG INFO WARNING ERROR CRITICAL
 
 data_source:
+  sandbox:
+    type: k8s
+    command_exec_timeout_seconds: 3600
+    sandbox_creation_timeout_seconds: 600
+    # R2E-Gym repositories live under /testbed.
+    working_dir: /testbed
+    kubeconfig: k8s/kubeconfig.yaml
+    pod_manifest_path: k8s/pod_manifest.yaml
   dataset:
     prompt_data_path: ???
+    data_pre_processor: r2e_gym
     input_key: prompt
     label_key: label
     metadata_key: metadata
@@ -72,14 +81,6 @@ agentflow:
     proxy_timeout_seconds: 1800
   tokenizer:
     generation_prompt_kwargs: {}
-  sandbox:
-    type: k8s
-    command_exec_timeout_seconds: 3600
-    sandbox_creation_timeout_seconds: 600
-    # R2E-Gym repositories live under /testbed.
-    working_dir: /testbed
-    kubeconfig: k8s/kubeconfig.yaml
-    pod_manifest_path: k8s/pod_manifest.yaml
 
 trainer:
   num_gpus_per_node: 8

@@ -257,6 +257,7 @@ class RolloutSampler:
             metrics.update(rollout_metrics)
 
         if metrics:
+            logger.info("[step %d] rollout metrics: %s", self.step, metrics)
             track(metrics, self.step)
 
     def snapshot_pipeline_buf(self) -> list[TrajectoryGroup]:
@@ -566,6 +567,7 @@ class RolloutSampler:
                 rollout_metrics = {k: v for k, v in self.metrics[step].items()
                                    if k.startswith(_TRACKED_PREFIXES)}
                 metrics.update(rollout_metrics)
+            logger.info("[step %d] rollout metrics: %s", step, metrics)
             track(metrics, step)
             await self._cleanup(running_tasks, step, overflow_groups)
 

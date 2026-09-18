@@ -22,7 +22,7 @@ from megatron.core.distributed import DistributedDataParallel as DDP
 from coda.backends.megatron.checkpoint import async_calls
 from megatron.bridge import AutoBridge
 from megatron.bridge.models import GPTModelProvider
-from coda.utils.channel_helper import ChannelMeta, create_sender_channel
+from coda.transfer_mesh import ChannelMeta, create_sender_channel
 
 from coda.backends.train_worker import TrainWorker
 from coda.utils.tensor_backuper import TensorBackuper
@@ -54,13 +54,6 @@ logger = logging.getLogger(__name__)
 
 class MegatronTrainWorker(TrainWorker):
     """Per-GPU Ray actor that drives Megatron-Core distributed training."""
-
-    @classmethod
-    def runtime_env_vars(cls):
-        """set custom runtime environment variables."""
-        return {
-            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"
-        }
 
     @classmethod
     def validate_config(cls, config):
@@ -99,6 +92,8 @@ class MegatronTrainWorker(TrainWorker):
         if config.megatron.optimizer.optimizer_cpu_offload:
             config.megatron.optimizer.use_precision_aware_optimizer = True
             config.megatron.optimizer.overlap_cpu_optimizer_d2h_h2d = True
+        if config.megatron.optimizer.chunked_optimizer_state_offload:
+            config.megatron.optimizer.use_precision_aware_optimizer = True
 
         if config.megatron.ddp_config.overlap_param_gather:
             config.megatron.ddp_config.setdefault("align_param_gather", True)
@@ -282,6 +277,7 @@ class MegatronTrainWorker(TrainWorker):
             load_checkpoint(self.model, self.optimizer, self.scheduler, ckpt_dir)
             logger.info(f"[Rank {self.rank}] Checkpoint loaded from {ckpt_dir}")
         self.offloaded = False
+        self.params_offloaded = False
 
         # Step 9: build KL policy instances and set up teacher lm_heads if an
         # active policy needs teacher logits (full_kl/full_jsd). The
@@ -360,12 +356,21 @@ class MegatronTrainWorker(TrainWorker):
 
     def _register_training_hooks(self):
         "following https://github.com/NVIDIA/Megatron-LM/blob/core_v0.16.0/megatron/training/training.py#L2546-L2565"
+        optimizer = self.optimizer
+
+        def finalize_model_grads_with_state_reload(*args, **kwargs):
+            # Restore chunked-offloaded optimizer state (fp32 masters + first
+            # state chunk) here so the async H2D overlaps gradient finalization,
+            # ``optimizer.step()`` also prefetches internally, so this is purely a perf overlap;
+            optimizer.prefetch_optimizer_state_for_gradient_finalization()
+            return finalize_model_grads(*args, **kwargs)
+
         for model_chunk in self.model:
             assert isinstance(model_chunk, DDP)
             config = get_model_config(model_chunk)
             ddp_config = model_chunk.ddp_config
             config.grad_scale_func = self.optimizer.scale_loss
-            config.finalize_model_grads_func = finalize_model_grads
+            config.finalize_model_grads_func = finalize_model_grads_with_state_reload
 
             if ddp_config.overlap_grad_reduce:
                 config.no_sync_func = [m.no_sync for m in self.model]
@@ -559,6 +564,10 @@ class MegatronTrainWorker(TrainWorker):
     @torch.no_grad()
     def update_weights(self, channel_meta: ChannelMeta):
         """Update weights"""
+        if self.params_offloaded:
+            self._onload_model(move_params=True, move_grads=False)
+            self.params_offloaded = False
+            clear_memory()
         print_memory("before send huggingface weights")
         send_channel = create_sender_channel(channel_meta)
         for name, tensor, in self.bridge.export_hf_weights(self.model):
@@ -566,6 +575,7 @@ class MegatronTrainWorker(TrainWorker):
         send_channel.send(None, flush=True)
         if self.offloaded:
             self._offload_model(move_params=True, move_grads=False)
+            self.params_offloaded = True
         clear_memory()
         print_memory("after send huggingface weights")
 
@@ -582,21 +592,22 @@ class MegatronTrainWorker(TrainWorker):
         clear_memory()
         print_memory("after onload")
         self.offloaded = False
+        self.params_offloaded = False
 
     @override
     @torch.no_grad()
-    def offload(self):
+    def offload(self, move_params: bool = False):
         """Offload: move from GPU memory to CPU memory (VRAM -> CPU RAM)"""
-        print_memory("before offload")
-        # keep params in gpu for latter update weights
-        self._offload_model(move_params=False, move_grads=True)
+        print_memory(f"before offload (move_params={move_params})")
+        self._offload_model(move_params=move_params, move_grads=True)
         self._move_optimizer("cpu")
         lm_heads = TeacherLMHeads.get()
         if lm_heads is not None:
             lm_heads.offload()
         clear_memory()
-        print_memory("after offload")
+        print_memory(f"after offload (move_params={move_params})")
         self.offloaded = True
+        self.params_offloaded = move_params
 
     def _offload_model(self, move_params: bool = True, move_grads: bool = True):
         """Offload model parameters and gradients to CPU."""
@@ -638,13 +649,25 @@ class MegatronTrainWorker(TrainWorker):
         param), so they are deliberately left untouched; only their moments move.
         Identity is preserved (``t.data = t.data.to(...)``) so HDO's internal
         param maps stay valid across the move.
+
+        With ``chunked_optimizer_state_offload`` the offloader owns its state:
+        ``step()`` leaves masters on GPU, so the D2H below hands them back to its
+        pinned CPU buffers (H2D is implicit in the next ``step()``; no onload
+        branch). Moments are offloader-owned and skipped below.
         """
+        if device == "cpu":
+            # Hand masters back to the offloader's pinned CPU buffers; they are
+            # invisible to the loops below (shard_fp32_from_float16_groups is None).
+            self.optimizer.offload_optimizer_state_for_forward()
+
         def _move(t):
             if t is not None:
                 t.data = t.data.to(device, non_blocking=True)
 
-        def _move_moments(state):
-            for value in state.values():
+        def _move_moments(state, offloader=None):
+            for param, value in state.items():
+                if offloader is not None and offloader.is_param_offloaded(param):
+                    continue
                 if "exp_avg" in value:
                     value["exp_avg"] = value["exp_avg"].to(device, non_blocking=True)
                 if "exp_avg_sq" in value:
@@ -665,7 +688,9 @@ class MegatronTrainWorker(TrainWorker):
                 for group in optimizer.shard_fp32_from_float16_groups:
                     for param in group:
                         _move(param)
-                _move_moments(optimizer.optimizer.state)
+                _move_moments(
+                    optimizer.optimizer.state, optimizer._optimizer_state_offloader
+                )
 
     @time_tracker("compute_log_probs")
     def _compute_log_probs(
@@ -832,9 +857,11 @@ class MegatronTrainWorker(TrainWorker):
         num_seqs = max(is_metrics.pop("num_seqs"), 1)
         kl_denom = num_seqs if self.config.algorithm.loss_agg_mode == "seq-mean-token-mean" else num_tokens
         approx_k3_kl = is_metrics.pop("train/is_approx_k3_kl") / float(kl_denom)
+        logprob_abs_diff = is_metrics.pop("train/is_logprob_abs_diff") / float(kl_denom)
         for k in list(is_metrics.keys()):
             is_metrics[k] = is_metrics[k] / float(num_tokens)
         is_metrics["train/is_approx_k3_kl"] = approx_k3_kl
+        is_metrics["train/is_logprob_abs_diff"] = logprob_abs_diff
 
         # Always report metrics; only apply weights/masks to loss when enabled
         result = {"is_metrics": is_metrics}

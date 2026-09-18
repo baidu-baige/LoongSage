@@ -151,11 +151,10 @@ ______________________________________________________________________
 
 以下为后续主要开发计划，欢迎通过 Issue 参与讨论与共建：
 
-- [ ] Claude Code & Codex支持
+- [ ] Claude Code 支持
 - [ ] 低精度训练支持
 - [ ] PPO能力支持
 - [ ] MTP/DSpark
-- [ ] PD 分离部署
 - [ ] 全异步场景下的多数据源、多智能体支持
 - [ ] SFT能力支持
 - [ ] LORA能力支持
@@ -217,7 +216,7 @@ LoongSage 在架构设计与代码实现层面，大量参考并学习了以下�
 
 ```bibtex
 @software{loongsage,
-  title  = {LoongSage: An Agent-Native Asynchronous Reinforcement Learning Framework for LLM Post-Training},
+  title  = {LoongSage: A Production-Grade, High-Efficiency Agentic RL Framework for Frontier LLMs with Validated Recipes},
   author = {LoongSage Contributors},
   year   = {2026},
   url    = {https://github.com/baidu-baige/LoongSage/}
