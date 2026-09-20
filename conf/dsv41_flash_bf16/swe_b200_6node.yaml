@@ -1,6 +1,6 @@
 # @package _global_
 #
-# DAPO math on DeepSeek-V4.1-Flash-BF16, 5-node B200 (5 x 8 = 40 GPUs).
+# mini-swe / R2E-Gym on DeepSeek-V4.1-Flash-BF16, 6-node B200.
 #
 # Set before launching: checkpoint_path, hf_model_path, data_source.dataset.prompt_data_path.
 # hf_model_path must point at the BF16 HF checkpoint produced by
@@ -9,47 +9,65 @@
 #
 # Launch:
 #   bash examples/start_ray_cluster.sh <master-ip>   # on every node first
-#   bash examples/start.sh dsv41_flash_bf16/dapo_b200_5node
+#   bash examples/start.sh dsv41_flash_bf16/swe_b200_6node
 defaults:
   - /default
   - _self_
 
 checkpoint_path: ???
 hf_model_path: ???
-colocate: false
+colocate: true
 total_steps: 300
 
 data_source:
   dataset:
     prompt_data_path: ???
     input_key: prompt
-    label_key: reward_model
+    label_key: label
+    metadata_key: metadata
+    data_pre_processor: r2e_gym
+  agent:
+    name: mini-swe
+    step_limit: 100
+    request_timeout: 1200
+    max_consecutive_format_errors: 10
+    # R2E-Gym images keep the testbed Python in a venv/conda env that is not on the
+    # default PATH; prepend it to every agent command.
+    shell_prefix: "source /root/.bashrc >/dev/null 2>&1 || true; export PATH=/testbed/.venv/bin:/opt/miniconda3/envs/testbed/bin:/root/.local/bin:$PATH; "
   reward:
-    name: dapo_math
-    overlong_penalty_length: 4096
-  num_prompts_per_step: 16
+    name: r2e_gym
   num_trajectories_per_prompt: 8
-  max_response_len_per_trajectory: 20480
+  num_prompts_per_step: 16
+  max_response_len_per_trajectory: 24576
 
 rollout:
   env_vars:
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE: "1"
+    SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT: "private"
     SGLANG_DSV4_FP4_EXPERTS: "0"
     SGLANG_OPT_FP8_WO_A_GEMM: "0"
     SGLANG_OPT_FUSE_WQA_WKV: "0"
     NCCL_CUMEM_ENABLE: "1"
+  retry_limit: 3
   num_gpus_per_node: 8
   sglang_args:
     mem_fraction_static: 0.85
+    # Hard cap on the KV pool (final KV tokens = min(mem_fraction-profiled, this)).
+    # Also sizes the R3 routing-replay host capture buffer at ~960 B/token
+    max_total_tokens: 10000000 #10M tokens
     disable_cuda_graph: false
-    ep_size: 8
+    ep_size: 16
+    dp_size: 2
+    enable_dp_attention: true
     attention_backend: dsv4
     moe_runner_backend: auto
     max_running_requests: 128
   sglang_replicas:
     regular:
-      num_nodes: 1
-      num_gpus_per_replica: 8
+      num_nodes: 6
+      num_gpus_per_replica: 16
+  sampler:
+    timeout: 10800
   use_fault_tolerance: true
 
 agentflow:
@@ -62,7 +80,7 @@ agentflow:
 
 trainer:
   num_gpus_per_node: 8
-  num_nodes: 4
+  num_nodes: 6
   mini_batch_size: 128
   max_tokens_per_gpu: 20480
   micro_batch_size: 1
@@ -73,14 +91,18 @@ trainer:
   async_save: false
   nccl_timeout_minutes: 60
   gloo_timeout_minutes: 60
+  deterministic_mode: true
   env_vars:
     PYTORCH_ALLOC_CONF: "expandable_segments:True,pinned_max_cached_size_mb:32"
 
 megatron:
   model:
-    tensor_model_parallel_size: 8
-    pipeline_model_parallel_size: 4
-    context_parallel_size: 1
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 6
+    # 40 layers do not divide evenly over PP=6 -> uneven split 6/7*4/6 
+    num_layers_in_first_pipeline_stage: 6
+    num_layers_in_last_pipeline_stage: 6
+    context_parallel_size: 2
     sequence_packing_scheduler: "default_dynamic_cp"
     attention_softmax_in_fp32: true
     cp_partition_mode: "contiguous"     # required for V4.1 context parallelism
