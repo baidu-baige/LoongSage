@@ -151,7 +151,6 @@ Chinese documentation is available in [`docs/zh/`](docs/zh/).
 
 Below are our main plans for upcoming work. Discussions and contributions via Issues are welcome:
 
-- [ ] Claude Code support
 - [ ] Low-precision training support
 - [ ] PPO support
 - [ ] MTP / DSpark

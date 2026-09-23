@@ -5,10 +5,10 @@
 # Set before launching: checkpoint_path, hf_model_path, data_source.dataset.prompt_data_path.
 # The first two must live on storage reachable by every node.
 #   hf download Qwen/Qwen3-Coder-30B-A3B-Instruct --local-dir <hf_model_path>
-#   hf download LoongSage/R2E-Gym R2E_Gym_Subset_opencode.parquet --repo-type=dataset --local-dir <dir>
+#   hf download loongsage/R2E-Gym --include "opencode/data/*.parquet" --repo-type=dataset --local-dir <prompt_data_path>
 #
 # Launch:
-#   bash examples/start_ray_cluster.sh <master-ip>   # on every node first
+#   bash examples/start_ray_cluster.sh <head-node-ip>   # on every node first
 #   bash examples/start.sh qwen3_coder_30b_a3b/opencode_h20_4node
 
 defaults:
@@ -19,7 +19,6 @@ checkpoint_path: ???
 hf_model_path: ???
 colocate: true
 total_steps: 300
-# log_level: DEBUG  # DEBUG INFO WARNING ERROR CRITICAL
 
 data_source:
   sandbox:
@@ -122,9 +121,7 @@ algorithm:
   advantage_estimator: grpo
   advantage_norm_mode: group_zscore
   policy_loss: grpo
-  loss_agg_mode: token-mean
-  #policy_loss: gspo
-  #loss_agg_mode: seq-mean-token-mean
+  loss_agg_mode: seq-mean-token-mean
   #clip_ratio_low: 3e-4
   #clip_ratio_high: 4e-4
   is_correction:

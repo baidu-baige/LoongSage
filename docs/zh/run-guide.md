@@ -155,14 +155,14 @@ bash examples/start.sh dsv4_flash_bf16/swe_h20_8node \
 
 ```bash
 hf download Qwen/Qwen3-Coder-30B-A3B-Instruct --local-dir /root/Qwen3-Coder-30B-A3B-Instruct
-hf download LoongSage/R2E-Gym R2E_Gym_Subset_opencode.parquet \
+hf download loongsage/R2E-Gym --include "opencode/data/*.parquet" \
   --repo-type=dataset --local-dir /root/R2E-Gym-OpenCode
 ```
 
 准备 K8s 沙箱 kubeconfig，可将其放到 `k8s/kubeconfig.yaml`，或在启动命令中覆盖路径。然后在四台 H20 机器上执行同一条 Ray 启动命令：
 
 ```bash
-bash examples/start_ray_cluster.sh <master-ip>
+bash examples/start_ray_cluster.sh <head-node-ip>
 ```
 
 所有节点加入后，在 head 节点启动 [`qwen3_coder_30b_a3b/opencode_h20_4node`](../../conf/qwen3_coder_30b_a3b/opencode_h20_4node.yaml)：
@@ -171,7 +171,59 @@ bash examples/start_ray_cluster.sh <master-ip>
 bash examples/start.sh qwen3_coder_30b_a3b/opencode_h20_4node \
   checkpoint_path=/root/ckpt/opencode \
   hf_model_path=/root/Qwen3-Coder-30B-A3B-Instruct \
-  data_source.dataset.prompt_data_path=/root/R2E-Gym-OpenCode/R2E_Gym_Subset_opencode.parquet \
+  data_source.dataset.prompt_data_path=/root/R2E-Gym-OpenCode/opencode \
+  data_source.sandbox.kubeconfig=/path/to/kubeconfig.yaml
+```
+
+### 任务六：运行 Codex 黑盒智能体
+
+Codex 与 OpenCode 一样是运行在 K8s 沙箱里的黑盒智能体。下载模型和 R2E-Gym 数据集（Codex 变体），数据中的镜像已预装 Codex，无需再做数据转换。注意只使用 `codex/` 目录，仓库里同时存在 OpenCode 版本的同名任务。
+
+```bash
+hf download Qwen/Qwen3-Coder-30B-A3B-Instruct --local-dir /root/Qwen3-Coder-30B-A3B-Instruct
+hf download loongsage/R2E-Gym --include "codex/data/*.parquet" \
+  --repo-type=dataset --local-dir /root/R2E-Gym-Codex
+```
+
+准备 K8s 沙箱 kubeconfig（放到 `k8s/kubeconfig.yaml`，或在启动命令中覆盖路径），在四台 H20 机器上执行同一条 Ray 启动命令：
+
+```bash
+bash examples/start_ray_cluster.sh <head-node-ip>
+```
+
+所有节点加入后，在 head 节点启动 [`qwen3_coder_30b_a3b/codex_h20_4node`](../../conf/qwen3_coder_30b_a3b/codex_h20_4node.yaml)：
+
+```bash
+bash examples/start.sh qwen3_coder_30b_a3b/codex_h20_4node \
+  checkpoint_path=/root/ckpt/codex \
+  hf_model_path=/root/Qwen3-Coder-30B-A3B-Instruct \
+  data_source.dataset.prompt_data_path=/root/R2E-Gym-Codex/codex \
+  data_source.sandbox.kubeconfig=/path/to/kubeconfig.yaml
+```
+
+### 任务七：运行 Claude Code 黑盒智能体
+
+Claude Code 也是黑盒智能体，与 Codex、OpenCode 不同的是，这里给出的是使用两台 H20（16 卡）承担 rollout 与训练。下载模型和 R2E-Gym 数据集（Claude Code 变体），数据中的镜像已预装 Claude Code CLI：
+
+```bash
+hf download Qwen/Qwen3-Coder-30B-A3B-Instruct --local-dir /root/Qwen3-Coder-30B-A3B-Instruct
+hf download loongsage/R2E-Gym --include "claude_code/data/*.parquet" \
+  --repo-type=dataset --local-dir /root/R2E-Gym-ClaudeCode
+```
+
+准备 K8s 沙箱 kubeconfig 后，在两台 H20 机器上执行同一条 Ray 启动命令：
+
+```bash
+bash examples/start_ray_cluster.sh <head-node-ip>
+```
+
+所有节点加入后，在 head 节点启动 [`qwen3_coder_30b_a3b/claude_code_h20_2node`](../../conf/qwen3_coder_30b_a3b/claude_code_h20_2node.yaml)：
+
+```bash
+bash examples/start.sh qwen3_coder_30b_a3b/claude_code_h20_2node \
+  checkpoint_path=/root/ckpt/claude_code \
+  hf_model_path=/root/Qwen3-Coder-30B-A3B-Instruct \
+  data_source.dataset.prompt_data_path=/root/R2E-Gym-ClaudeCode/claude_code \
   data_source.sandbox.kubeconfig=/path/to/kubeconfig.yaml
 ```
 
@@ -390,6 +442,8 @@ checkpoint_path/
 | `conf/qwen3.8_27b/` | `dapo_h20_1node` | Qwen3.8-27B | DAPO 数学 | 单机 8xH20 |
 | `conf/qwen3_coder_30b_a3b/` | `mini_swe_h20_4node` | Qwen3-Coder-30B-A3B | mini-SWE（R2E-Gym）| 4 节点 xH20 |
 | | `opencode_h20_4node` | Qwen3-Coder-30B-A3B | OpenCode（R2E-Gym）（任务五）| 4 节点 xH20 |
+| | `codex_h20_4node` | Qwen3-Coder-30B-A3B | Codex（R2E-Gym）（任务六）| 4 节点 xH20 |
+| | `claude_code_h20_2node` | Qwen3-Coder-30B-A3B | Claude Code（R2E-Gym）（任务七）| 2 节点 xH20 |
 | `conf/dsv4_flash_bf16/` | `swe_h20_8node` / `swe_gb200_8node` | DeepSeek-V4-Flash-BF16 | SWE（任务四）| 8xH20 / 8xGB200 |
 | | `dapo_h20_6node` / `dapo_gb200_8node` | DeepSeek-V4-Flash-BF16 | DAPO 数学 | 6xH20 / 8xGB200 |
 | `conf/dsv41_flash_bf16/` | `dapo_b200_5node` | DeepSeek-V4.1-Flash-BF16 | DAPO 数学 | 5 节点 xB200 |

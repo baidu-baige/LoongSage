@@ -108,6 +108,7 @@ class ParserMiddleware(BaseHTTPMiddleware):
             async with lock:
                 turn_ctx = await self.parser.build_turn_input(
                     trajectory, messages=messages, tools=tools, request_kind=request_kind,
+                    mask_tool_call_args=adapter.rewrites_history_tool_args,
                 )
                 # Enforce max_response_len_per_trajectory: compare response-area length against the budget.
                 # response_area = everything after the initial prompt (LLM replies + tool responses).

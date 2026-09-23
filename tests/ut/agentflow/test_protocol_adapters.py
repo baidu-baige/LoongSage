@@ -12,6 +12,7 @@ from coda.agentflow.router.protocols import (
     OpenAIChatCompletionsAdapter as ChatCompletionsAdapter,
     OpenAIResponsesAdapter as CodexAdapter,
 )
+from coda.agentflow.router.protocols.anthropic_messages import AnthropicMessagesAdapter
 from coda.agentflow.agent.codex.codex_agent import (
     _CONFIG_TOML,
     _MODEL_INSTRUCTIONS,
@@ -89,6 +90,70 @@ def test_codex_request_kind_uses_its_own_headers() -> None:
         "request_kind"
     ] == "compaction"
     assert adapter.normalize_headers(_request(path)).get("request_kind") is None
+
+
+def test_anthropic_agent_id_header_marks_subagent_request() -> None:
+    adapter = AnthropicMessagesAdapter()
+    path = "/traj/0/v1/messages"
+    headers = {"x-claude-code-agent-id": "agent-123"}
+
+    assert adapter.normalize_headers(_request(path, headers))["request_kind"] == "collab_spawn"
+    assert adapter.classify_request(path, {}, headers) == "collab_spawn"
+
+
+def test_anthropic_agent_id_header_is_case_insensitive_and_ignores_blank_value() -> None:
+    adapter = AnthropicMessagesAdapter()
+    path = "/traj/0/v1/messages"
+
+    assert adapter.normalize_headers(
+        _request(path, {"X-Claude-Code-Agent-Id": "agent-123"}),
+    )["request_kind"] == "collab_spawn"
+    assert adapter.normalize_headers(
+        _request(path, {"x-claude-code-agent-id": "   "}),
+    ).get("request_kind") is None
+
+
+def test_anthropic_agent_id_is_the_only_subagent_signal() -> None:
+    adapter = AnthropicMessagesAdapter()
+    path = "/traj/0/v1/messages"
+
+    assert adapter.classify_request(
+        path,
+        {
+            "system": "You are an agent for Claude Code",
+            "request_kind": "collab_spawn",
+            "metadata": {"request_kind": "collab_spawn"},
+        },
+    ) is None
+    assert adapter.classify_request(
+        path,
+        {"system": "main agent"},
+        {"x-claude-code-agent-id": "agent-123"},
+    ) == "collab_spawn"
+
+
+def test_anthropic_adapter_ignores_count_tokens_route() -> None:
+    """count_tokens is handled by the Router, so the adapter must not match it."""
+    adapter = AnthropicMessagesAdapter()
+
+    assert adapter.parse_route("/traj/0/v1/messages/count_tokens") is None
+    assert adapter.parse_route("/traj/0/v1/messages") == ("traj", 0)
+
+
+def test_rewrites_history_tool_args_only_for_anthropic() -> None:
+    """Only Claude Code (Anthropic) rewrites old tool-call arguments, so only its
+    adapter opts into masking them out of the prefix comparison."""
+    assert AnthropicMessagesAdapter().rewrites_history_tool_args is True
+    assert ChatCompletionsAdapter().rewrites_history_tool_args is False
+    assert CodexAdapter().rewrites_history_tool_args is False
+
+
+
+def test_anthropic_generation_request_still_requires_max_tokens() -> None:
+    with pytest.raises(ValueError, match="missing max_tokens"):
+        AnthropicMessagesAdapter().parse_request({
+            "messages": [{"role": "user", "content": "hello"}],
+        })
 
 
 def test_codex_request_preserves_empty_assistant_content_and_image_placeholder() -> None:

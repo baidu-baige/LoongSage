@@ -65,7 +65,6 @@ HOP_BY_HOP = {
 SESSION_PROXY_ROUTES = (
     "/v1/chat/completions",
     "/v1/messages",
-    "/v1/messages/count_tokens",
     "/v1/responses",
     "/v1/responses/compact",
 )
@@ -144,6 +143,7 @@ class Router:
         self._server: uvicorn.Server | None = None
         self._thread: threading.Thread | None = None
         self._startup_error: BaseException | None = None
+        self.trajectory_store = (middleware_kwargs or {}).get("trajectory_store")
         self.app = FastAPI()
         self._setup_routes()
         middleware_context = dict(middleware_kwargs or {})
@@ -183,6 +183,11 @@ class Router:
         session_router = APIRouter(prefix="/{trajectory_id}/{attempt_id}")
         for route in SESSION_PROXY_ROUTES:
             session_router.post(route, response_model=None)(self.proxy)
+        # Token counting bypasses generation: report the trajectory's stored token
+        # length straight from the store instead of proxying to a worker.
+        session_router.post("/v1/messages/count_tokens", response_model=None)(
+            self.count_tokens
+        )
 
         self.app.include_router(management_router)
         self.app.include_router(session_router)
@@ -539,6 +544,27 @@ class Router:
     # -------------------------------------------------------------------------
     # Proxy
     # -------------------------------------------------------------------------
+
+    async def count_tokens(
+        self,
+        trajectory_id: str,
+        attempt_id: int,
+        request: Request,
+    ) -> Response:
+        """Report the trajectory's stored token length for client-side accounting.
+
+        Bypasses generation entirely: the client's context / auto-compact
+        accounting reflects real usage. Falls back to 0 when the trajectory
+        cannot be resolved (e.g. before its first turn).
+        """
+        input_tokens = 0
+        if self.trajectory_store is not None:
+            entries = self.trajectory_store.get(
+                [trajectory_id], attempt_id=attempt_id
+            ).get(trajectory_id)
+            if entries:
+                input_tokens = len(entries[-1].tokens)
+        return JSONResponse(content={"input_tokens": input_tokens})
 
     async def proxy(
         self,

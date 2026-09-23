@@ -161,14 +161,14 @@ Download the model and the prepared R2E-Gym dataset. The dataset already points 
 
 ```bash
 hf download Qwen/Qwen3-Coder-30B-A3B-Instruct --local-dir /root/Qwen3-Coder-30B-A3B-Instruct
-hf download LoongSage/R2E-Gym R2E_Gym_Subset_opencode.parquet \
+hf download loongsage/R2E-Gym --include "opencode/data/*.parquet" \
   --repo-type=dataset --local-dir /root/R2E-Gym-OpenCode
 ```
 
 Prepare the K8s sandbox kubeconfig, placing it at `k8s/kubeconfig.yaml` or overriding its path in the launch command. Then run the same Ray command on all four H20 nodes:
 
 ```bash
-bash examples/start_ray_cluster.sh <master-ip>
+bash examples/start_ray_cluster.sh <head-node-ip>
 ```
 
 Once all nodes have joined, launch [`qwen3_coder_30b_a3b/opencode_h20_4node`](../../conf/qwen3_coder_30b_a3b/opencode_h20_4node.yaml) from the head node:
@@ -177,7 +177,59 @@ Once all nodes have joined, launch [`qwen3_coder_30b_a3b/opencode_h20_4node`](..
 bash examples/start.sh qwen3_coder_30b_a3b/opencode_h20_4node \
   checkpoint_path=/root/ckpt/opencode \
   hf_model_path=/root/Qwen3-Coder-30B-A3B-Instruct \
-  data_source.dataset.prompt_data_path=/root/R2E-Gym-OpenCode/R2E_Gym_Subset_opencode.parquet \
+  data_source.dataset.prompt_data_path=/root/R2E-Gym-OpenCode/opencode \
+  data_source.sandbox.kubeconfig=/path/to/kubeconfig.yaml
+```
+
+### Task 6: Run the Codex Black-Box Agent
+
+Like OpenCode, Codex is a black-box agent that runs inside a K8s sandbox. Download the model and the R2E-Gym dataset (Codex variant); the dataset already points to Codex-enabled sandbox images, so no additional data conversion is required. Use only the `codex/` directory — the repository also contains OpenCode copies of the same tasks.
+
+```bash
+hf download Qwen/Qwen3-Coder-30B-A3B-Instruct --local-dir /root/Qwen3-Coder-30B-A3B-Instruct
+hf download loongsage/R2E-Gym --include "codex/data/*.parquet" \
+  --repo-type=dataset --local-dir /root/R2E-Gym-Codex
+```
+
+Prepare the K8s sandbox kubeconfig (place it at `k8s/kubeconfig.yaml` or override its path in the launch command), then run the same Ray command on all four H20 nodes:
+
+```bash
+bash examples/start_ray_cluster.sh <head-node-ip>
+```
+
+Once all nodes have joined, launch [`qwen3_coder_30b_a3b/codex_h20_4node`](../../conf/qwen3_coder_30b_a3b/codex_h20_4node.yaml) from the head node:
+
+```bash
+bash examples/start.sh qwen3_coder_30b_a3b/codex_h20_4node \
+  checkpoint_path=/root/ckpt/codex \
+  hf_model_path=/root/Qwen3-Coder-30B-A3B-Instruct \
+  data_source.dataset.prompt_data_path=/root/R2E-Gym-Codex/codex \
+  data_source.sandbox.kubeconfig=/path/to/kubeconfig.yaml
+```
+
+### Task 7: Run the Claude Code Black-Box Agent
+
+Claude Code is also a black-box agent. Unlike Codex and OpenCode, the preset shown here uses two H20 nodes (16 GPUs) to handle both rollout and training. Download the model and the R2E-Gym dataset (Claude Code variant); the dataset already points to images with the Claude Code CLI preinstalled:
+
+```bash
+hf download Qwen/Qwen3-Coder-30B-A3B-Instruct --local-dir /root/Qwen3-Coder-30B-A3B-Instruct
+hf download loongsage/R2E-Gym --include "claude_code/data/*.parquet" \
+  --repo-type=dataset --local-dir /root/R2E-Gym-ClaudeCode
+```
+
+After preparing the K8s sandbox kubeconfig, run the same Ray command on both H20 nodes:
+
+```bash
+bash examples/start_ray_cluster.sh <head-node-ip>
+```
+
+Once all nodes have joined, launch [`qwen3_coder_30b_a3b/claude_code_h20_2node`](../../conf/qwen3_coder_30b_a3b/claude_code_h20_2node.yaml) from the head node:
+
+```bash
+bash examples/start.sh qwen3_coder_30b_a3b/claude_code_h20_2node \
+  checkpoint_path=/root/ckpt/claude_code \
+  hf_model_path=/root/Qwen3-Coder-30B-A3B-Instruct \
+  data_source.dataset.prompt_data_path=/root/R2E-Gym-ClaudeCode/claude_code \
   data_source.sandbox.kubeconfig=/path/to/kubeconfig.yaml
 ```
 
@@ -418,6 +470,8 @@ Besides the presets used in the tasks above, `conf/` ships the following ready-t
 | `conf/qwen3.8_27b/` | `dapo_h20_1node` | Qwen3.8-27B | DAPO math | 1 node x 8 H20 |
 | `conf/qwen3_coder_30b_a3b/` | `mini_swe_h20_4node` | Qwen3-Coder-30B-A3B | mini-SWE (R2E-Gym) | 4 nodes × H20 |
 | | `opencode_h20_4node` | Qwen3-Coder-30B-A3B | OpenCode (R2E-Gym) (Task 5) | 4 nodes × H20 |
+| | `codex_h20_4node` | Qwen3-Coder-30B-A3B | Codex (R2E-Gym) (Task 6) | 4 nodes × H20 |
+| | `claude_code_h20_2node` | Qwen3-Coder-30B-A3B | Claude Code (R2E-Gym) (Task 7) | 2 nodes × H20 |
 | `conf/dsv4_flash_bf16/` | `swe_h20_8node` / `swe_gb200_8node` | DeepSeek-V4-Flash-BF16 | SWE (Task 4) | 8×H20 / 8×GB200 |
 | | `dapo_h20_6node` / `dapo_gb200_8node` | DeepSeek-V4-Flash-BF16 | DAPO math | 6×H20 / 8×GB200 |
 | `conf/dsv41_flash_bf16/` | `dapo_b200_5node` | DeepSeek-V4.1-Flash-BF16 | DAPO math | 5 nodes × B200 |

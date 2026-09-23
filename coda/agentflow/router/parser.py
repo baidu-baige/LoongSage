@@ -39,6 +39,12 @@ logger = logging.getLogger(__name__)
 
 _NORMALIZED_HISTORY_KEY = "normalized_history"
 
+# True when the active protocol's client rewrites old tool-call arguments while
+# echoing history (Claude Code). Set per trajectory from the protocol adapter and
+# read by _history_compare_form to decide whether to mask tool-call arguments out
+# of the prefix comparison.
+_MASK_TOOL_ARGS_KEY = "mask_tool_call_args"
+
 # Tool schemas from the first request of a trajectory. Cached because agents such as
 # mini-swe-agent omit the "tools" field on follow-up turns while the LLM keeps emitting
 # tool-call markup. Distinct from metadata["tools"], which the dataset layer owns.
@@ -315,13 +321,19 @@ class TrajectoryParser:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         request_kind: str | None = None,
+        mask_tool_call_args: bool = False,
     ) -> TurnInputContext:
         """Compute tokenized input for the next LLM call on this trajectory.
 
-        request_kind: value of the ``request_kind`` request header, used to disambiguate
-        a prefix mismatch between context compaction (``None``/``"compaction"``/anything
-        other than "collab_spawn") and a subagent fork (``"collab_spawn"``). 
+        request_kind: value of the `request_kind` request header, used to disambiguate
+        a prefix mismatch between context compaction (`None`/`"compaction"`/anything
+        other than "collab_spawn") and a subagent fork (`"collab_spawn"`).
+
+        mask_tool_call_args: whether the active protocol's client rewrites old
+        tool-call arguments (Claude Code). Recorded on the trajectory so every
+        prefix comparison (here and in update_trajectory) masks consistently.
         """
+        trajectory.metadata[_MASK_TOOL_ARGS_KEY] = mask_tool_call_args
         normalized_messages = self._normalize_messages(messages)
         if tools:
             trajectory.metadata[_REQUEST_TOOLS_KEY] = copy.deepcopy(tools)
@@ -332,7 +344,9 @@ class TrajectoryParser:
             input_ids = await self._tokenize_messages(normalized_messages, tools=tools)
             await self._log_decode(input_ids, "[build_input] %s first turn: %d tokens\n%s",
                                    trajectory.trajectory_id, len(input_ids))
-            trajectory.metadata[_NORMALIZED_HISTORY_KEY] = normalized_messages
+            # History cache holds the compare form (tool_call arguments masked only for clients that rewrite history)
+            # tokenization above always used the full-argument original.
+            trajectory.metadata[_NORMALIZED_HISTORY_KEY] = self._history_compare_form(trajectory, normalized_messages)
             return TurnInputContext(
                 delta_prompt_ids=input_ids,
                 input_ids=list(input_ids),
@@ -349,13 +363,19 @@ class TrajectoryParser:
         active_id = trajectory.active_segment_id
         normalized_history = trajectory.metadata.get(_NORMALIZED_HISTORY_KEY)
         if not isinstance(normalized_history, list):
-            normalized_history = self._normalize_messages(self._chat_segment(trajectory, active_id))
+            normalized_history = self._history_compare_form(
+                trajectory, self._normalize_messages(self._chat_segment(trajectory, active_id)))
             trajectory.metadata[_NORMALIZED_HISTORY_KEY] = normalized_history
         history_len = len(normalized_history)
+        # For clients that rewrite old tool_use arguments in their echo (Claude Code),
+        # _history_compare_form masks those arguments out so the rewrite does not turn
+        # every tool-calling turn into a spurious compaction; other protocols compare
+        # the exact normalized messages.
+        incoming_compare_form = self._history_compare_form(trajectory, normalized_messages)
         prefix_len = history_len if (
             history_len > 0
-            and len(normalized_messages) >= history_len
-            and normalized_messages[:history_len] == normalized_history
+            and len(incoming_compare_form) >= history_len
+            and incoming_compare_form[:history_len] == normalized_history
         ) else 0
         logger.debug("[build_input] %s: active_segment=%d history=%d messages=%d prefix=%d",
                      trajectory.trajectory_id, active_id, history_len, len(normalized_messages), prefix_len)
@@ -407,7 +427,8 @@ class TrajectoryParser:
         input_ids = await self._tokenize_messages(normalized_messages, tools=tools)
         await self._log_decode(input_ids, "[build_input] %s compact segment: %d tokens\n%s",
                                trajectory.trajectory_id, len(input_ids))
-        trajectory.metadata[_NORMALIZED_HISTORY_KEY] = normalized_messages
+        # Comparison form, same as the case-1 store.
+        trajectory.metadata[_NORMALIZED_HISTORY_KEY] = self._history_compare_form(trajectory, normalized_messages)
         return TurnInputContext(
             delta_prompt_ids=input_ids,
             input_ids=input_ids,
@@ -642,8 +663,8 @@ class TrajectoryParser:
             trajectory.chat_completions[active_id] = segment_messages
         else:
             trajectory.chat_completions[active_id].extend(segment_messages)
-        trajectory.metadata[_NORMALIZED_HISTORY_KEY] = self._normalize_messages(
-            trajectory.chat_completions[active_id]
+        trajectory.metadata[_NORMALIZED_HISTORY_KEY] = self._history_compare_form(
+            trajectory, self._normalize_messages(trajectory.chat_completions[active_id])
         )
 
         logger.debug(
@@ -777,6 +798,53 @@ class TrajectoryParser:
                 normalize_assistant_tool_call_arguments(entry)
             normalized.append(entry)
         return normalized
+
+
+    def _history_compare_form(
+        self, trajectory: Trajectory, messages: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Return the prefix-comparison form of already-normalized messages.
+
+        For protocols whose client rewrites old tool-call arguments (Claude Code, flagged via _MASK_TOOL_ARGS_KEY)
+        the arguments are masked out so the echo rewrite does not break the comparison; all other protocols compare
+        the exact normalized messages. Applied identically to stored history and incoming messages so the two sides
+        always match.
+        """
+        if trajectory.metadata.get(_MASK_TOOL_ARGS_KEY):
+            return self._mask_tool_call_args_for_compare(messages)
+        return messages
+
+    @staticmethod
+    def _mask_tool_call_args_for_compare(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Return a copy of normalized messages with tool_call arguments blanked (id/name kept).
+
+        Claude Code rewrites old tool_use arguments when echoing history (e.g. dropping a
+        `cd <dir> && ` prefix), which would break a strict prefix comparison against the
+        stored original and misclassify every tool-calling turn as compaction. Only the
+        comparison ignores arguments; tokenization and chat_completions keep them in full.
+        """
+        out: list[dict[str, Any]] = []
+        for message in messages:
+            tool_calls = message.get("tool_calls")
+            if not isinstance(tool_calls, list) or not tool_calls:
+                out.append(message)
+                continue
+            message = dict(message)
+            copied: list[Any] = []
+            for tool_call in tool_calls:
+                if not isinstance(tool_call, dict):
+                    copied.append(tool_call)
+                    continue
+                tool_call = dict(tool_call)
+                function = tool_call.get("function")
+                if isinstance(function, dict):
+                    function = dict(function)
+                    function["arguments"] = "{}"
+                    tool_call["function"] = function
+                copied.append(tool_call)
+            message["tool_calls"] = copied
+            out.append(message)
+        return out
 
     def _strip_think_from_ids(
         self,

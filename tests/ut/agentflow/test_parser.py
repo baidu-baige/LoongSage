@@ -1086,7 +1086,68 @@ def test_build_turn_input_matches_reserialized_tool_call_arguments() -> None:
     assert ctx.target_segment_id == 0
 
 
-def test_build_turn_input_consecutive_compaction_chains_parent_ids() -> None:
+def _make_tool_arg_rewrite_trajectory():
+    """Trajectory whose stored tool_call arguments are semantically rewritten by
+    the client's echo (not just re-serialized), to exercise the mask gating."""
+    assistant = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{
+            "id": "call_0",
+            "type": "function",
+            "function": {"name": "bash", "arguments": '{"command": "cd /repo && ls"}'},
+        }],
+    }
+    stored_chat = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "task"},
+        assistant,
+    ]
+    trajectory = Trajectory(
+        trajectory_id="traj-argmask",
+        prompt_id="prompt-0",
+        tokens=[1, 2, 3],
+        active_segment_id=0,
+        chat_completions={0: copy.deepcopy(stored_chat)},
+        segments=[Segment(token_start=0, token_end=3, logprob_start=0, logprob_end=1,
+                          triplets=[Triplet(token_start=0, token_end=3, logprob_start=0, logprob_end=1)],
+                          segment_id=0, origin="root")],
+    )
+    # Client drops the `cd /repo && ` prefix when echoing the old tool_use back.
+    incoming = copy.deepcopy(stored_chat)
+    incoming[2]["tool_calls"][0]["function"]["arguments"] = '{"command": "ls"}'
+    incoming.append({"role": "tool", "tool_call_id": "call_0", "content": "a.go"})
+    return trajectory, incoming
+
+
+def test_build_turn_input_masks_tool_args_when_client_rewrites_history() -> None:
+    """With mask_tool_call_args=True a semantic argument rewrite still continues
+    the active segment (Claude Code rewrites old tool_use arguments)."""
+    parser = make_prefix_parser()
+    trajectory, incoming = _make_tool_arg_rewrite_trajectory()
+
+    ctx = asyncio.run(parser.build_turn_input(
+        trajectory, messages=incoming, request_kind=None, mask_tool_call_args=True,
+    ))
+
+    assert ctx.start_new_segment is False
+    assert ctx.target_segment_id == 0
+
+
+def test_build_turn_input_compares_tool_args_strictly_by_default() -> None:
+    """Without the mask (non-Claude-Code protocols) a semantic argument rewrite is
+    a genuine prefix mismatch, so it opens a new compaction segment."""
+    parser = make_prefix_parser()
+    trajectory, incoming = _make_tool_arg_rewrite_trajectory()
+
+    ctx = asyncio.run(parser.build_turn_input(
+        trajectory, messages=incoming, request_kind=None,
+    ))
+
+    assert ctx.start_new_segment is True
+    assert ctx.target_segment_id == 1
+
+
     """A second consecutive mismatch should parent onto the first compact segment."""
     parser = make_prefix_parser()
     trajectory = Trajectory(

@@ -13,6 +13,12 @@ from starlette.responses import Response
 class ProtocolAdapter(ABC):
     """A single external wire protocol <-> coda-internal shape conversion."""
 
+    # True when this protocol's client rewrites OLD tool-call arguments while
+    # echoing history back (see TrajectoryParser._mask_tool_call_args_for_compare).
+    # Only such protocols need tool-call arguments masked out of the prefix
+    # comparison; the default of False keeps the comparison strict.
+    rewrites_history_tool_args: bool = False
+
     @abstractmethod
     def parse_route(self, path: str) -> tuple[str, int] | None:
         """Return (trajectory_id, attempt_id), or None."""

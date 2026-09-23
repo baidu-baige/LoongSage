@@ -652,6 +652,51 @@ class TestRoutingLogic:
 
 
 # ---------------------------------------------------------------------------
+# Token counting
+# ---------------------------------------------------------------------------
+
+
+class TestCountTokens:
+    """The /v1/messages/count_tokens route reports stored token length directly."""
+
+    @pytest.mark.asyncio
+    async def test_count_tokens_reports_stored_token_length(self):
+        store = TrajectoryStore()
+        store.add(
+            "req-001",
+            Trajectory(
+                trajectory_id="req-001",
+                prompt_id="p0",
+                attempt_id=0,
+                tokens=list(range(1234)),
+            ),
+        )
+        router = make_router(middleware_kwargs={"trajectory_store": store})
+
+        async with make_client(router) as client:
+            response = await client.post(
+                "/req-001/0/v1/messages/count_tokens",
+                json={"messages": [{"role": "user", "content": "hi"}]},
+            )
+
+        assert response.status_code == status.HTTP_200_OK
+        assert response.json() == {"input_tokens": 1234}
+
+    @pytest.mark.asyncio
+    async def test_count_tokens_returns_zero_when_trajectory_missing(self):
+        router = make_router(middleware_kwargs={"trajectory_store": TrajectoryStore()})
+
+        async with make_client(router) as client:
+            response = await client.post(
+                "/unknown/0/v1/messages/count_tokens",
+                json={"messages": [{"role": "user", "content": "hi"}]},
+            )
+
+        assert response.status_code == status.HTTP_200_OK
+        assert response.json() == {"input_tokens": 0}
+
+
+# ---------------------------------------------------------------------------
 # Proxy and request forwarding
 # ---------------------------------------------------------------------------
 
