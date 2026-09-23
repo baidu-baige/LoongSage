@@ -421,6 +421,8 @@ Besides the presets used in the tasks above, `conf/` ships the following ready-t
 | `conf/dsv4_flash_bf16/` | `swe_h20_8node` / `swe_gb200_8node` | DeepSeek-V4-Flash-BF16 | SWE (Task 4) | 8×H20 / 8×GB200 |
 | | `dapo_h20_6node` / `dapo_gb200_8node` | DeepSeek-V4-Flash-BF16 | DAPO math | 6×H20 / 8×GB200 |
 | `conf/dsv41_flash_bf16/` | `dapo_b200_5node` | DeepSeek-V4.1-Flash-BF16 | DAPO math | 5 nodes × B200 |
+| | `swe_b200_6node` | DeepSeek-V4.1-Flash-BF16 | mini-SWE (R2E-Gym) | 6 nodes × B200 |
+| | `swe_h20_6node` | DeepSeek-V4.1-Flash-BF16 | mini-SWE (R2E-Gym) | 6 nodes × H20 |
 
 ## Related documents
 

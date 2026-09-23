@@ -6,7 +6,7 @@
 
 <img src="./docs/_static/image/logo.png" alt="LoongSage" width="420">
 
-# LoongSage: the coda of LLM training
+# LoongSage: The Coda of LLM training
 
 **Production-Grade · Agentic · Scalable · Lightweight**
 

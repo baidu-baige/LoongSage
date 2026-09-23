@@ -1,6 +1,6 @@
 # @package _global_
 #
-# mini-swe / R2E-Gym on DeepSeek-V4.1-Flash-BF16, 6-node B200.
+# mini-swe / R2E-Gym on DeepSeek-V4.1-Flash-BF16, 6-node H20.
 #
 # Set before launching: checkpoint_path, hf_model_path, data_source.dataset.prompt_data_path.
 # hf_model_path must point at the BF16 HF checkpoint produced by
@@ -9,7 +9,7 @@
 #
 # Launch:
 #   bash examples/start_ray_cluster.sh <master-ip>   # on every node first
-#   bash examples/start.sh dsv41_flash_bf16/swe_b200_6node
+#   bash examples/start.sh dsv41_flash_bf16/swe_h20_6node
 defaults:
   - /default
   - _self_

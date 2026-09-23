@@ -393,6 +393,8 @@ checkpoint_path/
 | `conf/dsv4_flash_bf16/` | `swe_h20_8node` / `swe_gb200_8node` | DeepSeek-V4-Flash-BF16 | SWE（任务四）| 8xH20 / 8xGB200 |
 | | `dapo_h20_6node` / `dapo_gb200_8node` | DeepSeek-V4-Flash-BF16 | DAPO 数学 | 6xH20 / 8xGB200 |
 | `conf/dsv41_flash_bf16/` | `dapo_b200_5node` | DeepSeek-V4.1-Flash-BF16 | DAPO 数学 | 5 节点 xB200 |
+| | `swe_b200_6node` | DeepSeek-V4.1-Flash-BF16 | mini-SWE（R2E-Gym）| 6 节点 xB200 |
+| | `swe_h20_6node` | DeepSeek-V4.1-Flash-BF16 | mini-SWE（R2E-Gym）| 6 节点 xH20 |
 
 
 ## 相关文档
