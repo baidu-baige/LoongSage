@@ -15,6 +15,8 @@ Built-in pre-processors
 - bcp: Decrypt and reshape raw `Tevatron/browsecomp-plus` rows.
 - r2e_gym: Reshape raw `R2E-Gym/R2E-Gym-Subset` rows into the prompt/metadata layout the
   mini-swe agent and the `r2e_gym` reward read.
+- countdown: Reshape raw `Jiayi-Pan/Countdown-Tasks-3to4` rows (`nums`/`target`) into a prompt
+  plus a structured `label` dict the `countdown` reward verifies against.
 
 Registering custom pre-processors
 ---------------------------------
@@ -197,3 +199,44 @@ def r2e_gym_pre_process(data: dict, prompt_key: str) -> dict:
 
 # Columns this pre-processor reads, so `Dataset` can restrict the parquet scan to them.
 r2e_gym_pre_process.source_columns = R2E_GYM_SOURCE_COLUMNS
+
+COUNTDOWN_SOURCE_COLUMNS = ("nums", "target")
+COUNTDOWN_FORMAT_INSTRUCTION = (
+    "\nUse every number exactly once with only + - * / and parentheses. "
+    "Give the final expression inside answer tags, e.g. <answer>(1 + 2) * 8</answer>."
+)
+
+
+def _to_int_list(value) -> list[int]:
+    """Coerce a nums field (list / numpy array / tuple) into a list of ints."""
+    if value is None:
+        return []
+    if hasattr(value, "tolist"):  # numpy.ndarray from parquet
+        value = value.tolist()
+    return [int(n) for n in value]
+
+
+@register_data_pre_processor("countdown")
+def countdown_pre_process(data: dict, prompt_key: str) -> dict:
+    """Build a prompt from ``nums``/``target`` and attach the label dict the countdown reward reads.
+
+    Already-prepared records (dict ``label`` present) pass through unchanged.
+    """
+    if isinstance(data.get("label"), dict) and data.get(prompt_key):
+        return data
+
+    nums = _to_int_list(data.get("nums"))
+    target_raw = data.get("target")
+    if not nums or target_raw is None:
+        raise ValueError("countdown_pre_process: 'nums' and 'target' are required in the dataset record")
+    target = int(target_raw)
+
+    data[prompt_key] = (
+        f"Numbers: {nums}\nTarget: {target}" + COUNTDOWN_FORMAT_INSTRUCTION
+    )
+    data["label"] = {"target": target, "nums": nums}
+    return data
+
+
+# Columns this pre-processor reads, so `Dataset` can restrict the parquet scan to them.
+countdown_pre_process.source_columns = COUNTDOWN_SOURCE_COLUMNS
