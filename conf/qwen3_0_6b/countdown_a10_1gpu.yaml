@@ -1,0 +1,65 @@
+# @package _global_
+# Qwen3-0.6B Countdown on a single A10 (24GB) GPU (colocated rollout + training).
+defaults:
+  - /default
+  - _self_
+
+checkpoint_path: "./checkpoints"
+hf_model_path: ???
+colocate: true
+total_steps: 300
+log_level: INFO
+
+data_source:
+  dataset:
+    prompt_data_path: ???
+    data_pre_processor: "countdown"
+    input_key: prompt
+    label_key: label
+    max_prompt_len: 1024
+  num_trajectories_per_prompt: 8
+  num_prompts_per_step: 32
+  agent:
+    name: countdown
+    max_iterations: 5
+  reward:
+    name: countdown
+    format_reward: 0.1
+  max_response_len_per_trajectory: 2048
+
+rollout:
+  num_gpus_per_node: 1
+  sglang_args:
+    mem_fraction_static: 0.3
+    attention_backend: triton
+  sglang_replicas:
+    regular:
+      num_nodes: 1
+      num_gpus_per_replica: 1
+
+agentflow:
+  dump_trajectory_path: "log/trajectories"
+  tokenizer:
+    generation_prompt_kwargs:
+      enable_thinking: false
+
+trainer:
+  num_gpus_per_node: 1
+  num_nodes: 1
+  mini_batch_size: 32
+  micro_batch_size: 1
+
+megatron:
+  model:
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    attention_backend: unfused
+    recompute_granularity: selective
+  optimizer:
+    optimizer_cpu_offload: true
+
+algorithm:
+  advantage_estimator: grpo
+  advantage_norm_mode: group_zscore
+  policy_loss: grpo
+  loss_agg_mode: token-mean
