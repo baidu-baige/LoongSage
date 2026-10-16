@@ -226,6 +226,19 @@ The commented-out `recompute_*` triplet (`granularity` / `method` / `num_layers`
 > - `megatron.optimizer`  → `megatron.core.optimizer.OptimizerConfig` (`torch.dtype` fields are auto-converted from strings)
 > - `megatron.scheduler`  → constructor kwargs of `megatron.core.optimizer_param_scheduler.OptimizerParamScheduler`. If `max_lr` / `min_lr` / `init_lr` / `start_wd` / `end_wd` are not set explicitly, they default from `megatron.optimizer.lr` / `min_lr` / `weight_decay`.
 
+### 7.3 `critic` (PPO value model)
+
+The critic is a second Megatron model trained alongside the actor for PPO. It always shares the actor's GPUs (each critic rank is pinned to the matching actor rank's bundle) and reuses `megatron.model` / `megatron.ddp_config`, so its parallelism equals the actor's. Only its optimizer, LR schedule and checkpoint are its own.
+
+| Field | Default | Description | Constraints |
+| --- | --- | --- | --- |
+| `critic.enable` | `false` | Train a PPO critic. | Requires `algorithm.advantage_estimator: gae`; `num_trajectories_per_prompt == 1`; cannot be combined with `opd.enable`. |
+| `critic.optimizer` | see yaml | Critic optimizer, configured independently of `megatron.optimizer` (same fields). | `min_lr` defaults from `critic.optimizer.lr`. |
+| `critic.scheduler` | see yaml | Critic LR scheduler, configured independently of `megatron.scheduler` (same fields). | `max_lr` / `min_lr` / `init_lr` / `start_wd` / `end_wd` default from the critic optimizer. |
+| `critic.critic_warmup` | `0` | Steps `<= critic_warmup` train only the critic; the actor is neither trained nor saved. | `>= 0`. |
+
+The critic checkpoint is saved synchronously to `train_step_N/critic_dist_ckpt`, next to the actor's `dist_ckpt`, and the two share `latest_checkpointed_iteration.txt`: during warmup the critic writes it, afterwards the actor does (the critic of the same step is always saved first). On resume inside warmup, the actor has no `dist_ckpt` for that step and starts from the HF weights, which is exactly its state.
+
 ## 8. OPD (On-Policy Distillation)
 
 OPD (On-Policy Distillation) attaches one or more teacher models to the RL loop and mixes a configurable KL term with policy gradient, yielding `L = (1-gkd_ratio) × [A - pg_ratio × KL_token] + gkd_ratio × L_GKD`. See [On-Policy Distillation](on-policy-distillation.md) for details.
@@ -261,7 +274,7 @@ The `algorithm` node bundles advantage estimation, policy loss, off-policy safeg
 
 | Field | Default | Description | Constraints |
 | --- | --- | --- | --- |
-| `algorithm.advantage_estimator` | `grpo` | Advantage estimator name. | Registered via the registry; built-in: `grpo`. |
+| `algorithm.advantage_estimator` | `grpo` | Advantage estimator name. | Registered via the registry; built-in: `grpo`, `gae` (PPO: advantages computed by the critic, requires `critic.enable`). |
 | `algorithm.advantage_norm_mode` | `group_zscore` | Advantage normalization mode. | `none` / `group_mean` / `group_zscore` / `batch_mean` / `batch_zscore`; `group_*` requires equal group sizes. |
 | `algorithm.policy_loss` | `grpo` | Policy loss name. | Built-in: `grpo` / `gspo`; see [GSPO paper](https://arxiv.org/pdf/2507.18071). |
 | `algorithm.loss_agg_mode` | `token-mean` | Loss aggregation mode. | `token-mean` / `seq-mean-token-mean`. |
@@ -349,7 +362,7 @@ The dependencies below span multiple sections and are the most common pitfalls w
   - `run_mode: default`
   - `rollout.sampler.num_oversample: 0` (extra capacity is provided by `fully_async.stale_steps`)
 - Only a single entry in `data_sources` is supported today.
-- `B × N` must be divisible by `trainer.mini_batch_size`; `M % N == 0` is strongly recommended (otherwise you cannot form complete groups). Here `B = num_prompts_per_step`, `N = num_trajectories_per_prompt`, `M = mini_batch_size`.
+- `B × N` must be divisible by `trainer.mini_batch_size`, as in synchronous mode. Here `B = num_prompts_per_step`, `N = num_trajectories_per_prompt`, `M = mini_batch_size`. The trainer fetches a whole step (`B` groups) at a time, so `M` need not be a multiple of `N`.
 
 ### 11.4 Partial rollout
 

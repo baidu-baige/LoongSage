@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from coda.algorithms.advantage import _group_normalize, _parse_advantage_norm
+from coda.algorithms.advantage import _group_normalize, _parse_advantage_norm, gae_advantage
 
 
 # ---------------------------------------------------------------------------
@@ -103,3 +103,17 @@ def test_group_zscore_unequal_group_sizes_raises():
     prompt_ids = ["p0", "p0", "p1"]  # p0 has 2, p1 has 1
     with pytest.raises(AssertionError):
         _group_normalize(rewards, prompt_ids, divide_std=True)
+
+
+# ---------------------------------------------------------------------------
+# gae — PPO advantages are computed by the critic and only read by the actor
+# ---------------------------------------------------------------------------
+
+def test_gae_advantage_reads_critic_advantages():
+    advs = [torch.tensor([0.1, 0.2]), torch.tensor([0.3])]
+    assert gae_advantage(None, {"critic_advantages": advs}) is advs
+
+
+def test_gae_advantage_without_critic_raises():
+    with pytest.raises(KeyError, match="critic_advantages"):
+        gae_advantage(None, {})

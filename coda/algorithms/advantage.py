@@ -1,7 +1,8 @@
 """Built-in advantage estimator implementations.
 
-Registers GRPO advantage estimation into the advantage registry, and
-provides the top-level ``compute_advantages`` dispatcher.
+Registers GRPO and PPO (``gae``, read from the critic) advantage estimation
+into the advantage registry, and provides the top-level ``compute_advantages``
+dispatcher.
 """
 
 from __future__ import annotations
@@ -159,6 +160,24 @@ def grpo_advantage(
     lengths_tensor = torch.tensor(response_lengths, dtype=torch.long, device=device)
     expanded = torch.repeat_interleave(adv_tensor, lengths_tensor)
     return list(expanded.split(response_lengths))
+
+
+@register_advantage("gae")
+def gae_advantage(
+    config: DictConfig,
+    rollout_data: RolloutBatch,
+) -> list[torch.Tensor]:
+    """PPO advantage, computed once by the critic worker.
+
+    GAE needs the critic's values, so the critic computes the advantages (from
+    its pre-update ``old_values``) and the train manager hands them to the
+    actor as ``critic_advantages``; the actor only reads them here.
+
+    Returns:
+        Per-Segment advantage tensors, each of shape ``(response_length,)``.
+    """
+
+    return advantages
 
 
 def _advantage_metrics(advantages: list[torch.Tensor]) -> dict[str, float]:

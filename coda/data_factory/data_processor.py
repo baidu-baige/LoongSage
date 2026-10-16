@@ -42,6 +42,9 @@ class Box:
     def __init__(self, ref: ray.ObjectRef) -> None:
         self.ref = ref
         self.teacher_worker_ref: list[ray.ObjectRef] = []
+        # PPO: this DP rank's critic outputs (``{"critic_advantages": [...]}``),
+        # attached by TrainManager after the critic step and read by the actor.
+        self.critic_ref: ray.ObjectRef | None = None
 
 
 def split_traj_group_by_dp(

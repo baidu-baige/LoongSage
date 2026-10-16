@@ -196,6 +196,48 @@ def _get_position_ids(
 # Forward-only
 # ════════════════════════════════════════════════════════════════════════
 
+def compute_forward_only_outputs(
+    packed_targets: torch.Tensor,
+    batch: dict,
+    packed_seq_params,
+    config: DictConfig,
+    pg_policy,
+    output_tensor: torch.Tensor,
+) -> tuple[torch.Tensor, dict[str, list[torch.Tensor]]]:
+    """Unified forward-only loss closure: log_probs + optional PG KL."""
+    temperature = config.trainer.temperature
+    total_lengths = batch["total_lengths"]
+    response_lengths = batch["response_lengths"]
+    cp_partition_mode = config.megatron.model.cp_partition_mode
+
+    collected = {}
+    collected["log_probs"] = compute_log_probs(
+        packed_targets,
+        total_lengths,
+        response_lengths,
+        # compute_log_probs mutates logits in-place; clone only when a PG policy
+        # below still needs the original output_tensor to compute KL.
+        output_tensor.clone() if pg_policy else output_tensor,
+        temperature,
+        cp_partition_mode=cp_partition_mode,
+    )
+
+    # Compute PG KL via the active PG policy
+    if pg_policy is not None:
+        ctx = KLCtx(
+            batch, output_tensor, packed_seq_params,
+            temperature=temperature, cp_partition_mode=cp_partition_mode,
+        )
+        per_token_kl, _ = pg_policy.compute_kl(config, ctx)
+        per_token_kl = gather_and_slice_response(
+            per_token_kl, total_lengths, response_lengths,
+            cp_partition_mode=cp_partition_mode,
+        )
+        collected["per_token_kl"] = per_token_kl
+
+    return torch.tensor(0.0, device=output_tensor.device), collected
+
+
 @torch.no_grad()
 def forward_only(
     config: DictConfig,
@@ -203,6 +245,7 @@ def forward_only(
     data_iterator: Sequence[DataIterator],
     num_microbatches: int,
     pg_policy=None,
+    output_fn: Callable = compute_forward_only_outputs,
 ) -> list[dict[str, list[torch.Tensor]]]:
     """Run forward passes only and collect non-loss outputs (e.g., logprobs, PG KL).
 
@@ -212,6 +255,10 @@ def forward_only(
         data_iterator: The iterable yielding forward-only microbatches.
         num_microbatches: Count of micro-batches to exhaust in the single forward pass.
         pg_policy: The active PG KL policy instance (or None).
+        output_fn: Output closure with the signature of
+            :func:`compute_forward_only_outputs` (the default), i.e.
+            ``(packed_targets, batch, packed_seq_params, config, pg_policy,
+            output_tensor) -> (loss, collected)``.
 
     Returns:
         List of per-microbatch dicts, each mapping output names (``"log_probs"``
@@ -262,7 +309,7 @@ def forward_only(
 
         # 4. Unified loss closure
         return output, partial(
-            compute_forward_only_outputs,
+            output_fn,
             packed_targets, batch, packed_seq_params, config, pg_policy,
         )
 
@@ -282,48 +329,6 @@ def forward_only(
     return forward_data_store
 
 
-def compute_forward_only_outputs(
-    packed_targets: torch.Tensor,
-    batch: dict,
-    packed_seq_params,
-    config: DictConfig,
-    pg_policy,
-    output_tensor: torch.Tensor,
-) -> tuple[torch.Tensor, dict[str, list[torch.Tensor]]]:
-    """Unified forward-only loss closure: log_probs + optional PG KL."""
-    temperature = config.trainer.temperature
-    total_lengths = batch["total_lengths"]
-    response_lengths = batch["response_lengths"]
-    cp_partition_mode = config.megatron.model.cp_partition_mode
-
-    collected = {}
-    collected["log_probs"] = compute_log_probs(
-        packed_targets,
-        total_lengths,
-        response_lengths,
-        # compute_log_probs mutates logits in-place; clone only when a PG policy
-        # below still needs the original output_tensor to compute KL.
-        output_tensor.clone() if pg_policy else output_tensor,
-        temperature,
-        cp_partition_mode=cp_partition_mode,
-    )
-
-    # Compute PG KL via the active PG policy
-    if pg_policy is not None:
-        ctx = KLCtx(
-            batch, output_tensor, packed_seq_params,
-            temperature=temperature, cp_partition_mode=cp_partition_mode,
-        )
-        per_token_kl, _ = pg_policy.compute_kl(config, ctx)
-        per_token_kl = gather_and_slice_response(
-            per_token_kl, total_lengths, response_lengths,
-            cp_partition_mode=cp_partition_mode,
-        )
-        collected["per_token_kl"] = per_token_kl
-
-    return torch.tensor(0.0, device=output_tensor.device), collected
-
-
 # ════════════════════════════════════════════════════════════════════════
 # Training
 # ════════════════════════════════════════════════════════════════════════
@@ -336,6 +341,7 @@ def train_minibatch(
     opt_param_scheduler: OptimizerParamScheduler,
     num_microbatches: int,
     gkd_policy=None,
+    loss_fn: Callable = loss_function,
 ) -> dict[str, float]:
     """Execute a single pipeline-parallel training step.
 
@@ -343,8 +349,10 @@ def train_minibatch(
     1. Fetches a micro-batch from the data iterator.
     2. CP-slices and packs tokens.
     3. Runs the model forward.
-    4. Returns a loss closure (``loss_function``) that computes log-probs and
-       loss from the model output.
+    4. Returns a loss closure (``loss_fn``, default ``loss_function``) that
+       computes the loss from the model output. It is called as
+       ``loss_fn(config, batch, packed_seq_params, gkd_policy, output_tensor)``
+       and returns ``(loss, denom, metrics)``.
 
     Then hands off to Megatron's ``forward_backward_func`` for gradient
     computation, and finishes with an optimizer + scheduler step.
@@ -364,7 +372,8 @@ def train_minibatch(
         *data_iter* is one of the VPP DataIterators; each call to
         ``get_next`` advances it by one micro-batch.
         """
-        # 1. Fetch micro-batch
+        # 1. Fetch micro-batch. Keys absent from the rollout data come back as
+        # None, so one list serves both the policy loss and the value loss.
         keys = [
             "tokens",
             "loss_masks",
@@ -377,6 +386,8 @@ def train_minibatch(
             "rollout_log_probs",
             "rollout_routed_experts",
             "ref_log_probs",
+            "old_values",
+            "returns",
         ]
         keys += teacher_keys
 
@@ -408,7 +419,7 @@ def train_minibatch(
             RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_BACKWARD)
 
         # 4. Loss callback
-        return output, partial(loss_function, config, batch, packed_seq_params, gkd_policy)
+        return output, partial(loss_fn, config, batch, packed_seq_params, gkd_policy)
 
     # Chunked optimizer-state offload: push fp32 master weights (and any resident
     # optimizer-state chunks) to CPU before the activation-heavy forward/backward so

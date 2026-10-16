@@ -118,7 +118,7 @@ class ResourceScheduler:
                 for _, replica in rollout_config.sglang_replicas.items()
             )
             teacher_num_gpus = 0
-            if "opd" in config and config.opd.get("enable", False):
+            if config.opd.enable:
                 teacher_num_gpus = config.opd.teacher_nodes * config.opd.teacher_gpus_per_node
             num_gpus = trainer_config.num_gpus_per_node * trainer_config.num_nodes + \
                 rollout_num_gpus + teacher_num_gpus
@@ -257,7 +257,7 @@ class ResourceScheduler:
 
 
     def schedule(
-        self, ray_actor: ActorClass, num_bundles: int = 1, recover_bundle_index: int = -1
+        self, ray_actor: ActorClass, num_bundles: int = 1, bundle_index: int = -1
     ) -> tuple[ActorClass, int]:
         """
         Schedule an actor onto a Ray placement group.
@@ -265,7 +265,12 @@ class ResourceScheduler:
         Args:
             ray_actor: The Ray ActorClass.
             num_bundles: The number of bundles to allocate.
-            recover_bundle_index: The bundle index of the dead actor.
+            bundle_index: Pin the actor to ``reorder_bundle_list[bundle_index]``
+                instead of taking bundles from the cursor; the cursor is left
+                untouched. ``-1`` (default) means allocate from the cursor. Used
+                to put a rebuilt engine back on its original GPUs, and to place a
+                worker group on the same GPUs as another group (e.g. the critic
+                onto the actor's GPUs).
 
         Returns:
             (prepared_actor, bundle_index): An ActorClass with resources and placement-group
@@ -274,7 +279,7 @@ class ResourceScheduler:
         """
         role = getattr(ray_actor, '__name__', None) or ray_actor.__ray_metadata__.class_name
 
-        if recover_bundle_index == -1:
+        if bundle_index == -1:
             # Get the cursor: per-role in colocate mode, shared in non-colocate mode
             cursor_key = role if self.colocate else "_global"
             if cursor_key not in self.role_cursors:
@@ -299,10 +304,9 @@ class ResourceScheduler:
                 placement_group_bundle_index=primary_bundle["p_idx"],
             )
         else:
-            bundle_index = recover_bundle_index
             scheduling_strategy = PlacementGroupSchedulingStrategy(
-                placement_group=self.reorder_bundle_list[recover_bundle_index]["pg"],
-                placement_group_bundle_index=self.reorder_bundle_list[recover_bundle_index]["p_idx"],
+                placement_group=self.reorder_bundle_list[bundle_index]["pg"],
+                placement_group_bundle_index=self.reorder_bundle_list[bundle_index]["p_idx"],
             )
 
         prepared_actor = ray_actor.options(

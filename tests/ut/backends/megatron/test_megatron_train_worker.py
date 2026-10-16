@@ -1,4 +1,4 @@
-"""Unit tests for MegatronTrainWorker.validate_config."""
+"""Unit tests for the Megatron train worker base and the actor worker."""
 from unittest.mock import MagicMock
 
 import pytest
@@ -9,7 +9,7 @@ from omegaconf import OmegaConf
 # validate_config itself is pure config manipulation.
 pytest.importorskip("megatron", reason="Megatron-Core is not installed")
 
-from coda.backends.megatron import MegatronTrainWorker
+from coda.backends.megatron import MegatronTrainWorker, MegatronActorWorker
 
 
 def make_minimal_config(**overrides):
@@ -62,6 +62,7 @@ def make_minimal_config(**overrides):
                 "lr": 1e-6,
                 "weight_decay": 0.01,
                 "optimizer_cpu_offload": False,
+                "chunked_optimizer_state_offload": False,
             },
             "scheduler": {},
         },
@@ -90,13 +91,13 @@ def make_minimal_config(**overrides):
 
 
 # ---------------------------------------------------------------------------
-# MegatronTrainWorker.validate_config — forced parameters
+# MegatronActorWorker.validate_config — forced parameters
 # ---------------------------------------------------------------------------
 
 class TestMegatronValidateConfigForced:
     def _run(self, **overrides):
         config = make_minimal_config(**overrides)
-        return MegatronTrainWorker.validate_config(config)
+        return MegatronActorWorker.validate_config(config)
 
     def test_variable_seq_lengths_always_true(self):
         result = self._run(megatron={"model": {"variable_seq_lengths": False}})
@@ -108,13 +109,13 @@ class TestMegatronValidateConfigForced:
 
 
 # ---------------------------------------------------------------------------
-# MegatronTrainWorker.validate_config — derived parameters
+# MegatronActorWorker.validate_config — derived parameters
 # ---------------------------------------------------------------------------
 
 class TestMegatronValidateConfigDerived:
     def _run(self, **overrides):
         config = make_minimal_config(**overrides)
-        return MegatronTrainWorker.validate_config(config)
+        return MegatronActorWorker.validate_config(config)
 
     def test_param_dtype_set_to_bfloat16_when_bf16_true(self):
         result = self._run(megatron={"model": {"bf16": True}})
@@ -136,7 +137,7 @@ class TestMegatronValidateConfigDerived:
 class TestMegatronValidateConfigM2PO:
     def _run(self, **overrides):
         config = make_minimal_config(**overrides)
-        return MegatronTrainWorker.validate_config(config)
+        return MegatronActorWorker.validate_config(config)
 
     def test_m2po_defaults_to_disabled(self):
         result = self._run()
@@ -153,12 +154,12 @@ class TestMegatronValidateConfigM2PO:
 
 
 def test_compute_m2po_updates_loss_masks_before_is_correction(monkeypatch):
-    import coda.backends.megatron.megatron_train_worker as worker_mod
+    import coda.backends.megatron.megatron_actor_worker as worker_mod
 
     monkeypatch.setattr(worker_mod.parallel_state, "get_data_parallel_group", lambda: None)
     monkeypatch.setattr(worker_mod, "reduce_dict", lambda metrics, group: metrics)
 
-    worker = MegatronTrainWorker.__new__(MegatronTrainWorker)
+    worker = MegatronActorWorker.__new__(MegatronActorWorker)
     worker.rank = 0
     worker.config = OmegaConf.create(
         {
@@ -201,7 +202,7 @@ def test_compute_m2po_updates_loss_masks_before_is_correction(monkeypatch):
 
 def test_compute_m2po_returns_empty_without_old_log_probs():
     """Non-last pipeline stages carry no old_log_probs, so M2PO is a no-op there."""
-    worker = MegatronTrainWorker.__new__(MegatronTrainWorker)
+    worker = MegatronActorWorker.__new__(MegatronActorWorker)
     worker.rank = 0
 
     result = worker._compute_m2po(step=1, rollout_data={"loss_masks": [torch.ones(3)]})
@@ -210,12 +211,12 @@ def test_compute_m2po_returns_empty_without_old_log_probs():
 
 
 def test_compute_is_correction_uses_existing_loss_masks(monkeypatch):
-    import coda.backends.megatron.megatron_train_worker as worker_mod
+    import coda.backends.megatron.megatron_actor_worker as worker_mod
 
     monkeypatch.setattr(worker_mod.parallel_state, "get_data_parallel_group", lambda: None)
     monkeypatch.setattr(worker_mod, "reduce_dict", lambda metrics, group: metrics)
 
-    worker = MegatronTrainWorker.__new__(MegatronTrainWorker)
+    worker = MegatronActorWorker.__new__(MegatronActorWorker)
     worker.config = OmegaConf.create(
         {
             "algorithm": {
@@ -247,12 +248,12 @@ def test_compute_is_correction_uses_existing_loss_masks(monkeypatch):
 
 def test_compute_is_correction_preserves_m2po_raw_loss_masks(monkeypatch):
     """IS correction must not overwrite raw_loss_masks set by M2PO."""
-    import coda.backends.megatron.megatron_train_worker as worker_mod
+    import coda.backends.megatron.megatron_actor_worker as worker_mod
 
     monkeypatch.setattr(worker_mod.parallel_state, "get_data_parallel_group", lambda: None)
     monkeypatch.setattr(worker_mod, "reduce_dict", lambda metrics, group: metrics)
 
-    worker = MegatronTrainWorker.__new__(MegatronTrainWorker)
+    worker = MegatronActorWorker.__new__(MegatronActorWorker)
     worker.config = OmegaConf.create(
         {
             "algorithm": {
@@ -280,3 +281,78 @@ def test_compute_is_correction_preserves_m2po_raw_loss_masks(monkeypatch):
 
     assert "raw_loss_masks" not in result
     assert rollout_data["raw_loss_masks"] is m2po_raw
+
+
+# ---------------------------------------------------------------------------
+# Base / actor split
+# ---------------------------------------------------------------------------
+
+def test_base_worker_is_abstract():
+    """The base only provides shared machinery; ``train`` must come from a subclass."""
+    with pytest.raises(TypeError, match="abstract"):
+        MegatronTrainWorker(1, 0)
+
+
+def test_base_validate_config_is_idempotent():
+    """Actor and critic both run the shared validation on the same driver config."""
+    once = MegatronTrainWorker.validate_config(make_minimal_config())
+    twice = MegatronTrainWorker.validate_config(OmegaConf.create(OmegaConf.to_container(once)))
+    assert OmegaConf.to_container(once) == OmegaConf.to_container(twice)
+
+
+def test_finalize_optim_sched_derives_from_its_own_lr():
+    config = make_minimal_config()
+    opt = OmegaConf.create({
+        "lr": 2e-5, "weight_decay": 0.1,
+        "optimizer_cpu_offload": False, "chunked_optimizer_state_offload": False,
+    })
+    sched = OmegaConf.create({})
+    MegatronTrainWorker._finalize_optim_sched(opt, sched, config)
+    assert opt.min_lr == pytest.approx(2e-6)
+    assert sched.max_lr == pytest.approx(2e-5)
+    assert sched.min_lr == pytest.approx(2e-6)
+    assert sched.start_wd == sched.end_wd == pytest.approx(0.1)
+    assert opt.bf16 is True and opt.use_distributed_optimizer is True
+
+
+def test_base_validate_config_leaves_policy_fields_to_actor():
+    cfg = make_minimal_config(trainer={"use_fp32_lm_head": True, "use_rollout_routing_replay": True})
+    base = MegatronTrainWorker.validate_config(cfg.copy())
+    assert "output_layer" not in base.megatron.keep_fp32_weights
+    assert base.megatron.model.get("moe_enable_routing_replay") is None
+
+    actor = MegatronActorWorker.validate_config(cfg.copy())
+    assert actor.megatron.keep_fp32_weights["output_layer"] is True
+    assert actor.megatron.model.moe_enable_routing_replay is True
+
+
+def test_ckpt_dir_name_defaults_to_dist_ckpt():
+    assert MegatronTrainWorker.CKPT_DIR_NAME == "dist_ckpt"
+    assert MegatronActorWorker.CKPT_DIR_NAME == "dist_ckpt"
+
+
+@pytest.mark.parametrize(
+    "calls, expected",
+    [
+        ([False], False),
+        ([True], True),
+        ([False, True], True),   # release params kept on GPU for weight sync
+        ([True, False], True),   # never claims offloaded params are back on GPU
+    ],
+)
+def test_offload_params_flag_tracks_where_params_live(monkeypatch, calls, expected):
+    import coda.backends.megatron.megatron_train_worker as base_mod
+
+    monkeypatch.setattr(base_mod, "print_memory", lambda *a, **k: None)
+    monkeypatch.setattr(base_mod, "clear_memory", lambda: None)
+    worker = MegatronActorWorker.__new__(MegatronActorWorker)
+    worker.offloaded = False
+    worker.params_offloaded = False
+    worker._offload_model = MagicMock()
+    worker._move_optimizer = MagicMock()
+
+    for move_params in calls:
+        MegatronTrainWorker.offload(worker, move_params)
+
+    assert worker.offloaded is True
+    assert worker.params_offloaded is expected

@@ -87,8 +87,8 @@ def _summary_metrics(bucket: dict, key_prefix: str) -> dict[str, float]:
 
     Every statistic is scoped to the given bucket, so the caller controls the scope by
     passing either the whole-batch accumulator or one data source's bucket.
-    The ``_mean`` / ``_max`` / ``_min`` suffixes are load-bearing: TrainMetricsAggregator
-    picks its cross-mini-batch reduction from them.
+    Keys follow the ``<domain>/<object>_<statistic>`` naming convention
+    (``_mean`` / ``_max`` / ``_min`` suffixes).
 
     ``prompt_length`` and ``completed_count`` are deliberately absent; they are reported
     globally only, by the caller.
@@ -141,10 +141,9 @@ class RolloutSampler:
         self.is_fully_async = config.fully_async.enable
 
         if self.is_fully_async:
-            num_trajectories_per_prompt = int(config.data_sources[0].num_trajectories_per_prompt)
-            mini_batch_size = config.trainer.mini_batch_size
-
-            self._groups_per_mini_batch = mini_batch_size // num_trajectories_per_prompt
+            # The trainer pulls one whole step per call (fully_async supports a
+            # single data source); mini-batches are split inside the train worker.
+            self._groups_per_step = int(config.data_sources[0].num_prompts_per_step)
             self._stopped = False
             self._run_gate = threading.Event()
             self._run_gate.set()  # initially not paused
@@ -198,7 +197,7 @@ class RolloutSampler:
             # fully_async runs rollout in a background thread; skip in-round eval
             # to avoid contending with it for the shared inference engine.
             groups = []
-            for _ in range(self._groups_per_mini_batch):
+            for _ in range(self._groups_per_step):
                 item = await self.pipeline_buf.async_get()
                 if item is None:
                     self._check_error()

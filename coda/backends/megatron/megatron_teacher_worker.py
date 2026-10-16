@@ -80,9 +80,9 @@ class MegatronTeacherWorker(BaseTeacherWorker):
         config.opd.model.batch_p2p_comm = not config.opd.model.overlap_p2p_comm
         return config
 
-    def init(self, config: DictConfig):
+    def init(self, config: DictConfig, master_addr: str, master_port: int):
         """Initialize distributed groups and load all assigned teachers."""
-        super().init(config)
+        super().init(config, master_addr, master_port)
         self.memory_pool = build_memory_pool(config)
 
         configure_tracking(config)

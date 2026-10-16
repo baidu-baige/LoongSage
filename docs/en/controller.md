@@ -132,14 +132,15 @@ RolloutManager
 
 Source: [coda/controller/train_manager.py](../../coda/controller/train_manager.py)
 
-`TrainManager` manages the Ray Actor pool on the training side. The current implementation creates `MegatronTrainWorker` instances based on `trainer.backend`, one Actor per GPU rank.
+`TrainManager` manages the Ray Actor pools on the training side. It always creates the actor (policy) pool, one `MegatronActorWorker` per GPU rank, based on `trainer.backend`. With `critic.enable` (PPO) it also creates a `MegatronCriticWorker` pool. Both worker classes derive from the shared `MegatronTrainWorker` base.
 
 #### Main Responsibilities
 
-- **Actor topology construction**: create one `MegatronTrainWorker` Actor per rank across the training world size.
+- **Actor topology construction**: create one `MegatronActorWorker` Actor per rank across the training world size. With a critic, pin critic rank `r` onto the bundle of actor rank `r` (`schedule(..., bundle_index=...)`), so the two pools share GPUs in every mode, including fully-async. Each pool is its own torch.distributed world with its own rendezvous port.
 - **Worker call proxying**: forward init, train, save_model, update_weights, and similar calls to every rank, returning handles that `Trainer` decides when to wait on.
 - **GPU memory lifecycle**: move parameters and optimizer state between GPU and CPU in colocated mode.
-- **Weight synchronization**: act as the sender side, accepting the `ChannelMeta` and writing weights into the `TransferMeshChannel`.
+- **Weight synchronization**: act as the sender side, accepting the `ChannelMeta` and writing weights into the `TransferMeshChannel` (actor only).
+- **PPO critic (hidden from `Trainer`)**: `Trainer` calls the same methods with or without a critic. Inside `async_train` the critic step runs first: release the actor, onload the critic, compute values / advantages and update the critic, save it on checkpoint steps, offload it, and attach each DP rank's advantages to `Box.critic_ref`. The actor is then onloaded and trains, reading those advantages through the `gae` advantage estimator. During `critic.critic_warmup` steps the actor is neither trained nor saved. The PPO config constraints are validated here as well.
 
 Training parallelism is determined jointly by Megatron configuration and LoongSage trainer configuration. The Controller only manages the lifecycle of the Worker pool; it does not replace Megatron's implementation of TP, PP, CP, EP, DP, or other parallelism strategies. Any non-`megatron` backend currently raises an error.
 
@@ -225,7 +226,7 @@ The following components are not part of the `coda.controller` package; this dir
 | `PipelineBuffer` | `coda.utils` | Connects the fully-async rollout producer thread and the training consumer thread |
 | `eval_utils` | `coda.utils` | Called by `RolloutSampler` on evaluation rounds to aggregate evaluation trajectories into `eval/*` metrics |
 | `ReplicaGroup` / `SglangEngine` | `coda.backends` | Host the SGLang rollout replicas and Rollout Worker Ray Actors |
-| `MegatronTrainWorker` / `MegatronTeacherWorker` | `coda.backends` | Execute training and Teacher forward passes |
+| `MegatronActorWorker` / `MegatronCriticWorker` / `MegatronTeacherWorker` | `coda.backends` | Execute training and Teacher forward passes |
 | `RolloutHealthMonitor` | `coda.utils` | Used by `RolloutManager` for Rollout Worker health checks |
 | `TransferMeshChannel` | `coda.transfer_mesh` | Transfers weights between Train Workers and Rollout Workers |
 
@@ -248,7 +249,7 @@ When `run_mode=default` and fully async is not enabled, the logical order of one
 4. DataFilter filters trajectories
 5. Trainer splits the batch by DP
 6. Optional Teacher / OPD computation
-7. TrainManager invokes MegatronTrainWorker
+7. TrainManager invokes MegatronActorWorker (and MegatronCriticWorker first, for PPO)
 8. Save checkpoint and metrics
 9. Update SGLang rollout weights and weight_version
 10. Move to the next step
@@ -333,7 +334,7 @@ on-disk batch
     -> restore data source / step
     -> load and place into Ray by DP
     -> TrainManager
-    -> MegatronTrainWorker
+    -> MegatronActorWorker
     -> checkpoint / metrics
 ```
 

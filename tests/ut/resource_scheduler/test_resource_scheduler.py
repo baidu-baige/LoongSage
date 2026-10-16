@@ -29,8 +29,8 @@ def _make_config(
             "sglang_replicas": sglang_replicas if sglang_replicas is not None else {},
         },
     }
-    if opd is not None:
-        cfg["opd"] = opd
+    # default.yaml always provides the opd block.
+    cfg["opd"] = opd if opd is not None else {"enable": False}
     return OmegaConf.create(cfg)
 
 
@@ -463,8 +463,36 @@ class TestSchedule:
         assert call_kwargs["placement_group_bundle_index"] == 0
         assert bundle_index == 0
 
+    @patch('coda.resource_scheduler.resource_scheduler.PlacementGroupSchedulingStrategy')
+    def test_schedule_pinned_bundle_skips_cursor(self, mock_pg_strategy):
+        """bundle_index >= 0 pins the actor to that bundle and leaves the cursor alone."""
+        mock_actor = MagicMock()
+        mock_actor.__name__ = "Pinned"
+        mock_actor.options.return_value = mock_actor
+        mock_pg_strategy.return_value = "mock_strategy"
 
-class TestIntegration:
+        _a, idx = self.scheduler.schedule(mock_actor, num_bundles=1, bundle_index=2)
+
+        assert idx == 2
+        call_kwargs = mock_pg_strategy.call_args[1]
+        assert call_kwargs["placement_group"] == self.scheduler.reorder_bundle_list[2]["pg"]
+        assert call_kwargs["placement_group_bundle_index"] == 2
+        assert self.scheduler.role_cursors == {}
+
+    @patch('coda.resource_scheduler.resource_scheduler.PlacementGroupSchedulingStrategy')
+    def test_schedule_pinned_group_does_not_shift_later_allocations(self, mock_pg_strategy):
+        """A group pinned onto existing bundles must not consume cursor slots."""
+        mock_pg_strategy.return_value = "mock_strategy"
+        actor_cls, critic_cls, rollout_cls = MagicMock(), MagicMock(), MagicMock()
+        for cls, name in ((actor_cls, "Actor"), (critic_cls, "Critic"), (rollout_cls, "Rollout")):
+            cls.__name__ = name
+            cls.options.return_value = cls
+
+        _a, actor_idx = self.scheduler.schedule(actor_cls, num_bundles=1)
+        _c, critic_idx = self.scheduler.schedule(critic_cls, num_bundles=1, bundle_index=actor_idx)
+        _r, rollout_idx = self.scheduler.schedule(rollout_cls, num_bundles=1)
+
+        assert (actor_idx, critic_idx, rollout_idx) == (0, 0, 1)
     """Integration tests for ResourceScheduler."""
 
     def _create_test_config(self, num_gpus=3, colocate=False):

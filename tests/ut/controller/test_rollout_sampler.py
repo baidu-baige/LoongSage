@@ -1276,7 +1276,8 @@ class TestFullyAsyncInit:
         sampler = RolloutSampler(config, Mock(), Mock())
 
         assert sampler.is_fully_async is True
-        assert sampler._groups_per_mini_batch == 2
+        # One call returns a whole step (num_prompts_per_step groups).
+        assert sampler._groups_per_step == 5
         assert sampler.pipeline_buf is not None
         assert sampler._stopped is False
         assert sampler.step == 0
@@ -1324,5 +1325,26 @@ class TestFullyAsyncInit:
 
             assert len(result) == 2
             assert result[0] is group
+
+        asyncio.run(_run())
+
+    def test_call_fully_async_returns_whole_step(self):
+        """One __call__ drains num_prompts_per_step groups, independent of mini_batch_size."""
+        from coda.controller.rollout_sampler import RolloutSampler
+
+        async def _run():
+            config = make_minimal_config()
+            config.fully_async.enable = True
+            # mini_batch_size % num_trajectories_per_prompt != 0 used to under-fetch.
+            config.trainer.mini_batch_size = 3
+
+            sampler = RolloutSampler(config, Mock(), Mock())
+            groups = [create_test_trajectory_group(f"p{i}") for i in range(6)]
+            sampler.pipeline_buf.async_get = AsyncMock(side_effect=groups)
+
+            result = await sampler(step=0)
+
+            assert result == groups[:5]
+            assert sampler.pipeline_buf.async_get.await_count == 5
 
         asyncio.run(_run())

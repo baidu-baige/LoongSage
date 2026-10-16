@@ -144,10 +144,13 @@ def merge_rollout_batch(batches: list[RolloutBatch], key: str) -> RolloutBatch:
 # Data Fetching
 # ────────────────────────────────────────────────────────────────────────
 def get_rollout_data(rollout_data_ref) -> RolloutBatch:
-    """Resolve a Ray rollout shard and merge teacher data if present.
+    """Resolve a Ray rollout shard and merge teacher / critic data if present.
 
-    Static tensor fields and any teacher tensor fields supplied via
-    ``teacher_worker_ref`` are moved to the current CUDA device.
+    Static tensor fields, any teacher tensor fields supplied via
+    ``teacher_worker_ref`` and any critic fields supplied via ``critic_ref``
+    (one tensor per Segment row, ``response_length`` long; the critic reads the
+    same shard in the same row order, so no re-indexing) are moved to the
+    current CUDA device.
     """
     dp_rank = mpu.get_data_parallel_rank()
     box = rollout_data_ref[dp_rank]
@@ -175,10 +178,31 @@ def get_rollout_data(rollout_data_ref) -> RolloutBatch:
                 teacher_tensor_fields.append(k)
         rollout_data.update(merged)
 
+    critic_tensor_fields: list[str] = []
+    if box.critic_ref is not None:
+        critic_data = ray.get(box.critic_ref)
+        response_lengths = rollout_data["response_lengths"]
+        for k, values in critic_data.items():
+            # TODO: remove once validated in end-to-end testing.
+            if len(values) != len(response_lengths):
+                raise ValueError(
+                    f"Critic field {k!r} has {len(values)} rows but the rollout shard has "
+                    f"{len(response_lengths)}"
+                )
+            # TODO: remove once validated in end-to-end testing.
+            for i, (v, n_resp) in enumerate(zip(values, response_lengths)):
+                if v.numel() != n_resp:
+                    raise ValueError(
+                        f"Critic field {k!r} row {i} has {v.numel()} tokens, expected "
+                        f"response_length {n_resp}"
+                    )
+            critic_tensor_fields.append(k)
+        rollout_data.update(critic_data)
+
     device = torch.cuda.current_device()
     for field in (
         "tokens", "loss_masks", "rollout_log_probs", "rollout_routed_experts", "raw_loss_masks",
-        *teacher_tensor_fields,
+        *teacher_tensor_fields, *critic_tensor_fields,
     ):
         if rollout_data.get(field):
             rollout_data[field] = [t.to(device) for t in rollout_data[field]]

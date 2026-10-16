@@ -76,7 +76,7 @@ TransferMesh 由三个模块组成：
 
 ### 2.3. 发送侧：桶聚合与流式转换
 
-训练侧的发送逻辑集中在 [`megatron_train_worker.py:554-560`](../../coda/backends/megatron/megatron_train_worker.py)：
+训练侧的发送逻辑集中在 [`megatron_actor_worker.py:340-355`](../../coda/backends/megatron/megatron_actor_worker.py)：
 
 ```python
 send_channel = create_sender_channel(channel_meta)
@@ -194,7 +194,7 @@ Trainer._update_weights(meta, weight_version)
 TransferMesh 本身不区分模式，但两种模式下的调度上下文不同，反映到 [`Trainer.train_loop`](../../coda/controller/trainer.py) 中：
 
 - **colocate 模式**（rollout 与 trainer 复用同一批 GPU）：因为单卡显存无法同时容纳两套完整模型状态，`update_weights` 前后需要在 GPU 上进行分阶段调度：
-  1. `train_manager.offload()`：将训练侧梯度和优化器状态卸载至 CPU，**但保留参数在 GPU**（[`megatron_train_worker.py:586`](../../coda/backends/megatron/megatron_train_worker.py) 中 `move_params=False`，注释 "keep params in gpu for latter update weights"）；
+  1. `train_manager.offload()`：将训练侧梯度和优化器状态卸载至 CPU，**但保留参数在 GPU**（同步循环用默认的 `move_params=False` 调用，见 [`trainer.py:385`](../../coda/controller/trainer.py)，这样 `update_weights` 可以直接从 GPU 导出）；
   2. `rollout_manager.onload_weights()`：将 SGLang 的权重容器载回 GPU（`tags=[GPU_MEMORY_TYPE_WEIGHTS]`），KV cache 继续留在 CPU；
   3. `_update_weights(...)`：通过 TransferMesh 完成权重传输，此时同卡的发送方（trainer worker）和接收方（SGLang TP worker）会自动选择 IPC 零拷贝路径；
   4. 传输结束后，若之前调用过 `offload()`（`self.offloaded=True`），`update_weights` 内部再调 `_offload_model(move_params=True, move_grads=False)` 将训练参数完全卸载至 CPU；
@@ -304,5 +304,5 @@ channel = create_channel(
 - [`MetaFrame` / `TensorSpec`](../../coda/transfer_mesh/protocol.py) — 桶元数据协议
 - [`ChannelMeta` / `create_sender_channel` / `create_receiver_channel`](../../coda/transfer_mesh/channel.py) — 通道入参与进程内生命周期（同在 `channel.py`）
 - [`Trainer._init_channel_meta` / `Trainer._update_weights`](../../coda/controller/trainer.py) — 顶层编排
-- [`MegatronTrainWorker.update_weights`](../../coda/backends/megatron/megatron_train_worker.py) — 训练侧发送
+- [`MegatronActorWorker.update_weights`](../../coda/backends/megatron/megatron_actor_worker.py) — 训练侧发送
 - [`SglangEngine.update_weights_from_channel`](../../coda/backends/sglang/engine.py) — 推理侧接收

@@ -131,14 +131,21 @@ RolloutManager 不负责生成 prompt，也不负责决定一个 step 需要多�
 
 源码：[coda/controller/train_manager.py](../../coda/controller/train_manager.py)
 
-`TrainManager` 管理训练侧的 Ray Actor 池。当前实现根据 `trainer.backend` 创建 `MegatronTrainWorker`，并为每个 Worker 分配 GPU 资源。
+`TrainManager` 管理训练侧的 Ray Actor 池。它总是根据 `trainer.backend` 创建 actor（policy）池，每个 GPU rank 一个 `MegatronActorWorker`。开启 `critic.enable`（PPO）时，还会再创建一组 `MegatronCriticWorker`。两种 worker 都继承自公共基类 `MegatronTrainWorker`。
 
 #### 主要职责
 
-- **Actor 拓扑构建**：按训练 world size 为每个 rank 创建一个 `MegatronTrainWorker` Actor。
+- **Actor 拓扑构建**：按训练 world size 为每个 rank 创建一个 `MegatronActorWorker` Actor。开启 critic 时，critic 的 rank `r` 钉到 actor rank `r` 所在的 bundle 上（`schedule(..., bundle_index=...)`），因此在包括全异步在内的所有模式下，两组 worker 都共用同一批卡。两组各自是独立的 torch.distributed world，使用不同的 rendezvous 端口。
 - **Worker 调用代理**：把 init、train、save_model、update_weights 等调用转发到全部 rank，返回句柄由 `Trainer` 决定何时等待。
 - **显存生命周期**：共置模式下在 GPU 与 CPU 之间搬运参数与优化器状态。
-- **权重同步**：作为发送侧，接收 `ChannelMeta` 并把权重写入 `TransferMeshChannel`。
+- **权重同步**：作为发送侧，接收 `ChannelMeta` 并把权重写入 `TransferMeshChannel`（仅 actor）。
+- **PPO critic（对 `Trainer` 透明）**：不管有没有 critic，`Trainer` 调用的都是同一组方法。`async_train` 内部会先执行 critic：
+  1. 卸载 actor，onload critic。
+  2. 计算 value 和 advantage，更新 critic。
+  3. 如果是保存 checkpoint 的 step，保存 critic。
+  4. offload critic，并把每个 DP rank 的 advantage 挂到 `Box.critic_ref` 上。
+
+  之后再 onload actor 进行训练，actor 通过 `gae` advantage estimator 读取这些 advantage。在 `critic.critic_warmup` 范围内的 step，actor 既不训练也不保存。PPO 相关的配置约束也在这里校验。
 
 训练并行度由 Megatron 配置和 LoongSage trainer 配置共同决定。Controller 只负责 Worker 池的生命周期，不替代 Megatron 对 TP、PP、CP、EP、DP 等并行策略的实现。当前对非 `megatron` backend 会直接报错。
 
@@ -224,7 +231,7 @@ Trainer 主线程                    rollout 线程                 collector �
 | `PipelineBuffer` | `coda.utils` | 连接全异步 rollout 生产线程和训练消费线程 |
 | `eval_utils` | `coda.utils` | 由 `RolloutSampler` 在评测轮次调用，聚合评测轨迹并产出 `eval/*` 指标 |
 | `ReplicaGroup` / `SglangEngine` | `coda.backends` | 承载 SGLang rollout replica 和 Rollout Worker Ray Actor |
-| `MegatronTrainWorker` / `MegatronTeacherWorker` | `coda.backends` | 执行训练与 Teacher 前向 |
+| `MegatronActorWorker` / `MegatronCriticWorker` / `MegatronTeacherWorker` | `coda.backends` | 执行训练与 Teacher 前向 |
 | `RolloutHealthMonitor` | `coda.utils` | 由 `RolloutManager` 用于 Rollout Worker 健康检查 |
 | `TransferMeshChannel` | `coda.transfer_mesh` | 在 Train Worker 与 Rollout Worker 之间传输权重 |
 
@@ -247,7 +254,7 @@ Controller 的入口是 `coda.controller.trainer`。启动后，`Trainer` 先完
 4. DataFilter 筛选轨迹
 5. Trainer 按 DP 切分 batch
 6. 可选 Teacher / OPD 计算
-7. TrainManager 调用 MegatronTrainWorker
+7. TrainManager 调用 MegatronActorWorker（PPO 时先调用 MegatronCriticWorker）
 8. 保存 checkpoint 和指标
 9. 更新 SGLang rollout 权重及 weight_version
 10. 进入下一个 step
@@ -330,7 +337,7 @@ Rollout-only 不代表不需要训练 backend 的配置。数据切分和 batch 
     -> 恢复数据源 / step
     -> 加载并按 DP 放入 Ray
     -> TrainManager
-    -> MegatronTrainWorker
+    -> MegatronActorWorker
     -> checkpoint / 指标
 ```
 

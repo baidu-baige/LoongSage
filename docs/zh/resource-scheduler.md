@@ -59,7 +59,7 @@ GPU 总量按模式计算：
 ## 4. schedule() 的返回值与资源声明
 
 ```python
-prepared_actor, bundle_index = scheduler.schedule(ray_actor_cls, num_bundles=1, recover_bundle_index=-1)
+prepared_actor, bundle_index = scheduler.schedule(ray_actor_cls, num_bundles=1, bundle_index=-1)
 handle = prepared_actor.remote(...)   # 调用方自己实例化
 ```
 
@@ -67,9 +67,12 @@ handle = prepared_actor.remote(...)   # 调用方自己实例化
 
 一个容易误解的细节：`prepared_actor` 被强制设置为 `num_cpus=0.1, num_gpus=0.1`。这里的小数值不代表真实用量——GPU 的独占性已经由 bundle 划分保证，声明小值只是为了让 Ray 的调度器放行，同时避免同一 bundle 内 actor 之间因资源账面不足而互相阻塞。因此 **Ray dashboard 上看到的 GPU 占用数字不反映真实使用情况**。
 
-## 5. 故障恢复
+## 5. 指定 bundle：故障恢复与共卡
 
-传入 `recover_bundle_index >= 0` 时，调度器跳过游标逻辑，直接把 actor 放回指定索引的 bundle。rollout 引擎在 `start_engines(recover=True)` 时用记录下来的 `engine_bundle_indices[i]` 走这条路径（[`replica_group.py`](../../coda/backends/replica_group.py)），保证重建后的引擎回到原来的物理卡上，权重传输的拓扑关系（同卡 IPC / 跨卡 NCCL）不发生变化。
+传入 `bundle_index >= 0` 时，调度器跳过游标逻辑，直接把 actor 放到指定索引的 bundle 上，游标保持不变。这条路径有两个用途：
+
+- **故障恢复**：rollout 引擎在 `start_engines(recover=True)` 时，用记录下来的 `engine_bundle_indices[i]` 走这条路径（[`replica_group.py`](../../coda/backends/replica_group.py)）。这样重建后的引擎会回到原来的物理卡上，权重传输的拓扑关系（同卡 IPC / 跨卡 NCCL）不会改变。
+- **共卡的 worker 组**：critic 的每个 rank 钉到对应 actor rank 所在的 bundle 上（[`train_manager.py`](../../coda/controller/train_manager.py)）。因为游标不动，后面再调度 rollout 时，分配结果不会受到影响。
 
 ## 6. Probe：IP 与端口探测
 
