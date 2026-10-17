@@ -290,6 +290,16 @@ class TestTrainerValidateConfig:
         ):
             trainer._validate_config()
 
+    def test_sft_mode_runs_sft_checks(self):
+        """run_mode=sft routes through validate_sft_config (rules tested in test_sft_sampler)."""
+        config = make_minimal_config(
+            run_mode="sft",
+            algorithm={"policy_loss": "grpo", "advantage_estimator": "grpo"},
+        )
+
+        with pytest.raises(ValueError, match="run_mode=sft requires algorithm.policy_loss=sft"):
+            self._trainer(config)._validate_config()
+
 
 class TestTrainerValidateReadOnlyCkptPaths:
     """ref / teacher dist checkpoint dirs are checked before GPUs are reserved.

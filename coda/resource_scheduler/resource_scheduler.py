@@ -109,7 +109,8 @@ class ResourceScheduler:
         trainer_config = config.trainer
         rollout_config = config.rollout
 
-        if self.colocate:
+        # SFT runs no inference engines, so it only needs the trainer GPUs.
+        if self.colocate or config.get("run_mode") == "sft":
             num_gpus = trainer_config.num_gpus_per_node * trainer_config.num_nodes
         else:
             assert rollout_config.backend == "sglang"

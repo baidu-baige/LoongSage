@@ -1,6 +1,6 @@
 # Default configuration parameters for Coda. Users shall not edit this file.
 
-run_mode: default  # or "train-only" or "rollout-only"
+run_mode: default  # or "train-only" or "rollout-only" or "sft"
 seed: 42
 colocate: true
 checkpoint_path: ???  # Training model ckpt base dir: both output and resume input. The latest step is found via latest_checkpointed_iteration.txt.
@@ -145,6 +145,20 @@ agentflow:
     manager:
       mode: thread
       num_workers: 8
+
+# Only read when run_mode=sft. Each dataset row's input_key holds the full conversation
+# (OpenAI-style message list); assistant turns are trained, everything else is context.
+# An assistant message with "step_loss_mask": 0 stays in context but is not trained on.
+sft:
+  max_seq_len: null       # truncate rendered conversations to this many tokens; null = no limit
+  loss_mask:
+    # Built-in preset for locating assistant turns in the rendered chat template.
+    # Must be set explicitly per model; there is no auto-detection:
+    #   qwen         ChatML Qwen2.5/3/3.5 checkpoints. The thinking prefix is probed
+    #                from the active template, so one preset covers both thinking modes.
+    #   deepseek_v4  DeepSeek-V4/V4.1 checkpoints rendered by the official encoder.
+    # Other chat templates are not supported by run_mode=sft.
+    preset: null          # qwen|deepseek_v4
 
 tracking:
   project_name: "default"

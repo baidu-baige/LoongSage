@@ -22,6 +22,7 @@ from coda.data_factory.data_processor import (
 from coda.controller.train_manager import TrainManager
 from coda.controller.rollout_manager import RolloutManager
 from coda.controller.teacher_manager import TeacherManager
+from coda.controller.sft_sampler import SFTSampler, validate_sft_config
 from coda.transfer_mesh import ChannelMeta
 from coda.utils.checkpoint_utils import get_tracker_file, resolve_dist_ckpt_dir
 from coda.utils.tracking import configure_tracking, time_marker, TimeMarkerAcc, track
@@ -52,6 +53,7 @@ class Mode(str, Enum):
     DEFAULT = "default"
     TRAIN_ONLY = "train-only"
     ROLLOUT_ONLY = "rollout-only"
+    SFT = "sft"
 
 
 class Trainer:
@@ -78,8 +80,9 @@ class Trainer:
                 f"TP*PP*CP ({num_gpu_per_dp})"
             )
         self.dp_size = train_world_size // num_gpu_per_dp
+        self.is_sft = Mode(self.config.run_mode) == Mode.SFT
         self._validate_config()
-        self.is_colocated = self.config.colocate
+        self.is_colocated = self.config.colocate and not self.is_sft
         self.is_fully_async = self.config.fully_async.enable
         self.num_mini_batches = 0
         if self.is_fully_async:
@@ -98,7 +101,8 @@ class Trainer:
             ds = RolloutDataSourceWithBuffer(ds_cfg, self.config, ds_index=ds_index)
             self.datasources.append(ds)
 
-        agent_flow = AgentFlow(self.config)
+        # SFT tokenizes dataset conversations itself; AgentFlow would start the router.
+        agent_flow = None if self.is_sft else AgentFlow(self.config)
 
         self.train_manager = TrainManager(self.config, self.scheduler)
         ray.get(self.train_manager.async_init())
@@ -120,18 +124,22 @@ class Trainer:
                 self.teacher_manager.offload()
                 logger.info("[init] teacher workers offloaded")
 
-        # train-only mode replays rollout data from disk and never runs
-        # inference, so skip creating the rollout engines (which would launch
-        # the whole sglang cluster and load weights).
+        # train-only mode replays rollout data from disk and sft mode trains on
+        # dataset conversations; neither runs inference, so skip creating the
+        # rollout engines (which would launch the whole sglang cluster and load weights).
         self.rollout_manager = None
         self.rollout_sampler = None
-        if Mode(self.config.run_mode) != Mode.TRAIN_ONLY:
+        self.sft_sampler = SFTSampler(self.config, self.datasources) if self.is_sft else None
+        if Mode(self.config.run_mode) not in (Mode.TRAIN_ONLY, Mode.SFT):
             self.rollout_manager = RolloutManager(self.config, self.scheduler)
             self.rollout_sampler = RolloutSampler(self.config, self.datasources, agent_flow)
             self.channel_master_addr, self.channel_gloo_port = self.scheduler.get_gloo_master_address()
             self.rollout_manager.clear_num_new_engines()
 
     def _validate_config(self) -> None:
+        if Mode(self.config.run_mode) == Mode.SFT:
+            validate_sft_config(self.config)
+
         if self.config.fully_async.enable:
             if self.config.colocate:
                 raise ValueError("fully_async and colocate cannot be enabled at the same time")
@@ -498,6 +506,34 @@ class Trainer:
 
         self._finalize_training()
 
+    async def sft_loop(self) -> None:
+        """SFT loop: dataset conversations go straight to training, no inference or weight sync."""
+        start_step = current_weight_version = self.resume_datasource() + 1
+
+        if start_step > self.config.total_steps:
+            logger.info(
+                "SFT already complete: start_step=%d > total_steps=%d.",
+                start_step, self.config.total_steps,
+            )
+            return
+
+        for step in range(start_step, self.config.total_steps + 1):
+            with time_marker("step", step=step):
+                with time_marker("process_traj", step=step):
+                    groups = self.sft_sampler(step)
+                    splited_batch_refs = self._process_traj_for_train(
+                        groups, Mode.SFT, step, current_weight_version)
+
+                with time_marker("train", step=step):
+                    ray.get(self.train_manager.async_train(step, splited_batch_refs))
+
+                current_weight_version = self._post_train_weight_version(current_weight_version)
+
+                with time_marker("save_ckpt", step=step):
+                    self.save_ckpt(step)
+
+        self._finalize_training()
+
     def _process_traj_for_train(
         self,
         batch: list[TrajectoryGroup],
@@ -650,6 +686,8 @@ def main(config: Optional[DictConfig] = None) -> None:
         asyncio.run(trainer.train_only_loop())
     elif mode == Mode.ROLLOUT_ONLY:
         asyncio.run(trainer.rollout_only_loop())
+    elif mode == Mode.SFT:
+        asyncio.run(trainer.sft_loop())
     else:
         asyncio.run(trainer.train_loop())
 
