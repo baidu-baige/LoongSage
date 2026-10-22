@@ -1,18 +1,44 @@
 # @package _global_
+# RLCD² on StartLux-Decision-v1.1-4B-AutoThink, single 8-GPU H20 node:
+# GPU 0-5 training + colocated rollout, GPU 6-7 frozen scorers (SGLang). Run the commands from LoongSage/.
+#
+# 1. Download the model, the benchmark and the official inference package (used to render the prompts):
+#      hf download startlux-models/StartLux-Decision-v1.1-4B-AutoThink \
+#        --local-dir /root/StartLux-Decision-v1.1-4B-AutoThink
+#      hf download startlux-models/DecisionPivot --repo-type=dataset --local-dir /root/DecisionPivot
+#      git clone https://github.com/StartLuxLabs/StartLux-Decision.git /root/StartLux-Decision
+#    DecisionPivot is licensed for evaluation only: data built from it validates the pipeline,
+#    it is not for training a model that is used or published.
+#
+# 2. Start the frozen scorers on GPU 6,7 (prints the url list used below):
+#      coda/custom/rlcd2/tools/launch_scorer.sh 6,7 30106 /root/StartLux-Decision-v1.1-4B-AutoThink
+#
+# 3. Build the data (train.jsonl, eval.jsonl, eval_small.jsonl; keeps items with max p0 < 0.9):
+#      RLCD2_INFER_DIR=/root/StartLux-Decision python3 coda/custom/rlcd2/tools/build_rlcd2_data.py \
+#        --bench /root/DecisionPivot --model /root/StartLux-Decision-v1.1-4B-AutoThink \
+#        --scorer-url http://127.0.0.1:30106,http://127.0.0.1:30107 --out /root/rlcd2_data
+#
+# 4. Train on GPU 0-5 with those paths (the scorers stay up):
+#      coda/custom/rlcd2/tools/launch_train.sh 0,1,2,3,4,5 rlcd2/rlcd2_4b_h20_1node \
+#        hf_model_path=/root/StartLux-Decision-v1.1-4B-AutoThink \
+#        data_source.dataset.prompt_data_path=/root/rlcd2_data/train.jsonl \
+#        data_source.dataset.eval_prompt_data_path=/root/rlcd2_data/eval_small.jsonl \
+#        'data_source.reward.scorer_urls="http://127.0.0.1:30106,http://127.0.0.1:30107"'
+#    The url list is quoted: Hydra rejects an unquoted comma in an override.
 defaults:
   - /default
   - _self_
 
 checkpoint_path: "./checkpoints"
 hf_model_path: ???                # the 4B AutoThink model folder (BF16, with decision_config.json)
-ref_hf_model_path: null           # required, the same folder: π_ref = the starting policy (Eq. 6) = the scorer's weights
+ref_hf_model_path: ${hf_model_path}   # π_ref = the starting policy (Eq. 6) = the scorer's weights
 colocate: true
 total_steps: 200
 
 data_source:
   dataset:
     prompt_data_path: ???       # train.jsonl (max p0 < 0.9)
-    eval_prompt_data_path: null # required (rollout.eval.interval > 0): eval_small.jsonl, 128 held-out items
+    eval_prompt_data_path: ??? # required (rollout.eval.interval > 0): eval_small.jsonl, 128 held-out items
     input_key: prompt
     label_key: label
     metadata_key: metadata
@@ -20,7 +46,7 @@ data_source:
     name: rlcd2                 # one Router call, then awaits the scorer (coda/custom/rlcd2/reward.py)
   reward:
     name: rlcd2
-    model_path: ???             # the model folder again: decision_config.json (letter ids, read-out temperatures)
+    model_path: ${hf_model_path}  # decision_config.json (letter ids, read-out temperatures)
     scorer_urls: ???            # "http://host:port[,http://host:port]" of the frozen scorer servers
     rule: decision_weighted     # decision_weighted | brier | log
     lam: 1.0e-4
@@ -71,7 +97,6 @@ trainer:
 
 megatron:
   model:
-    # TP1 ran out of memory in the fp32 logits (16k tokens x 248k vocab); TP2 splits the vocab, dp = 3.
     tensor_model_parallel_size: 2
     pipeline_model_parallel_size: 1
     mtp_num_layers: null
