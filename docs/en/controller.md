@@ -338,8 +338,8 @@ on-disk batch
 ```
 
 Train-only creates neither `RolloutManager` nor `RolloutSampler`, so there is no weight-transfer
-channel and no `_update_weights` call anywhere in the flow; `_post_train_weight_version()` only
-advances the `weight_version` counter for checkpoint bookkeeping. It requires the on-disk data
+channel and no `_update_weights` call anywhere in the flow; each training step only
+increments the `weight_version` counter for checkpoint bookkeeping. It requires the on-disk data
 structure to be compatible with the current training configuration, including DP splitting,
 mini-batch, and trajectory fields.
 
