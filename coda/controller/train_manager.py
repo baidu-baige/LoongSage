@@ -102,12 +102,12 @@ class TrainManager:
         self._onload_pool(self._critic_worker_handlers)
         self._resident = "critic"
 
-    # ── public API (unchanged for the trainer) ───────────────────────────
+    # ── public API (the same with or without a critic) ───────────────────
 
     def async_init(self):
         """Initialize the train workers.
 
-        Without a critic this is asynchronous as before. With a critic the two
+        Without a critic this is asynchronous. With a critic the two
         pools are initialized one after the other, inside this call, so two
         full models + optimizers never sit on the GPU together; each pool is
         offloaded right after its init. The critic's port is picked after the

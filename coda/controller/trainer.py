@@ -329,7 +329,7 @@ class Trainer:
                         self.rollout_sampler.pause()
 
                 # Fraction of the step the trainer spent NOT training (waiting
-                # for / preparing rollout data, flushing, pausing) vs training.
+                # for / preparing rollout data, pausing) vs training.
                 wait = timers.elapsed("wait")
                 train = timers.elapsed("train")
                 if wait + train > 0:

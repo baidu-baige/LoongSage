@@ -77,6 +77,7 @@ def test_init_rewrites_only_the_process_local_config(monkeypatch):
     )
     cfg.megatron.model.moe_enable_routing_replay = True
     cfg.megatron.model.mtp_num_layers = 1
+    cfg.megatron.keep_fp32_weights = {"output_layer": True, "router": False}  # use_fp32_lm_head
     seen = {}
 
     def fake_base_init(self, config, master_addr, master_port):
@@ -92,6 +93,8 @@ def test_init_rewrites_only_the_process_local_config(monkeypatch):
     assert seen["config"]["trainer"]["use_rollout_routing_replay"] is False
     assert seen["config"]["megatron"]["model"]["moe_enable_routing_replay"] is False
     assert seen["config"]["megatron"]["model"]["mtp_num_layers"] is None
+    # The value head follows the model precision; other fp32 layers are kept.
+    assert seen["config"]["megatron"]["keep_fp32_weights"] == {"router": False}
 
 
 @pytest.mark.parametrize("step, update_tracker", [(1, True), (2, True), (3, False)])
@@ -112,29 +115,102 @@ def test_save_model_flush_and_disabled_are_noops():
     worker._save_dist_checkpoint.assert_not_called()
 
 
-def test_train_exports_advantages_from_pre_update_values(monkeypatch):
+def _train_harness(monkeypatch, last_stage):
     order = []
     rollout_data = {"tokens": [torch.zeros(3)]}
     monkeypatch.setattr(critic_mod, "get_rollout_data", lambda ref: rollout_data)
-    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda: None)
+    ps = MagicMock()
+    ps.is_pipeline_last_stage.return_value = last_stage
+    monkeypatch.setattr(critic_mod, "parallel_state", ps)
+
+    advs, rets = [torch.tensor([0.5])], [torch.tensor([1.0])]
+
+    def fake_compute(config, data):
+        order.append("advantages")
+        assert data["old_values"] == ["v"]
+        return advs, rets, {"train/adv_zero_ratio": 0.0}
+
+    monkeypatch.setattr(critic_mod, "compute_advantages_and_returns", fake_compute)
 
     worker = make_worker()
     model_chunk = MagicMock()
     model_chunk.eval.side_effect = lambda: order.append("eval")
     model_chunk.train.side_effect = lambda: order.append("train_mode")
     worker.model = [model_chunk]
-    worker._compute_old_values = lambda step, data: order.append("old_values") or ["v"]
-    advs, rets = [torch.tensor([0.5])], [torch.tensor([1.0])]
-    worker._compute_advantages_and_returns = lambda data: order.append("gae") or (advs, rets)
-    worker._train_critic = lambda step, data: order.append("update")
+    worker._compute_old_values = lambda step, data: order.append("old_values") or (["v"] if last_stage else None)
+    worker._train_critic = lambda step, data: order.append(("update", dict(data.get("adv_metrics", {}))))
     worker._export_advantages = lambda a: order.append("export") or {"exported": a}
+    return worker, order, rollout_data, advs, rets
+
+
+def test_train_exports_advantages_from_pre_update_values(monkeypatch):
+    worker, order, rollout_data, advs, rets = _train_harness(monkeypatch, last_stage=True)
 
     out = worker.train(5, "refs")
 
-    assert order == ["eval", "old_values", "gae", "train_mode", "update", "export"]
+    assert order == [
+        "eval", "old_values", "advantages", "train_mode",
+        ("update", {"train/adv_zero_ratio": 0.0}), "export",
+    ]
     assert out == {"exported": advs}
-    assert rollout_data["old_values"] == ["v"]
     assert rollout_data["returns"] is rets
+
+
+def test_train_skips_advantages_off_the_last_pp_stage(monkeypatch):
+    worker, order, rollout_data, _, _ = _train_harness(monkeypatch, last_stage=False)
+
+    out = worker.train(5, "refs")
+
+    assert "advantages" not in order
+    assert ("update", {}) in order
+    assert "returns" not in rollout_data
+    assert out == {"exported": None}
+
+
+class _FakeChunk:
+    def __init__(self, post_process):
+        self.post_process = post_process
+        self.output_layer = "lm_head"
+
+
+class _FakeProvider:
+    hidden_size = 16
+    sequence_parallel = False
+    share_embeddings_and_output_weights = True
+
+    def __init__(self):
+        self.hooks = []
+
+    def register_pre_wrap_hook(self, hook, prepend=False):
+        self.hooks.append(hook)
+
+
+def test_configure_provider_unties_and_appends_value_head_hook():
+    provider = _FakeProvider()
+    provider.hooks.append(lambda model: model)  # stands for the HF weight-loading hook
+    worker = make_worker(make_critic_config(seed=11, critic={"value_head_init_std": 0.05}))
+
+    worker._configure_provider(provider)
+
+    assert provider.share_embeddings_and_output_weights is False
+    assert len(provider.hooks) == 2                     # appended after HF loading
+    chunks = [_FakeChunk(False), _FakeChunk(True)]
+    out = provider.hooks[-1](chunks)
+    assert out is chunks                                # hooks are chained
+    assert chunks[0].output_layer == "lm_head"          # only the post_process chunk
+    head = chunks[1].output_layer
+    assert isinstance(head, critic_mod.LinearValueHead)
+    assert head.in_features == 16 and head.out_features == 1
+    assert head.bias.item() == 0.0
+
+
+def test_compute_forward_only_values_collects_per_row_values(monkeypatch):
+    monkeypatch.setattr(critic_mod, "response_values", lambda config, batch, out: ["row0", "row1"])
+    loss, collected = critic_mod.compute_forward_only_values(
+        None, {}, None, make_critic_config(), None, torch.zeros(1)
+    )
+    assert loss.item() == 0.0
+    assert collected == {"values": ["row0", "row1"]}
 
 
 @pytest.mark.parametrize(

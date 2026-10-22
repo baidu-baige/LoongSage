@@ -34,9 +34,10 @@ def _get_group_partition_loads(groups: list[TrajectoryGroup]) -> list[int]:
 
 
 class Box:
-    """Lightweight wrapper that holds a single ray.ObjectRef.
+    """Lightweight holder for one DP rank's rollout shard ref and its side refs.
 
-    Exposes the ref via attribute access (box.ref) so that callers do not need to unpack a tuple or dict manually.
+    ``ref`` is the rollout shard; ``teacher_worker_ref`` / ``critic_ref`` are
+    attached later with the OPD teacher / PPO critic outputs for the same shard.
     """
 
     def __init__(self, ref: ray.ObjectRef) -> None:

@@ -391,30 +391,6 @@ class TestGetRolloutData:
         assert torch.equal(result["critic_advantages"][0], torch.tensor([0.5, -0.5]))
         assert torch.equal(result["critic_advantages"][1], torch.tensor([1.0]))
 
-    @pytest.mark.parametrize(
-        "advantages, message",
-        [
-            ([torch.zeros(2)], "has 1 rows"),
-            ([torch.zeros(2), torch.zeros(3)], "row 1 has 3 tokens"),
-        ],
-    )
-    def test_critic_fields_must_match_rows(self, advantages, message):
-        _set_parallel(dp_rank=0)
-        raw = {
-            "tokens": [torch.tensor([1, 2, 3, 4]), torch.tensor([5, 6])],
-            "loss_masks": [torch.ones(2), torch.ones(1)],
-            "response_lengths": [2, 1],
-        }
-        critic = {"critic_advantages": advantages}
-
-        with (
-            patch.object(_data_mod, "ray") as ray_mock,
-            patch("torch.cuda.current_device", return_value="cpu"),
-        ):
-            ray_mock.get.side_effect = lambda ref: {"ref": raw, "critic": critic}[ref]
-            with pytest.raises(ValueError, match=message):
-                get_rollout_data([MagicMock(ref="ref", teacher_worker_ref=[], critic_ref="critic")])
-
 
 # ═══════════════════════════════════════════════════════════════════════════
 # get_data_iterator — static batching

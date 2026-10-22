@@ -1335,7 +1335,7 @@ class TestFullyAsyncInit:
         async def _run():
             config = make_minimal_config()
             config.fully_async.enable = True
-            # mini_batch_size % num_trajectories_per_prompt != 0 used to under-fetch.
+            # mini_batch_size not divisible by num_trajectories_per_prompt.
             config.trainer.mini_batch_size = 3
 
             sampler = RolloutSampler(config, Mock(), Mock())

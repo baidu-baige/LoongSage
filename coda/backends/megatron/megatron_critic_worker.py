@@ -11,14 +11,13 @@ read the same rollout shard per DP rank.
 Per step the critic runs before the actor:
 
 1. forward-only pass -> ``old_values`` (pre-update critic),
-2. GAE -> ``advantages`` and ``returns``,
-3. value update on ``returns``,
+2. ``compute_advantages_and_returns`` (GAE + optional whitening) ->
+   ``advantages`` and ``returns``,
+3. clipped value update on ``returns``,
 4. return the advantages; the manager hands them to the actor through
-   ``Box.critic_ref`` and the actor's ``gae`` advantage estimator reads them.
+   ``Box.critic_ref`` and the actor uses them as is.
 
-The value head, the value output closure, GAE and the value loss are the PPO
-algorithm part and are filled in separately; the methods marked below raise
-``NotImplementedError`` until then.
+The LM head is replaced by :class:`~coda.backends.megatron.value_head.LinearValueHead`.
 """
 
 import logging
@@ -29,31 +28,22 @@ import torch
 
 from megatron.core import parallel_state
 
+from coda.algorithms.advantage import compute_advantages_and_returns
 from coda.backends.megatron.megatron_train_worker import MegatronTrainWorker
 from coda.backends.megatron.data import get_rollout_data, get_data_iterator
+from coda.backends.megatron.loss import response_values, value_loss_function
 from coda.backends.megatron.model import forward_only, train_minibatch, is_main_rank
+from coda.backends.megatron.value_head import LinearValueHead
 from coda.utils.types import RolloutBatch
 from coda.utils.tracking import time_tracker, track
 
 logger = logging.getLogger(__name__)
 
+
 def compute_forward_only_values(packed_targets, batch, packed_seq_params, config, pg_policy, output_tensor):
-    """``forward_only`` output closure collecting per-response-token values.
-
-    Algorithm part (value-head output -> per-row response values); not
-    implemented yet.
-    """
-    raise NotImplementedError("critic value output closure is part of the PPO algorithm round")
-
-
-def value_loss_function(config, batch, packed_seq_params, gkd_policy, output_tensor):
-    """``train_minibatch`` loss closure for the (clipped) value loss.
-
-    Algorithm part; must follow the ``loss_function`` contract
-    ``(loss, denom, metrics)`` with ``num_tokens`` / ``num_sequences`` /
-    ``train/loss`` in ``metrics``. Not implemented yet.
-    """
-    raise NotImplementedError("critic value loss is part of the PPO algorithm round")
+    """``forward_only`` output closure collecting the per-row response values."""
+    values = response_values(config, batch, output_tensor)
+    return torch.tensor(0.0, device=output_tensor.device), {"values": values}
 
 
 class MegatronCriticWorker(MegatronTrainWorker):
@@ -78,25 +68,22 @@ class MegatronCriticWorker(MegatronTrainWorker):
     def init(self, config, master_addr, master_port):
         """Rewrite this process's config for the critic, then run the shared init.
 
-        Ray hands every worker process its own deserialized copy of the config,
-        so these rewrites never reach the driver or the actor workers:
+        Each Ray worker holds its own copy of the config, so these rewrites do
+        not reach the driver or the actor workers:
 
-        * the shared init builds the optimizer / scheduler from
-          ``megatron.optimizer`` / ``megatron.scheduler``, so point them at the
-          critic's (already finalized on the driver by :meth:`validate_config`);
-        * MoE routing replay reproduces the experts the *rollout policy* picked
-          so train-time log-probs match inference; the critic is a different,
-          separately trained model, so replaying those routes is meaningless.
-        * MTP is a next-tokens prediction head for the policy and reuses
-          ``output_layer``, which the critic replaces with the value head, so
-          the critic is built without MTP layers (as verl does). The override
-          is applied to the provider before ``finalize()``.
+        * optimizer / scheduler: use the critic's;
+        * MoE routing replay: off, the replayed routes belong to the policy;
+        * MTP (multi-token prediction): off, it reuses ``output_layer``, which
+          the critic replaces with the value head;
+        * ``output_layer`` is dropped from ``keep_fp32_weights``, so the value
+          head follows the model precision.
         """
         config.megatron.optimizer = config.critic.optimizer
         config.megatron.scheduler = config.critic.scheduler
         config.trainer.use_rollout_routing_replay = False
         config.megatron.model.moe_enable_routing_replay = False
         config.megatron.model.mtp_num_layers = None
+        config.megatron.keep_fp32_weights.pop("output_layer", None)
 
         super().init(config, master_addr, master_port)
         logger.info(f"[Rank {self.rank}] MegatronCriticWorker initialization complete")
@@ -105,11 +92,33 @@ class MegatronCriticWorker(MegatronTrainWorker):
     def _configure_provider(self, provider) -> None:
         """Replace the LM head with a hidden->1 value head before DDP wrapping.
 
-        Algorithm part. Must use ``provider.register_pre_wrap_hook`` (appends)
-        rather than the ``pre_wrap_hook=`` argument, which would replace the
-        hook that loads the HF weights.
+        * Untie embedding and output weights: with tied weights and PP > 1 the
+          last stage's ``output_layer.weight`` is all-reduced with the first
+          stage's embedding gradient and checkpointed as the embedding, which
+          breaks once it is a ``[1, H]`` head.
+        * The swap is a pre-wrap hook *appended* after the one that loads the
+          HF weights (``provider.register_pre_wrap_hook``; the
+          ``pre_wrap_hook=`` argument would replace that hook), so the HF load
+          never sees the value head. Hooks are chained, so it returns the model.
         """
-        raise NotImplementedError("critic value head is part of the PPO algorithm round")
+        provider.share_embeddings_and_output_weights = False
+        hidden_size = provider.hidden_size
+        sequence_parallel = bool(provider.sequence_parallel)
+        init_std = float(self.config.critic.value_head_init_std)
+        seed = int(self.config.seed)
+
+        def install_value_head(model_chunks):
+            for chunk in model_chunks:
+                if chunk.post_process:
+                    chunk.output_layer = LinearValueHead(
+                        hidden_size,
+                        sequence_parallel=sequence_parallel,
+                        init_std=init_std,
+                        seed=seed,
+                    )
+            return model_chunks
+
+        provider.register_pre_wrap_hook(install_value_head)
 
     @override
     @torch.no_grad()
@@ -136,15 +145,20 @@ class MegatronCriticWorker(MegatronTrainWorker):
             ``{"critic_advantages": [cpu tensor per Segment row]}``; ``{}`` on
             every other rank.
         """
-        torch.cuda.reset_peak_memory_stats()
         rollout_data = get_rollout_data(rollout_data_ref)
 
         for m in self.model:
             m.eval()
         rollout_data["old_values"] = self._compute_old_values(step, rollout_data)
-        advantages, returns = self._compute_advantages_and_returns(rollout_data)
-        rollout_data["advantages"] = advantages
-        rollout_data["returns"] = returns
+        # Values only exist on the last PP stage; the other stages train with
+        # old_values / returns absent (fetched as None).
+        advantages = None
+        if parallel_state.is_pipeline_last_stage():
+            advantages, returns, adv_metrics = compute_advantages_and_returns(
+                self.config.algorithm, rollout_data
+            )
+            rollout_data["returns"] = returns
+            rollout_data["adv_metrics"] = adv_metrics
 
         for m in self.model:
             m.train()
@@ -173,16 +187,13 @@ class MegatronCriticWorker(MegatronTrainWorker):
         self._reorder_to_rows(collected, data_iterator, len(rollout_data["tokens"]))
         return collected.get("values")
 
-    def _compute_advantages_and_returns(self, rollout_data: RolloutBatch):
-        """GAE over ``old_values`` -> ``(advantages, returns)`` per Segment row.
-
-        Algorithm part; not implemented yet.
-        """
-        raise NotImplementedError("GAE is part of the PPO algorithm round")
-
     @time_tracker("train_critic")
     def _train_critic(self, step, rollout_data: RolloutBatch):
-        """Value update over the step's mini-batches; metrics go under ``critic/``."""
+        """Value update over the step's mini-batches; metrics go under ``critic/``.
+
+        ``rollout_data["adv_metrics"]`` (from the advantage computation, reported
+        here because the actor does not recompute advantages) keep their own names.
+        """
         data_iterator, num_microbatches = get_data_iterator(
             self.config.trainer, self.model, rollout_data
         )
@@ -207,22 +218,17 @@ class MegatronCriticWorker(MegatronTrainWorker):
             report = {
                 k.replace("train/", "critic/", 1): v / n_minibatches for k, v in avg_metrics.items()
             }
-            report["perf/critic_memory_allocated_max"] = \
-                round(torch.cuda.max_memory_allocated() / (1024 * 1024 * 1024), 2)
+            report.update(rollout_data.get("adv_metrics", {}))
             logger.info(f"[Rank {self.rank}] step: {step}, critic metrics: {report}")
             track(report, step)
 
-    @staticmethod
-    def _is_output_rank() -> bool:
-        """One rank per DP group publishes the advantages."""
-        return (
+    def _export_advantages(self, advantages) -> dict:
+        # One rank per DP group publishes its DP shard of the advantages.
+        if not (
             parallel_state.is_pipeline_last_stage()
             and parallel_state.get_tensor_model_parallel_rank() == 0
             and parallel_state.get_context_parallel_rank() == 0
-        )
-
-    def _export_advantages(self, advantages) -> dict:
-        if not self._is_output_rank():
+        ):
             return {}
         payload = {"critic_advantages": [a.detach().cpu() for a in advantages]}
         return {parallel_state.get_data_parallel_rank(): ray.put(payload)}

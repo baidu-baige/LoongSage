@@ -1,8 +1,10 @@
 """Megatron forward / training / teacher-forward routines.
 
-* ``forward_only``    – student inference pass collecting log-probs (and, when
-  a PG KL policy is active, per-token PG KL) for the subsequent RL update.
-* ``train_minibatch`` – single gradient step through the Megatron scheduler.
+* ``forward_only``    – inference pass whose ``output_fn`` collects per-token
+  outputs: log-probs (and, when a PG KL policy is active, per-token PG KL) for
+  the actor, values for the critic.
+* ``train_minibatch`` – single gradient step through the Megatron scheduler,
+  with the actor's policy loss or the critic's value loss.
 * ``forward_teacher`` – teacher inference pass for OPD; always collects
   ``teacher_entropy`` plus the subset of {hidden states, top-k log_softmax,
   full log probs} that the active GKD / pg KL methods request.
@@ -73,9 +75,17 @@ def reduce_dict(
 
 def is_main_rank(last_pp=True):
     """Check if the current process is the main rank."""
-    return mpu.get_tensor_model_parallel_rank() == 0 and \
-        mpu.get_data_parallel_rank(with_context_parallel=True) == 0 and \
-        mpu.is_pipeline_last_stage() if last_pp else mpu.is_pipeline_first_stage()
+    is_pp_stage = mpu.is_pipeline_last_stage() if last_pp else mpu.is_pipeline_first_stage()
+    return (
+        mpu.get_tensor_model_parallel_rank() == 0
+        and mpu.get_data_parallel_rank(with_context_parallel=True) == 0
+        and is_pp_stage
+    )
+
+# Metrics reported as the ``loss_agg_mode``-aggregated loss (policy loss, PPO
+# value loss); normalized by num_sequences in seq-mean modes.
+_AGGREGATED_LOSS_KEYS = ("train/loss", "train/value_loss")
+
 
 def _collect_loss_metrics(
     config: DictConfig,
@@ -97,12 +107,13 @@ def _collect_loss_metrics(
     dp_group = mpu.get_data_parallel_group()
     loss_dict = reduce_dict(loss_dict, group=dp_group)
 
-    # Normalize: divide by num_tokens (token-mean) or num_sequences (seq-mean)
+    # Normalize: the aggregated losses follow loss_agg_mode (divide by
+    # num_sequences for seq-mean); every other metric is a per-token sum.
     loss_agg_mode = config.algorithm.loss_agg_mode
     num_tokens = max(loss_dict.pop("num_tokens"), 1)
     num_sequences = max(loss_dict.pop("num_sequences"), 1)
     for k in loss_dict:
-        if k == "train/loss" and loss_agg_mode != "token-mean":
+        if k in _AGGREGATED_LOSS_KEYS and loss_agg_mode != "token-mean":
             loss_dict[k] /= float(num_sequences)
         else:
             loss_dict[k] /= float(num_tokens)

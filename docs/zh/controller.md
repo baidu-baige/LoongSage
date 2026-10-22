@@ -145,7 +145,7 @@ RolloutManager 不负责生成 prompt，也不负责决定一个 step 需要多�
   3. 如果是保存 checkpoint 的 step，保存 critic。
   4. offload critic，并把每个 DP rank 的 advantage 挂到 `Box.critic_ref` 上。
 
-  之后再 onload actor 进行训练，actor 通过 `gae` advantage estimator 读取这些 advantage。在 `critic.critic_warmup` 范围内的 step，actor 既不训练也不保存。PPO 相关的配置约束也在这里校验。
+  之后再 onload actor 进行训练，actor 直接使用这些 advantage（从 `critic_advantages` 字段读取，actor 侧不再运行 estimator）。在 `critic.critic_warmup` 范围内的 step，actor 既不训练也不保存。PPO 相关的配置约束也在这里校验。
 
 训练并行度由 Megatron 配置和 LoongSage trainer 配置共同决定。Controller 只负责 Worker 池的生命周期，不替代 Megatron 对 TP、PP、CP、EP、DP 等并行策略的实现。当前对非 `megatron` backend 会直接报错。
 

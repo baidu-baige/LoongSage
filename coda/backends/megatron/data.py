@@ -3,7 +3,7 @@
 Provides:
 * RolloutBatch shard utilities — ``group_rollout_batch``, ``merge_rollout_batch``,
   ``concat_rollout_batch``, ``slice_rollout_batch``, ``select_rollout_batch``.
-* ``get_rollout_data`` — resolve Ray refs and merge teacher data.
+* ``get_rollout_data`` — resolve Ray refs and merge teacher / critic data.
 * ``DataIterator`` — micro-batch level iteration.
 * ``get_data_iterator`` — factory that handles static / dynamic batch
   construction, VPP replication, and DP-level synchronisation.
@@ -181,22 +181,7 @@ def get_rollout_data(rollout_data_ref) -> RolloutBatch:
     critic_tensor_fields: list[str] = []
     if box.critic_ref is not None:
         critic_data = ray.get(box.critic_ref)
-        response_lengths = rollout_data["response_lengths"]
-        for k, values in critic_data.items():
-            # TODO: remove once validated in end-to-end testing.
-            if len(values) != len(response_lengths):
-                raise ValueError(
-                    f"Critic field {k!r} has {len(values)} rows but the rollout shard has "
-                    f"{len(response_lengths)}"
-                )
-            # TODO: remove once validated in end-to-end testing.
-            for i, (v, n_resp) in enumerate(zip(values, response_lengths)):
-                if v.numel() != n_resp:
-                    raise ValueError(
-                        f"Critic field {k!r} row {i} has {v.numel()} tokens, expected "
-                        f"response_length {n_resp}"
-                    )
-            critic_tensor_fields.append(k)
+        critic_tensor_fields = list(critic_data)
         rollout_data.update(critic_data)
 
     device = torch.cuda.current_device()

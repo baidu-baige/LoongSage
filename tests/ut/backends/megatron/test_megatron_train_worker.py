@@ -356,3 +356,48 @@ def test_offload_params_flag_tracks_where_params_live(monkeypatch, calls, expect
 
     assert worker.offloaded is True
     assert worker.params_offloaded is expected
+
+
+# ---------------------------------------------------------------------------
+# Actor advantages: own estimator vs. the critic's (PPO)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("critic_enable", [False, True])
+def test_actor_advantages_source(monkeypatch, critic_enable):
+    import coda.backends.megatron.megatron_actor_worker as actor_mod
+
+    critic_advs = [torch.tensor([0.3, -0.3])]
+    own_advs = [torch.tensor([1.0, 1.0])]
+    rollout_data = {"critic_advantages": critic_advs} if critic_enable else {}
+    calls = []
+
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda: None)
+    monkeypatch.setattr(actor_mod.async_calls, "maybe_finalize_async_calls", lambda: None)
+    monkeypatch.setattr(actor_mod, "get_rollout_data", lambda ref: rollout_data)
+
+    def fake_compute(config, data):
+        calls.append("estimator")
+        return own_advs, own_advs, {"train/adv_zero_ratio": 0.0}
+
+    monkeypatch.setattr(actor_mod, "compute_advantages_and_returns", fake_compute)
+
+    worker = MegatronActorWorker.__new__(MegatronActorWorker)
+    worker.config = OmegaConf.create({
+        "opd": {"enable": False},
+        "critic": {"enable": critic_enable},
+        "trainer": {"use_rollout_log_probs": True},
+        "algorithm": {"ref_kl": {"enable": False}, "m2po": {"enable": False}},
+    })
+    worker.model = [MagicMock()]
+    worker._compute_is_correction = lambda step, data: {}
+    worker._train_actor = lambda step, data: calls.append(("train", data["advantages"]))
+
+    worker.train(1, "refs")
+
+    if critic_enable:
+        assert calls == [("train", critic_advs)]
+        assert "critic_advantages" not in rollout_data
+        assert rollout_data["adv_metrics"] == {}
+    else:
+        assert calls == ["estimator", ("train", own_advs)]
+        assert rollout_data["adv_metrics"] == {"train/adv_zero_ratio": 0.0}

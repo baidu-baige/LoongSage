@@ -76,7 +76,7 @@ TransferMesh 由三个模块组成：
 
 ### 2.3. 发送侧：桶聚合与流式转换
 
-训练侧的发送逻辑集中在 [`megatron_actor_worker.py:340-355`](../../coda/backends/megatron/megatron_actor_worker.py)：
+训练侧的发送逻辑集中在 [`megatron_actor_worker.py:352-355`](../../coda/backends/megatron/megatron_actor_worker.py#L352-L355)：
 
 ```python
 send_channel = create_sender_channel(channel_meta)

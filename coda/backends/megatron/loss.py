@@ -6,6 +6,8 @@ Main components
   etc.) into a scalar, either as a per-trajectory mean or a per-token sum.
 * ``loss_function``    – framework-level loss wrapper consumed by the
   Megatron forward-backward scheduler.
+* ``value_loss_function`` – the PPO critic's clipped value loss, with the same
+  Megatron callback contract.
 """
 
 from __future__ import annotations
@@ -251,6 +253,89 @@ def loss_function(
 
     loss = (1 - gkd_ratio) * rl_loss + gkd_ratio * gkd_loss
     reported_metrics["train/loss"] = loss.item()
+
+    # Megatron averages the loss over CP ranks; pre-multiply so the summed
+    # per-token loss is preserved after that division.
+    loss = loss * cp_size
+
+    return (
+        loss,
+        torch.tensor(
+            num_tokens if loss_agg_mode == "token-mean" else num_sequences,
+            dtype=torch.int,
+            device=output_tensor.device,
+        ),
+        reported_metrics,
+    )
+
+
+# ════════════════════════════════════════════════════════════════════════
+# PPO critic: value predictions and value loss
+# ════════════════════════════════════════════════════════════════════════
+
+
+def response_values(
+    config: DictConfig,
+    batch: RolloutBatch,
+    output_tensor: torch.Tensor,
+) -> list[torch.Tensor]:
+    """Value-head output ``[1, T_local, 1]`` -> per-row response values.
+
+    Sliced exactly like the log-probs (the value at position ``t-1`` belongs to
+    response token ``t``) and CP all-gathered, so every CP rank holds full rows
+    while gradients only flow through its own chunk.
+    """
+    values = output_tensor.squeeze(0).squeeze(-1).float()
+    return gather_and_slice_response(
+        [values], batch["total_lengths"], batch["response_lengths"],
+        cp_partition_mode=config.megatron.model.cp_partition_mode,
+    )
+
+
+def value_loss_function(
+    config: DictConfig,
+    batch: RolloutBatch,
+    packed_seq_params: PackedSeqParams,
+    gkd_policy,
+    output_tensor: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+    """Clipped PPO value loss.
+
+    Per token ``0.5 * max((v - R)^2, (clip(v, v_old ± value_clip) - R)^2)``,
+    aggregated with ``algorithm.loss_agg_mode``. Same ``(loss, denominator,
+    metrics)`` contract as :func:`loss_function`; the extra metrics are
+    masked token sums, normalized by ``_collect_loss_metrics``.
+    """
+    cp_size = mpu.get_context_parallel_world_size()
+    loss_masks = batch["loss_masks"]
+    loss_agg_mode = config.algorithm.loss_agg_mode
+    value_clip = config.algorithm.ppo.value_clip
+
+    # Whole micro-batch at once on the concatenated response tokens.
+    values = torch.cat(response_values(config, batch, output_tensor))
+    old_values = torch.cat(batch["old_values"])
+    returns = torch.cat(batch["returns"])
+    mask = torch.cat(loss_masks)
+
+    values_clipped = old_values + (values - old_values).clamp(-value_clip, value_clip)
+    unclipped_losses = (values - returns) ** 2
+    clipped_losses = (values_clipped - returns) ** 2
+    per_token_losses = 0.5 * torch.max(unclipped_losses, clipped_losses)
+
+    # Split back per row only for the (possibly per-sequence) aggregation.
+    loss = _aggregate_loss(
+        list(per_token_losses.split(batch["response_lengths"])), loss_masks, loss_agg_mode
+    )
+
+    num_tokens = mask.sum().item()
+    num_sequences = sum(1 for m in loss_masks if m.any())
+    with torch.no_grad():
+        reported_metrics = {
+            "num_tokens": num_tokens,
+            "num_sequences": num_sequences,
+            "train/value_loss": loss.item(),
+            "train/value_clipfrac": ((clipped_losses > unclipped_losses).float() * mask).sum().item(),
+        }
 
     # Megatron averages the loss over CP ranks; pre-multiply so the summed
     # per-token loss is preserved after that division.

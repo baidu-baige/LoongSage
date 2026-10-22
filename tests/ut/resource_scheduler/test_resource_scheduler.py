@@ -493,6 +493,9 @@ class TestSchedule:
         _r, rollout_idx = self.scheduler.schedule(rollout_cls, num_bundles=1)
 
         assert (actor_idx, critic_idx, rollout_idx) == (0, 0, 1)
+
+
+class TestIntegration:
     """Integration tests for ResourceScheduler."""
 
     def _create_test_config(self, num_gpus=3, colocate=False):

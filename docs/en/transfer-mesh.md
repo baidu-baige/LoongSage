@@ -76,7 +76,7 @@ Same-GPU IPC requires no extra group; it performs point-to-point handle passing 
 
 ### 2.3. Sender Side: Bucket Aggregation and Streaming Conversion
 
-The training-side sending logic is centralized at [`megatron_actor_worker.py:340-355`](../../coda/backends/megatron/megatron_actor_worker.py):
+The training-side sending logic is centralized at [`megatron_actor_worker.py:352-355`](../../coda/backends/megatron/megatron_actor_worker.py#L352-L355):
 
 ```python
 send_channel = create_sender_channel(channel_meta)

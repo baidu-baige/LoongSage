@@ -20,7 +20,7 @@ from coda.utils.tensor_backuper import TensorBackuper
 from coda.utils.memory_utils import print_memory, clear_memory
 from coda.utils.checkpoint_utils import resolve_dist_ckpt_dir, get_hf_dir
 from coda.utils.types import RolloutBatch
-from coda.algorithms.advantage import compute_advantages
+from coda.algorithms.advantage import compute_advantages_and_returns
 from coda.algorithms.is_correction import apply_is_correction
 from coda.algorithms.second_moment_trust_policy_optimization import apply_m2po_masking
 from coda.backends.megatron.data import (
@@ -230,7 +230,13 @@ class MegatronActorWorker(MegatronTrainWorker):
 
             rollout_data.update(self._compute_is_correction(step, rollout_data))
 
-            advantages, adv_metrics = compute_advantages(self.config.algorithm, rollout_data)
+            if self.config.critic.enable:
+                # PPO: GAE (+ whitening) was computed once by the critic.
+                advantages, adv_metrics = rollout_data.pop("critic_advantages"), {}
+            else:
+                advantages, _, adv_metrics = compute_advantages_and_returns(
+                    self.config.algorithm, rollout_data
+                )
             rollout_data["adv_metrics"] = adv_metrics
 
             if pg_ratio > 0:
@@ -335,17 +341,16 @@ class MegatronActorWorker(MegatronTrainWorker):
         return policies
 
 
-    @override
     @torch.no_grad()
     def update_weights(self, channel_meta: ChannelMeta):
-        """Update weights"""
+        """Export the current weights as HF tensors and send them to rollout over ``channel_meta``."""
         if self.params_offloaded:
             self._onload_model(move_params=True, move_grads=False)
             self.params_offloaded = False
             clear_memory()
         print_memory("before send huggingface weights")
         send_channel = create_sender_channel(channel_meta)
-        for name, tensor, in self.bridge.export_hf_weights(self.model):
+        for name, tensor in self.bridge.export_hf_weights(self.model):
             send_channel.send((name, tensor))
         send_channel.send(None, flush=True)
         if self.offloaded:
