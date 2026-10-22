@@ -103,7 +103,10 @@ def test_group_zscore_unequal_group_sizes_raises():
 @pytest.fixture
 def single_rank(monkeypatch):
     """No process group: all_reduce is the identity, as on a 1-rank DP group."""
-    from megatron.core import parallel_state as mpu
+    # The code under test imports Megatron's parallel_state lazily.
+    mpu = pytest.importorskip(
+        "megatron.core.parallel_state", reason="Megatron-Core is not installed"
+    )
 
     monkeypatch.setattr(adv_mod.dist, "all_reduce", lambda tensor, **kwargs: None)
     monkeypatch.setattr(mpu, "get_data_parallel_group", lambda *a, **k: None)
