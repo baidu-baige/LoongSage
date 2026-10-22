@@ -323,7 +323,7 @@ class TestGetRolloutData:
             patch("torch.cuda.current_device", return_value="cpu"),
         ):
             ray_mock.get.return_value = raw
-            result = get_rollout_data([MagicMock(ref="ref_placeholder", teacher_worker_ref=[])])
+            result = get_rollout_data([MagicMock(ref="ref_placeholder", teacher_worker_ref=[], critic_ref=None)])
 
         # Every tensor field lands on the device returned by current_device().
         for field in ("tokens", "loss_masks", "raw_loss_masks"):
@@ -344,7 +344,7 @@ class TestGetRolloutData:
             patch("torch.cuda.current_device", return_value="cpu"),
         ):
             ray_mock.get.return_value = raw
-            result = get_rollout_data([MagicMock(ref="ref", teacher_worker_ref=[])])
+            result = get_rollout_data([MagicMock(ref="ref", teacher_worker_ref=[], critic_ref=None)])
 
         assert torch.equal(result["raw_loss_masks"][0], torch.tensor([1.0, 1.0, 0.0]))
         assert result["raw_loss_masks"][0] is not result["loss_masks"][0]
@@ -366,10 +366,30 @@ class TestGetRolloutData:
             patch("torch.cuda.current_device", return_value="cpu"),
         ):
             ray_mock.get.return_value = raw
-            result = get_rollout_data([MagicMock(ref="ref", teacher_worker_ref=[])])
+            result = get_rollout_data([MagicMock(ref="ref", teacher_worker_ref=[], critic_ref=None)])
 
         assert result["rollout_log_probs"] is None
         assert result["rollout_routed_experts"] is None
+
+    def test_critic_fields_are_merged_by_row(self):
+        """critic_ref carries one response-length tensor per Segment row of the same shard."""
+        _set_parallel(dp_rank=0)
+        raw = {
+            "tokens": [torch.tensor([1, 2, 3, 4]), torch.tensor([5, 6])],
+            "loss_masks": [torch.ones(2), torch.ones(1)],
+            "response_lengths": [2, 1],
+        }
+        critic = {"critic_advantages": [torch.tensor([0.5, -0.5]), torch.tensor([1.0])]}
+
+        with (
+            patch.object(_data_mod, "ray") as ray_mock,
+            patch("torch.cuda.current_device", return_value="cpu"),
+        ):
+            ray_mock.get.side_effect = lambda ref: {"ref": raw, "critic": critic}[ref]
+            result = get_rollout_data([MagicMock(ref="ref", teacher_worker_ref=[], critic_ref="critic")])
+
+        assert torch.equal(result["critic_advantages"][0], torch.tensor([0.5, -0.5]))
+        assert torch.equal(result["critic_advantages"][1], torch.tensor([1.0]))
 
 
 # ═══════════════════════════════════════════════════════════════════════════

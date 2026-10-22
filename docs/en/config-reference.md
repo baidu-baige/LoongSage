@@ -227,6 +227,20 @@ The commented-out `recompute_*` triplet (`granularity` / `method` / `num_layers`
 > - `megatron.optimizer`  → `megatron.core.optimizer.OptimizerConfig` (`torch.dtype` fields are auto-converted from strings)
 > - `megatron.scheduler`  → constructor kwargs of `megatron.core.optimizer_param_scheduler.OptimizerParamScheduler`. If `max_lr` / `min_lr` / `init_lr` / `start_wd` / `end_wd` are not set explicitly, they default from `megatron.optimizer.lr` / `min_lr` / `weight_decay`.
 
+### 7.3 `critic` (PPO value model)
+
+The critic is a second Megatron model trained alongside the actor for PPO. It always shares the actor's GPUs (each critic rank is pinned to the matching actor rank's bundle) and reuses `megatron.model` / `megatron.ddp_config`, so its parallelism equals the actor's. Only its optimizer, LR schedule and checkpoint are its own.
+
+| Field | Default | Description | Constraints |
+| --- | --- | --- | --- |
+| `critic.enable` | `false` | Train a PPO critic. | Requires `algorithm.advantage_estimator: gae`; `num_trajectories_per_prompt == 1`; cannot be combined with `opd.enable`; one Segment per trajectory (multi-Segment is not supported yet). |
+| `critic.optimizer` | see yaml | Critic optimizer. Replaces `megatron.optimizer` for the critic; nothing is inherited from the actor. | `min_lr` defaults from `critic.optimizer.lr`. |
+| `critic.scheduler` | see yaml | Critic LR scheduler. Replaces `megatron.scheduler` for the critic; nothing is inherited from the actor. | `max_lr` / `min_lr` / `init_lr` / `start_wd` / `end_wd` default from the critic optimizer. |
+| `critic.critic_warmup` | `0` | Steps `<= critic_warmup` train only the critic; the actor is neither trained nor saved. | `>= 0`. |
+| `critic.value_head_init_std` | `0.02` | Std of the value head's normal weight init (bias starts at 0). | The head follows the model precision. |
+
+The critic checkpoint is saved synchronously to `train_step_N/critic_dist_ckpt`, next to the actor's `dist_ckpt`, and the two share `latest_checkpointed_iteration.txt`: during warmup the critic writes it, afterwards the actor does (the critic of the same step is always saved first). On resume inside warmup, the actor has no `dist_ckpt` for that step and starts from the HF weights, which is exactly its state.
+
 ## 8. OPD (On-Policy Distillation)
 
 OPD (On-Policy Distillation) attaches one or more teacher models to the RL loop and mixes a configurable KL term with policy gradient, yielding `L = (1-gkd_ratio) × [A - pg_ratio × KL_token] + gkd_ratio × L_GKD`. See [On-Policy Distillation](on-policy-distillation.md) for details.
@@ -262,14 +276,18 @@ The `algorithm` node bundles advantage estimation, policy loss, off-policy safeg
 
 | Field | Default | Description | Constraints |
 | --- | --- | --- | --- |
-| `algorithm.advantage_estimator` | `grpo` | Advantage estimator name. | Registered via the registry; built-in: `grpo`. |
-| `algorithm.advantage_norm_mode` | `group_zscore` | Advantage normalization mode. | `none` / `group_mean` / `group_zscore` / `batch_mean` / `batch_zscore`; `group_*` requires equal group sizes. |
-| `algorithm.policy_loss` | `grpo` | Policy loss name. | Built-in: `grpo` / `gspo`; see [GSPO paper](https://arxiv.org/pdf/2507.18071). |
+| `algorithm.advantage_estimator` | `grpo` | Advantage estimator name. | Registered via the registry; built-in: `grpo`, `gae` (PPO: advantages computed by the critic, requires `critic.enable`). |
+| `algorithm.advantage_norm_mode` | `group_zscore` | Group-level reward normalization of `grpo`. | `none` / `group_mean` / `group_zscore`; `group_*` requires equal group sizes; ignored by `gae`. |
+| `algorithm.use_masked_whiten` | `false` | Whiten the advantages of any estimator over all response tokens of the step (DP all-reduced). | Applied after the estimator; PPO returns are not whitened. |
+| `algorithm.policy_loss` | `grpo` | Policy loss name. | Built-in: `grpo` / `ppo` (same clipped surrogate as `grpo`) / `gspo`; see [GSPO paper](https://arxiv.org/pdf/2507.18071). |
+| `algorithm.ppo.value_clip` | `0.2` | Clip range of the critic value loss around the old values. | Only with `advantage_estimator: gae`. |
+| `algorithm.ppo.gamma` | `1.0` | GAE discount factor. | Only with `advantage_estimator: gae`. |
+| `algorithm.ppo.lam` | `0.95` | GAE lambda. | Only with `advantage_estimator: gae`. |
 | `algorithm.loss_agg_mode` | `token-mean` | Loss aggregation mode. | `token-mean` / `seq-mean-token-mean`. |
 | `algorithm.entropy_coef` | `0.0` | Entropy regularization coefficient. | When non-zero, subtracts `entropy_coef × entropy` from the loss. |
 | `algorithm.clip_ratio_low` | `0.2` | Lower clip ratio for GRPO / GSPO. | Combined with `clip_ratio_high` for asymmetric clipping (DAPO clip-higher). |
 | `algorithm.clip_ratio_high` | `0.28` | Upper clip ratio. | Same as above. |
-| `algorithm.clip_ratio_c` | `10.0` | Dual-clip upper bound for negative advantages. | Only active for `policy_loss: grpo`. |
+| `algorithm.clip_ratio_c` | `10.0` | Dual-clip upper bound for negative advantages. | Only active for `policy_loss: grpo` / `ppo`. |
 
 ### 9.2 `is_correction` (importance-sampling correction)
 
@@ -350,7 +368,7 @@ The dependencies below span multiple sections and are the most common pitfalls w
   - `run_mode: default`
   - `rollout.sampler.num_oversample: 0` (extra capacity is provided by `fully_async.stale_steps`)
 - Only a single entry in `data_sources` is supported today.
-- `B × N` must be divisible by `trainer.mini_batch_size`; `M % N == 0` is strongly recommended (otherwise you cannot form complete groups). Here `B = num_prompts_per_step`, `N = num_trajectories_per_prompt`, `M = mini_batch_size`.
+- `B × N` must be divisible by `trainer.mini_batch_size`, as in synchronous mode. Here `B = num_prompts_per_step`, `N = num_trajectories_per_prompt`, `M = mini_batch_size`. The trainer fetches a whole step (`B` groups) at a time, so `M` need not be a multiple of `N`.
 
 ### 11.4 Partial rollout
 

@@ -68,11 +68,10 @@ class TimeMarkerAcc:
     Usage::
 
         with TimeMarkerAcc(step=step) as timers:
-            for mb_idx in range(num_mini_batches):
-                with timers("rollout"):
-                    ...
-                with timers("train"):
-                    ...
+            with timers("rollout"):
+                ...
+            with timers.inverse_timer("wait"), timers("train"):
+                ...
         # auto-reports {"timing/rollout": ..., "timing/train": ...} on exit
     """
 
@@ -164,84 +163,6 @@ def time_marker(name: str, step: int):
     elapsed = time.time() - t0
     track({f"timing/{name}": f"{elapsed:.4f}"}, step=step)
     logger.info("[step %d] %s done, elapsed=%.4fs", step, name, elapsed)
-
-
-class TrainMetricsAggregator:
-    """Process-local accumulator for training metrics in fully_async mode.
-
-    Aggregation is decided purely by the metric key, following the unified
-    ``<domain>/<object_statistic>`` two-level naming convention:
-
-    * ``timing/*``               -> sum   (wall-clock durations accumulate)
-    * key ending in ``_max``     -> max   (e.g. ``perf/train_memory_allocated_max``)
-    * key ending in ``_min``     -> min
-    * everything else            -> mean
-    """
-
-    def __init__(self) -> None:
-        self._step: Optional[int] = None
-        self._values: dict[str, list[float]] = {}
-
-    def add(self, data: dict[str, Any], step: int) -> None:
-        """Buffer a batch of metrics for ``step``.
-
-        If ``step`` differs from the currently buffered step, emit a warning and
-        drop the previously buffered values -- callers are expected to call
-        flush() at every step boundary.
-        """
-        if self._step is None:
-            self._step = step
-        elif self._step != step:
-            logger.warning(
-                "TrainMetricsAggregator: step changed from %s to %s without "
-                "explicit flush; discarding %d buffered keys.",
-                self._step, step, len(self._values),
-            )
-            self._values = {}
-            self._step = step
-
-        for k, v in data.items():
-            try:
-                fv = float(v)
-            except (TypeError, ValueError):
-                continue
-            self._values.setdefault(k, []).append(fv)
-
-    def flush(self) -> Optional[tuple[int, dict[str, float]]]:
-        """Return ``(step, aggregated_dict)`` and reset state, or ``None`` if empty"""
-        if self._step is None or not self._values:
-            self._step = None
-            self._values = {}
-            return None
-        step = self._step
-        result: dict[str, float] = {}
-        for k, vals in self._values.items():
-            if k.startswith("timing/"):
-                result[k] = sum(vals)
-            elif k.endswith("_max"):
-                result[k] = max(vals)
-            elif k.endswith("_min"):
-                result[k] = min(vals)
-            else:
-                result[k] = sum(vals) / len(vals)
-        self._step = None
-        self._values = {}
-        return step, result
-
-
-class _TrackBuffer:
-    """Module-level holder for the optional process-local TrainMetricsAggregator"""
-    _aggregator: Optional["TrainMetricsAggregator"] = None
-
-    @classmethod
-    def install(cls, aggregator: "TrainMetricsAggregator") -> None:
-        """Register the process-local aggregator that intercepts ``Tracking.log()`` calls."""
-        cls._aggregator = aggregator
-
-    @classmethod
-    def get(cls) -> Optional["TrainMetricsAggregator"]:
-        """Return the currently installed aggregator, or ``None`` if none has been installed."""
-        return cls._aggregator
 
 
 class Tracking:
@@ -420,20 +341,8 @@ class Tracking:
         """Clear the singleton so it can be re-initialized (mainly for testing)."""
         cls._instance = None
 
-    def log(self, data, step, backend=None, _bypass_buffer=False):
-        """Log data to all configured backends, or only to the specified one(s).
-
-        When a ``TrainMetricsAggregator`` is installed (see
-        ``install_train_metrics_aggregator``), incoming metrics are buffered and
-        not forwarded to backends until ``flush_train_metrics()`` is called.
-        ``_bypass_buffer=True`` is the escape hatch the flush path uses to write
-        the aggregated record straight through.
-        """
-        if not _bypass_buffer:
-            aggregator = _TrackBuffer.get()
-            if aggregator is not None:
-                aggregator.add(data, step)
-                return
+    def log(self, data, step, backend=None):
+        """Log data to all configured backends, or only to the specified one(s)."""
         for default_backend, logger_instance in self.logger.items():
             # Log to all backends if no filter is specified, otherwise match by name
             if backend is None or default_backend in backend:
@@ -493,36 +402,6 @@ class _MlflowLoggingAdapter:
         # Sanitize all keys before logging to prevent MLflow validation errors
         results = {self._sanitize_key(k): v for k, v in data.items()}
         mlflow.log_metrics(metrics=results, step=step, run_id=self.run_id)
-
-
-def install_train_metrics_aggregator() -> None:
-    """Install a process-local ``TrainMetricsAggregator``.
-
-    While installed, every ``Tracking.log()`` call (e.g. ``track()``, the
-    ``time_tracker`` decorator, etc.) is intercepted and buffered instead of
-    being written to the configured backends. ``flush_train_metrics()`` drains
-    the buffer and emits one aggregated record.
-    """
-    if _TrackBuffer.get() is None:
-        _TrackBuffer.install(TrainMetricsAggregator())
-
-
-def flush_train_metrics() -> None:
-    """Aggregate buffered metrics and emit one record to the configured backends.
-
-    No-op when no aggregator is installed or when nothing has been buffered.
-    """
-    aggregator = _TrackBuffer.get()
-    if aggregator is None:
-        return
-    flushed = aggregator.flush()
-    if flushed is None:
-        return
-    step, agg_dict = flushed
-    tracker = Tracking.get_instance()
-    if tracker is None:
-        return
-    tracker.log(data=agg_dict, step=step, _bypass_buffer=True)
 
 
 def time_tracker(func=None, func_name: Optional[str] = None):

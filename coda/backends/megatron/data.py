@@ -3,7 +3,7 @@
 Provides:
 * RolloutBatch shard utilities — ``group_rollout_batch``, ``merge_rollout_batch``,
   ``concat_rollout_batch``, ``slice_rollout_batch``, ``select_rollout_batch``.
-* ``get_rollout_data`` — resolve Ray refs and merge teacher data.
+* ``get_rollout_data`` — resolve Ray refs and merge teacher / critic data.
 * ``DataIterator`` — micro-batch level iteration.
 * ``get_data_iterator`` — factory that handles static / dynamic batch
   construction, VPP replication, and DP-level synchronisation.
@@ -144,10 +144,13 @@ def merge_rollout_batch(batches: list[RolloutBatch], key: str) -> RolloutBatch:
 # Data Fetching
 # ────────────────────────────────────────────────────────────────────────
 def get_rollout_data(rollout_data_ref) -> RolloutBatch:
-    """Resolve a Ray rollout shard and merge teacher data if present.
+    """Resolve a Ray rollout shard and merge teacher / critic data if present.
 
-    Static tensor fields and any teacher tensor fields supplied via
-    ``teacher_worker_ref`` are moved to the current CUDA device.
+    Static tensor fields, any teacher tensor fields supplied via
+    ``teacher_worker_ref`` and any critic fields supplied via ``critic_ref``
+    (one tensor per Segment row, ``response_length`` long; the critic reads the
+    same shard in the same row order, so no re-indexing) are moved to the
+    current CUDA device.
     """
     dp_rank = mpu.get_data_parallel_rank()
     box = rollout_data_ref[dp_rank]
@@ -175,10 +178,16 @@ def get_rollout_data(rollout_data_ref) -> RolloutBatch:
                 teacher_tensor_fields.append(k)
         rollout_data.update(merged)
 
+    critic_tensor_fields: list[str] = []
+    if box.critic_ref is not None:
+        critic_data = ray.get(box.critic_ref)
+        critic_tensor_fields = list(critic_data)
+        rollout_data.update(critic_data)
+
     device = torch.cuda.current_device()
     for field in (
         "tokens", "loss_masks", "rollout_log_probs", "rollout_routed_experts", "raw_loss_masks",
-        *teacher_tensor_fields,
+        *teacher_tensor_fields, *critic_tensor_fields,
     ):
         if rollout_data.get(field):
             rollout_data[field] = [t.to(device) for t in rollout_data[field]]

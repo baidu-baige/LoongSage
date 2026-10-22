@@ -212,6 +212,32 @@ megatron:
     # output_layer: true
   optimizer_sharding_type: "dp_reshardable" # dp_reshardable|fully_reshardable
 
+# PPO critic (value model). Always co-located with the actor on the same GPUs
+# and uses the same megatron.model / megatron.ddp_config parallelism.
+critic:
+  enable: false               # requires algorithm.advantage_estimator=gae; one Segment per trajectory
+  # Replace megatron.optimizer / megatron.scheduler for the critic; nothing is
+  # inherited from the actor. Unset derived fields (optimizer.min_lr;
+  # scheduler.max_lr/min_lr/init_lr/start_wd/end_wd) follow the critic's own
+  # lr / weight_decay.
+  optimizer:
+    lr: 1.0e-6
+    weight_decay: 0.01
+    optimizer_cpu_offload: false
+    optimizer_offload_fraction: 1.0
+    # chunked optimizer state offload
+    chunked_optimizer_state_offload: false
+    optimizer_state_offload_fraction: 1.0
+    optimizer_state_offload_chunk_size_mb: 1024
+  scheduler:
+    lr_warmup_steps: 0
+    lr_decay_steps: 1
+    lr_decay_style: constant
+    wd_incr_steps: 0
+    wd_incr_style: constant
+  critic_warmup: 0            # steps <= critic_warmup train only the critic (actor is not trained or saved)
+  value_head_init_std: 0.02   # std of the value head's normal init (bias starts at 0)
+
 opd:
   enable: false
   pg_ratio: 0.0 # L = (1-gkd_ratio)*[A - pg_ratio*KL_token] + gkd_ratio*L_GKD
@@ -249,9 +275,14 @@ opd:
     PYTORCH_ALLOC_CONF: expandable_segments:True
 
 algorithm:
-  advantage_estimator: grpo
-  advantage_norm_mode: group_zscore # none|group_mean|group_zscore|batch_mean|batch_zscore
-  policy_loss: grpo # grpo|gspo
+  advantage_estimator: grpo # grpo|gae (gae = PPO, requires critic.enable)
+  advantage_norm_mode: group_zscore # none|group_mean|group_zscore (grpo only; ignored by gae)
+  use_masked_whiten: false # whiten advantages over all response tokens of the step (any estimator)
+  policy_loss: grpo # grpo|gspo|ppo (ppo = the grpo clipped surrogate)
+  ppo:                     # used when advantage_estimator=gae
+    value_clip: 0.2        # clip range of the critic value loss around old values
+    gamma: 1.0             # GAE discount
+    lam: 1.0               # GAE lambda
   loss_agg_mode: token-mean # token-mean|seq-mean-token-mean
   is_correction:
     enable: false
