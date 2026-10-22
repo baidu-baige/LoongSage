@@ -1,0 +1,105 @@
+# @package _global_
+defaults:
+  - /default
+  - _self_
+
+checkpoint_path: "./checkpoints"
+hf_model_path: ???                # the 4B AutoThink model folder (BF16, with decision_config.json)
+ref_hf_model_path: null           # required, the same folder: π_ref = the starting policy (Eq. 6) = the scorer's weights
+colocate: true
+total_steps: 200
+
+data_source:
+  dataset:
+    prompt_data_path: ???       # train.jsonl (max p0 < 0.9)
+    eval_prompt_data_path: null # required (rollout.eval.interval > 0): eval_small.jsonl, 128 held-out items
+    input_key: prompt
+    label_key: label
+    metadata_key: metadata
+  agent:
+    name: rlcd2                 # one Router call, then awaits the scorer (coda/custom/rlcd2/reward.py)
+  reward:
+    name: rlcd2
+    model_path: ???             # the model folder again: decision_config.json (letter ids, read-out temperatures)
+    scorer_urls: ???            # "http://host:port[,http://host:port]" of the frozen scorer servers
+    rule: decision_weighted     # decision_weighted | brier | log
+    lam: 1.0e-4
+    budget: 3072                # soft budget B (penalty), distinct from the 4096 generation limit
+    empty_tokens: 8
+    max_concurrency: 128
+  num_prompts_per_step: 48
+  num_trajectories_per_prompt: 8
+  max_response_len_per_trajectory: 4096
+  completion_params:            # sampling of the inference AutoThink path; temperature is trainer.temperature
+    top_p: 0.95
+    top_k: 20
+    stop: "</think>"            # string, not list: the Router's dict() leaves a list as ListConfig, which json.dumps rejects
+
+rollout:
+  num_gpus_per_node: 6
+  sglang_args:
+    mem_fraction_static: 0.7
+    disable_cuda_graph: false
+  sglang_replicas:
+    regular:
+      num_nodes: 1
+      num_gpus_per_replica: 1
+  eval:
+    interval: 10                # eval_prompt_data_path through the same agent + frozen scorer: eval/ds0_*
+
+agentflow:
+  dump_trajectory_path: "log/trajectories"
+  router:
+    middleware:
+      parser:
+        reasoning_parser: false   # the whole thought stays in "content"
+  tokenizer:
+    custom_chat_template_path: rlcd2/rlcd2_chat_template.jinja   # appends the forced prefix after <think>\n
+    generation_prompt_kwargs:
+      enable_thinking: true
+
+trainer:
+  num_gpus_per_node: 6
+  num_nodes: 1
+  temperature: 0.6
+  mini_batch_size: 384          # one optimizer step per rollout batch (48 x 8)
+  max_tokens_per_gpu: 16384     # >= longest sequence (prompt <= 12288 + thought <= 4096)
+  use_dynamic_batch_size: true
+  use_fp32_lm_head: true
+  save_freq: 50
+  save_hf: true                 # train_step_N/hf_model for the evaluation
+
+megatron:
+  model:
+    # TP1 ran out of memory in the fp32 logits (16k tokens x 248k vocab); TP2 splits the vocab, dp = 3.
+    tensor_model_parallel_size: 2
+    pipeline_model_parallel_size: 1
+    mtp_num_layers: null
+    attention_backend: flash
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 1
+    freeze_vision_model: true
+    freeze_vision_projection: true
+  optimizer:
+    lr: 1.0e-6
+
+algorithm:
+  advantage_estimator: rlcd2
+  rlcd2_adv_clip: 5.0
+  policy_loss: grpo
+  loss_agg_mode: token-mean     # 1/N over all generated tokens of the batch
+  clip_ratio_low: 0.2
+  clip_ratio_high: 0.2
+  clip_ratio_c: 1.0e9           # no dual clip (Eq. 6 has none)
+  ref_kl:
+    enable: true
+    coef: 1.0e-3
+    kl_type: k3                 # π_ref/π_θ - log(π_ref/π_θ) - 1
+    update_interval: -1
+  is_correction:                # as in the Qwen3.8-27B recipe (hybrid GDN kernels differ between Megatron and SGLang)
+    enable: true
+    action: mask
+    level: token
+    lower_bound: 0.5
+    upper_bound: 2
