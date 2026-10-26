@@ -255,6 +255,97 @@ class TestPutDpShardsToRay(unittest.TestCase):
         self.assertEqual(d["tokens"][1].untyped_storage().nbytes(), 3 * 8)
         self.assertEqual(d["tokens"][1].tolist(), [3, 4, 5])
 
+    # --- multimodal_train_inputs ---
+
+    MM_PAD = 999
+
+    @classmethod
+    def _mm_traj(cls, traj, *items):
+        """Attach `items` to `traj` and write the pad token over each item's token range."""
+        for it in items:
+            for i in range(it["token_start"], it["token_end"]):
+                traj.tokens[i] = cls.MM_PAD
+        traj.multimodal_train_inputs = list(items)
+        return traj
+
+    @staticmethod
+    def _mm_item(token_start, token_end, n_patches, fill):
+        import torch as real_torch
+
+        return {
+            "token_start": token_start,
+            "token_end": token_end,
+            "image_hash": f"h{fill}" * 4,
+            "pad_id": 999,
+            "tensors": {
+                "pixel_values": real_torch.full((n_patches, 4), float(fill)),
+                "image_grid_thw": real_torch.tensor([[1, 2, n_patches // 2]]),
+            },
+        }
+
+    def _put_one_group(self, traj):
+        group = TrajectoryGroup(prompt_id="p0", trajectories=[traj])
+        mock_ray, captured = _fake_ray_put()
+        with patch("coda.data_factory.data_processor.torch", _torch_mod):
+            with patch("coda.data_factory.data_processor.ray", mock_ray):
+                put_dp_shards_to_ray([[group]], dp_size=1)
+        return captured[0]
+
+    def test_multimodal_rows_aligned_to_segments(self):
+        # Segment 0 holds image A, Segment 1 holds no image, Segment 2 holds image B.
+        traj = _make_trajectory(n_tokens=30, pid="p0")
+        traj.segments = [
+            Segment(token_start=0, token_end=10, logprob_start=0, logprob_end=10, trainable=True),
+            Segment(token_start=10, token_end=20, logprob_start=10, logprob_end=20, trainable=True),
+            Segment(token_start=20, token_end=30, logprob_start=20, logprob_end=30, trainable=True),
+        ]
+        self._mm_traj(traj, self._mm_item(2, 6, 4, 1), self._mm_item(22, 28, 6, 2))
+        d = self._put_one_group(traj)
+        rows, table = d["multimodal_train_inputs"], d["image_table"]
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(rows[0], ["h1h1h1h1"])
+        self.assertIsNone(rows[1])
+        self.assertEqual(rows[2], ["h2h2h2h2"])
+        self.assertEqual(set(table), {"h1h1h1h1", "h2h2h2h2"})
+        self.assertEqual(table["h1h1h1h1"]["pixel_values"].shape, (4, 4))
+        self.assertEqual(table["h2h2h2h2"]["pixel_values"].shape, (6, 4))
+        self.assertEqual(table["h2h2h2h2"]["pixel_values"][0, 0].item(), 2.0)
+
+    def test_multimodal_samples_sharing_an_image_share_one_table_entry(self):
+        # Two samples of one prompt see the same image: both rows name the hash, the table holds it once.
+        trajs = [self._mm_traj(_make_trajectory(n_tokens=10, pid="p0"), self._mm_item(2, 6, 4, 1)) for _ in range(2)]
+        group = TrajectoryGroup(prompt_id="p0", trajectories=trajs)
+        mock_ray, captured = _fake_ray_put()
+        with patch("coda.data_factory.data_processor.torch", _torch_mod):
+            with patch("coda.data_factory.data_processor.ray", mock_ray):
+                put_dp_shards_to_ray([[group]], dp_size=1)
+        d = captured[0]
+        self.assertEqual(d["multimodal_train_inputs"], [["h1h1h1h1"], ["h1h1h1h1"]])
+        self.assertEqual(list(d["image_table"]), ["h1h1h1h1"])
+
+    def test_multimodal_keys_omitted_for_text_only(self):
+        d = self._put_one_group(_make_trajectory(n_tokens=8, pid="p0"))
+        self.assertNotIn("multimodal_train_inputs", d)
+        self.assertNotIn("image_table", d)
+
+    def test_multimodal_skips_non_trainable_segment(self):
+        traj = _make_trajectory(n_tokens=20, pid="p0")
+        traj.segments = [
+            Segment(token_start=0, token_end=10, logprob_start=0, logprob_end=10, trainable=False),
+            Segment(token_start=10, token_end=20, logprob_start=10, logprob_end=20, trainable=True),
+        ]
+        self._mm_traj(traj, self._mm_item(2, 6, 4, 1), self._mm_item(12, 16, 4, 2))
+        d = self._put_one_group(traj)
+        self.assertEqual(d["multimodal_train_inputs"], [["h2h2h2h2"]])
+        self.assertEqual(list(d["image_table"]), ["h2h2h2h2"])
+
+    def test_multimodal_pad_without_image_raises(self):
+        traj = _make_trajectory(n_tokens=20, pid="p0")
+        self._mm_traj(traj, self._mm_item(2, 6, 4, 1))
+        traj.tokens[12:16] = [self.MM_PAD] * 4  # pad run whose image tensors are missing
+        with self.assertRaisesRegex(ValueError, "pad tokens"):
+            self._put_one_group(traj)
+
 
 # ---------------------------------------------------------------------------
 # Tests: get_dp_shard_from_ray

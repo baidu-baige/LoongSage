@@ -20,6 +20,7 @@ def make_minimal_config(**overrides):
     added here fails every test in this file.
     """
     base = {
+        "hf_model_path": "/tmp/fake_model",
         "fully_async": {
             "enable": False,
         },
