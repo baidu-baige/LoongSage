@@ -27,6 +27,7 @@ from coda.transfer_mesh import ChannelMeta, create_sender_channel
 from coda.backends.train_worker import TrainWorker
 from coda.utils.tensor_backuper import TensorBackuper
 from coda.utils.memory_utils import print_memory, clear_memory
+from coda.utils.multimodal_config import validate_vlm_parallel_config
 from coda.utils.checkpoint_utils import (
     find_latest_ckpt_path, resolve_dist_ckpt_dir, update_latest, get_ckpt_dir, get_hf_dir
 )
@@ -140,6 +141,8 @@ class MegatronTrainWorker(TrainWorker):
                 f"must be divisible by micro_batch_size ({config.trainer.micro_batch_size})."
             )
         assert config.algorithm.clip_ratio_c > 1.0, "clip_ratio_c must be greater than 1.0"
+
+        validate_vlm_parallel_config(config, config.megatron.model, config.hf_model_path)
 
         if config.algorithm.ref_kl.enable:
             if config.algorithm.ref_kl.kl_type not in {"k1", "k2", "k3"}:

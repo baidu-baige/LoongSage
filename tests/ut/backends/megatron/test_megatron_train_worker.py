@@ -20,6 +20,7 @@ def make_minimal_config(**overrides):
     added here fails every test in this file.
     """
     base = {
+        "hf_model_path": "/tmp/fake_model",
         "fully_async": {
             "enable": False,
         },
@@ -62,6 +63,7 @@ def make_minimal_config(**overrides):
                 "lr": 1e-6,
                 "weight_decay": 0.01,
                 "optimizer_cpu_offload": False,
+                "chunked_optimizer_state_offload": False,
             },
             "scheduler": {},
         },

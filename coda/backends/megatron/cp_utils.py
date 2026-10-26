@@ -217,27 +217,30 @@ def prepare_packed_seq_params(
 
 
 def _pad_positions(tensor: torch.Tensor, pad_len: int) -> torch.Tensor:
-    """Continue a 1-D position arange over padded slots.
+    """Continue a position arange over padded slots (`[seq]` or `[seq, 3]` MRoPE positions).
 
     Alignment pad slots live *inside* the trajectory's ``cu_seqlens`` segment, so
     continuing the arange keeps intra-segment positions monotone instead of aliasing
-    real tokens' positions.
+    real tokens' positions. The continuation is index-based (`seq .. seq + pad_len`):
+    MRoPE positions of image rows never exceed their token index, so it cannot alias them.
     """
-    return torch.cat([
-        tensor,
-        torch.arange(
-            tensor.size(0), tensor.size(0) + pad_len,
-            dtype=tensor.dtype, device=tensor.device,
-        ),
-    ])
+    steps = torch.arange(
+        tensor.size(0), tensor.size(0) + pad_len,
+        dtype=tensor.dtype, device=tensor.device,
+    )
+    if tensor.dim() > 1:
+        steps = steps.reshape(-1, *([1] * (tensor.dim() - 1))).expand(-1, *tensor.shape[1:])
+    return torch.cat([tensor, steps])
 
 
 def prepare_packed_mrope_position_ids(
     tokens_list: list[torch.Tensor],
     pad_multiplier: int = 128,
     cp_partition_mode: CPPartitionMode = "zigzag",
+    image_grid_thw_list: list[torch.Tensor | None] | None = None,
+    rope_index_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
 ) -> torch.Tensor:
-    """Rank-local text-only 3D MRoPE position ids ``[3, 1, local_len]``.
+    """Rank-local 3D MRoPE position ids ``[3, 1, local_len]``.
 
     Megatron-Bridge's ``Qwen3VLModel.forward`` refuses pre-sharded packed CP inputs
     without explicit rank-local MRoPE ids, because it cannot recover global positions
@@ -246,18 +249,36 @@ def prepare_packed_mrope_position_ids(
     ``pad_multiplier`` and ``cp_partition_mode`` must match the
     ``prepare_packed_seq_params`` call for the same micro-batch.
 
-    Text-only: MRoPE degenerates to a per-trajectory arange with identical T/H/W rows.
+    Rows without images (`image_grid_thw_list[i]` is None, or the list is omitted) use the
+    text-only degeneration: a per-trajectory arange with identical T/H/W rows. For rows with
+    images, `rope_index_fn(tokens, image_grid_thw)` must return the full-sequence `[3, len]`
+    positions, which are then CP-sliced like the tokens.
     """
-    pos_list = [
-        torch.arange(t.size(0), dtype=torch.long, device=t.device)
-        for t in tokens_list
-    ]
+    image_grid_thw_list = image_grid_thw_list or [None] * len(tokens_list)
+    assert len(image_grid_thw_list) == len(tokens_list), (
+        f"image_grid_thw_list ({len(image_grid_thw_list)}) must align with tokens_list ({len(tokens_list)})"
+    )
+
+    pos_list = []
+    for tokens, grid in zip(tokens_list, image_grid_thw_list):
+        if grid is None:
+            positions = torch.arange(tokens.size(0), dtype=torch.long, device=tokens.device).unsqueeze(1).expand(-1, 3)
+        else:
+            assert rope_index_fn is not None, "rope_index_fn is required for rows with images"
+            positions = rope_index_fn(tokens, grid).to(device=tokens.device, dtype=torch.long)
+            assert positions.shape == (3, tokens.size(0)), (
+                f"rope_index_fn returned {tuple(positions.shape)}, expected (3, {tokens.size(0)})"
+            )
+            positions = positions.transpose(0, 1)
+        pos_list.append(positions)
+
+    # [seq, 3] slices along dim 0 exactly like 1-D tokens.
     packed, _ = slice_cp_packed(
         pos_list, cp_partition_mode, _pad_positions, pad_multiplier
     )
-    # [local_len] -> [3, 1, local_len]: dim 0 is MRoPE's temporal/height/width axes
-    # (identical without vision grids), dim 1 is the THD batch of 1.
-    return packed.reshape(1, 1, -1).expand(3, 1, -1).contiguous()
+    # [local_len, 3] -> [3, 1, local_len]: dim 0 is MRoPE's temporal/height/width axes,
+    # dim 1 is the THD batch of 1.
+    return packed.transpose(0, 1).unsqueeze(1).contiguous()
 
 
 def prepare_routing_replay_data(

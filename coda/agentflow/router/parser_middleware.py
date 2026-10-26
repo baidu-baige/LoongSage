@@ -15,6 +15,7 @@ from starlette.requests import Request
 from starlette.responses import Response
 from starlette.types import ASGIApp
 
+from coda.agentflow.multimodal import MultimodalRequestError
 from coda.agentflow.tokenizer_manager import DEEPSEEK_OFFICIAL_ENCODER_MODULES
 from coda.agentflow.trajectory_store import TrajectoryStore
 from coda.agentflow.utils import CONTEXT_LENGTH_EXCEEDED, build_request_id
@@ -106,10 +107,19 @@ class ParserMiddleware(BaseHTTPMiddleware):
         lock = self._trajectory_locks[trajectory_id]
         try:
             async with lock:
-                turn_ctx = await self.parser.build_turn_input(
-                    trajectory, messages=messages, tools=tools, request_kind=request_kind,
-                    mask_tool_call_args=adapter.rewrites_history_tool_args,
-                )
+                try:
+                    turn_ctx = await self.parser.build_turn_input(
+                        trajectory, messages=messages, tools=tools, request_kind=request_kind,
+                        mask_tool_call_args=adapter.rewrites_history_tool_args,
+                    )
+                except MultimodalRequestError as exc:
+                    logger.warning("[dispatch] %s: rejected multimodal request: %s", trajectory_id, exc)
+                    return adapter.build_error_response(
+                        request_body,
+                        error_type="invalid_request_error",
+                        message=str(exc),
+                        status_code=http.HTTPStatus.BAD_REQUEST,
+                    )
                 # Enforce max_response_len_per_trajectory: compare response-area length against the budget.
                 # response_area = everything after the initial prompt (LLM replies + tool responses).
                 seg = (
@@ -161,12 +171,13 @@ class ParserMiddleware(BaseHTTPMiddleware):
                 budget_capped = not request_max_new_tokens or max_new_tokens < request_max_new_tokens
 
                 request.state.upstream_body = self._build_generate_body(
-                    turn_ctx.input_ids,
+                    turn_ctx.send_input_ids or turn_ctx.input_ids,
                     completion_params=ds_config.get("completion_params", {}),
                     request_id=request_id,
                     max_new_tokens=max_new_tokens,
                     routed_experts_start_len=turn_ctx.routed_experts_start_len,
                     is_eval=trajectory.is_eval,
+                    image_data=turn_ctx.image_data,
                 )
 
                 # 2. Forward to LLM worker and parse response
@@ -178,6 +189,17 @@ class ParserMiddleware(BaseHTTPMiddleware):
                 if isinstance(parsed_response, Response):
                     return parsed_response
                 payload, response_json, assistant_message, finish_reason_override = parsed_response
+                mismatch = self._check_prompt_tokens(turn_ctx, response_json)
+                if mismatch:
+                    # The local expanded ids no longer line up with what SGLang actually ran, so
+                    # recording this sample would train on misaligned image tokens: discard it.
+                    logger.error("[dispatch] %s: %s; sample discarded", trajectory_id, mismatch)
+                    return adapter.build_error_response(
+                        request_body,
+                        error_type="multimodal_token_mismatch",
+                        message=mismatch,
+                        status_code=http.HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
                 finish_reason = self._finish_reason(
                     response_json, finish_reason_override
                 )
@@ -271,6 +293,7 @@ class ParserMiddleware(BaseHTTPMiddleware):
         max_new_tokens: int,
         routed_experts_start_len: int = 0,
         is_eval: bool = False,
+        image_data: list[str] | None = None,
     ) -> bytes:
         sampling_params = dict(completion_params or {})
         sampling_params["temperature"] = (
@@ -292,12 +315,30 @@ class ParserMiddleware(BaseHTTPMiddleware):
             "return_logprob": True,
             "sampling_params": sampling_params,
         }
+        if image_data:
+            payload["image_data"] = image_data
 
         if self.r3_enabled:
             payload["return_routed_experts"] = True
             payload["routed_experts_start_len"] = routed_experts_start_len
 
         return json.dumps(payload).encode("utf-8")
+
+    @staticmethod
+    def _check_prompt_tokens(turn_ctx: TurnInputContext, response_json: dict[str, Any]) -> str | None:
+        """Return an error message when SGLang's prompt length differs from the local expanded ids.
+
+        Only checked for turns that carry images: SGLang expands each folded image pad itself, so
+        `meta_info.prompt_tokens` must equal the locally expanded `len(input_ids)`.
+        """
+        if not turn_ctx.image_data:
+            return None
+        meta = response_json.get("meta_info") or {}
+        prompt_tokens = meta.get("prompt_tokens")
+        expected = len(turn_ctx.input_ids)
+        if prompt_tokens == expected:
+            return None
+        return f"multimodal prompt token mismatch: sglang prompt_tokens={prompt_tokens}, local expanded={expected}"
 
     async def _read_response_body(self, response: Response) -> bytes:
         # Buffer all chunks from the LLM worker's StreamingResponse. Currently we wait for

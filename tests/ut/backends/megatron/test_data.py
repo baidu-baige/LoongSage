@@ -17,6 +17,7 @@ pytest.importorskip("megatron", reason="Megatron-Core is not installed")
 from coda.backends.megatron.data import (
     DataIterator,
     _get_min_num_microbatches,
+    concat_rollout_batch,
     get_data_iterator,
     get_rollout_data,
 )
@@ -371,6 +372,93 @@ class TestGetRolloutData:
         assert result["rollout_log_probs"] is None
         assert result["rollout_routed_experts"] is None
 
+    def test_multimodal_rows_moved_and_none_rows_kept(self):
+        _set_parallel(dp_rank=0)
+        pixel = torch.ones(4, 8)
+        raw = {
+            "tokens": [torch.tensor([1, 2]), torch.tensor([3])],
+            "loss_masks": [torch.tensor([1.0, 1.0]), torch.tensor([1.0])],
+            "multimodal_train_inputs": [{"pixel_values": pixel}, None],
+        }
+
+        with (
+            patch.object(_data_mod, "ray") as ray_mock,
+            patch("torch.cuda.current_device", return_value="cpu"),
+        ):
+            ray_mock.get.return_value = raw
+            result = get_rollout_data([MagicMock(ref="ref", teacher_worker_ref=[])])
+
+        rows = result["multimodal_train_inputs"]
+        assert torch.equal(rows[0]["pixel_values"], pixel)
+        assert rows[1] is None
+
+    def test_text_only_shard_has_no_multimodal_key(self):
+        _set_parallel(dp_rank=0)
+        raw = {"tokens": [torch.tensor([1])], "loss_masks": [torch.tensor([1.0])]}
+
+        with (
+            patch.object(_data_mod, "ray") as ray_mock,
+            patch("torch.cuda.current_device", return_value="cpu"),
+        ):
+            ray_mock.get.return_value = raw
+            result = get_rollout_data([MagicMock(ref="ref", teacher_worker_ref=[])])
+
+        assert "multimodal_train_inputs" not in result
+
+
+class TestDataIteratorMultimodal:
+    """The row-aligned ``multimodal_train_inputs`` key follows the micro-batch row order."""
+
+    @staticmethod
+    def _rows(n):
+        return [None if i % 2 else {"pixel_values": torch.full((2, 4), float(i))} for i in range(n)]
+
+    def test_rows_follow_micro_batch_slices(self):
+        rows = self._rows(4)
+        data = _make_rollout(4, extra_fields={"multimodal_train_inputs": rows})
+        it = DataIterator(data, micro_batch_size=2)
+
+        b0 = it.get_next(["tokens", "multimodal_train_inputs"])
+        b1 = it.get_next(["tokens", "multimodal_train_inputs"])
+
+        assert b0["multimodal_train_inputs"][0] is rows[0]
+        assert b0["multimodal_train_inputs"][1] is None
+        assert b1["multimodal_train_inputs"][0] is rows[2]
+
+    def test_absent_key_returns_none(self):
+        it = DataIterator(_make_rollout(4), micro_batch_size=2)
+        batch = it.get_next(["tokens", "multimodal_train_inputs"])
+        assert batch["multimodal_train_inputs"] is None
+
+
+class TestConcatRolloutBatchMultimodal:
+    """Text-only shards omit ``multimodal_train_inputs``; concatenation must keep row alignment."""
+
+    @staticmethod
+    def _image_shard(n):
+        rows = [{"pixel_values": torch.full((2, 4), float(i))} for i in range(n)]
+        return _make_rollout(n, extra_fields={"multimodal_train_inputs": rows})
+
+    def test_first_shard_text_only_keeps_later_images(self):
+        text, image = _make_rollout(2), self._image_shard(3)
+        merged = concat_rollout_batch([text, image])
+        rows = merged["multimodal_train_inputs"]
+        assert len(rows) == len(merged["tokens"]) == 5
+        assert rows[:2] == [None, None]
+        assert rows[2:] == image["multimodal_train_inputs"]
+
+    def test_later_shard_text_only_does_not_raise(self):
+        image, text = self._image_shard(2), _make_rollout(3)
+        merged = concat_rollout_batch([image, text])
+        rows = merged["multimodal_train_inputs"]
+        assert len(rows) == len(merged["tokens"]) == 5
+        assert rows[:2] == image["multimodal_train_inputs"]
+        assert rows[2:] == [None, None, None]
+
+    def test_all_text_only_stays_without_key_and_inputs_unmutated(self):
+        shards = [_make_rollout(2), _make_rollout(2)]
+        assert "multimodal_train_inputs" not in concat_rollout_batch(shards)
+        assert all("multimodal_train_inputs" not in s for s in shards)
 
 # ═══════════════════════════════════════════════════════════════════════════
 # get_data_iterator — static batching

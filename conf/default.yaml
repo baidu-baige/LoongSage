@@ -37,12 +37,20 @@ data_source:
     # to null to disable filtering.
     max_prompt_len: null
 
+    # Maximum estimated vision tokens summed over all images of one prompt. Samples above it are dropped during
+    # loading. Independent of max_prompt_len (text characters only).
+    max_image_tokens: null
+
     # Dataset column names
     input_key: ???            # Column holding the prompt text or message list.
     label_key: ???            # Column holding the ground-truth label. null = disabled.
     metadata_key: metadata    # Column holding per-row metadata dicts.
 
     shuffle: true
+
+    # Multimodal columns, e.g. {image: images}: the "images" column holds one data URI per <image>
+    # placeholder in the prompt text. Requires multimodal.enable=true. null = text-only dataset.
+    multimodal_keys: null
 
     # Registered name of a raw-record pre-processor, applied to every dataset record before messages are built.
     # Pre-processors are registered via @register_data_pre_processor("name") in
@@ -80,6 +88,16 @@ data_source:
 
 data_sources:
   - ${data_source}
+
+# Multimodal (image) training. When enabled, rollout.sglang_args.enable_multimodal is set automatically.
+multimodal:
+  enable: false
+  modalities: [image]     # only image is implemented; video / audio are reserved
+  image:
+    # Router pre-resize bounds (global). Qwen3-VL emits 1 image token per 32x32 pixels.
+    # min_pixels must be >= the processor's shortest_edge and max_pixels <= its longest_edge.
+    min_pixels: 65536
+    max_pixels: 16777216    # 4096x4096 -> at most 16384 image tokens per image
 
 rollout:
   partial: false

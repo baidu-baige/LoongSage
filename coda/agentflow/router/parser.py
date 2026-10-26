@@ -4,7 +4,7 @@ import base64
 import copy
 import logging
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Literal
 
@@ -26,6 +26,16 @@ from sglang.srt.parser.template_detection import (
     match_rules,
 )
 
+from coda.agentflow.multimodal import (
+    ImageHashCache,
+    MultimodalRequestError,
+    expand_pad_spans,
+    extract_image_refs,
+    find_pad_spans,
+    fold_pad_spans,
+    has_images,
+    replace_images_with_hashes,
+)
 from coda.agentflow.tokenizer_manager import DEFAULT_THINK_TAGS
 from coda.agentflow.trajectory_store import (
     Segment,
@@ -200,6 +210,18 @@ class TurnInputContext:
     # must skip writing any token/loss/triplet data and must not move active_segment_id.
     is_subagent_placeholder: bool = False
 
+    # --- Multimodal (image) fields; all empty/None for text-only turns ---
+
+    # Folded ids (one pad token per image) sent to SGLang. None means `input_ids` is sent as-is.
+    send_input_ids: list[int] | None = None
+    # PNG data URIs of every image in the sent prompt, in placeholder order.
+    image_data: list[str] = field(default_factory=list)
+    # Images first seen in this turn's delta: {local_start, local_end, image_hash, tensors}, with the
+    # range relative to `delta_prompt_ids`. Empty for subagent placeholder turns.
+    new_images: list[dict[str, Any]] = field(default_factory=list)
+    # Image URI -> sha256 memo of this request, so update_trajectory rebuilds the history compare form
+    # without decoding the images again.
+    image_hashes: ImageHashCache = field(default_factory=ImageHashCache)
 
 @dataclass
 class LLMGenerateResponse:
@@ -335,18 +357,31 @@ class TrajectoryParser:
         """
         trajectory.metadata[_MASK_TOOL_ARGS_KEY] = mask_tool_call_args
         normalized_messages = self._normalize_messages(messages)
+        # Every helper below that needs an image's sha256 goes through this memo, so the request
+        # decodes and hashes each image once instead of once per helper.
+        hashes = ImageHashCache()
         if tools:
             trajectory.metadata[_REQUEST_TOOLS_KEY] = copy.deepcopy(tools)
         turn_tools = trajectory.metadata.get(_REQUEST_TOOLS_KEY)
 
         # case 1: first turn — tokenize full messages as the trajectory's root segment.
         if not trajectory.tokens:
-            input_ids = await self._tokenize_messages(normalized_messages, tools=tools)
+            # Tokenizing only needs to know that an image is there (it becomes one placeholder token),
+            # not what the image looks like. So replace each image url (a huge base64 string) with its
+            # short `sha256:<hex>` hash, to avoid copying/pickling the base64 into the tokenizer workers.
+            # Hashed lazily here and in case 4: continuation turns tokenize only the delta messages.
+            input_ids = await self._tokenize_messages(
+                replace_images_with_hashes(normalized_messages, hashes), tools=tools)
+            input_ids, send_ids, image_data, new_images = await self._expand_multimodal(
+                prefix_ids=[], delta_ids=input_ids,
+                all_messages=normalized_messages, new_messages=normalized_messages, hashes=hashes,
+            )
             await self._log_decode(input_ids, "[build_input] %s first turn: %d tokens\n%s",
                                    trajectory.trajectory_id, len(input_ids))
             # History cache holds the compare form (tool_call arguments masked only for clients that rewrite history)
             # tokenization above always used the full-argument original.
-            trajectory.metadata[_NORMALIZED_HISTORY_KEY] = self._history_compare_form(trajectory, normalized_messages)
+            trajectory.metadata[_NORMALIZED_HISTORY_KEY] = self._history_compare_form(
+                trajectory, normalized_messages, hashes)
             return TurnInputContext(
                 delta_prompt_ids=input_ids,
                 input_ids=list(input_ids),
@@ -357,6 +392,10 @@ class TrajectoryParser:
                 new_segment_parent_id=None,
                 new_segment_origin="root",
                 new_segment_depth=0,
+                send_input_ids=send_ids,
+                image_data=image_data,
+                new_images=new_images,
+                image_hashes=hashes,
             )
 
         # Detect how many of the incoming messages match the active segment's chat prefix.
@@ -364,14 +403,14 @@ class TrajectoryParser:
         normalized_history = trajectory.metadata.get(_NORMALIZED_HISTORY_KEY)
         if not isinstance(normalized_history, list):
             normalized_history = self._history_compare_form(
-                trajectory, self._normalize_messages(self._chat_segment(trajectory, active_id)))
+                trajectory, self._normalize_messages(self._chat_segment(trajectory, active_id)), hashes)
             trajectory.metadata[_NORMALIZED_HISTORY_KEY] = normalized_history
         history_len = len(normalized_history)
         # For clients that rewrite old tool_use arguments in their echo (Claude Code),
         # _history_compare_form masks those arguments out so the rewrite does not turn
         # every tool-calling turn into a spurious compaction; other protocols compare
         # the exact normalized messages.
-        incoming_compare_form = self._history_compare_form(trajectory, normalized_messages)
+        incoming_compare_form = self._history_compare_form(trajectory, normalized_messages, hashes)
         prefix_len = history_len if (
             history_len > 0
             and len(incoming_compare_form) >= history_len
@@ -387,7 +426,7 @@ class TrajectoryParser:
         if prefix_len > 0:
             return await self._build_continuation_input(
                 trajectory, normalized_messages, prefix_len, raw_new_messages, turn_tools,
-                target_segment_id=active_id,
+                target_segment_id=active_id, hashes=hashes,
             )
 
         # Case 3: prefix miss + subagent fork — new placeholder segment. Not written to
@@ -403,7 +442,13 @@ class TrajectoryParser:
                 trajectory.trajectory_id, active_id, parent.depth + 1,
             )
             subagent_messages = self._normalize_messages(messages, strip_think=False)
-            input_ids = await self._tokenize_messages(subagent_messages, tools=tools)
+            input_ids = await self._tokenize_messages(
+                replace_images_with_hashes(subagent_messages, hashes), tools=tools)
+            # Images still go to SGLang, but the placeholder turn records no training tensors.
+            input_ids, send_ids, image_data, _ = await self._expand_multimodal(
+                prefix_ids=[], delta_ids=input_ids,
+                all_messages=subagent_messages, new_messages=subagent_messages, hashes=hashes,
+            )
             return TurnInputContext(
                 delta_prompt_ids=[],
                 input_ids=input_ids,
@@ -415,6 +460,8 @@ class TrajectoryParser:
                 new_segment_origin="subagent",
                 new_segment_depth=parent.depth + 1,
                 is_subagent_placeholder=True,
+                send_input_ids=send_ids,
+                image_data=image_data,
             )
 
         # Case 4: prefix miss + not a subagent fork — context compaction. New mainline
@@ -424,11 +471,17 @@ class TrajectoryParser:
             "treating as context compaction, opening new compact segment",
             trajectory.trajectory_id, active_id, request_kind,
         )
-        input_ids = await self._tokenize_messages(normalized_messages, tools=tools)
+        input_ids = await self._tokenize_messages(
+            replace_images_with_hashes(normalized_messages, hashes), tools=tools)
+        input_ids, send_ids, image_data, new_images = await self._expand_multimodal(
+            prefix_ids=[], delta_ids=input_ids,
+            all_messages=normalized_messages, new_messages=normalized_messages, hashes=hashes,
+        )
         await self._log_decode(input_ids, "[build_input] %s compact segment: %d tokens\n%s",
                                trajectory.trajectory_id, len(input_ids))
         # Comparison form, same as the case-1 store.
-        trajectory.metadata[_NORMALIZED_HISTORY_KEY] = self._history_compare_form(trajectory, normalized_messages)
+        trajectory.metadata[_NORMALIZED_HISTORY_KEY] = self._history_compare_form(
+            trajectory, normalized_messages, hashes)
         return TurnInputContext(
             delta_prompt_ids=input_ids,
             input_ids=input_ids,
@@ -439,7 +492,77 @@ class TrajectoryParser:
             new_segment_parent_id=active_id,
             new_segment_origin="compact",
             new_segment_depth=0,
+            send_input_ids=send_ids,
+            image_data=image_data,
+            new_images=new_images,
+            image_hashes=hashes,
         )
+
+    async def _expand_multimodal(
+        self,
+        *,
+        prefix_ids: list[int],
+        delta_ids: list[int],
+        all_messages: list[dict[str, Any]],
+        new_messages: list[dict[str, Any]],
+        hashes: ImageHashCache,
+    ) -> tuple[list[int], list[int] | None, list[str], list[dict[str, Any]]]:
+        """Turn the one-pad-per-image `delta_ids` into the two forms we need, and collect the images.
+
+        The tokenizer output has a single pad token per image (the "folded" form). We need:
+          - the expanded form (each image becomes N pads, as the model sees it) to store and train on;
+          - the folded form, to send to SGLang, which expands the pads itself.
+
+        Args:
+            prefix_ids: Tokens already in the segment this turn continues, in expanded form(empty for a fresh segment).
+            delta_ids: Newly tokenized tokens for this turn, in folded form.
+            all_messages: The whole request, so every image so far is sent to SGLang.
+            new_messages: Only the messages not yet tokenized, so only their images are recorded.
+            hashes: Per-request image hash memo; reused by `prepare` so the workers skip re-decoding.
+
+        Returns:
+            `(expanded_delta_ids, send_input_ids, image_data, new_images)`:
+              - expanded_delta_ids: `delta_ids` with each image pad expanded.
+              - send_input_ids: folded `prefix_ids` + `delta_ids`, the prompt sent to SGLang.
+              - image_data: PNG data URIs of all images in `all_messages`, in order.
+              - new_images: one record per image in `new_messages`(its span in `expanded_delta_ids`, hash and tensors).
+            Without images this is `(delta_ids, None, [], [])`.
+
+        Raises:
+            MultimodalRequestError: Images are present but unsupported or unprocessable, or the
+                placeholder count in the prompt does not match the number of images.
+        """
+        if not has_images(all_messages):
+            return delta_ids, None, [], []
+        mm_processor = getattr(self.tokenizer_manager, "multimodal_processor", None)
+        if mm_processor is None:
+            raise MultimodalRequestError("request contains images but multimodal.enable is false")
+        pad_id = mm_processor.image_pad_id
+
+        processed_images = await mm_processor.prepare(extract_image_refs(all_messages, hashes), hashes)
+        new_image_count = len(extract_image_refs(new_messages, hashes))
+        new_processed_images = processed_images[len(processed_images) - new_image_count:]
+        # Each pad becomes `num_tokens` pads (from image_grid_thw). `MultimodalProcessor.verify_expansion`
+        # checked at startup that this matches what the HF processor produces.
+        expanded, spans = expand_pad_spans(delta_ids, pad_id, [p.num_tokens for p in new_processed_images])
+
+        send_ids = [*fold_pad_spans(prefix_ids, pad_id), *delta_ids]
+        placeholders = len(find_pad_spans(send_ids, pad_id))
+        if placeholders != len(processed_images):
+            raise MultimodalRequestError(
+                f"image placeholder count mismatch: {placeholders} in prompt vs {len(processed_images)} images"
+            )
+        new_images = [
+            {
+                "local_start": start,
+                "local_end": end,
+                "image_hash": p.image_hash,
+                "pad_id": pad_id,
+                "tensors": p.tensors,
+            }
+            for (start, end), p in zip(spans, new_processed_images)
+        ]
+        return expanded, send_ids, [p.png_data_uri for p in processed_images], new_images
 
     async def _build_continuation_input(
         self,
@@ -450,13 +573,18 @@ class TrajectoryParser:
         turn_tools: list[dict[str, Any]] | None,
         *,
         target_segment_id: int,
+        hashes: ImageHashCache,
     ) -> TurnInputContext:
         """Delta-tokenize a continuation turn appended to target_segment_id (cases 1/2)."""
         if self.enable_thinking and not self.accumulate_reasoning:
             await self._prune_last_response_think(trajectory)
 
-        delta_prompt_ids = await self._tokenize_delta_messages(
-            normalized_messages[prefix_len:]
+        new_messages = normalized_messages[prefix_len:]
+        delta_prompt_ids = await self._tokenize_delta_messages(replace_images_with_hashes(new_messages, hashes))
+        segment_ids = trajectory.tokens[trajectory.segments[target_segment_id].token_start:]
+        delta_prompt_ids, send_ids, image_data, new_images = await self._expand_multimodal(
+            prefix_ids=segment_ids, delta_ids=delta_prompt_ids,
+            all_messages=normalized_messages, new_messages=new_messages, hashes=hashes,
         )
         await self._log_decode(delta_prompt_ids,
                                "[build_input] %s continuation: +%d tokens (total=%d)\n%s",
@@ -470,12 +598,16 @@ class TrajectoryParser:
             routed_experts_start_len = trajectory.rollout_routed_experts.shape[0] - 1 - segment_offset
         return TurnInputContext(
             delta_prompt_ids=delta_prompt_ids,
-            input_ids=[*trajectory.tokens[trajectory.segments[target_segment_id].token_start:], *delta_prompt_ids],
+            input_ids=[*segment_ids, *delta_prompt_ids],
             start_new_segment=False,
             raw_new_messages=raw_new_messages,
             routed_experts_start_len=routed_experts_start_len,
             tools=turn_tools,
             target_segment_id=target_segment_id,
+            send_input_ids=send_ids,
+            image_data=image_data,
+            new_images=new_images,
+            image_hashes=hashes,
         )
 
     def build_assistant_message(
@@ -628,6 +760,7 @@ class TrajectoryParser:
             return
         trajectory = active
 
+        base = len(trajectory.tokens)
         self._append_triplet(
             trajectory,
             delta_prompt_ids=turn_ctx.delta_prompt_ids,
@@ -636,6 +769,8 @@ class TrajectoryParser:
             weight_version=payload.weight_version,
             turn_ctx=turn_ctx,
         )
+        if turn_ctx.new_images and not turn_ctx.is_subagent_placeholder:
+            self._record_multimodal_inputs(trajectory, turn_ctx, base)
 
         if turn_ctx.is_subagent_placeholder:
             # Subagent requests/responses never enter the training data pipeline: no
@@ -664,7 +799,7 @@ class TrajectoryParser:
         else:
             trajectory.chat_completions[active_id].extend(segment_messages)
         trajectory.metadata[_NORMALIZED_HISTORY_KEY] = self._history_compare_form(
-            trajectory, self._normalize_messages(trajectory.chat_completions[active_id])
+            trajectory, self._normalize_messages(trajectory.chat_completions[active_id]), turn_ctx.image_hashes
         )
 
         logger.debug(
@@ -674,6 +809,27 @@ class TrajectoryParser:
             len(trajectory.metadata[_NORMALIZED_HISTORY_KEY]),
         )
         self.trajectory_store.update(trajectory.trajectory_id, trajectory)
+
+    @staticmethod
+    def _record_multimodal_inputs(trajectory: Trajectory, turn_ctx: TurnInputContext, base: int) -> None:
+        """Append one `multimodal_train_inputs` item per newly placed image.
+
+        `base` is the length of `trajectory.tokens` before this turn's delta was appended, so the delta-relative
+        ranges become absolute token positions. Tensors are shared by reference with the Router image cache.
+        """
+        items = trajectory.multimodal_train_inputs
+        if items is None:
+            items = trajectory.multimodal_train_inputs = []
+        for image in turn_ctx.new_images:
+            items.append(
+                {
+                    "token_start": base + image["local_start"],
+                    "token_end": base + image["local_end"],
+                    "image_hash": image["image_hash"],
+                    "pad_id": image["pad_id"],
+                    "tensors": image["tensors"],
+                }
+            )
 
     async def _tokenize_messages(
         self,
@@ -801,7 +957,7 @@ class TrajectoryParser:
 
 
     def _history_compare_form(
-        self, trajectory: Trajectory, messages: list[dict[str, Any]]
+        self, trajectory: Trajectory, messages: list[dict[str, Any]], hashes: ImageHashCache | None = None
     ) -> list[dict[str, Any]]:
         """Return the prefix-comparison form of already-normalized messages.
 
@@ -809,7 +965,11 @@ class TrajectoryParser:
         the arguments are masked out so the echo rewrite does not break the comparison; all other protocols compare
         the exact normalized messages. Applied identically to stored history and incoming messages so the two sides
         always match.
+
+        Image data URIs are replaced by their content hash first, so the stored history never holds base64
+        payloads and identical images compare equal.
         """
+        messages = replace_images_with_hashes(messages, hashes)
         if trajectory.metadata.get(_MASK_TOOL_ARGS_KEY):
             return self._mask_tool_call_args_for_compare(messages)
         return messages

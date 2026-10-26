@@ -28,6 +28,8 @@ from coda.backends.megatron.data import (
 from coda.backends.memory_pool import build_memory_pool
 from coda.backends.teacher_worker import TeacherWorker as BaseTeacherWorker
 from coda.utils.memory_utils import clear_memory
+from coda.utils.multimodal_tensors import move_multimodal_to_device
+from coda.utils.multimodal_config import validate_vlm_parallel_config
 from coda.backends.megatron.checkpoint import load_model_weights
 from coda.backends.megatron.mixed_precision import KeepFP32Module
 from coda.utils.checkpoint_utils import resolve_dist_ckpt_dir
@@ -78,6 +80,9 @@ class MegatronTeacherWorker(BaseTeacherWorker):
         ):
             config.opd.model.overlap_p2p_comm = True
         config.opd.model.batch_p2p_comm = not config.opd.model.overlap_p2p_comm
+
+        for teacher in config.opd.teachers:
+            validate_vlm_parallel_config(config, config.opd.model, teacher.get("hf_path"))
         return config
 
     def init(self, config: DictConfig):
@@ -410,6 +415,11 @@ class MegatronTeacherWorker(BaseTeacherWorker):
         for field in ("tokens", "loss_masks", "rollout_log_probs", "rollout_routed_experts"):
             if rollout_data.get(field):
                 rollout_data[field] = [t.to(device) for t in rollout_data[field]]
+
+        if rollout_data.get("multimodal_train_inputs"):
+            rollout_data["multimodal_train_inputs"] = move_multimodal_to_device(
+                rollout_data["multimodal_train_inputs"], device
+            )
         return rollout_data
 
 

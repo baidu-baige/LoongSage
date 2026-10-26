@@ -40,12 +40,12 @@ from coda.backends.megatron.cp_utils import (
 from coda.backends.megatron.data import DataIterator
 from coda.backends.megatron.loss import loss_function
 from coda.backends.megatron.logits_utils import compute_log_probs
+from coda.utils.multimodal_tensors import merge_multimodal_batch
 from coda.backends.megatron.kl_ctx import (
     KLCtx,
     TeacherCtx,
 )
-from megatron.core.transformer.transformer_block import get_num_layers_to_build
-from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
+from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 
 
@@ -114,10 +114,34 @@ def _collect_loss_metrics(
 # Routing Replay Helpers
 # ════════════════════════════════════════════════════════════════════════
 
-def setup_routing_replay(config: DictConfig, batch: dict, model_chunk: torch.nn.Module, model: Sequence):
+def collect_replay_routers(model_chunk: torch.nn.Module) -> dict[int, RouterReplay]:
+    """Map 0-based global decoder layer id -> its `RouterReplay` in `model_chunk`.
+
+    Walks the module tree instead of indexing `RouterReplay.global_router_replay_instances`: that list is
+    append-only and may contain orphans. For example, Qwen3-VL's text model builds a decoder in
+    `GPTModel.__init__` and then replaces it, so the first set of instances never runs and positional
+    indexing would hit the wrong routers.
+
+    MTP layers are skipped because their `layer_number` restarts at 1 and would collide with decoder layer 1.
+    They get no replay data (MTP is disabled in replay-enabled recipes).
+    """
+    routers: dict[int, RouterReplay] = {}
+    for module in model_chunk.modules():
+        if not isinstance(module, TransformerLayer) or module.is_mtp_layer:
+            continue
+        router_replay = getattr(getattr(module.mlp, "router", None), "router_replay", None)
+        if router_replay is None:
+            continue
+        layer_id = module.layer_number - 1  # layer_number is 1-based and includes the PP/VP offset
+        assert layer_id not in routers, f"Duplicate RouterReplay for decoder layer {layer_id}"
+        routers[layer_id] = router_replay
+    return routers
+
+
+def setup_routing_replay(config: DictConfig, batch: dict, model_chunk: torch.nn.Module):
     """
     Extract routing data from batch and setup Megatron RouterReplay for the current model chunk.
-    Only sets replay data for the RouterReplay instances belonging to the current model_chunk's vp_stage. 
+    Only sets replay data for the routers that live in `model_chunk` (its PP/VP stage).
     """
     model_config = get_model_config(model_chunk)
     rollout_routed_experts = [
@@ -127,37 +151,10 @@ def setup_routing_replay(config: DictConfig, batch: dict, model_chunk: torch.nn.
 
     packed_experts = prepare_routing_replay_data(rollout_routed_experts, model_config)
 
-    # Determine which vp_stage this model_chunk corresponds to.
-    # Megatron scheduler passes model[model_chunk_id] to forward_step_func,
-    # so identity comparison is reliable.
-    vp_stage = next(i for i, m in enumerate(model) if m is model_chunk)
-
-    def _is_moe_layer(layer_id):
-        if isinstance(model_config.moe_layer_freq, int):
-            return layer_id % model_config.moe_layer_freq == 0
-        elif isinstance(model_config.moe_layer_freq, list):
-            return model_config.moe_layer_freq[layer_id] != 0
-        return True
-
-    # Compute instance offset: count MoE layers in all preceding vp stages
-    instance_offset = 0
-    for vp in range(vp_stage):
-        num_layers = get_num_layers_to_build(model_config, vp_stage=vp)
-        layer_offset = get_transformer_layer_offset(model_config, vp_stage=vp)
-        for layer_id in range(layer_offset, layer_offset + num_layers):
-            if _is_moe_layer(layer_id):
-                instance_offset += 1
-
-    # Set target indices only for this vp_stage's MoE layers
-    num_layers = get_num_layers_to_build(model_config, vp_stage=vp_stage)
-    layer_offset = get_transformer_layer_offset(model_config, vp_stage=vp_stage)
-    instances = RouterReplay.global_router_replay_instances
-    idx = instance_offset
-    for layer_id in range(layer_offset, layer_offset + num_layers):
-        if not _is_moe_layer(layer_id):
-            continue
-        instances[idx].set_target_indices(packed_experts[:, layer_id])
-        idx += 1
+    routers = collect_replay_routers(model_chunk)
+    assert routers, "Routing replay is enabled but no live RouterReplay was found in the model chunk"
+    for layer_id, router_replay in routers.items():
+        router_replay.set_target_indices(packed_experts[:, layer_id])
 
     RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
 
@@ -173,24 +170,62 @@ def _uses_mrope(model_chunk: torch.nn.Module) -> bool:
     return getattr(get_model_config(model_chunk), "position_embedding_type", None) == "mrope"
 
 
+def _make_rope_index_fn(model_chunk: torch.nn.Module) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
+    """Full-sequence MRoPE positions `[3, len]` of one trajectory, via Bridge's own `get_rope_index`.
+
+    Reusing Bridge's function keeps CP>1 positions identical to what the CP=1 path computes
+    internally. Only Qwen3-VL family models reach here (Qwen2.5-VL with CP>1 is rejected by
+    `validate_config`), so the import is lazy.
+    """
+    from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.rope import get_rope_index
+
+    cfg = get_model_config(model_chunk)
+
+    def rope_index_fn(tokens: torch.Tensor, image_grid_thw: torch.Tensor) -> torch.Tensor:
+        positions, _ = get_rope_index(
+            cfg.spatial_merge_size,
+            cfg.image_token_id,
+            cfg.video_token_id,
+            cfg.vision_start_token_id,
+            input_ids=tokens.unsqueeze(0),
+            image_grid_thw=image_grid_thw,
+        )
+        return positions[:, 0]
+
+    return rope_index_fn
+
+
 def _get_position_ids(
     model_chunk: torch.nn.Module,
     tokens_list: list[torch.Tensor],
     packed_tokens: torch.Tensor,
     cp_partition_mode: str,
+    multimodal_rows: list[dict[str, torch.Tensor] | None] | None = None,
 ) -> torch.Tensor | None:
     """Rank-local 3D MRoPE position ids for this micro-batch, or None when not needed."""
     if mpu.get_context_parallel_world_size() <= 1 or not _uses_mrope(model_chunk):
         # Without CP the model derives MRoPE itself from the full input_ids.
         return None
+    grids = [row.get("image_grid_thw") if row else None for row in (multimodal_rows or [])] or None
     position_ids = prepare_packed_mrope_position_ids(
         tokens_list, cp_partition_mode=cp_partition_mode,
+        image_grid_thw_list=grids,
+        rope_index_fn=_make_rope_index_fn(model_chunk) if grids and any(g is not None for g in grids) else None,
     )
     assert position_ids.size(-1) == packed_tokens.size(0), (
         f"MRoPE position_ids ({position_ids.size(-1)}) must align token-for-token "
         f"with CP-local packed tokens ({packed_tokens.size(0)})"
     )
     return position_ids
+
+
+def _multimodal_forward_kwargs(batch: dict) -> dict[str, torch.Tensor]:
+    """Per-image tensors (`pixel_values`, `image_grid_thw`) to splat into the model forward.
+
+    Empty for text-only micro-batches. Every PP stage must pass the same kwargs, so this is
+    called unconditionally in the forward step; loss_mask is deliberately not forwarded.
+    """
+    return merge_multimodal_batch(batch.get("multimodal_train_inputs")) or {}
 
 # ════════════════════════════════════════════════════════════════════════
 # Forward-only
@@ -223,7 +258,9 @@ def forward_only(
 
     def forward_step_func(data_iter, model_chunk):
         # 1. Fetch micro-batch
-        fetch_keys = ["tokens", "total_lengths", "response_lengths", "rollout_routed_experts"]
+        fetch_keys = [
+            "tokens", "total_lengths", "response_lengths", "rollout_routed_experts", "multimodal_train_inputs",
+        ]
         fetch_keys += teacher_keys
         batch = data_iter.get_next(fetch_keys)
         tokens_list: list[torch.Tensor] = batch["tokens"]
@@ -242,11 +279,12 @@ def forward_only(
         )
         position_ids = _get_position_ids(
             model_chunk, tokens_list, packed_tokens, cp_partition_mode,
+            multimodal_rows=batch.get("multimodal_train_inputs"),
         )
 
         # Handle Routing Replay (Forward Only)
         if config.trainer.use_rollout_routing_replay:
-            setup_routing_replay(config, batch, model_chunk, model)
+            setup_routing_replay(config, batch, model_chunk)
 
         # 3. Model forward
         output = model_chunk(
@@ -254,6 +292,7 @@ def forward_only(
             position_ids=position_ids,
             attention_mask=None,
             packed_seq_params=packed_seq_params,
+            **_multimodal_forward_kwargs(batch),
         )
 
         if config.trainer.use_rollout_routing_replay:
@@ -377,6 +416,7 @@ def train_minibatch(
             "rollout_log_probs",
             "rollout_routed_experts",
             "ref_log_probs",
+            "multimodal_train_inputs",
         ]
         keys += teacher_keys
 
@@ -391,11 +431,12 @@ def train_minibatch(
         )
         position_ids = _get_position_ids(
             model_chunk, tokens_list, packed_tokens, cp_partition_mode,
+            multimodal_rows=batch.get("multimodal_train_inputs"),
         )
 
         # Handle Routing Replay (Train)
         if config.trainer.use_rollout_routing_replay:
-            setup_routing_replay(config, batch, model_chunk, model)
+            setup_routing_replay(config, batch, model_chunk)
 
         # 3. Model forward
         output = model_chunk(
@@ -403,6 +444,7 @@ def train_minibatch(
             position_ids=position_ids,
             attention_mask=None,
             packed_seq_params=packed_seq_params,
+            **_multimodal_forward_kwargs(batch),
         )
         if config.trainer.use_rollout_routing_replay:
             RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_BACKWARD)
@@ -503,7 +545,7 @@ def forward_teacher(
     hook_handle = _register_hidden_states_hook(model, hidden_cache) if need_hidden else None
 
     def forward_step_func(data_iter, model_chunk):
-        batch = data_iter.get_next(["tokens", "total_lengths", "response_lengths"])
+        batch = data_iter.get_next(["tokens", "total_lengths", "response_lengths", "multimodal_train_inputs"])
         tokens_list = batch["tokens"]
         cp_partition_mode = config.megatron.model.cp_partition_mode
         packed_tokens, packed_seq_params = prepare_packed_seq_params(
@@ -511,12 +553,14 @@ def forward_teacher(
         )
         position_ids = _get_position_ids(
             model_chunk, tokens_list, packed_tokens, cp_partition_mode,
+            multimodal_rows=batch.get("multimodal_train_inputs"),
         )
         output = model_chunk(
             input_ids=packed_tokens.unsqueeze(0),
             position_ids=position_ids,
             attention_mask=None,
             packed_seq_params=packed_seq_params,
+            **_multimodal_forward_kwargs(batch),
         )
 
         target_list = [
