@@ -22,6 +22,7 @@ from megatron.core import parallel_state as mpu
 from omegaconf import DictConfig
 
 from megatron.core.utils import get_model_config
+from coda.utils.multimodal_tensors import move_image_table_to_device
 from coda.utils.seqlen_balancing import get_seqlen_balanced_partitions
 from coda.utils.types import RolloutBatch
 
@@ -43,18 +44,47 @@ def select_rollout_batch(shard: RolloutBatch, indices: list[int]) -> RolloutBatc
     return subset
 
 
+_OPTIONAL_ROW_KEYS = ("multimodal_train_inputs",)
+# Shard-level dict keys that are not row-aligned: `image_table` maps image hash -> tensors and is shared by
+# the rows that reference it through `multimodal_train_inputs`. Absent from text-only shards.
+_SHARED_KEYS = ("image_table",)
+
+
+def _union_shared(batches: Sequence[RolloutBatch], key: str) -> dict | None:
+    """Union of the shared dicts `key` of `batches` (first entry wins); `None` if no batch has it."""
+    tables = [b[key] for b in batches if b.get(key)]
+    if not tables:
+        return None
+    union: dict = {}
+    for table in tables:
+        for h, value in table.items():
+            union.setdefault(h, value)
+    return union
+
+
 def concat_rollout_batch(shards: list[RolloutBatch]) -> RolloutBatch:
     """Concatenate multiple shards by appending list fields."""
     if len(shards) == 1:
         return shards[0]
+    # Row-aligned keys that `put_dp_shards_to_ray` omits from shards without data for them (text-only shards).
+    # Fill them with per-row `None` so the key is neither dropped nor missing for some shards.
+    for key in _OPTIONAL_ROW_KEYS:
+        if any(key in s for s in shards):
+            shards = [s if key in s else {**s, key: [None] * len(s.get("tokens", []))} for s in shards]
     merged = {}
     num_trajectories_first = len(shards[0].get("tokens", []))
     for key in shards[0]:
+        if key in _SHARED_KEYS:
+            continue
         values = [s[key] for s in shards]
         if isinstance(values[0], list) and len(values[0]) == num_trajectories_first:
             merged[key] = sum(values, [])
         else:
             merged[key] = values[0]
+    for key in _SHARED_KEYS:
+        union = _union_shared(shards, key)
+        if union is not None:
+            merged[key] = union
     return merged
 
 
@@ -81,16 +111,21 @@ def group_rollout_batch(rollout_data: RolloutBatch, key: str, allowed_keys=None)
             collection are silently skipped.
 
     Returns:
-        ``dict[key_value, RolloutBatch]`` — one sub-batch per distinct key value.
+        ``dict[key_value, RolloutBatch]`` — one sub-batch per distinct key value. Shared keys
+        (``image_table``) are not row-aligned: every sub-batch references the full table.
     """
     grouped: dict = {}
+    row_fields = [f for f in rollout_data if f not in _SHARED_KEYS]
     for i, k in enumerate(rollout_data[key]):
         if allowed_keys is not None and k not in allowed_keys:
             continue
         if k not in grouped:
-            grouped[k] = {f: [] for f in rollout_data}
-        for f, values in rollout_data.items():
-            grouped[k][f].append(values[i])
+            grouped[k] = {f: [] for f in row_fields}
+            for f in _SHARED_KEYS:
+                if f in rollout_data:
+                    grouped[k][f] = rollout_data[f]
+        for f in row_fields:
+            grouped[k][f].append(rollout_data[f][i])
     return grouped
 
 
@@ -126,6 +161,7 @@ def merge_rollout_batch(batches: list[RolloutBatch], key: str) -> RolloutBatch:
     for b in batches:
         field_keys.update(b.keys())
     field_keys.discard(key)
+    field_keys.difference_update(_SHARED_KEYS)
 
     # Place each batch's values at its indexed positions
     merged: RolloutBatch = {f: [None] * n for f in field_keys}
@@ -137,6 +173,10 @@ def merge_rollout_batch(batches: list[RolloutBatch], key: str) -> RolloutBatch:
                 continue
             for i, pos in enumerate(positions):
                 merged[f][pos] = values[i]
+    for f in _SHARED_KEYS:
+        union = _union_shared(batches, f)
+        if union is not None:
+            merged[f] = union
     return merged
 
 
@@ -192,6 +232,16 @@ def get_rollout_data(rollout_data_ref) -> RolloutBatch:
     ):
         if rollout_data.get(field):
             rollout_data[field] = [t.to(device) for t in rollout_data[field]]
+
+    if rollout_data.get("image_table"):
+        rollout_data["image_table"] = move_image_table_to_device(rollout_data["image_table"], device)
+        table_bytes = sum(v.numel() * v.element_size() for t in rollout_data["image_table"].values() for v in t.values())
+        if torch.device(device).type == "cuda":
+            free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+            logger.info(
+                "Image table on GPU: %d images, %.2f GB; free GPU memory %.2f / %.2f GB",
+                len(rollout_data["image_table"]), table_bytes / 1e9, free_bytes / 1e9, total_bytes / 1e9,
+            )
     return rollout_data
 
 # ────────────────────────────────────────────────────────────────────────
@@ -231,6 +281,11 @@ class DataIterator:
         self.offset: int = 0
 
     # ── public API ──────────────────────────────────────────────────────
+
+    @property
+    def image_table(self) -> dict | None:
+        """Shard-level `{image_hash: tensors}` table that `multimodal_train_inputs` rows refer to (or `None`)."""
+        return self.rollout_data.get("image_table")
 
     def get_next(self, keys: Sequence[str]) -> dict[str, list[object] | None]:
         """Return the next micro-batch filtered by *keys*.

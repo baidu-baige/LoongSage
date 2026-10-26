@@ -149,6 +149,24 @@ class TestRolloutDataSourceInit(unittest.TestCase):
         self.assertEqual(ds.prompt_index, 0)
         self.assertEqual(ds.trajectory_index, 0)
 
+    def test_multimodal_keys_passed_to_dataset_when_enabled(self):
+        img = "data:image/png;base64,AAAA"
+        path = self._jsonl([{"text": "<image>q", "images": [img]}])
+        cfg = _make_config(prompt_data_path=path)
+        cfg.dataset.multimodal_keys = {"image": "images"}
+        cfg.multimodal = SimpleNamespace(enable=True)
+        ds = RolloutDataSource(cfg, cfg)
+        content = ds.dataset[0].prompt[0]["content"]
+        self.assertEqual(content[0], {"type": "image_url", "image_url": {"url": img}})
+
+    def test_multimodal_keys_ignored_when_disabled(self):
+        path = self._jsonl([{"text": "<image>q", "images": ["data:image/png;base64,AAAA"]}])
+        cfg = _make_config(prompt_data_path=path)
+        cfg.dataset.multimodal_keys = {"image": "images"}
+        cfg.multimodal = SimpleNamespace(enable=False)
+        ds = RolloutDataSource(cfg, cfg)
+        self.assertEqual(ds.dataset[0].prompt, [{"role": "user", "content": "<image>q"}])
+
     def test_dataset_loaded(self):
         path = self._jsonl([{"text": "hello"}, {"text": "world"}])
         cfg = _make_config(prompt_data_path=path)

@@ -363,6 +363,13 @@ list of TrajectoryGroup
 
 In full training mode, Ray ObjectRefs are passed to the training Workers. In rollout-only mode, DP shards are written to disk and an empty list is returned. In train-only mode, on-disk batches are restored as Ray references.
 
+When the image modality is on, `put_dp_shards_to_ray` ([data_processor.py](../../coda/data_factory/data_processor.py)) adds two keys to a DP shard that contains images:
+
+- `multimodal_train_inputs`: row-aligned with `tokens`. Each row is the list of image hashes whose pad runs lie in that Segment, in pad order, or `None`.
+- `image_table`: `{image_hash: {pixel_values, image_grid_thw}}`, built once per shard. An image that appears in many rows is stored once. The shard-level table is not row-aligned, so mini-batch and micro-batch splitting leaves it whole and every sub-batch refers to the full table.
+
+Both keys are omitted from text-only shards, so their layout is unchanged. The same hash with a different `pixel_values` shape or `image_grid_thw` raises an error, as does a Segment whose pad tokens do not match its images. The training Worker moves the table to the GPU once per step when it loads the shard (`get_rollout_data`); the Teacher Worker does the same for OPD.
+
 When OPD is enabled, `TeacherManager.compute_teacher()` runs after this step. It does not rebuild the batch; it appends the ObjectRefs of the Teacher forward results to each DP shard's `teacher_worker_ref` field.
 
 ### Weight-Update Flow

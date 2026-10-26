@@ -43,6 +43,7 @@ from megatron.bridge.models import GPTModelProvider
 
 from coda.backends.train_worker import TrainWorker
 from coda.utils.memory_utils import print_memory, clear_memory
+from coda.utils.multimodal_config import validate_vlm_parallel_config
 from coda.utils.checkpoint_utils import (
     DIST_CKPT_DIR_NAME, find_latest_ckpt_path, update_latest, get_ckpt_dir,
 )
@@ -110,6 +111,8 @@ class MegatronTrainWorker(TrainWorker):
                 f"When use_dynamic_batch_size is disabled, mini_batch_size ({config.trainer.mini_batch_size}) "
                 f"must be divisible by micro_batch_size ({config.trainer.micro_batch_size})."
             )
+
+        validate_vlm_parallel_config(config, config.megatron.model, config.hf_model_path)
 
         return config
 

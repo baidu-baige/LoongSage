@@ -110,6 +110,7 @@ class AgentFlow:
         self._generate_sem = asyncio.Semaphore(self._max_connections)
         self._control_sem = asyncio.Semaphore(self._max_connections)
         self._control_client: httpx.AsyncClient | None = None
+        self._generate_client: httpx.AsyncClient | None = None
 
         # Per-data-source agent classes and reward functions (keyed by ds index)
         self.ds_agent_classes: dict[int, type[BaseAgent] | None] = {}
@@ -127,7 +128,9 @@ class AgentFlow:
     def _init_tokenizer(self) -> None:
         """Initialize tokenizer from config."""
         tokenizer_cfg = self.config.agentflow.tokenizer
-        self.tokenizer_manager = create_tokenizer_manager(tokenizer_cfg, self.config.hf_model_path)
+        self.tokenizer_manager = create_tokenizer_manager(
+            tokenizer_cfg, self.config.hf_model_path, getattr(self.config, "multimodal", None)
+        )
         self._resources.callback(self.tokenizer_manager.shutdown)
         logger.info(
             "[init] tokenizer=%s manager=%s workers=%d",
@@ -180,7 +183,20 @@ class AgentFlow:
             limits=httpx.Limits(max_connections=self._max_connections),
         )
 
+        # Shared client for generate calls: creating one per trajectory loads the CA bundle synchronously and blocks
+        # the event loop. Connections are not reused (generate calls last seconds to minutes): a reused idle
+        # connection can be closed by uvicorn's 5s keep-alive while this loop is stalled, which surfaces as
+        # httpx.ReadError.
+        self._generate_client = httpx.AsyncClient(
+            timeout=float(router_config.proxy_timeout_seconds),
+            limits=httpx.Limits(
+                max_connections=self._max_connections,
+                max_keepalive_connections=0,
+            ),
+        )
+
         async def _shutdown_router() -> None:
+            await self._generate_client.aclose()
             await self._control_client.aclose()
             await self.router.shutdown()
             self.router = None
@@ -559,18 +575,14 @@ class AgentFlow:
 
         async with self._generate_sem:
             messages = copy.deepcopy(_active_chat(traj))  # already normalized to list[dict] by _build_messages
-            generate_client = httpx.AsyncClient(timeout=float(self.config.agentflow.router.proxy_timeout_seconds))
-            try:
-                response = await generate_client.post(
-                    f"{self.router_url}/{traj.trajectory_id}/{attempt_id}/v1/chat/completions",
-                    json={
-                        "model": "default",
-                        "messages": messages,
-                        "max_tokens": int(ds_cfg.max_response_len_per_trajectory),
-                    },
-                )
-            finally:
-                await generate_client.aclose()
+            response = await self._generate_client.post(
+                f"{self.router_url}/{traj.trajectory_id}/{attempt_id}/v1/chat/completions",
+                json={
+                    "model": "default",
+                    "messages": messages,
+                    "max_tokens": int(ds_cfg.max_response_len_per_trajectory),
+                },
+            )
         is_context_length_exceeded = False
         if response.status_code == httpx.codes.BAD_REQUEST:
             try:
@@ -589,7 +601,11 @@ class AgentFlow:
             logger.warning("[%s] Trajectory not found in store after single-turn", traj.trajectory_id)
         if reward_fn:
             reward_messages = copy.deepcopy(_active_chat(traj_out) if traj_out else messages)
-            return reward_fn(
+            # Off the event loop: a reward_fn can be CPU-heavy (e.g. sympy), and running it
+            # inline would stall every other concurrent rollout. Multi-turn agents already
+            # wrap their reward_fn in asyncio.to_thread for the same reason.
+            return await asyncio.to_thread(
+                reward_fn,
                 reward_messages, traj.label,
                 traj_out.model_dump() if traj_out else {},
                 max_tokens=int(ds_cfg.max_response_len_per_trajectory),
@@ -648,6 +664,25 @@ class AgentFlow:
         except Exception as exc:
             logger.warning("[%s] Failed to dump trajectory: %s", traj.trajectory_id, exc)
 
+    @staticmethod
+    def _copy_for_queue(trajectory: Trajectory) -> Trajectory:
+        """Deep-copy a terminal trajectory, sharing its multimodal tensors by reference.
+
+        The store drops the original right after the queue write, so the (large) per-image tensors
+        need not be duplicated. Runs synchronously on the event loop, so nothing observes the
+        temporarily detached field.
+        """
+        inputs = trajectory.multimodal_train_inputs
+        if not inputs:
+            return trajectory.model_copy(deep=True)
+        trajectory.multimodal_train_inputs = None
+        try:
+            copy = trajectory.model_copy(deep=True)
+        finally:
+            trajectory.multimodal_train_inputs = inputs
+        copy.multimodal_train_inputs = inputs
+        return copy
+
     async def _emit_terminal_trajectory(self, trajectory: Trajectory) -> None:
         """Push a terminal trajectory to the queue and remove it from the store.
         Eval trajectories share this queue; RolloutSampler splits them out by is_eval.
@@ -658,7 +693,7 @@ class AgentFlow:
         trajectory.rollout_routed_experts = None
         trajectory_id = trajectory.trajectory_id
         try:
-            snapshot = trajectory.model_copy(deep=True)
+            snapshot = self._copy_for_queue(trajectory)
             if routed_experts is not None:
                 snapshot.rollout_routed_experts = routed_experts.clone()
         finally:
