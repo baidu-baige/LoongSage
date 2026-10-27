@@ -122,6 +122,25 @@ def _release_staging_tensors(async_request):
     )
 
 
+def _load_module_state_dict(module, state_dict):
+    """``load_state_dict`` for LoRA models: ckpt keys ``x.weight`` -> ``x.to_wrap.weight``."""
+    from megatron.bridge.peft.adapter_wrapper import AdapterWrapper
+
+    wrapper_prefixes = [
+        f"{name}." for name, sub in module.named_modules() if isinstance(sub, AdapterWrapper)
+    ]
+    if wrapper_prefixes:
+        renamed = {}
+        for key, value in state_dict.items():
+            for prefix in wrapper_prefixes:
+                rest = key[len(prefix):]
+                if key.startswith(prefix) and not rest.startswith(("adapter.", "to_wrap.")):
+                    key = f"{prefix}to_wrap.{rest}"
+                    break
+            renamed[key] = value
+        state_dict = renamed
+    module.load_state_dict(state_dict)
+
 @torch.no_grad()
 def load_checkpoint(model, optimizer, scheduler, ckpt_dir):
     """Load checkpoint and restore model, optimizer, scheduler and RNG states."""
@@ -156,7 +175,7 @@ def load_checkpoint(model, optimizer, scheduler, ckpt_dir):
     # Restore model, optimizer, scheduler and RNG states
     for i, m in enumerate(model):
         model_key = f"model{i}" if len(model) > 1 else "model"
-        m.load_state_dict(loaded_state_dict[model_key])
+        _load_module_state_dict(m, loaded_state_dict[model_key])
     optimizer.load_state_dict(loaded_state_dict["optimizer"])
     scheduler.load_state_dict(loaded_state_dict["scheduler"])
     if load_rng:
@@ -197,7 +216,7 @@ def load_model_weights(model, ckpt_dir):
 
     for i, m in enumerate(model):
         model_key = f"model{i}" if len(model) > 1 else "model"
-        m.load_state_dict(loaded_state_dict[model_key])
+        _load_module_state_dict(m, loaded_state_dict[model_key])
 
     logger.info(f"Successfully loaded model weights from {ckpt_dir}")
 

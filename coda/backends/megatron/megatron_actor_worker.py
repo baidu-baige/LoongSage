@@ -7,16 +7,19 @@ sync to the rollout engines.
 """
 
 import logging
+from functools import partial
 from typing import override
 
 import torch
 
 from megatron.core import parallel_state
+from megatron.bridge.peft.lora import LoRA
 from coda.transfer_mesh import ChannelMeta, create_sender_channel
 
 from coda.backends.megatron.megatron_train_worker import MegatronTrainWorker
 from coda.backends.megatron.checkpoint import async_calls, load_model_weights
 from coda.utils.tensor_backuper import TensorBackuper
+from coda.utils.lora_utils import hf_lora_target_modules, lora_delta_sync_enabled
 from coda.utils.memory_utils import print_memory, clear_memory
 from coda.utils.checkpoint_utils import resolve_dist_ckpt_dir, get_hf_dir
 from coda.utils.types import RolloutBatch
@@ -76,16 +79,42 @@ class MegatronActorWorker(MegatronTrainWorker):
 
         assert config.algorithm.clip_ratio_c > 1.0, "clip_ratio_c must be greater than 1.0"
 
+        lora = config.megatron.get("lora")
+        lora_enabled = lora is not None and lora.get("enable", False)
+
         if config.algorithm.ref_kl.enable:
             if config.algorithm.ref_kl.kl_type not in {"k1", "k2", "k3"}:
                 raise ValueError(
                     "algorithm.ref_kl.kl_type must be one of: k1, k2, k3."
                 )
-            if not (config.ref_dist_ckpt_path or config.ref_hf_model_path):
+            if lora_enabled:
+                if config.ref_dist_ckpt_path or config.ref_hf_model_path not in (
+                    None, config.get("hf_model_path")
+                ):
+                    raise ValueError(
+                        "With megatron.lora.enable=True the ref model is the frozen base "
+                        "(actor with adapters disabled); leave ref_dist_ckpt_path and "
+                        "ref_hf_model_path unset."
+                    )
+            elif not (config.ref_dist_ckpt_path or config.ref_hf_model_path):
                 raise ValueError(
                     "algorithm.ref_kl.enable=True requires either "
                     "ref_dist_ckpt_path or ref_hf_model_path to be set."
                 )
+
+        if lora_enabled:
+            if lora.get("rank", 0) <= 0:
+                raise ValueError(
+                    "megatron.lora.enable=True requires megatron.lora.rank > 0."
+                )
+            if not lora.get("target_modules"):
+                raise ValueError(
+                    "megatron.lora.enable=True requires a non-empty "
+                    "megatron.lora.target_modules (TE/mcore names, e.g. "
+                    "[linear_qkv, linear_proj, linear_fc1, linear_fc2])."
+                )
+            if lora_delta_sync_enabled(config):
+                hf_lora_target_modules(lora.target_modules)
 
         return config
 
@@ -120,21 +149,45 @@ class MegatronActorWorker(MegatronTrainWorker):
         self.kl_policies = self._init_kl_policies()
 
         # forward-only also uses the backuper as its param offloader (no DDP buffers).
+        # With LoRA the frozen base is shared by actor/ref, so snapshots hold only the
+        # adapter (except forward-only, where the backuper must offload every param).
         if self._forward_only or config.algorithm.ref_kl.enable:
             self._weights_backuper = TensorBackuper(
                 source_getter=lambda: (
                     (f"chunk{i}.{name}", param)
                     for i, m in enumerate(self.model)
                     for name, param in m.named_parameters()
+                    if self.lora is None or self._forward_only or param.requires_grad
                 ),
             )
 
         self._active_model_tag = "actor"
+        # LoRA: ref is the actor with adapters disabled until a moving-ref snapshot exists.
+        self._ref_is_base = False
 
         # Step 10: set up the frozen reference model for ref-KL (weight hot-swap).
         self._setup_ref_model()
 
         logger.info(f"[Rank {self.rank}] MegatronActorWorker initialization complete")
+
+    @override
+    def _configure_provider(self, provider) -> None:
+        """Wrap the target linears with LoRA adapters when ``megatron.lora.enable``.
+
+        Appended (not provide_distributed_model(pre_wrap_hook=...), which would drop
+        the HF weight-loading hook) so the base is loaded, then frozen before DDP wrap.
+        """
+        lora_cfg = self.config.megatron.get("lora")
+        if lora_cfg is None or not lora_cfg.get("enable", False):
+            return
+        self.lora = LoRA(
+            target_modules=list(lora_cfg.target_modules),
+            dim=lora_cfg.rank,
+            alpha=lora_cfg.alpha,
+            dropout=float(lora_cfg.get("dropout", 0.0)),
+            share_expert_adapters=bool(lora_cfg.get("share_expert_adapters", True)),
+        )
+        provider.register_pre_wrap_hook(partial(self.lora, training=True))
 
     @override
     @torch.no_grad()
@@ -212,6 +265,11 @@ class MegatronActorWorker(MegatronTrainWorker):
         """
         ref_kl = self.config.algorithm.ref_kl
         if not ref_kl.enable:
+            return
+
+        if self.lora is not None:
+            self._ref_is_base = True
+            logger.info(f"[Rank {self.rank}] Reference model for ref-KL: frozen base (adapters disabled)")
             return
 
         self._weights_backuper.backup("actor")  # snapshot current student weights
@@ -323,6 +381,7 @@ class MegatronActorWorker(MegatronTrainWorker):
 
             if ref_kl.update_interval > 0 and step % ref_kl.update_interval == 0:
                 self._weights_backuper.backup("ref")
+                self._ref_is_base = False
                 logger.info(f"[Rank {self.rank}] Ref-model update at step {step}")
 
 
@@ -407,22 +466,35 @@ class MegatronActorWorker(MegatronTrainWorker):
 
     @torch.no_grad()
     def update_weights(self, channel_meta: ChannelMeta):
-        """Export the current weights as HF tensors and send them to rollout over ``channel_meta``."""
+        """Export the current weights as HF tensors and send them to rollout over ``channel_meta``.
+
+        LoRA merge=false (``lora_name`` set): ships the unmerged base, or only the
+        adapter when ``lora_adapter_sync``. Otherwise ships merged full weights.
+        """
         if self.params_offloaded:
             self._onload_model(move_params=True, move_grads=False)
             self.params_offloaded = False
             clear_memory()
         print_memory("before send huggingface weights")
         send_channel = create_sender_channel(channel_meta)
-        hf_weights = self.bridge.export_hf_weights(self.model)
-        if self._quant.quantized:  # the bridge re-quantizes to the checkpoint format; verify it
-            hf_weights = self._quant.check_export(hf_weights)
+        adapter_only = channel_meta.lora_adapter_sync
+        merge_adapter = channel_meta.lora_name is None
+        if adapter_only:
+            hf_weights = self.bridge.export_adapter_weights(self.model, cpu=False)
+        else:
+            hf_weights = self.bridge.export_hf_weights(self.model, merge_adapter_weights=merge_adapter)
+            if self._quant.quantized:  # the bridge re-quantizes to the checkpoint format; verify it
+                hf_weights = self._quant.check_export(hf_weights)
         names = set()
         for name, tensor in hf_weights:
+            if not merge_adapter and not adapter_only:
+                # SGLang load_weights silently skips PEFT names like q_proj.base_layer.weight.
+                name = name.replace(".base_layer.", ".")
             names.add(name)
             send_channel.send((name, tensor))
         send_channel.send(None, flush=True)
-        self._hf_export_names = names  # reused by _save_hf_like_source
+        if merge_adapter and not adapter_only:  # same names as the merged HF export
+            self._hf_export_names = names  # reused by _save_hf_like_source
         if self.offloaded:
             self._offload_model(move_params=True, move_grads=False)
             self.params_offloaded = True
@@ -498,9 +570,13 @@ class MegatronActorWorker(MegatronTrainWorker):
         pass (no PG policy), then swaps back to "actor". Eval mode is set by the
         caller.
         """
-        self.switch("ref")
-        collected_all = self._forward_only_log_probs(rollout_data, step, pg_policy=None)
-        self.switch("actor")
+        if self._ref_is_base:
+            with self.lora.disable_adapter(self.model):
+                collected_all = self._forward_only_log_probs(rollout_data, step, pg_policy=None)
+        else:
+            self.switch("ref")
+            collected_all = self._forward_only_log_probs(rollout_data, step, pg_policy=None)
+            self.switch("actor")
         return {"ref_log_probs": collected_all.get("log_probs")}
 
 
