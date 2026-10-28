@@ -46,7 +46,7 @@ UNPUBLISHED_PAGES = [
     "transfer-mesh.md",
 ]
 
-exclude_patterns = ["build", "Thumbs.db", ".DS_Store", *UNPUBLISHED_PAGES]
+exclude_patterns = ["build", "Thumbs.db", ".DS_Store", *UNPUBLISHED_PAGES, "design/**"]  # design notes: not published yet
 
 intersphinx_mapping: dict[str, tuple[str, None]] = {}
 

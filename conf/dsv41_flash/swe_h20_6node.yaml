@@ -1,0 +1,160 @@
+# @package _global_
+#
+# mini-swe / R2E-Gym on DeepSeek-V4.1-Flash, 6-node H20 (6 x 8 = 48 GPUs), QAT against an FP8/FP4 rollout.
+#
+# Train directly from the ORIGINAL release checkpoint (no BF16 conversion): the Megatron-Bridge
+# V4.1 bridge dequantizes FP8/MXFP4 to bf16 on import (text-only, no MTP). SGLang boots from the
+# same directory and serves the checkpoint's own format (dense FP8 32x32 W8A8, MXFP4 experts
+# W4A16); weight sync re-encodes into that format, trainer.qat snaps the quantized weights onto
+# the grid after every optimizer step and fake-quantizes the W8A8 linears' inputs. save_hf writes
+# a drop-in copy of the source checkpoint (same shards / dtypes / config).
+#
+#   hf download deepseek-ai/DeepSeek-V4.1-Flash-1017 --local-dir /root/DeepSeek-V4.1-Flash-1017
+#   hf download R2E-Gym/R2E-Gym-Subset --repo-type=dataset --local-dir /root/R2E-Gym-Subset
+#
+# Prepare the kubeconfig required by the K8s sandbox used for SWE rollouts. Place it at
+# k8s/kubeconfig.yaml (the path configured by this preset), or override it on the command line.
+#
+#   # Run the same command on every machine
+#   bash examples/start_ray_cluster.sh <master-ip>
+#
+#   # Once the cluster is ready, run this on the head node only
+#   bash examples/start.sh dsv41_flash/swe_h20_6node \
+#     checkpoint_path=/root/ckpt/dsv41_swe_qat \
+#     hf_model_path=/root/DeepSeek-V4.1-Flash-1017 \
+#     data_source.dataset.prompt_data_path=/root/R2E-Gym-Subset \
+#     data_source.sandbox.kubeconfig=/path/to/kubeconfig.yaml
+#
+# checkpoint_path and hf_model_path must live on storage that every node can reach
+# through the same path.
+defaults:
+  - /default
+  - _self_
+
+checkpoint_path: ???
+hf_model_path: ???
+colocate: true
+total_steps: 300
+
+data_source:
+  dataset:
+    prompt_data_path: ???
+    input_key: prompt
+    label_key: label
+    metadata_key: metadata
+    data_pre_processor: r2e_gym
+  agent:
+    name: mini-swe
+    step_limit: 100
+    request_timeout: 1200
+    max_consecutive_format_errors: 10
+    # R2E-Gym images keep the testbed Python in a venv/conda env that is not on the
+    # default PATH; prepend it to every agent command.
+    shell_prefix: "source /root/.bashrc >/dev/null 2>&1 || true; export PATH=/testbed/.venv/bin:/opt/miniconda3/envs/testbed/bin:/root/.local/bin:$PATH; "
+  reward:
+    name: r2e_gym
+  num_trajectories_per_prompt: 8
+  num_prompts_per_step: 16
+  max_response_len_per_trajectory: 24576
+  sandbox:
+    type: k8s
+    command_exec_timeout_seconds: 600
+    sandbox_creation_timeout_seconds: 600
+    working_dir: /rl-sandbox
+    kubeconfig: k8s/kubeconfig.yaml
+    pod_manifest_path: k8s/pod_manifest.yaml
+
+rollout:
+  env_vars:
+    SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE: "1"
+    SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT: "per_rank"
+    SGLANG_DSV4_FP4_EXPERTS: "1"        # MXFP4 routed experts (flashinfer_mxfp4 CUTLASS, W4A16 on SM90)
+    SGLANG_SHARED_EXPERT_TP1: "1"       # shared experts unsharded: 2304/16 is not 32-block aligned
+    SGLANG_OPT_FP8_WO_A_GEMM: "0"       # no-op for 32x32 blocks (wo_a -> bf16); guard checked by the QAT adapter
+    SGLANG_OPT_FUSE_WQA_WKV: "0"
+    NCCL_CUMEM_ENABLE: "1"
+  retry_limit: 3
+  num_gpus_per_node: 8
+  sglang_args:
+    # Serve the text-only model like the trainer: with vision enabled SGLang routes with the VL
+    # correction bias (gate.bias_vl) and returns all-zero routed experts (breaks R3).
+    json_model_override_args: '{"vision_n_layers": 0}'
+    moe_runner_backend: flashinfer_mxfp4        # the backend with the in-place MXFP4 hot update
+    flashinfer_mxfp4_moe_precision: bf16        # W4A16 (QAT does not model expert act quant)
+    disable_shared_experts_fusion: true         # keep shared experts as dense FP8 linears
+    mem_fraction_static: 0.75
+    # Hard cap on the KV pool (final KV tokens = min(mem_fraction-profiled, this)).
+    # Also sizes the R3 routing-replay host capture buffer at ~960 B/token
+    max_total_tokens: 10000000 #10M tokens
+    disable_cuda_graph: false
+    ep_size: 8
+    attention_backend: dsv4
+    max_running_requests: 128
+  sglang_replicas:
+    regular:
+      num_nodes: 6
+      num_gpus_per_replica: 8
+  sampler:
+    timeout: 10800
+  use_fault_tolerance: true
+
+agentflow:
+  dump_trajectory_path: "log/trajectories"
+  router:
+    proxy_timeout_seconds: 1800
+  tokenizer:
+    generation_prompt_kwargs:
+      thinking: true
+
+trainer:
+  num_gpus_per_node: 8
+  num_nodes: 6
+  mini_batch_size: 128
+  max_tokens_per_gpu: 20480
+  micro_batch_size: 1
+  use_dynamic_batch_size: false
+  use_rollout_routing_replay: true   # R3 (on by default for V4.1)
+  use_fp32_lm_head: true
+  save_freq: 5                       # save_hf=true writes a full checkpoint copy (~same size as hf_model_path)
+  save_hf: true
+  async_save: false
+  nccl_timeout_minutes: 60
+  gloo_timeout_minutes: 60
+  deterministic_mode: true
+  qat: true
+  env_vars:
+    PYTORCH_ALLOC_CONF: "expandable_segments:True,pinned_max_cached_size_mb:32"
+
+megatron:
+  model:
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 6
+    # 40 layers do not divide evenly over PP=6 -> uneven split 6/7*4/6
+    num_layers_in_first_pipeline_stage: 6
+    num_layers_in_last_pipeline_stage: 6
+    context_parallel_size: 2
+    sequence_packing_scheduler: "default_dynamic_cp"
+    attention_softmax_in_fp32: true
+    cp_partition_mode: "contiguous"     # required for V4.1 context parallelism
+    expert_model_parallel_size: 8
+    expert_tensor_parallel_size: 1
+    moe_shared_expert_overlap: false    # keep off (V4 shared-expert-overlap NaN RCA)
+    recompute_granularity: full         # selective|full
+    recompute_method: uniform
+    recompute_num_layers: 1
+  optimizer:
+    lr: 1.0e-6
+    chunked_optimizer_state_offload: true
+    optimizer_state_offload_fraction: 1.0
+
+algorithm:
+  advantage_estimator: grpo
+  advantage_norm_mode: group_zscore
+  policy_loss: grpo
+  loss_agg_mode: token-mean
+  is_correction:
+    enable: true
+    action: mask
+    level: token
+    lower_bound: 0.5
+    upper_bound: 2

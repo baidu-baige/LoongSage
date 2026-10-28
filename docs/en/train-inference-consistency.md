@@ -4,7 +4,7 @@ Train-inference inconsistency means that the same trajectory yields different to
 
 The framework addresses this at three levels:
 
-1. **Source alignment**: TITO whole-chain token passing, R3 routing replay, and FP32 LM head directly narrow the gap between `π_train` and `π_rollout`;
+1. **Source alignment**: TITO whole-chain token passing, R3 routing replay, FP32 LM head, and QAT when the inference side serves a quantized checkpoint directly narrow the gap between `π_train` and `π_rollout`;
 2. **Algorithm-level correction**: IS correction / M2PO / OPSM weight or mask out the residual deviation;
 3. **Continuous monitoring**: metrics such as `train/is_approx_k3_kl` quantify the deviation between the two engines.
 
@@ -38,7 +38,41 @@ Notes:
 
 `trainer.use_fp32_lm_head: true` keeps the weights and computation of the output layer (LM head) in FP32 (equivalent to configuring `output_layer` in `megatron.keep_fp32_weights`). Under bf16, the rounding error of the logits enters log_probs directly through softmax, and may become a major source of train-inference probability deviation for dense models; computing the LM head in FP32 can reduce this part of the error, at the cost of extra memory and computation for the output layer.
 
-## 4. Algorithm-Level Correction
+## 4. Quantization-Aware Training (QAT)
+
+When the inference side serves a quantized checkpoint directly (for example the DeepSeek-V4.1-Flash release weights: FP8 e4m3 with one ue8m0 scale per 32x32 tile for dense layers, MXFP4 for routed experts), the precision gap between bf16 training and quantized inference becomes the main source of train-inference deviation. `trainer.qat: true` makes the training forward see the same numerics as inference:
+
+- **Weights**: after every optimizer step, the weights that the checkpoint stores quantized are overwritten in place with their quantize-then-dequantize values. The fp32 master weights are left untouched and keep accumulating unquantized updates (a straight-through estimator). Weight sync quantizes them again, and the result is bit-identical to the weights the training forward used.
+- **Activations**: for the linears the inference side runs as W8A8, the training side fake-quantizes their inputs with SGLang's own quantization kernel (per token, groups of 32 elements, ue8m0 scale), and the gradient passes straight through in the backward pass. Layers whose activations stay bf16 on the inference side (such as the MXFP4 experts) are left as is.
+
+Quantization formats are detected automatically from the safetensors headers of `hf_model_path`; nothing needs to be configured by hand. Whenever the checkpoint is quantized, weight sync and `save_hf` encode back into the original format whether or not QAT is on, and the `save_hf` output can replace the source checkpoint directly. `trainer.qat` only affects the training side.
+
+Usage: point `hf_model_path` directly at the original quantized checkpoint (no bf16 conversion needed); the inference side boots from the same directory. The DeepSeek-V4.1 recipe is [dapo_h20_6node.yaml](../../conf/dsv41_flash/dapo_h20_6node.yaml). The following rollout settings in it are prerequisites for QAT and are validated at startup:
+
+```yaml
+rollout:
+  env_vars:
+    SGLANG_DSV4_FP4_EXPERTS: "1"                        # run routed experts as MXFP4
+    SGLANG_SHARED_EXPERT_TP1: "1"                       # keep shared experts unsharded so 32x32 tiles stay whole
+    SGLANG_OPT_FP8_WO_A_GEMM: "0"                       # keep wo_a activations in bf16
+  sglang_args:
+    json_model_override_args: '{"vision_n_layers": 0}'  # boot as a text-only model, otherwise R3 gets no routing
+    moe_runner_backend: flashinfer_mxfp4
+    flashinfer_mxfp4_moe_precision: bf16                # W4A16 experts; the B200 default is W4A8
+    disable_shared_experts_fusion: true                 # run shared experts as dense FP8 linears
+trainer:
+  qat: true
+```
+
+Notes:
+
+- Enabling `trainer.qat` fails at startup if `hf_model_path` is not a quantized checkpoint;
+- So far it has only been verified on DeepSeek-V4.1 with the SGLang rollout; MTP is not trained and vision is not supported yet;
+- With `save_hf` on, every save writes a full checkpoint (including the untrained vision / MTP weights); reserve several hundred GB of disk for the full model;
+- Activation alignment covers the quantization function only. The GEMM implementations and accumulation order still differ between the two sides, so the residual deviation is still handled by the algorithm-level correction in Section 5;
+- To measure the benefit of QAT, run a control with `trainer.qat: false`: the inference side still serves the quantized weights while the training side does no QAT, then compare `train/is_approx_k3_kl` between the two runs.
+
+## 5. Algorithm-Level Correction
 
 Source alignment cannot fully eliminate the deviation (differences in precision and operator implementation remain), and it does not cover the weight version differences introduced by async / partial rollout; the residual part is handled at the algorithm level, see Section 1.3 of [Training Algorithms](./training-algorithms.md):
 
@@ -47,13 +81,13 @@ Source alignment cannot fully eliminate the deviation (differences in precision 
 
 Another route is `trainer.use_rollout_log_probs: true`: use `π_rollout` directly as the behavior policy in the policy loss, letting the ratio `π_θ / π_rollout` implicitly absorb the train-inference difference and saving the recomputation of `old_log_probs`; this switch is mutually exclusive with IS correction and M2PO.
 
-## 5. Monitoring Metrics
+## 6. Monitoring Metrics
 
 When not in pure-GKD and when the training side has computed `old_log_probs`, the framework always reports the following metrics; among them the clip/nan metrics only appear when IS correction is enabled:
 
 | Metric | Meaning | Interpretation |
 | --- | --- | --- |
-| `train/is_approx_k3_kl` | The k3 KL estimate between `π_old` and `π_rollout` | A continuous increase means the train-inference deviation is worsening; check the R3 / precision settings, or strengthen the algorithm-level correction |
+| `train/is_approx_k3_kl` | The k3 KL estimate between `π_old` and `π_rollout` | A continuous increase means the train-inference deviation is worsening; check the R3 / precision settings (when the inference side serves quantized weights, check that QAT is on), or strengthen the algorithm-level correction |
 | `train/is_clip_ratio`, `train/is_nan_ratio` | The fraction of tokens where the IS weight goes out of bounds and the log-ratio is clamped | A high value means the bounds are too tight or the deviation is too large |
 | `rollout/partial_ratio`, `rollout/partial_span_max` | The fraction of trajectories spanning weight versions and the maximum span | The degree of off-policyness in async / partial scenarios, see [Fully Async Mode](./fully-async-mode.md) |
 

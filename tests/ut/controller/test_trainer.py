@@ -148,6 +148,7 @@ def make_minimal_config(**overrides):
             "num_nodes": 1,
             "num_gpus_per_node": 1,
             "save_freq": 1,
+            "forward_only": False,
             "project_name": "test_project",
             "experiment_name": "test_experiment",
             "tracking_backend": "console",
@@ -289,6 +290,25 @@ class TestTrainerValidateConfig:
             ValueError, match=r"num_prompts_per_step \(4\) is not divisible by"
         ):
             trainer._validate_config()
+
+    def test_rollout_only_forces_forward_only(self):
+        config = make_minimal_config(run_mode="rollout-only")
+        trainer = self._trainer(config)
+
+        trainer._validate_config()
+
+        assert trainer.config.trainer.forward_only is True
+
+    def test_forward_only_rejects_saving(self):
+        config = make_minimal_config(trainer={"forward_only": True, "save_freq": 1})
+
+        with pytest.raises(ValueError, match="forward_only"):
+            self._trainer(config)._validate_config()
+
+    def test_forward_only_allowed_without_saving(self):
+        config = make_minimal_config(trainer={"forward_only": True, "save_freq": -1})
+
+        self._trainer(config)._validate_config()
 
 
 class TestTrainerValidateReadOnlyCkptPaths:

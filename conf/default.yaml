@@ -285,6 +285,11 @@ trainer:
   use_rollout_log_probs: false
   use_rollout_routing_replay: false
   use_fp32_lm_head: false
+  # Forward-only train worker: skip DDP (no grad buffer) and the optimizer/scheduler.
+  # The worker only holds weights and syncs them to the rollout engines, so it never
+  # runs backward. Use for rollout-only / inference-only runs to avoid the (large)
+  # gradient buffer allocation. Must be false for any run that trains.
+  forward_only: false
   temperature: 1.0
   mini_batch_size: 64    # num_prompts_per_step x num_trajectories_per_prompt / mini_batch_size = num_mini_batch
   micro_batch_size: 8
@@ -299,6 +304,12 @@ trainer:
   async_save: true
   save_checkpoint: true   # Save distributed checkpoint.
   save_hf: false          # Also export HuggingFace-format weights to train_step_{step}/hf_model.
+  # QAT against a rollout serving the checkpoint's own block-scaled FP8/MXFP4 format
+  # (coda/backends/megatron/qat.py; recipes in conf/dsv41_flash/). Formats are read from the
+  # hf_model_path checkpoint; weight sync (and save_hf) re-encode into that format whenever the
+  # checkpoint is quantized, independent of this switch. true: snap the quantized weights onto the
+  # grid after every optimizer step and fake-quant the inputs of the linears the rollout runs as W8A8.
+  qat: false
   env_vars:
     # Inject per-rank env vars into the train worker Ray actors (runtime_env).
     PYTORCH_ALLOC_CONF: expandable_segments:True

@@ -76,6 +76,12 @@ class TensorBackuper:
             self._backups[dst_tag][name].copy_(self._backups[src_tag][name])
 
     @torch.no_grad()
+    def release(self) -> None:
+        """Free the GPU storage of every source tensor; ``restore`` re-materializes it."""
+        for _, param in self._source_getter():
+            param.data.storage().resize_(0)
+
+    @torch.no_grad()
     def restore(self, tag: str) -> None:
         """Copy CPU pinned memory -> GPU params (async + sync)."""
         backup_dict = self._backups[tag]

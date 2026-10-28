@@ -336,6 +336,7 @@ def train_minibatch(
     opt_param_scheduler: OptimizerParamScheduler,
     num_microbatches: int,
     gkd_policy=None,
+    qat_plan=None,
 ) -> dict[str, float]:
     """Execute a single pipeline-parallel training step.
 
@@ -347,7 +348,8 @@ def train_minibatch(
        loss from the model output.
 
     Then hands off to Megatron's ``forward_backward_func`` for gradient
-    computation, and finishes with an optimizer + scheduler step.
+    computation, and finishes with an optimizer + scheduler step (followed by a
+    QAT re-snap of the params when ``qat_plan`` is given).
 
     Returns:
         ``loss_dict`` — aggregated/normalized metrics with ``grad_norm`` folded
@@ -447,6 +449,10 @@ def train_minibatch(
     )
     if update_successful:
         opt_param_scheduler.step(increment=1)
+        if qat_plan is not None:
+            # Re-snap the freshly updated bf16 params onto the rollout quantization grid; the fp32
+            # master keeps the un-quantized value (straight-through QAT).
+            qat_plan.snap_()
 
     return _collect_loss_metrics(
         config,

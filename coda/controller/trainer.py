@@ -132,6 +132,14 @@ class Trainer:
             self.rollout_manager.clear_num_new_engines()
 
     def _validate_config(self) -> None:
+        if self.config.run_mode == Mode.ROLLOUT_ONLY:
+            # Rollout-only never trains: build the train workers without DDP/optimizer.
+            self.config.trainer.forward_only = True
+        elif self.config.trainer.forward_only and self.config.trainer.save_freq > 0:
+            raise ValueError(
+                "trainer.forward_only has no optimizer and never updates weights, "
+                "so saving is not supported; set trainer.save_freq <= 0"
+            )
         if self.config.fully_async.enable:
             if self.config.colocate:
                 raise ValueError("fully_async and colocate cannot be enabled at the same time")

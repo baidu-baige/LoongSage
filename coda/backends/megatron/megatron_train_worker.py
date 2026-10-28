@@ -48,6 +48,8 @@ from coda.utils.tracking import (
 from coda.backends.megatron.mixed_precision import KeepFP32Module
 from coda.algorithms.kl_policy import build_kl_policies
 from coda.backends.megatron.teacher_lm_head import TeacherLMHeads
+from coda.backends.megatron import qat
+from coda.utils.hf_ckpt import save_like_source
 
 logger = logging.getLogger(__name__)
 
@@ -175,6 +177,10 @@ class MegatronTrainWorker(TrainWorker):
         super().init(config)
         configure_tracking(config)
 
+        # Forward-only: the worker never runs backward, so it is built without DDP
+        # (no grad buffer) and without optimizer/scheduler.
+        self._forward_only = config.trainer.forward_only
+
         # Step 2: parallel groups
         parallel_state.initialize_model_parallel(
             tensor_model_parallel_size=config.megatron.model.tensor_model_parallel_size,
@@ -250,41 +256,50 @@ class MegatronTrainWorker(TrainWorker):
         )
         self.model = provider.provide_distributed_model(
             ddp_config=megatron_ddp_config,
-            wrap_with_ddp=True,
+            wrap_with_ddp=not self._forward_only,
             mixed_precision_wrapper=partial(KeepFP32Module, config.megatron.keep_fp32_weights)
         )
-        logger.info(f"[Rank {self.rank}] Model created via Megatron-bridge")
+        logger.info(
+            f"[Rank {self.rank}] Model created via Megatron-bridge "
+            f"(forward_only={self._forward_only}, wrap_with_ddp={not self._forward_only})"
+        )
 
-        # Step 6: create optimizer
-        optimizer_config_dict = OmegaConf.to_container(config.megatron.optimizer)
-        hints = get_type_hints(MegatronOptimizerConfig)
-        for k, v in optimizer_config_dict.items():
-            hint = hints.get(k)
-            if hint is torch.dtype or hint is Optional[torch.dtype]:
-                    optimizer_config_dict[k] = to_torch_dtype(v)
-        megatron_opt_config = MegatronOptimizerConfig(**optimizer_config_dict)
-        self.optimizer = get_megatron_optimizer(megatron_opt_config, self.model)
-        self._register_training_hooks()
-        logger.info(f"[Rank {self.rank}] Optimizer created")
-
-        # Step 7: create learning rate scheduler
-        scheduler_config = OmegaConf.to_container(config.megatron.scheduler)
-        self.scheduler = OptimizerParamScheduler(self.optimizer, **scheduler_config)
-        logger.info(f"[Rank {self.rank}] LR scheduler created")
+        # Steps 6-7: optimizer + LR scheduler (none in forward-only mode)
+        if self._forward_only:
+            self.optimizer = None
+            self.scheduler = None
+        else:
+            self._build_optimizer()
 
         # Step 8: load checkpoint if exists
         if has_checkpoint:
-            load_checkpoint(self.model, self.optimizer, self.scheduler, ckpt_dir)
+            if self._forward_only:
+                load_model_weights(self.model, ckpt_dir)
+            else:
+                load_checkpoint(self.model, self.optimizer, self.scheduler, ckpt_dir)
             logger.info(f"[Rank {self.rank}] Checkpoint loaded from {ckpt_dir}")
         self.offloaded = False
         self.params_offloaded = False
+
+        # Step 8.5: quantized checkpoint (FP8/FP4 rollout). The plan maps every Megatron param to
+        # the checkpoint's storage format; weight sync re-encodes into that format. With QAT, snap
+        # the loaded weights onto the grid (before any TensorBackuper snapshot) and hook the
+        # activation fake-quant.
+        self._quant = qat.QuantPlan(self.bridge, self.model, config.hf_model_path, config)
+        if self._quant.qat:
+            n = self._quant.snap_()
+            n_act = self._quant.register_activation_hooks()
+            logger.info(f"[Rank {self.rank}] QAT: snapped {n} params, {n_act} activation hooks")
+        elif self._quant.quantized:
+            logger.info(f"[Rank {self.rank}] Quantized checkpoint without QAT: weight sync re-encodes, no snapping")
 
         # Step 9: build KL policy instances and set up teacher lm_heads if an
         # active policy needs teacher logits (full_kl/full_jsd). The
         # TeacherLMHeads singleton owns the lm_head lifecycle (last PP stage only).
         self.kl_policies = self._init_kl_policies()
 
-        if config.fully_async.enable or config.algorithm.ref_kl.enable:
+        # forward-only also uses the backuper as its param offloader (no DDP buffers).
+        if self._forward_only or config.fully_async.enable or config.algorithm.ref_kl.enable:
             self._weights_backuper = TensorBackuper(
                 source_getter=lambda: (
                     (f"chunk{i}.{name}", param)
@@ -331,6 +346,8 @@ class MegatronTrainWorker(TrainWorker):
                 "algorithm.ref_kl.enable=True requires either "
                 "ref_dist_ckpt_path or ref_hf_model_path to be set."
             )
+        if self._quant.qat:
+            self._quant.snap_()
 
         self._weights_backuper.backup("ref")     # snapshot ref weights
         self._weights_backuper.restore("actor")  # switch back to the student
@@ -353,6 +370,23 @@ class MegatronTrainWorker(TrainWorker):
             return
         self._weights_backuper.restore(tag)
         self._active_model_tag = tag
+
+    def _build_optimizer(self):
+        """Create the Megatron optimizer, register its training hooks, and the LR scheduler."""
+        optimizer_config_dict = OmegaConf.to_container(self.config.megatron.optimizer)
+        hints = get_type_hints(MegatronOptimizerConfig)
+        for k, v in optimizer_config_dict.items():
+            hint = hints.get(k)
+            if hint is torch.dtype or hint is Optional[torch.dtype]:
+                optimizer_config_dict[k] = to_torch_dtype(v)
+        megatron_opt_config = MegatronOptimizerConfig(**optimizer_config_dict)
+        self.optimizer = get_megatron_optimizer(megatron_opt_config, self.model)
+        self._register_training_hooks()
+        logger.info(f"[Rank {self.rank}] Optimizer created")
+
+        scheduler_config = OmegaConf.to_container(self.config.megatron.scheduler)
+        self.scheduler = OptimizerParamScheduler(self.optimizer, **scheduler_config)
+        logger.info(f"[Rank {self.rank}] LR scheduler created")
 
     def _register_training_hooks(self):
         "following https://github.com/NVIDIA/Megatron-LM/blob/core_v0.16.0/megatron/training/training.py#L2546-L2565"
@@ -425,6 +459,11 @@ class MegatronTrainWorker(TrainWorker):
                 self._free_pg_fields(rollout_data, gkd_ratio)
 
             rollout_data["advantages"] = advantages
+
+        if self._forward_only:
+            # No optimizer: report the forward-side metrics (IS/k3, adv, ...) only.
+            self._track_metrics(step, rollout_data, {})
+            return
 
         # Train
         for m in self.model:
@@ -557,8 +596,30 @@ class MegatronTrainWorker(TrainWorker):
 
         if hf:
             hf_dir = get_hf_dir(self.config.checkpoint_path, step)
-            self.bridge.save_hf_pretrained(self.model, hf_dir)
+            if self._quant.quantized:
+                self._save_hf_like_source(hf_dir)
+            else:
+                self.bridge.save_hf_pretrained(self.model, hf_dir)
             logger.info(f"[Rank {self.rank}] HF model exported for step={step}")
+
+    @torch.no_grad()
+    def _save_hf_like_source(self, hf_dir: str) -> None:
+        """Save the HF model in the source checkpoint's own (quantized) format: same files, names,
+        dtypes and config as ``hf_model_path``; untrained tensors (vision, MTP, ...) are copied."""
+        names = {
+            n for t in self.bridge.get_conversion_tasks(self.model) if t is not None for n in qat.hf_names(t.mapping)
+        }
+        gathered = [None] * torch.distributed.get_world_size()
+        torch.distributed.all_gather_object(gathered, sorted(names))  # EP ranks own different experts
+        expected = set().union(*map(set, gathered))
+        expected |= {q.scale_name for n, q in self._quant.ckpt.items() if n in expected}
+        hf_weights = self.bridge.export_hf_weights(self.model)
+        if torch.distributed.get_rank() == 0:
+            save_like_source(self._quant.encode(hf_weights), self.config.hf_model_path, hf_dir, expected)
+        else:
+            for _ in hf_weights:  # collectives
+                pass
+        torch.distributed.barrier()
 
     @override
     @torch.no_grad()
@@ -570,7 +631,10 @@ class MegatronTrainWorker(TrainWorker):
             clear_memory()
         print_memory("before send huggingface weights")
         send_channel = create_sender_channel(channel_meta)
-        for name, tensor, in self.bridge.export_hf_weights(self.model):
+        hf_weights = self.bridge.export_hf_weights(self.model)
+        if self._quant.quantized:
+            hf_weights = self._quant.encode(hf_weights)
+        for name, tensor, in hf_weights:
             send_channel.send((name, tensor))
         send_channel.send(None, flush=True)
         if self.offloaded:
@@ -599,6 +663,8 @@ class MegatronTrainWorker(TrainWorker):
     def offload(self, move_params: bool = False):
         """Offload: move from GPU memory to CPU memory (VRAM -> CPU RAM)"""
         print_memory(f"before offload (move_params={move_params})")
+        # Forward-only has no grads/optimizer to free, so the params are all there is to release.
+        move_params = move_params or self._forward_only
         self._offload_model(move_params=move_params, move_grads=True)
         self._move_optimizer("cpu")
         lm_heads = TeacherLMHeads.get()
@@ -611,12 +677,25 @@ class MegatronTrainWorker(TrainWorker):
 
     def _offload_model(self, move_params: bool = True, move_grads: bool = True):
         """Offload model parameters and gradients to CPU."""
+        if self._forward_only:
+            # No DDP buffers: snapshot the plain params under the active tag and free them.
+            # Weights never change in forward-only mode, so one snapshot stays valid
+            # (and with ref-KL the existing "actor" snapshot is reused as-is).
+            if move_params:
+                if self._active_model_tag not in self._weights_backuper.backup_tags:
+                    self._weights_backuper.backup(self._active_model_tag)
+                self._weights_backuper.release()
+            return
         for model in self.model:
             for buffer in model.buffers + model.expert_parallel_buffers:
                 buffer.offload_to_cpu(move_params, move_grads)
 
     def _onload_model(self, move_params: bool = True, move_grads: bool = True):
         """Onload model parameters and gradients from CPU."""
+        if self._forward_only:
+            if move_params:
+                self._weights_backuper.restore(self._active_model_tag)
+            return
         for model in self.model:
             for buffer in model.buffers + model.expert_parallel_buffers:
                 buffer.reload_from_cpu(move_params, move_grads)
@@ -655,6 +734,8 @@ class MegatronTrainWorker(TrainWorker):
         pinned CPU buffers (H2D is implicit in the next ``step()``; no onload
         branch). Moments are offloader-owned and skipped below.
         """
+        if self.optimizer is None:  # forward-only
+            return
         if device == "cpu":
             # Hand masters back to the offloader's pinned CPU buffers; they are
             # invisible to the loops below (shard_fp32_from_float16_groups is None).
@@ -893,7 +974,6 @@ class MegatronTrainWorker(TrainWorker):
         avg_metrics: dict[str, float] = {}
         n_minibatches = len(num_microbatches)
         for index in range(n_minibatches):
-            is_last_minibatch = index == n_minibatches - 1
             metrics = train_minibatch(
                 self.config,
                 step,
@@ -903,25 +983,28 @@ class MegatronTrainWorker(TrainWorker):
                 self.scheduler,
                 num_microbatches=num_microbatches[index],
                 gkd_policy=self.kl_policies.get("gkd"),
+                qat_plan=self._quant if self._quant.qat else None,
             )
             if is_main_rank():
                 for k, v in metrics.items():
                     avg_metrics[k] = avg_metrics.get(k, 0.0) + v
                 logger.info(f"[Rank {self.rank}] step: {step}, minibatch: {index}, metrics: {metrics}")
-                if not is_last_minibatch:
-                    continue
-                # Average metrics across minibatches and track
-                for k in avg_metrics:
-                    avg_metrics[k] /= n_minibatches            
-                avg_metrics.update(rollout_data.get("m2po_metrics", {}))
-                avg_metrics.update(rollout_data.get("is_metrics", {}))
-                avg_metrics.update(rollout_data.get("kl_metrics", {}))
-                avg_metrics.update(rollout_data.get("adv_metrics", {}))
-                avg_metrics["train/segment_padding_count"] = global_padding_count
-                avg_metrics["train/segment_padding_ratio"] = global_padding_ratio
-                avg_metrics["perf/train_memory_allocated_max"] = \
-                    round(torch.cuda.max_memory_allocated() / (1024 * 1024 * 1024), 2)
-                avg_metrics["perf/train_memory_reserved_max"] = \
-                    round(torch.cuda.max_memory_reserved() / (1024 * 1024 * 1024), 2)
-                logger.info(f"[Rank {self.rank}] step: {step}, avg_metrics: {avg_metrics}")
-                track(avg_metrics, step)
+
+        for k in avg_metrics:
+            avg_metrics[k] /= n_minibatches
+        avg_metrics["train/segment_padding_count"] = global_padding_count
+        avg_metrics["train/segment_padding_ratio"] = global_padding_ratio
+        self._track_metrics(step, rollout_data, avg_metrics)
+
+    def _track_metrics(self, step, rollout_data: RolloutBatch, metrics: dict[str, float]):
+        """Merge the pre-train metrics from ``rollout_data`` into ``metrics`` and track (main rank only)."""
+        if not is_main_rank():
+            return
+        for key in ("m2po_metrics", "is_metrics", "kl_metrics", "adv_metrics"):
+            metrics.update(rollout_data.get(key, {}))
+        metrics["perf/train_memory_allocated_max"] = \
+            round(torch.cuda.max_memory_allocated() / (1024 * 1024 * 1024), 2)
+        metrics["perf/train_memory_reserved_max"] = \
+            round(torch.cuda.max_memory_reserved() / (1024 * 1024 * 1024), 2)
+        logger.info(f"[Rank {self.rank}] step: {step}, avg_metrics: {metrics}")
+        track(metrics, step)
