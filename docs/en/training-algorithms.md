@@ -1,6 +1,6 @@
 # Training Algorithms
 
-The framework currently supports only the **GRPO-like** (critic-free) algorithm family: advantages are obtained directly by normalizing rewards within a group or within a batch, and no value model is trained, so algorithms that require a critic such as PPO are not supported for now. The whole algorithm pipeline is split into several independent components — advantage estimation, policy loss, off-policy protection (IS correction, M2PO i.e. Second-Moment Trust Policy Optimization, OPSM i.e. Off-Policy Sequence Masking), regularization terms (entropy / ref KL), and loss aggregation. All switches are centralized in the `algorithm` section of the configuration, where advantage and policy loss support registering custom implementations — see the [Custom RL Algorithm Development Guide](./custom-algorithm.md).
+The framework supports the **GRPO-like** (critic-free) algorithm family, where advantages come from normalizing rewards within a prompt group, and **PPO**, where a co-located critic estimates per-token advantages with GAE (see §1.6). The whole algorithm pipeline is split into several independent components — advantage estimation, policy loss, off-policy protection (IS correction, M2PO i.e. Second-Moment Trust Policy Optimization, OPSM i.e. Off-Policy Sequence Masking), regularization terms (entropy / ref KL), and loss aggregation. All switches are centralized in the `algorithm` section of the configuration, where advantage and policy loss support registering custom implementations — see the [Custom RL Algorithm Development Guide](./custom-algorithm.md).
 
 The execution order of the components within a mini-batch is: (optional) recompute `old_log_probs` → (optional) ref model forward → (optional) M2PO masking → (optional) IS weight computation → advantage computation → actor forward to obtain `log_probs` → (optional) OPSM masking → policy loss → (optional) multiply by OPSM / IS weights → aggregation, and (optional) add the entropy and ref KL terms on top.
 
@@ -8,17 +8,19 @@ The execution order of the components within a mini-batch is: (optional) recompu
 
 ### 1.1. Advantage Estimation
 
-`algorithm.advantage_estimator` currently provides the built-in `grpo` (default). It normalizes the scalar reward of each trajectory into an advantage and broadcasts it to every response token of that trajectory. The normalization method is controlled by `algorithm.advantage_norm_mode`:
+`algorithm.advantage_estimator` provides the built-in `grpo` (default) and `gae` (PPO, see §1.6). `grpo` normalizes the scalar reward of each trajectory into an advantage and broadcasts it to every response token of that trajectory. The normalization method is controlled by `algorithm.advantage_norm_mode`:
 
 | Value | Meaning |
 | --- | --- |
 | `group_zscore` (default) | z-score within the same prompt group: `(x - mean) / std` |
 | `group_mean` | mean subtraction within the group: `x - mean` |
-| `batch_zscore` | full-batch z-score across all DP ranks |
-| `batch_mean` | full-batch mean subtraction across all DP ranks |
 | `none` | use the raw reward directly |
 
-The `batch_*` modes all-reduce the statistics within the DP group, so samples on different DP ranks share the same mean/std; the `group_*` modes require the number of trajectories in each prompt group to be identical (i.e. `num_trajectories_per_prompt`).
+The `group_*` modes require the number of trajectories in each prompt group to be identical (i.e. `num_trajectories_per_prompt`). `advantage_norm_mode` only applies to `grpo`; `gae` ignores it.
+
+Normalization over the whole step is a separate, estimator-independent step: with `algorithm.use_masked_whiten: true`, the advantages returned by any estimator are whitened, `(A - mean) / std`, with the mean / unbiased std taken over all response tokens (`raw_loss_masks`) of the step, all-reduced over the DP group.
+
+Every estimator reports `train/adv_zero_ratio`: the fraction of Segment rows whose advantage is all zero, taken after the optional whitening.
 
 ### 1.2. Policy Loss
 
@@ -28,6 +30,7 @@ The `batch_*` modes all-reduce the statistics within the DP group, so samples on
 | --- | --- | --- |
 | `grpo` (default) | token-level `exp(logπ - logπ_old)` | Asymmetric clipping (`clip_ratio_low` / `clip_ratio_high`, default 0.2 / 0.28, i.e. DAPO's clip-higher); additionally applies dual-clip for negative advantages (`clip_ratio_c`, default 10.0) |
 | `gspo` | sequence-level `exp(mean(Δlogp))` | Sequence-level ratio with token-level gradient routing, see [GSPO](https://arxiv.org/pdf/2507.18071); only uses `clip_ratio_low` / `clip_ratio_high` |
+| `ppo` | token-level, same as `grpo` | The same clipped surrogate (PPO and GRPO differ only in the advantage); the standard PPO setting is `clip_ratio_low = clip_ratio_high = 0.2`, `clip_ratio_c = 3.0` |
 
 The behavior policy `logπ_old` is by default recomputed by the training engine at the beginning of every step; setting `trainer.use_rollout_log_probs: true` switches to the `rollout_log_probs` returned by the inference engine (in which case IS correction and M2PO cannot be enabled, see the next section).
 
@@ -73,6 +76,17 @@ algorithm:
     enable: true
     delta: 0.1
 ```
+
+### 1.6. PPO (GAE + critic)
+
+Set `critic.enable: true` together with `algorithm.advantage_estimator: gae` (and usually `algorithm.policy_loss: ppo`). The critic is a second Megatron model with the actor's parallelism and its own optimizer, scheduler and checkpoint (see [Configuration Reference §7.3](./config-reference.md)); it shares the actor's GPUs and runs first in every step:
+
+1. A forward-only pass of the pre-update critic gives `old_values`. The value head (`hidden -> 1`, replacing the LM head) is read at the same positions as the log-probs: the value at position `t-1` belongs to response token `t`.
+2. GAE over the rollout's `token_rewards` with `algorithm.ppo.gamma` / `algorithm.ppo.lam`, tokens with mask 0 are not steps, the bootstrap value and the running advantage are carried across them. `returns = advantages + old_values`; then the optional `use_masked_whiten` step whitens the advantages (not the returns).
+3. Clipped value loss `0.5 * max((V - R)^2, (clip(V, V_old ± ppo.value_clip) - R)^2)`, aggregated with `loss_agg_mode`; metrics are reported under `critic/`.
+4. The advantages are handed to the actor, which uses them as they are (GAE and whitening run once per step).
+
+KL to the reference model is only applied as a loss term (`ref_kl`). Steps `<= critic.critic_warmup` train only the critic. Current limitations: `num_trajectories_per_prompt == 1`, one Segment per trajectory (no context compression / subagent), and no OPD.
 
 ## 2. Unbiased Loss Aggregation
 

@@ -155,7 +155,6 @@ Chinese documentation is available in [`docs/zh/`](docs/zh/).
 Below are our main plans for upcoming work. Discussions and contributions via Issues are welcome:
 
 - [ ] Low-precision training support
-- [ ] PPO support
 - [ ] MTP / DSpark
 - [ ] Multi-data-source and multi-agent support in fully asynchronous mode
 - [ ] SFT support

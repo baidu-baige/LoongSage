@@ -1,6 +1,6 @@
 """Built-in policy-loss implementations.
 
-Registers GRPO and GSPO clipped surrogate losses into the policy-loss registry.
+Registers the GRPO / PPO and GSPO clipped surrogate losses into the policy-loss registry.
 """
 
 from __future__ import annotations
@@ -66,6 +66,23 @@ def grpo_loss(
     }
 
     return per_token_loss, metrics
+
+
+@register_policy_loss("ppo")
+def ppo_loss(
+    config: DictConfig,
+    old_log_prob: list[torch.Tensor],
+    log_prob: list[torch.Tensor],
+    advantages: list[torch.Tensor],
+    loss_masks: list[torch.Tensor],
+    **kwargs,
+) -> tuple[list[torch.Tensor], dict[str, float]]:
+    """PPO clipped surrogate loss (per-token).
+
+    The same objective as :func:`grpo_loss`; PPO and GRPO differ only in how
+    the advantages are estimated.
+    """
+    return grpo_loss(config, old_log_prob, log_prob, advantages, loss_masks, **kwargs)
 
 
 @register_policy_loss("gspo")

@@ -229,6 +229,24 @@ Agent 侧的 Router 与 tokenizer，以及 trajectory dump 等框架级能力。
 > - `megatron.scheduler`  → `megatron.core.optimizer_param_scheduler.OptimizerParamScheduler` 构造参数；其中 `max_lr` / `min_lr` / `init_lr` / `start_wd` / `end_wd` 未显式设置时会自动从 `megatron.optimizer.lr` / `min_lr` / `weight_decay` 兜底。
 
 
+### 7.3 `critic`（PPO value 模型）
+
+critic 是 PPO 中和 actor 一起训练的第二个 Megatron 模型。它总是和 actor 共卡：每个 critic rank 都钉在对应 actor rank 所在的 bundle 上。critic 复用 `megatron.model` / `megatron.ddp_config`，并行配置和 actor 完全相同，只有 optimizer、LR schedule 和 checkpoint 是自己独立的。
+
+| 字段 | 默认值 | 说明 | 约束 |
+| --- | --- | --- | --- |
+| `critic.enable` | `false` | 是否训练 PPO critic。 | 需要 `algorithm.advantage_estimator: gae`、`num_trajectories_per_prompt == 1`；不能和 `opd.enable` 同时开启；每条 trajectory 只能有一个 Segment（暂不支持多 Segment）。 |
+| `critic.optimizer` | 见 yaml | critic 的 optimizer。对 critic 整体替换 `megatron.optimizer`，不继承 actor 的配置。 | `min_lr` 没有显式设置时按 `critic.optimizer.lr` 推导。 |
+| `critic.scheduler` | 见 yaml | critic 的 LR scheduler。对 critic 整体替换 `megatron.scheduler`，不继承 actor 的配置。 | `max_lr` / `min_lr` / `init_lr` / `start_wd` / `end_wd` 没有显式设置时按 critic 的 optimizer 推导。 |
+| `critic.critic_warmup` | `0` | `step <= critic_warmup` 时只训练 critic，actor 既不训练也不保存。 | `>= 0`。 |
+| `critic.value_head_init_std` | `0.02` | value head 权重正态初始化的 std，bias 初始为 0。 | head 跟随模型精度。 |
+
+critic 的 checkpoint 同步保存到 `train_step_N/critic_dist_ckpt`，和 actor 的 `dist_ckpt` 放在同一个 step 目录下，两者共用 `latest_checkpointed_iteration.txt`：
+- warmup 期间由 critic 写 tracker。
+- warmup 之后由 actor 写 tracker。同一个 step 里，critic 总是先保存完成。
+
+如果 resume 的 step 落在 warmup 内，该 step 下没有 actor 的 `dist_ckpt`，actor 会直接从 HF 权重启动，这和它在 warmup 期间的真实状态一致。
+
 ## 8. OPD（On-Policy Distillation）
 
 OPD（On-Policy Distillation）在 RL 流程中额外挂载若干 teacher 模型，把 teacher 的分布作为软目标，用可配置的 KL 项与 policy gradient 项混合，形成 `L = (1-gkd_ratio) × [A - pg_ratio × KL_token] + gkd_ratio × L_GKD`。详见 [在线蒸馏 (On-Policy Distillation)](on-policy-distillation.md)。
@@ -264,14 +282,18 @@ OPD（On-Policy Distillation）在 RL 流程中额外挂载若干 teacher 模型
 
 | 参数 | 默认 | 说明 | 约束 |
 | --- | --- | --- | --- |
-| `algorithm.advantage_estimator` | `grpo` | advantage 估计方法名。 | 通过 registry 注册；当前内置 `grpo`。 |
-| `algorithm.advantage_norm_mode` | `group_zscore` | advantage 归一化模式。 | `none` / `group_mean` / `group_zscore` / `batch_mean` / `batch_zscore`；`group_*` 要求同组 trajectory 数一致。 |
-| `algorithm.policy_loss` | `grpo` | policy loss 名。 | 内置 `grpo` / `gspo`；GSPO 见 [论文](https://arxiv.org/pdf/2507.18071)。 |
+| `algorithm.advantage_estimator` | `grpo` | advantage 估计方法名。 | 通过 registry 注册；当前内置 `grpo`、`gae`（PPO：advantage 由 critic 计算，需要 `critic.enable`）。 |
+| `algorithm.advantage_norm_mode` | `group_zscore` | `grpo` 的组内 reward 归一化方式。 | `none` / `group_mean` / `group_zscore`；`group_*` 要求同组 trajectory 数一致；`gae` 忽略此项。 |
+| `algorithm.use_masked_whiten` | `false` | 对任意 estimator 的 advantage，在整个 step 的全部 response token 上做白化（DP 内 all-reduce）。 | 在 estimator 之后执行；PPO 的 returns 不做白化。 |
+| `algorithm.policy_loss` | `grpo` | policy loss 名。 | 内置 `grpo` / `ppo`（与 `grpo` 同一个 clipped surrogate）/ `gspo`；GSPO 见 [论文](https://arxiv.org/pdf/2507.18071)。 |
+| `algorithm.ppo.value_clip` | `0.2` | critic value loss 围绕 old values 的裁剪范围。 | 仅 `advantage_estimator: gae` 时使用。 |
+| `algorithm.ppo.gamma` | `1.0` | GAE 折扣因子。 | 仅 `advantage_estimator: gae` 时使用。 |
+| `algorithm.ppo.lam` | `0.95` | GAE lambda。 | 仅 `advantage_estimator: gae` 时使用。 |
 | `algorithm.loss_agg_mode` | `token-mean` | loss 聚合方式。 | `token-mean` / `seq-mean-token-mean`。 |
 | `algorithm.entropy_coef` | `0.0` | entropy 正则系数。 | 非零时 loss 中减去 `entropy_coef × entropy`。 |
 | `algorithm.clip_ratio_low` | `0.2` | GRPO / GSPO 的下侧 clip。 | 与 `clip_ratio_high` 组合成非对称裁剪（DAPO clip-higher）。 |
 | `algorithm.clip_ratio_high` | `0.28` | 上侧 clip。 | 同上。 |
-| `algorithm.clip_ratio_c` | `10.0` | 负 advantage 的 dual-clip 上界。 | 仅 `policy_loss: grpo` 生效。 |
+| `algorithm.clip_ratio_c` | `10.0` | 负 advantage 的 dual-clip 上界。 | 仅 `policy_loss: grpo` / `ppo` 生效。 |
 
 ### 9.2 is_correction（重要性采样修正）
 
@@ -352,7 +374,7 @@ OPD（On-Policy Distillation）在 RL 流程中额外挂载若干 teacher 模型
   - `run_mode: default`
   - `rollout.sampler.num_oversample: 0`（额外容量由 `fully_async.stale_steps` 提供）
 - 目前 `data_sources` 只允许一个数据源。
-- 需满足 `B × N` 能被 `trainer.mini_batch_size` 整除，且强烈建议 `M % N == 0`（否则拿不齐完整 group）。其中 `B = num_prompts_per_step`、`N = num_trajectories_per_prompt`、`M = mini_batch_size`。
+- 和同步模式一样，需满足 `B × N` 能被 `trainer.mini_batch_size` 整除。其中 `B = num_prompts_per_step`、`N = num_trajectories_per_prompt`、`M = mini_batch_size`。trainer 每次取出一整个 step（`B` 个 group），因此 `M` 不必是 `N` 的整数倍。
 
 ### 11.4 Partial rollout
 
