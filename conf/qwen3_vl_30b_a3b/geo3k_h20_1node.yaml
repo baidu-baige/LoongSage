@@ -1,0 +1,87 @@
+# @package _global_
+#
+# Qwen3-VL-30B-A3B-Instruct single-image GRPO on geo3k, single 8-GPU H20 node.
+#
+# Set before launching: checkpoint_path, hf_model_path, data_source.dataset.prompt_data_path and
+# data_source.dataset.eval_prompt_data_path.
+#   hf download Qwen/Qwen3-VL-30B-A3B-Instruct --local-dir <hf_model_path>
+#   hf download hiyouga/geometry3k --repo-type=dataset --local-dir <geometry3k dir>
+#
+# Launch:
+#   bash examples/start.sh qwen3_vl_30b_a3b/geo3k_h20_1node \
+#     data_source.dataset.prompt_data_path=<geometry3k dir>/data/train-00000-of-00001.parquet \
+#     data_source.dataset.eval_prompt_data_path=<geometry3k dir>/data/validation-00000-of-00001.parquet
+
+defaults:
+  - /default
+  - _self_
+
+checkpoint_path: ???
+hf_model_path: ???
+colocate: true
+total_steps: 300
+
+multimodal:
+  enable: true
+  modalities: [image]
+
+data_source:
+  dataset:
+    prompt_data_path: ???
+    eval_prompt_data_path: ???
+    data_pre_processor: geo3k
+    input_key: problem
+    label_key: answer
+    multimodal_keys: {image: images}
+  reward:
+    name: boxed_math
+  num_trajectories_per_prompt: 8
+  num_prompts_per_step: 32
+  max_response_len_per_trajectory: 32768
+
+rollout:
+  num_gpus_per_node: 8
+  sglang_replicas:
+    regular:
+      num_nodes: 1
+      num_gpus_per_replica: 4
+  sglang_args:
+    mem_fraction_static: 0.8
+    disable_cuda_graph: false
+  filter:
+    reward: {}
+  eval:
+    interval: 5
+
+agentflow:
+  dump_trajectory_path: "log/trajectories"
+
+trainer:
+  num_gpus_per_node: 8
+  num_nodes: 1
+  mini_batch_size: 64
+  max_tokens_per_gpu: 20480
+  use_dynamic_batch_size: true
+  save_freq: 10
+  # Routing replay (R3) is MoE-only; Qwen3-VL-30B-A3B is MoE.
+  use_rollout_routing_replay: true
+  use_fp32_lm_head: true
+
+megatron:
+  model:
+    # Qwen3-VL-30B-A3B is MoE: tensor + pipeline + expert parallelism on 8 GPUs (TP4 x PP2, EP4).
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 2
+    virtual_pipeline_model_parallel_size: null
+    context_parallel_size: 1
+    expert_model_parallel_size: 4
+    expert_tensor_parallel_size: 1
+    # Qwen3-VL-MoE defaults both to True in Megatron-Bridge; make the choice explicit.
+    freeze_vision_model: true
+    freeze_language_model: false
+
+algorithm:
+  advantage_estimator: grpo
+  advantage_norm_mode: group_zscore
+  policy_loss: grpo
+  loss_agg_mode: token-mean

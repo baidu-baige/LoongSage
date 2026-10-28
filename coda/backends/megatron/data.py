@@ -22,6 +22,7 @@ from megatron.core import parallel_state as mpu
 from omegaconf import DictConfig
 
 from megatron.core.utils import get_model_config
+from coda.utils.multimodal_tensors import move_multimodal_to_device
 from coda.utils.seqlen_balancing import get_seqlen_balanced_partitions
 from coda.utils.types import RolloutBatch
 
@@ -43,10 +44,18 @@ def select_rollout_batch(shard: RolloutBatch, indices: list[int]) -> RolloutBatc
     return subset
 
 
+_OPTIONAL_ROW_KEYS = ("multimodal_train_inputs",)
+
+
 def concat_rollout_batch(shards: list[RolloutBatch]) -> RolloutBatch:
     """Concatenate multiple shards by appending list fields."""
     if len(shards) == 1:
         return shards[0]
+    # Row-aligned keys that `put_dp_shards_to_ray` omits from shards without data for them (text-only shards).
+    # Fill them with per-row `None` so the key is neither dropped nor missing for some shards.
+    for key in _OPTIONAL_ROW_KEYS:
+        if any(key in s for s in shards):
+            shards = [s if key in s else {**s, key: [None] * len(s.get("tokens", []))} for s in shards]
     merged = {}
     num_trajectories_first = len(shards[0].get("tokens", []))
     for key in shards[0]:
@@ -182,6 +191,11 @@ def get_rollout_data(rollout_data_ref) -> RolloutBatch:
     ):
         if rollout_data.get(field):
             rollout_data[field] = [t.to(device) for t in rollout_data[field]]
+
+    if rollout_data.get("multimodal_train_inputs"):
+        rollout_data["multimodal_train_inputs"] = move_multimodal_to_device(
+            rollout_data["multimodal_train_inputs"], device
+        )
     return rollout_data
 
 # ────────────────────────────────────────────────────────────────────────

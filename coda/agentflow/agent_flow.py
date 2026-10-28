@@ -106,6 +106,7 @@ class AgentFlow:
         self._generate_sem = asyncio.Semaphore(self._max_connections)
         self._control_sem = asyncio.Semaphore(self._max_connections)
         self._control_client: httpx.AsyncClient | None = None
+        self._generate_client: httpx.AsyncClient | None = None
 
         # Per-data-source agent classes and reward functions (keyed by ds index)
         self.ds_agent_classes: dict[int, type[BaseAgent] | None] = {}
@@ -123,7 +124,9 @@ class AgentFlow:
     def _init_tokenizer(self) -> None:
         """Initialize tokenizer from config."""
         tokenizer_cfg = self.config.agentflow.tokenizer
-        self.tokenizer_manager = create_tokenizer_manager(tokenizer_cfg, self.config.hf_model_path)
+        self.tokenizer_manager = create_tokenizer_manager(
+            tokenizer_cfg, self.config.hf_model_path, getattr(self.config, "multimodal", None)
+        )
         self._resources.callback(self.tokenizer_manager.shutdown)
         logger.info(
             "[init] tokenizer=%s manager=%s workers=%d",
@@ -176,7 +179,20 @@ class AgentFlow:
             limits=httpx.Limits(max_connections=self._max_connections),
         )
 
+        # Shared client for generate calls: creating one per trajectory loads the CA bundle synchronously and blocks
+        # the event loop. keepalive_expiry < uvicorn's 5s keep-alive, so idle connections are dropped client-side
+        # first and never reused after the Router has closed them.
+        self._generate_client = httpx.AsyncClient(
+            timeout=float(router_config.proxy_timeout_seconds),
+            limits=httpx.Limits(
+                max_connections=self._max_connections,
+                max_keepalive_connections=self._max_connections,
+                keepalive_expiry=2,
+            ),
+        )
+
         async def _shutdown_router() -> None:
+            await self._generate_client.aclose()
             await self._control_client.aclose()
             await self.router.shutdown()
             self.router = None
@@ -549,18 +565,14 @@ class AgentFlow:
 
         async with self._generate_sem:
             messages = copy.deepcopy(_active_chat(traj))  # already normalized to list[dict] by _build_messages
-            generate_client = httpx.AsyncClient(timeout=float(self.config.agentflow.router.proxy_timeout_seconds))
-            try:
-                response = await generate_client.post(
-                    f"{self.router_url}/{traj.trajectory_id}/{attempt_id}/v1/chat/completions",
-                    json={
-                        "model": "default",
-                        "messages": messages,
-                        "max_tokens": int(ds_cfg.max_response_len_per_trajectory),
-                    },
-                )
-            finally:
-                await generate_client.aclose()
+            response = await self._generate_client.post(
+                f"{self.router_url}/{traj.trajectory_id}/{attempt_id}/v1/chat/completions",
+                json={
+                    "model": "default",
+                    "messages": messages,
+                    "max_tokens": int(ds_cfg.max_response_len_per_trajectory),
+                },
+            )
         is_context_length_exceeded = False
         if response.status_code == httpx.codes.BAD_REQUEST:
             try:

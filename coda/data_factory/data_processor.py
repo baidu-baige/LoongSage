@@ -21,6 +21,7 @@ import ray
 import torch
 
 from coda.agentflow.trajectory_store import TrajectoryGroup
+from coda.utils.multimodal_tensors import slice_segment_inputs
 from coda.utils.seqlen_balancing import get_seqlen_balanced_partitions
 
 
@@ -131,6 +132,7 @@ def put_dp_shards_to_ray(dp_traj_groups_list: list[list[TrajectoryGroup]], dp_si
         response_lengths: list[int] = []
         total_lengths: list[int] = []
         rollout_routed_experts: list[torch.Tensor | None] = []
+        multimodal_train_inputs: list[dict[str, torch.Tensor] | None] = []
         metadata: list[dict] = []
         ds_indices: list[int] = []
 
@@ -165,6 +167,11 @@ def put_dp_shards_to_ray(dp_traj_groups_list: list[list[TrajectoryGroup]], dp_si
                     rollout_routed_experts.append(
                         traj_experts[ts:te] if traj_experts is not None else None
                     )
+                    # Images whose pad run lies in this Segment's token span (None if none); raises if
+                    # the Segment's pad tokens do not line up with those images.
+                    multimodal_train_inputs.append(
+                        slice_segment_inputs(traj.multimodal_train_inputs, ts, te, traj.tokens[ts:te])
+                    )
                     total_lengths.append(te - ts)
                     response_lengths.append(le - ls)
                     rewards.append(traj.reward)
@@ -186,6 +193,9 @@ def put_dp_shards_to_ray(dp_traj_groups_list: list[list[TrajectoryGroup]], dp_si
             "metadata": metadata,
             "ds_indices": ds_indices,
         }
+        # Row-aligned with `tokens`; omitted for text-only shards so they keep the old layout.
+        if any(row is not None for row in multimodal_train_inputs):
+            rollout_data["multimodal_train_inputs"] = multimodal_train_inputs
         if rollout_routed_experts and all(experts is not None for experts in rollout_routed_experts):
             rollout_data["rollout_routed_experts"] = rollout_routed_experts
         elif any(experts is None for experts in rollout_routed_experts):

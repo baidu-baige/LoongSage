@@ -28,14 +28,20 @@ try:
 except ImportError:
     pq = None
 
+from coda.agentflow.multimodal import estimate_data_uri_tokens
 from coda.agentflow.trajectory_store import Trajectory
+from coda.utils.types import MODALITY_PLACEHOLDER, ModalityKind
 
 __all__ = ["Dataset"]
 
 logger = logging.getLogger(__name__)
 
+# Rows per parquet batch when the dataset carries images: rows hold data URIs, so pyarrow's default batch
+# (65536 rows) could be many GB. Text-only datasets keep the pyarrow default.
+_MULTIMODAL_PARQUET_BATCH_ROWS = 32
 
-def read_file(path, columns=None):
+
+def read_file(path, columns=None, batch_size=None):
     """Yield raw dicts from a `.jsonl`/`.parquet` dataset file, or from a directory of them.
 
     Supports an optional row-slice suffix in the path (see `_parse_generalized_path`), e.g.
@@ -56,6 +62,8 @@ def read_file(path, columns=None):
         columns: Optional collection of column names to restrict `.parquet` reads to; names absent from
                  a file are ignored, and `None` (or no name matching the file) reads every column.
                  `.jsonl` files are always read in full.
+        batch_size: Optional cap on the rows per pyarrow batch of `.parquet` reads, to bound memory when rows
+                 are large (e.g. embed image data URIs). `None` keeps pyarrow's default; `.jsonl` ignores it.
 
     Yields:
         dict: One parsed record per row.
@@ -76,9 +84,9 @@ def read_file(path, columns=None):
         if not files:
             raise ValueError(f"No .jsonl or .parquet file found under directory: {path}")
         logger.info("read_file dir=%s files=%s", path, files)
-        reader = itertools.chain.from_iterable(_read_one_file(p, columns) for p in files)
+        reader = itertools.chain.from_iterable(_read_one_file(p, columns, batch_size) for p in files)
     else:
-        reader = _read_one_file(path, columns)
+        reader = _read_one_file(path, columns, batch_size)
 
     if row_slice is not None:
         logger.info("read_file path=%s applying slice row_slice=%s", path, row_slice)
@@ -101,8 +109,11 @@ def _list_dataset_files(root):
     return sorted(matched)
 
 
-def _read_one_file(path, columns=None):
-    """Yield raw dicts from a single `.jsonl` or `.parquet` file, optionally reading only *columns*."""
+def _read_one_file(path, columns=None, batch_size=None):
+    """Yield raw dicts from a single `.jsonl` or `.parquet` file, optionally reading only *columns*.
+
+    *batch_size* caps the rows per pyarrow batch of a `.parquet` read (`None` = pyarrow default).
+    """
     if path.endswith(".jsonl"):
 
         def jsonl_reader(p):
@@ -130,7 +141,9 @@ def _read_one_file(path, columns=None):
             projected = [c for c in columns if c in pf.schema_arrow.names] if columns else None
             logger.info("read_file path=%s projected_columns=%s", p, projected)
 
-            for batch in pf.iter_batches(columns=projected or None):
+            # pyarrow's default batch (65536 rows) is fine for text; image rows carry data URIs and need a small one.
+            batch_kwargs = {"batch_size": batch_size} if batch_size else {}
+            for batch in pf.iter_batches(columns=projected or None, **batch_kwargs):
                 yield from batch.to_pylist()
 
         reader = parquet_reader(path)
@@ -165,18 +178,28 @@ def _parse_generalized_path(s: str):
     return s, None
 
 
-def _build_messages(data: dict, prompt_key: str):
+def _build_messages(data: dict, prompt_key: str, multimodal_keys: dict | None = None):
     """Build a prompt from a raw dataset record.
 
     Converts the value at *prompt_key* into a list of message dicts.  Plain strings are wrapped in a
     single `{"role": "user", "content": ...}` message; values that are already a list are returned as-is.
 
+    When *multimodal_keys* is given, every modality placeholder (e.g. `<image>`) in a string `content`
+    is replaced by an OpenAI-style content part, so that `content` becomes a list of
+    `{"type": "text", ...}` and `{"type": "image_url", "image_url": {"url": <data URI>}}` parts.
+
     Args:
-        data:       Raw dataset record (one row from the dataset file).
-        prompt_key: Key in *data* whose value is the prompt (string or list of message dicts).
+        data:            Raw dataset record (one row from the dataset file).
+        prompt_key:      Key in *data* whose value is the prompt (string or list of message dicts).
+        multimodal_keys: Optional `{modality: column}` mapping, e.g. `{"image": "images"}`.  The column
+                         holds one data URI per placeholder in the prompt text.
 
     Returns:
         A `list[dict]` of message dicts, or `None` if *prompt_key* is absent from *data*.
+
+    Raises:
+        ValueError: If the placeholder count does not match the number of items in the column, or an
+                    item is not a data URI.
     """
     prompt = data.get(prompt_key)
 
@@ -186,9 +209,88 @@ def _build_messages(data: dict, prompt_key: str):
         # numpy.ndarray from parquet — convert to plain list of dicts
         prompt = [dict(m) for m in prompt]
 
-    # TODO: support multi modal
+    if multimodal_keys and isinstance(prompt, list):
+        prompt = _expand_multimodal_placeholders(prompt, data, multimodal_keys)
 
     return prompt
+
+
+def _load_placeholder_items(multimodal_keys: dict, data: dict) -> dict:
+    """Map each configured placeholder to `(column, items)`; every item must be a data URI."""
+    items_by_placeholder = {}
+    for modality_name, column in multimodal_keys.items():
+        kind = ModalityKind(modality_name)
+        if kind is not ModalityKind.IMAGE:
+            raise ValueError(f"multimodal_keys: modality {modality_name!r} is reserved but not implemented yet")
+        raw_items = data.get(column)
+        items = list(raw_items) if raw_items is not None else []
+        for item in items:
+            if not isinstance(item, str) or not item.startswith("data:"):
+                raise ValueError(f"{column!r} items must be data URIs ('data:...'), got {str(item)[:64]!r}")
+        items_by_placeholder[MODALITY_PLACEHOLDER[kind]] = (column, items)
+    return items_by_placeholder
+
+
+def _reject_unconfigured_placeholders(messages: list, configured: dict) -> None:
+    """Raise if a string content uses a modality placeholder that has no entry in `multimodal_keys`."""
+    unconfigured = [p for p in MODALITY_PLACEHOLDER.values() if p not in configured]
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, str):
+            for placeholder in unconfigured:
+                if placeholder in content:
+                    raise ValueError(
+                        f"prompt contains {placeholder!r} modality placeholder, but this modality is not supported yet"
+                    )
+
+
+def _expand_multimodal_placeholders(messages: list, data: dict, multimodal_keys: dict) -> list:
+    """Replace modality placeholders in string contents with OpenAI-style content parts.
+
+    Only string `content` is handled; messages whose content is already a list are passed through.
+    """
+    items_by_placeholder = _load_placeholder_items(multimodal_keys, data)
+    _reject_unconfigured_placeholders(messages, items_by_placeholder)
+
+    # Split every string content once; None marks non-string content, which is passed through untouched.
+    pattern = "(" + "|".join(re.escape(p) for p in items_by_placeholder) + ")"
+    segments_per_message = [
+        re.split(pattern, message["content"]) if isinstance(message.get("content"), str) else None
+        for message in messages
+    ]
+
+    placeholder_count = {p: 0 for p in items_by_placeholder}
+    for segments in segments_per_message:
+        for segment in segments or ():
+            if segment in placeholder_count:
+                placeholder_count[segment] += 1
+
+    for placeholder, (column, items) in items_by_placeholder.items():
+        if placeholder_count[placeholder] != len(items):
+            raise ValueError(
+                f"{placeholder!r} placeholder count ({placeholder_count[placeholder]}) does not match "
+                f"the number of items in column {column!r} ({len(items)})"
+            )
+
+    if not any(placeholder_count.values()):
+        return messages
+
+    # Counts match the item lists, so each placeholder consumes its items in order.
+    item_iters = {p: iter(items) for p, (_, items) in items_by_placeholder.items()}
+    expanded = []
+    for message, segments in zip(messages, segments_per_message):
+        if segments is None:
+            expanded.append(message)
+            continue
+        parts = [
+            {"type": "image_url", "image_url": {"url": next(item_iters[segment])}}
+            if segment in item_iters
+            else {"type": "text", "text": segment}
+            for segment in segments
+            if segment
+        ]
+        expanded.append({**message, "content": parts})
+    return expanded
 
 
 class Dataset:
@@ -217,6 +319,9 @@ class Dataset:
         metadata_key="metadata",
         seed=42,
         data_pre_processor=None,
+        multimodal_keys=None,
+        max_image_tokens=None,
+        image_pixel_bounds=None,
     ):
         """Load and preprocess the dataset from *path*.
 
@@ -235,27 +340,38 @@ class Dataset:
                           A pre-processor that sets a `source_columns` attribute declares the raw columns it
                           reads; parquet reads are then restricted to those plus the key columns above.  When
                           the attribute is absent the pre-processor may read anything, so no projection is done.
+            multimodal_keys: Optional `{modality: column}` mapping (e.g. `{"image": "images"}`); the column holds
+                          one data URI per placeholder in the prompt text.  `None` = text-only dataset.
+            max_image_tokens: Optional cap on the estimated vision tokens summed over all images of one prompt.
+                          Samples above it are dropped.  Independent of *max_length*, which only counts text
+                          characters.  Needs *image_pixel_bounds*.  `None` disables the check.
+            image_pixel_bounds: `(min_pixels, max_pixels)` the router resizes images into (see `multimodal.image`);
+                          used to estimate image tokens.  The estimate assumes a Qwen3-VL token size of 32x32 pixels.
         """
+        if max_image_tokens is not None and image_pixel_bounds is None:
+            raise ValueError("max_image_tokens requires image_pixel_bounds=(min_pixels, max_pixels)")
+        multimodal_keys = dict(multimodal_keys) if multimodal_keys else None
         columns = {key for key in (prompt_key, label_key, metadata_key) if key}
+        if multimodal_keys:
+            columns |= set(multimodal_keys.values())
         if data_pre_processor is not None:
             source_columns = getattr(data_pre_processor, "source_columns", None)
             columns = columns | set(source_columns) if source_columns else None
 
         origin_prompts = []
-        for data in read_file(path, columns=columns):
+        for data in read_file(
+            path, columns=columns, batch_size=_MULTIMODAL_PARQUET_BATCH_ROWS if multimodal_keys else None
+        ):
             if data_pre_processor is not None:
                 data = data_pre_processor(data, prompt_key)
 
-            prompt = _build_messages(data, prompt_key)
+            prompt = _build_messages(data, prompt_key, multimodal_keys)
 
             metadata = data.get(metadata_key) or {}
 
             raw_label = data.get(label_key) if label_key is not None else None
             if raw_label is not None and not isinstance(raw_label, dict):
                 raw_label = {"value": raw_label}
-
-            logger.debug("data: %s\n, prompt_key: %s\n, label_key: %s\n, prompt: %s\n, raw_label: %s",
-                         data, prompt_key, label_key, prompt, raw_label)
 
             origin_prompts.append(
                 Trajectory(
@@ -271,6 +387,9 @@ class Dataset:
             self.origin_prompts = self.filter_long_prompt(origin_prompts, max_length)
         else:
             self.origin_prompts = origin_prompts
+
+        if max_image_tokens is not None:
+            self.origin_prompts = self.filter_large_images(self.origin_prompts, max_image_tokens, image_pixel_bounds)
 
         self.epoch_id = -1
         self.seed = seed
@@ -300,7 +419,8 @@ class Dataset:
         """Remove prompts that exceed *max_length* characters.
 
         For string prompts, length is measured directly via `len(prompt)`.  For list-of-message-dict prompts, length is
-        the sum of all `"content"` string lengths across all messages.
+        the sum of all `"content"` string lengths across all messages; for list-valued content, only the `"text"` parts
+        are counted (image parts are not).
 
         Args:
             origin_prompts: List of `Trajectory` objects to filter.
@@ -324,6 +444,13 @@ class Dataset:
                 content = msg.get("content", "")
                 if isinstance(content, str):
                     total += len(content)
+                elif isinstance(content, list):
+                    # Content parts (e.g. after multimodal placeholder expansion): count text parts only.
+                    total += sum(
+                        len(part.get("text") or "")
+                        for part in content
+                        if isinstance(part, dict) and part.get("type") == "text"
+                    )
             return total
 
         filtered = [
@@ -334,6 +461,46 @@ class Dataset:
             f"Filtered {len(origin_prompts) - len(filtered)} prompts longer than max_length={max_length}."
         )
 
+        return filtered
+
+    @staticmethod
+    def filter_large_images(
+        origin_prompts: list[Trajectory], max_image_tokens: int, image_pixel_bounds: tuple[int, int]
+    ) -> list[Trajectory]:
+        """Remove prompts whose images add up to more than *max_image_tokens* estimated vision tokens.
+
+        Only `image_url` parts of list-form message content are counted; only image headers are parsed.
+
+        Args:
+            origin_prompts:     List of `Trajectory` objects to filter.
+            max_image_tokens:   Maximum allowed estimated image tokens per prompt (inclusive).
+            image_pixel_bounds: `(min_pixels, max_pixels)` used for the token estimate.
+
+        Returns:
+            Filtered list of `Trajectory` objects.
+        """
+        min_pixels, max_pixels = image_pixel_bounds
+
+        def _image_tokens(prompt) -> int:
+            if isinstance(prompt, str):
+                return 0
+            total = 0
+            for msg in prompt:
+                content = msg.get("content")
+                if not isinstance(content, list):
+                    continue
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "image_url":
+                        value = part.get("image_url")
+                        url = value.get("url") if isinstance(value, dict) else value
+                        total += estimate_data_uri_tokens(url, min_pixels, max_pixels)
+            return total
+
+        filtered = [p for p in origin_prompts if _image_tokens(p.prompt) <= max_image_tokens]
+        logger.info(
+            f"Filtered {len(origin_prompts) - len(filtered)} prompts with more than "
+            f"max_image_tokens={max_image_tokens} estimated image tokens."
+        )
         return filtered
 
     def __getitem__(self, idx):

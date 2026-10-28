@@ -231,7 +231,7 @@ class Trajectory(PydanticModel):
     # True for eval-dataset trajectories (routed out of the training batch).
     is_eval: bool = False
 
-    prompt: str | list[dict[str, str]] | dict[str, Any] = ""
+    prompt: str | list[dict[str, Any]] | dict[str, Any] = ""
     label: Any = None
 
     # Retry counter for this trajectory (0 = first attempt).
@@ -309,6 +309,17 @@ class Trajectory(PydanticModel):
     # is appended to `segments` but never becomes active. Lets the parser locate "which
     # segment do I append this turn's triplet to" in O(1) instead of re-walking the tree.
     active_segment_id: int = 0
+
+    # --- Multimodal training inputs ---
+    # One item per image, in prompt order, written back by the Router. Each item is a dict:
+    #   token_start / token_end : int  – the image's expanded-pad run in `tokens` (half-open)
+    #   image_hash              : str  – sha256 of the image bytes, used for prefix matching
+    #   tensors                 : dict[str, torch.Tensor] – processor outputs (e.g. pixel_values,
+    #                             image_grid_thw)
+    # None for text-only trajectories. Excluded from `model_dump` so the tensors never reach
+    # reward functions or trajectory dumps.
+    multimodal_train_inputs: list[dict[str, Any]] | None = Field(default=None, exclude=True)
+
 
 class TrajectoryGroup(PydanticModel):
     """A group of Trajectory objects that are n rollout trajectories from the same prompt.

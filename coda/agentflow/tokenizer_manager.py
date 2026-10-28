@@ -137,6 +137,48 @@ def load_tokenizer(model_path: str, custom_chat_template: str | None = None) -> 
     return tokenizer
 
 
+def load_processor(model_path: str) -> Any:
+    """Load the HuggingFace multimodal processor (image processor + tokenizer) of a model."""
+    from transformers import AutoProcessor
+
+    return AutoProcessor.from_pretrained(str(Path(model_path)), trust_remote_code=True)
+
+
+def build_multimodal_processor(multimodal_config: Any, model_path: str, tokenizer: Any, num_workers: int) -> Any:
+    """Build a MultimodalProcessor from the `multimodal` config block, or None if disabled."""
+    if multimodal_config is None or not getattr(multimodal_config, "enable", False):
+        return None
+    from coda.agentflow.multimodal import MultimodalProcessor
+
+    # Fail at startup rather than on the first image request.
+    try:
+        import qwen_vl_utils  # noqa: F401
+    except ImportError as exc:
+        raise ImportError(
+            "multimodal.enable=true requires the `qwen-vl-utils` package (pip install qwen-vl-utils==0.0.14)"
+        ) from exc
+
+    image_cfg = multimodal_config.image
+    processor = MultimodalProcessor(
+        load_processor(model_path),
+        tokenizer,
+        min_pixels=int(image_cfg.min_pixels),
+        max_pixels=int(image_cfg.max_pixels),
+        num_workers=num_workers,
+    )
+    # Fail at startup if the HF processor's pad expansion differs from the num_tokens-based one used per request.
+    processor.verify_expansion()
+    logger.info(
+        "Multimodal processor ready: pad_id=%d patch=%d merge=%d min_pixels=%d max_pixels=%d",
+        processor.image_pad_id,
+        processor.patch_size,
+        processor.merge_size,
+        processor.min_pixels,
+        processor.max_pixels,
+    )
+    return processor
+
+
 def _init_process_tokenizer(model_path: str, custom_chat_template: str | None) -> None:
     """Load one tokenizer per worker process."""
     global _PROCESS_TOKENIZER
@@ -244,6 +286,8 @@ class BaseTokenizerManager(ABC):
         self.model_family = getattr(tokenizer, "model_family", None)
         self.mode = mode
         self.num_workers = num_workers
+        # Optional MultimodalProcessor (set by create_tokenizer_manager when multimodal.enable).
+        self.multimodal_processor: Any = None
         self.generation_prompt_kwargs: dict[str, Any] = generation_prompt_kwargs or {}
         if self.model_family in DEEPSEEK_OFFICIAL_ENCODER_MODULES:
             self.thinking_mode = _deepseek_v4_thinking_mode(
@@ -425,8 +469,14 @@ class ProcessTokenizerManager(BaseTokenizerManager):
 # Factory
 # ---------------------------------------------------------------------------
 
-def create_tokenizer_manager(tokenizer_config: Any, model_path: str) -> BaseTokenizerManager:
-    """Build tokenizer manager from YAML config."""
+def create_tokenizer_manager(
+    tokenizer_config: Any, model_path: str, multimodal_config: Any = None
+) -> BaseTokenizerManager:
+    """Build tokenizer manager from YAML config.
+
+    When `multimodal_config.enable` is true the returned manager carries a
+    `multimodal_processor`; otherwise `manager.multimodal_processor` is None.
+    """
     if not model_path:
         raise ValueError("hf_model_path is required in config")
 
@@ -449,14 +499,14 @@ def create_tokenizer_manager(tokenizer_config: Any, model_path: str) -> BaseToke
     tokenizer = load_tokenizer(model_path, custom_chat_template)
 
     if mode == "thread":
-        return ThreadedTokenizerManager(
+        manager: BaseTokenizerManager = ThreadedTokenizerManager(
             tokenizer,
             num_workers=num_workers,
             generation_prompt_kwargs=generation_prompt_kwargs,
             thought_words=think_tags,
         )
-    if mode == "process":
-        return ProcessTokenizerManager(
+    elif mode == "process":
+        manager = ProcessTokenizerManager(
             tokenizer,
             model_path=str(Path(model_path)),
             custom_chat_template=custom_chat_template,
@@ -464,7 +514,14 @@ def create_tokenizer_manager(tokenizer_config: Any, model_path: str) -> BaseToke
             generation_prompt_kwargs=generation_prompt_kwargs,
             thought_words=think_tags,
         )
+    else:
+        raise ValueError(
+            f"Unsupported tokenizer.manager.mode: {mode!r} (expected 'thread' or 'process')"
+        )
 
-    raise ValueError(
-        f"Unsupported tokenizer.manager.mode: {mode!r} (expected 'thread' or 'process')"
-    )
+    try:
+        manager.multimodal_processor = build_multimodal_processor(multimodal_config, model_path, tokenizer, num_workers)
+    except BaseException:
+        manager.shutdown()
+        raise
+    return manager

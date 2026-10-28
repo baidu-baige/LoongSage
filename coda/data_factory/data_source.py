@@ -31,6 +31,7 @@ from coda.data_factory import (
 )
 from coda.data_factory.dataset import Dataset
 from coda.utils.checkpoint_utils import get_data_source_dir
+from coda.utils.multimodal_config import multimodal_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -115,7 +116,9 @@ class RolloutDataSource(DataSource):
     ------------------------------------
     - `prompt_data_path` (str):         Path to the dataset file, or to a directory of dataset files.
     - `eval_prompt_data_path` (str):    Path to the eval split, used when `is_eval` is set.
-    - `max_prompt_len` (int | None):    Max prompt character length.
+    - `max_prompt_len` (int | None):    Max prompt character length (text only; images are not counted).
+    - `max_image_tokens` (int | None):  Max estimated image tokens summed over one prompt's images; uses the
+                                        `multimodal.image` pixel bounds.  null = disabled.
     - `input_key` (str):                Dataset column for the prompt text.
     - `label_key` (str | None):         Dataset column for ground-truth labels.
     - `metadata_key` (str):             Dataset column for per-row metadata dicts.
@@ -139,6 +142,7 @@ class RolloutDataSource(DataSource):
         self.trajectory_count = 0
 
         pre_processor_name = self.dataset_config.data_pre_processor
+        max_image_tokens = getattr(self.dataset_config, "max_image_tokens", None)
         self.dataset = Dataset(
             self.dataset_config.eval_prompt_data_path if is_eval else self.dataset_config.prompt_data_path,
             max_length=self.dataset_config.max_prompt_len,
@@ -147,10 +151,25 @@ class RolloutDataSource(DataSource):
             metadata_key=self.dataset_config.metadata_key,
             seed=global_config.seed,
             data_pre_processor=get_data_pre_processor(pre_processor_name) if pre_processor_name else None,
+            multimodal_keys=self._multimodal_keys(),
+            max_image_tokens=max_image_tokens,
+            image_pixel_bounds=self._image_pixel_bounds() if max_image_tokens is not None else None,
         )
 
         if self.dataset_config.shuffle:
             self.dataset.shuffle(self.epoch_id)
+
+    def _image_pixel_bounds(self) -> tuple[int, int]:
+        """Return `(min_pixels, max_pixels)` from `multimodal.image`, the bounds the router resizes images into."""
+        image_config = self.config.multimodal.image
+        return int(image_config.min_pixels), int(image_config.max_pixels)
+
+    def _multimodal_keys(self) -> dict | None:
+        """Return this source's `{modality: column}` mapping as a plain dict, or None when multimodal is off."""
+        keys = getattr(self.dataset_config, "multimodal_keys", None)
+        if not keys or not multimodal_enabled(self.config):
+            return None
+        return {str(modality): str(column) for modality, column in keys.items()}
 
     def get(self, num):
         """Return *num* trajectory groups from the dataset.

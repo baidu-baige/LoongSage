@@ -26,6 +26,7 @@ from coda.transfer_mesh import ChannelMeta
 from coda.utils.checkpoint_utils import get_tracker_file, resolve_dist_ckpt_dir
 from coda.utils.tracking import configure_tracking, time_marker, TimeMarkerAcc, track
 from coda.utils import logging_utils
+from coda.utils.multimodal_config import validate_multimodal_config
 
 logger = logging.getLogger(__name__)
 
@@ -627,6 +628,7 @@ def main(config: Optional[DictConfig] = None) -> None:
     OmegaConf.resolve(config)
     normalize_data_sources(config)
     logging_utils.configure_logger(level=config.log_level)
+    validate_multimodal_config(config)
 
     # Load user extensions from coda/custom/ so their @register_* decorators run
     # before any registry lookup. Imported here rather than at module scope so a

@@ -273,3 +273,19 @@ class TestTrajectoryStore:
         store.clear()
 
         assert store.trajectory_data == {}
+
+
+def test_trajectory_prompt_accepts_content_parts():
+    parts = [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}]}]
+    traj = Trajectory(trajectory_id="t", prompt_id="p", prompt=parts)
+    assert traj.prompt == parts
+
+
+def test_multimodal_train_inputs_defaults_to_none_and_is_excluded_from_dump():
+    traj = Trajectory(trajectory_id="t", prompt_id="p")
+    assert traj.multimodal_train_inputs is None
+    traj.multimodal_train_inputs = [
+        {"token_start": 1, "token_end": 5, "image_hash": "h", "tensors": {"pixel_values": object()}}
+    ]
+    assert "multimodal_train_inputs" not in traj.model_dump()
+    assert "multimodal_train_inputs" not in traj.model_dump_json()

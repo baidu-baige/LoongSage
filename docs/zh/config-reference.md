@@ -45,6 +45,7 @@
 | `dataset.prompt_data_path` | `???` | prompt 数据集路径，支持 `.jsonl` / `.parquet`；可加行切片后缀 `data.jsonl@[0:1000]`。 | 必填。 |
 | `dataset.eval_prompt_data_path` | `null` | 评测集路径，格式同上。 | `null` 表示禁用 eval；同时需 `rollout.eval.interval > 0` 才会真正运行 eval。 |
 | `dataset.max_prompt_len` | `null` | 单个 prompt 允许的最大字符数，超长样本会在加载时丢弃。 | `null` 关闭过滤；这里是**字符**长度，不是 token 长度。 |
+| `dataset.max_image_tokens` | `null` | 单个 prompt 全部图片的估算 token 数之和上限，超限样本会在加载时丢弃。 | `null` 关闭过滤；按图片头部尺寸和 `multimodal.image.{min_pixels,max_pixels}` 估算，假设 Qwen3-VL 每 32x32 像素 1 个 token；与 `max_prompt_len` 相互独立。 |
 | `dataset.input_key` | `???` | prompt 文本或 message 列的列名。 | 必填。 |
 | `dataset.label_key` | `???` | 参考答案 / label 列的列名。 | 必填；不需要时可显式设为 `null`。 |
 | `dataset.metadata_key` | `metadata` | 每行 metadata dict 的列名。列值会原样交给 agent，即 `trajectory["metadata"]`。schema 不固定，可放任意样本级信息（如 `{"difficulty": "hard"}`）。 | 列值须为 dict；缺省时视为空 dict。 |

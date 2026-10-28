@@ -1182,3 +1182,120 @@ class TestPreparePackedMropePositionIds:
         else:
             assert pos[0, 0].tolist() == [2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
             assert packed.tolist() == [2, 3, 4, 5, 6, 7, 8, 9, -1, -1]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# prepare_packed_mrope_position_ids with images
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _fake_rope_index_fn(calls=None):
+    """Return ``[3, L]`` positions whose T/H/W axes are offset by 0 / 100 / 200 from the index."""
+
+    def fn(tokens, grid):
+        if calls is not None:
+            calls.append((tokens.size(0), grid))
+        idx = torch.arange(tokens.size(0))
+        return torch.stack([idx, idx + 100, idx + 200])
+
+    return fn
+
+
+_GRID = torch.tensor([[1, 2, 2]])
+
+
+class TestPreparePackedMropePositionIdsWithImages:
+    def test_image_row_axes_differ_and_pad_is_index_based(self):
+        _set_cp(rank=0, size=2)
+        _set_tp(size=1)
+
+        pos = prepare_packed_mrope_position_ids(
+            [_tok(6)], pad_multiplier=0,
+            image_grid_thw_list=[_GRID], rope_index_fn=_fake_rope_index_fn(),
+        )
+
+        # chunk 2, padded to 8; rank 0 holds chunks 0 and 3 -> indices [0, 1] and [6, 7] (pad).
+        assert pos.shape == (3, 1, 4)
+        assert pos[0, 0].tolist() == [0, 1, 6, 7]
+        assert pos[1, 0].tolist() == [100, 101, 6, 7]
+        assert pos[2, 0].tolist() == [200, 201, 6, 7]
+
+    def test_image_row_rank1_slice(self):
+        _set_cp(rank=1, size=2)
+        _set_tp(size=1)
+
+        pos = prepare_packed_mrope_position_ids(
+            [_tok(6)], pad_multiplier=0,
+            image_grid_thw_list=[_GRID], rope_index_fn=_fake_rope_index_fn(),
+        )
+
+        assert pos[0, 0].tolist() == [2, 3, 4, 5]
+        assert pos[1, 0].tolist() == [102, 103, 104, 105]
+
+    def test_mixed_text_and_image_rows(self):
+        _set_cp(rank=1, size=2)
+        _set_tp(size=1)
+        calls = []
+
+        pos = prepare_packed_mrope_position_ids(
+            [_tok(6), _tok(10)], pad_multiplier=0,
+            image_grid_thw_list=[None, _GRID], rope_index_fn=_fake_rope_index_fn(calls),
+        )
+
+        # rope_index_fn only runs for the image row, with that row's tokens.
+        assert calls == [(10, _GRID)]
+        # Text row (first 4 slots): identical axes. Image row: axes offset.
+        assert torch.equal(pos[0, 0, :4], pos[1, 0, :4])
+        assert pos[0, 0, 4:].tolist() == [3, 4, 5, 6, 7, 8]
+        assert pos[1, 0, 4:].tolist() == [103, 104, 105, 106, 107, 108]
+
+    def test_all_none_grids_equal_text_only(self):
+        _set_cp(rank=0, size=2)
+        _set_tp(size=1)
+
+        text_only = prepare_packed_mrope_position_ids([_tok(6), _tok(10)], pad_multiplier=0)
+        with_none = prepare_packed_mrope_position_ids(
+            [_tok(6), _tok(10)], pad_multiplier=0, image_grid_thw_list=[None, None],
+        )
+
+        assert torch.equal(text_only, with_none)
+
+    def test_image_row_cp1(self):
+        _set_cp(rank=0, size=1)
+        _set_tp(size=1)
+
+        pos = prepare_packed_mrope_position_ids(
+            [_tok(6)], pad_multiplier=0,
+            image_grid_thw_list=[_GRID], rope_index_fn=_fake_rope_index_fn(),
+        )
+
+        assert pos.shape == (3, 1, 6)
+        assert pos[1, 0].tolist() == [100, 101, 102, 103, 104, 105]
+
+    def test_missing_rope_index_fn_raises(self):
+        _set_cp(rank=0, size=2)
+        _set_tp(size=1)
+
+        with pytest.raises(AssertionError, match="rope_index_fn"):
+            prepare_packed_mrope_position_ids(
+                [_tok(6)], pad_multiplier=0, image_grid_thw_list=[_GRID],
+            )
+
+    def test_wrong_rope_shape_raises(self):
+        _set_cp(rank=0, size=2)
+        _set_tp(size=1)
+
+        with pytest.raises(AssertionError, match="expected"):
+            prepare_packed_mrope_position_ids(
+                [_tok(6)], pad_multiplier=0, image_grid_thw_list=[_GRID],
+                rope_index_fn=lambda t, g: torch.zeros(3, 5, dtype=torch.long),
+            )
+
+    def test_grid_list_length_mismatch_raises(self):
+        _set_cp(rank=0, size=2)
+        _set_tp(size=1)
+
+        with pytest.raises(AssertionError, match="align"):
+            prepare_packed_mrope_position_ids(
+                [_tok(6), _tok(10)], pad_multiplier=0, image_grid_thw_list=[None],
+            )
