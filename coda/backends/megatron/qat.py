@@ -17,7 +17,8 @@ numerics that cannot be read from the checkpoint live in a small :class:`QATAdap
   rollout receives exactly the training weights.
 * Activation QAT: forward pre-hooks fake-quantize the inputs of the linears the rollout runs as
   W8A8 (dynamic per-token, group = scale tile width, ue8m0) with SGLang's own kernel;
-  straight-through backward.
+  straight-through backward. Temporary escape hatch: ``CODA_QAT_DISABLE_ACT=1`` (trainer env)
+  keeps weight QAT only, since activation QAT currently raises k3 on DeepSeek-V4.1.
 
 Snapping a local (TP/EP) shard equals snapping the full checkpoint tensor only when the shard is a
 contiguous, tile-aligned slice of it; :func:`_local_layout_ok` checks this per param and raises
@@ -44,6 +45,9 @@ from megatron.bridge.models.conversion.param_mapping import (
 from coda.utils.quant_formats import CkptQuant, QuantScheme, read_ckpt_quant
 
 logger = logging.getLogger(__name__)
+
+# Temporary: set to "1" in trainer.env_vars to keep weight QAT but skip the activation fake-quant.
+DISABLE_ACT_ENV = "CODA_QAT_DISABLE_ACT"
 
 # Mappings that place a contiguous dim-0 / dim-1 slice (or the whole tensor, or a dim-0 concat of
 # such slices for GatedMLP) of each HF tensor into the local param.
@@ -230,6 +234,10 @@ class QuantPlan:
 
     # -- activation QAT
     def register_activation_hooks(self) -> int:
+        """Hook the activation fake-quant. Returns #hooks; 0 when disabled via ``DISABLE_ACT_ENV``."""
+        if os.environ.get(DISABLE_ACT_ENV) == "1":
+            logger.info(f"[QAT] activation QAT disabled by {DISABLE_ACT_ENV}=1, weight QAT only")
+            return 0
         for _, module, group in self.act_modules:
             module.register_forward_pre_hook(_make_act_pre_hook(group))
         return len(self.act_modules)

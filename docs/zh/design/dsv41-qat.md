@@ -101,6 +101,8 @@ checkpoint 里只有 `activation_scheme: dynamic`，不包含激活 scale，所�
 
 对齐到什么程度：两侧使用的量化函数相同，但 GEMM 结果不会逐位相同。SGLang 的 FP8 kernel 以 fp32 累加 `q_x·q_w·s_x·s_w`，Megatron 用反量化后的 bf16 做 GEMM，两者累加顺序和 kernel 不同；上游层的数值也存在差异。
 
+**临时开关 `CODA_QAT_DISABLE_ACT`**。实测在 DeepSeek-V4.1 上，激活 QAT 会让 `train/is_approx_k3_kl` 变大：H20 完整模型约 +25%，B200 toy 约 +27%。原因是训推两侧的激活差异逐层累积，超过约 1% 后，fake-quant 反而多出一份量化误差。在查清差异来源之前，可以在 `trainer.env_vars` 中设置 `CODA_QAT_DISABLE_ACT: "1"`，只保留权重 QAT。值必须写成字符串，否则 Ray 的 runtime_env 会报类型错误。启动日志会打印 `[QAT] activation QAT disabled by CODA_QAT_DISABLE_ACT=1, weight QAT only`。这个开关是临时的，找到原因后会删除。
+
 ### 3.5 各硬件上 rollout 的实际数值路径
 
 | | H20 (SM90) | B200 (SM100) |
@@ -257,7 +259,7 @@ B200 toy 上用原始 checkpoint 启动，开和关的输出逐位相同（token
 - **不训练 MTP 和 vision**：`save_hf` 写出的 MTP 和 vision 权重是原始 checkpoint 中未改动的版本。
 - **每次 save_hf 都写出完整 checkpoint**：包括未训练的部分，toy 约 100 GB，完整模型约 476 GB，请预留足够的磁盘空间。
 - **未建模的 rollout 配置**：MXFP4 W4A8（B200 默认）、FP8 wo_a GEMM、shared experts fusion、dense trtllm 后端（会 reshuffle 权重，refresh 时直接报错）、EPLB。
-- **激活对齐只做到 kernel 级**：量化函数与 SGLang 一致，但还没有做过逐层把 SGLang 实际的量化输入 dump 出来和 Megatron 对比的端到端验证。
+- **激活 QAT 目前是负收益**：已逐层 dump 对比过 SGLang 实际的量化输入和 Megatron 的输入，51 个 hook 与 SGLang 一一对应，没有挂错。问题出在训推激活差异逐层累积。可用 `CODA_QAT_DISABLE_ACT=1` 临时关闭激活 QAT（见 3.4）。
 
 ## 8. 代码索引
 

@@ -124,6 +124,7 @@ trainer:
   qat: true
   env_vars:
     PYTORCH_ALLOC_CONF: "expandable_segments:True,pinned_max_cached_size_mb:32"
+    CODA_QAT_DISABLE_ACT: "1"
 
 megatron:
   model:
