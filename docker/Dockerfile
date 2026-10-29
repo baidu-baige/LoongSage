@@ -39,13 +39,10 @@ RUN CPATH=/opt/sglang/lib/python3.12/site-packages/nvidia/cu13/include/cccl pip 
 RUN pip install flash-linear-attention==0.5.2
 RUN MAX_JOBS=16 pip install -v --no-build-isolation "flash-attn-3 @ git+https://github.com/Dao-AILab/flash-attention@main#subdirectory=hopper"
 
-# patch
-COPY patch /tmp/patch
-RUN cd /sgl-workspace/sglang && git apply /tmp/patch/sglang-0.5.21.patch
-# for dsv41
-RUN cd /sgl-workspace/Megatron-LM && git apply /tmp/patch/dsv41/megatron-core.patch
-RUN cd /sgl-workspace/Megatron-Bridge && git apply /tmp/patch/dsv41/megatron-bridge.patch
-RUN rm -rf /tmp/patch
-
 # loongsage
-RUN git clone https://github.com/baidu-baige/LoongSage.git && cd LoongSage && pip install --no-deps --no-build-isolation -e .
+RUN git clone https://github.com/baidu-baige/LoongSage.git && cd LoongSage && git checkout eb1d0cd && pip install --no-deps --no-build-isolation -e .
+
+# patch
+RUN cd /sgl-workspace/sglang && git apply ../LoongSage/docker/patch/sglang-0.5.21.patch
+RUN cd /sgl-workspace/Megatron-LM && git apply ../LoongSage/docker/patch/dsv41/megatron-core.patch
+RUN cd /sgl-workspace/Megatron-Bridge && git apply ../LoongSage/docker/patch/dsv41/megatron-bridge.patch
