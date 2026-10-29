@@ -40,7 +40,7 @@ RUN pip install flash-linear-attention==0.5.2
 RUN MAX_JOBS=16 pip install -v --no-build-isolation "flash-attn-3 @ git+https://github.com/Dao-AILab/flash-attention@main#subdirectory=hopper"
 
 # loongsage
-RUN git clone https://github.com/baidu-baige/LoongSage.git && cd LoongSage && git checkout eb1d0cd && pip install --no-deps --no-build-isolation -e .
+RUN git clone https://github.com/baidu-baige/LoongSage.git && cd LoongSage && pip install --no-deps --no-build-isolation -e .
 
 # patch
 RUN cd /sgl-workspace/sglang && git apply ../LoongSage/docker/patch/sglang-0.5.21.patch
