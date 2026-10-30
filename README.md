@@ -56,7 +56,7 @@ ______________________________________________________________________
 
 ## 📰 News
 
-- **[2026-10]** Added support for DeepSeek-V4.1-Flash (1017 release) and a new [RLCD2 recipe](conf/rlcd2/)!
+- **[2026-10]** Added [QAT](conf/dsv41_flash/) support for DeepSeek-V4.1-Flash and a new [RLCD2 recipe](conf/rlcd2/)!
 - **[2026-10]** Our technical report [*LoongSage: A Production-Grade, High-Efficiency Agentic RL Framework for Frontier LLMs with Validated Recipes*](https://arxiv.org/abs/2610.16352) is now available on arXiv!
 - **[2026-09]** Native support for black-box agents: OpenCode, Codex, and Claude Code can now be trained with RL out of the box, with no changes to agent code (recipes in [`conf/qwen3_coder_30b_a3b/`](conf/qwen3_coder_30b_a3b/))!
 - **[2026-08]** LoongSage is officially open-sourced!
