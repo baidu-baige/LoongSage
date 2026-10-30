@@ -96,6 +96,11 @@ class MegatronTrainWorker(TrainWorker):
             config.megatron.optimizer.overlap_cpu_optimizer_d2h_h2d = True
         if config.megatron.optimizer.chunked_optimizer_state_offload:
             config.megatron.optimizer.use_precision_aware_optimizer = True
+        if config.trainer.qat:
+            # QAT snaps the bf16 params in place after each step. With param remainders the fp32
+            # master is the bf16 param plus an int16 remainder, so the snap would overwrite it too and
+            # drop every sub-grid update. Keep a separate fp32 master (+2 B/param).
+            config.megatron.optimizer.store_param_remainders = False
 
         if config.megatron.ddp_config.overlap_param_gather:
             config.megatron.ddp_config.setdefault("align_param_gather", True)

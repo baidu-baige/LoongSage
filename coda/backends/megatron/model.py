@@ -451,7 +451,8 @@ def train_minibatch(
         opt_param_scheduler.step(increment=1)
         if qat_plan is not None:
             # Re-snap the freshly updated bf16 params onto the rollout quantization grid; the fp32
-            # master keeps the un-quantized value (straight-through QAT).
+            # master keeps the un-quantized value (straight-through QAT). Needs a separate fp32
+            # master: validate_config turns off store_param_remainders under QAT.
             qat_plan.snap_()
 
     return _collect_loss_metrics(
