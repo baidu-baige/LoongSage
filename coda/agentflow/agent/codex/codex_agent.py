@@ -12,7 +12,12 @@ from typing import Any, Callable
 from urllib.parse import urlparse
 
 from coda.agentflow.agent import BaseAgent, register_agent
-from coda.agentflow.utils import require_docker_image
+from coda.agentflow.utils import (
+    RESUME_PROMPT,
+    cli_process_pattern,
+    kill_process_tree_command,
+    require_docker_image,
+)
 from coda.reward.reward import Reward
 
 logger = logging.getLogger(__name__)
@@ -21,6 +26,9 @@ _CONFIG_PATH = "/root/.codex/config.toml"
 _MODEL_INSTRUCTIONS_PATH = "/root/.codex/coda_prompt.md"
 _CODEX_PATH = "codex"
 _LOG_PATH = "/tmp/coda-codex.log"
+# Written right before `codex exec` starts; its presence means this sandbox
+# holds a Codex session that a partial resume can continue.
+_STARTED_MARKER_PATH = "/tmp/coda-codex.started"
 _MODEL_INSTRUCTIONS = Path(__file__).with_name("prompt.md").read_text(encoding="utf-8")
 
 _CONFIG_TOML = '''model = "coda-actor"
@@ -146,13 +154,30 @@ class CodexAgent(BaseAgent):
         context_length = self.context_length
         await asyncio.to_thread(_write_file, execute, _MODEL_INSTRUCTIONS_PATH, _MODEL_INSTRUCTIONS)
         await asyncio.to_thread(_write_file, execute, _CONFIG_PATH, _build_config(self.router_url, context_length))
-        instruction = _instruction(trajectory.get("prompt", ""))
+        prompt = trajectory.get("prompt", "")
+        # Partial resume: reload Codex's own session from the retained sandbox
+        # so the model sees the full pre-abort history. The marker confirms the
+        # abort came after Codex actually started.
+        resume = bool(trajectory.get("resume"))
+        if resume:
+            marker = await asyncio.to_thread(
+                execute, f"test -f {shlex.quote(_STARTED_MARKER_PATH)}", workdir="/"
+            )
+            resume = marker.get("exit_code", -1) == 0
+        if resume:
+            session_args = "resume --last "
+            instruction = RESUME_PROMPT
+            logger.info("[codex] resuming session in sandbox %s", self.sandbox_id)
+        else:
+            session_args = ""
+            instruction = _instruction(trajectory.get("initial_prompt", prompt))
         command = (
+            f"touch {shlex.quote(_STARTED_MARKER_PATH)} && "
             "OPENAI_API_KEY=not-needed "
             f"CODEX_HOME={shlex.quote(str(PurePosixPath(_CONFIG_PATH).parent))} "
             f"{shlex.quote(_CODEX_PATH)} exec --json "
             "--dangerously-bypass-approvals-and-sandbox "
-            f"{shlex.quote(instruction)} </dev/null >{shlex.quote(_LOG_PATH)} 2>&1"
+            f"{session_args}{shlex.quote(instruction)} </dev/null >{shlex.quote(_LOG_PATH)} 2>&1"
         )
         self._codex_running = True
         result = await asyncio.to_thread(execute, command, workdir=repo_path)
@@ -177,14 +202,11 @@ class CodexAgent(BaseAgent):
         )
 
     async def close(self) -> None:
-        """Interrupt Codex if needed, then close shared resources."""
+        """Interrupt Codex and its tool processes if needed, then close shared resources."""
         await super().close()
         if not self._codex_running:
             return
-        command = (
-            "pkill -INT -f codex 2>/dev/null || true; sleep 1; "
-            "pkill -KILL -f codex 2>/dev/null || true"
-        )
+        command = kill_process_tree_command(cli_process_pattern(_CODEX_PATH))
         try:
             await asyncio.to_thread(self.sandbox_client.execute, self.sandbox_id, command)
         except Exception as exc:
