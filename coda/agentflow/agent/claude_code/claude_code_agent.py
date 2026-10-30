@@ -11,13 +11,22 @@ from typing import Any, Callable
 from urllib.parse import urlparse
 
 from coda.agentflow.agent import BaseAgent, register_agent
-from coda.agentflow.utils import CONTEXT_LENGTH_EXCEEDED, require_docker_image
+from coda.agentflow.utils import (
+    CONTEXT_LENGTH_EXCEEDED,
+    RESUME_PROMPT,
+    cli_process_pattern,
+    kill_process_tree_command,
+    require_docker_image,
+)
 from coda.reward.reward import Reward
 
 logger = logging.getLogger(__name__)
 
 _CLAUDE_PATH = "claude"
 _LOG_PATH = "/tmp/coda-claude-code.log"
+# Written right before `claude` starts; its presence means this sandbox holds a
+# Claude Code session that a partial resume can continue.
+_STARTED_MARKER_PATH = "/tmp/coda-claude-code.started"
 
 
 def _write_file(execute: Callable[..., dict], path: str, content: str) -> None:
@@ -144,7 +153,23 @@ class ClaudeCodeAgent(BaseAgent):
         await asyncio.to_thread(_write_file, execute, _READ_HOOK_PATH, _READ_LIMIT_HOOK_SH)
         await asyncio.to_thread(_write_file, execute, _SETTINGS_PATH, _SETTINGS_JSON)
 
-        instruction = _instruction(trajectory.get("prompt", ""))
+        prompt = trajectory.get("prompt", "")
+        # Partial resume: reload Claude Code's own session from the retained
+        # sandbox so the model sees the full pre-abort history. The marker
+        # confirms the abort came after Claude Code actually started.
+        resume = bool(trajectory.get("resume"))
+        if resume:
+            marker = await asyncio.to_thread(
+                execute, f"test -f {shlex.quote(_STARTED_MARKER_PATH)}", workdir="/"
+            )
+            resume = marker.get("exit_code", -1) == 0
+        if resume:
+            session_args = "--continue "
+            instruction = RESUME_PROMPT
+            logger.info("[claude_code] resuming session in sandbox %s", self.sandbox_id)
+        else:
+            session_args = ""
+            instruction = _instruction(trajectory.get("initial_prompt", prompt))
         env_vars = {
             "IS_SANDBOX": "1",
             "ANTHROPIC_BASE_URL": self.router_url.rstrip("/"),
@@ -172,8 +197,9 @@ class ClaudeCodeAgent(BaseAgent):
             f"{name}={shlex.quote(value)}" for name, value in env_vars.items()
         )
         command = (
+            f"touch {shlex.quote(_STARTED_MARKER_PATH)} && "
             f"printf %s {shlex.quote(instruction)} | {env_prefix} "
-            f"{shlex.quote(_CLAUDE_PATH)} --print --verbose "
+            f"{shlex.quote(_CLAUDE_PATH)} --print {session_args}--verbose "
             "--output-format stream-json "
             "--permission-mode bypassPermissions "
             f"--settings {shlex.quote(_SETTINGS_PATH)} "
@@ -233,16 +259,19 @@ class ClaudeCodeAgent(BaseAgent):
         )
 
     async def close(self) -> None:
-        """Interrupt a still-running Claude Code process, then close shared resources."""
+        """Interrupt a still-running Claude Code process tree, then close shared resources."""
         await super().close()
         if not self._claude_running:
             return
         if self.sandbox_id is None:
             return
-        command = (
-            "pkill -INT -f '(^|/)claude( |$)' 2>/dev/null || true; sleep 1; "
-            "pkill -KILL -f '(^|/)claude( |$)' 2>/dev/null || true"
-        )
+        # Partial resume keeps the Router prefix only on Claude Code >= 2.1.290
+        # (images ship 2.1.308): on SIGINT it records the interrupted tool call
+        # as a tool_result, so --continue replays the pre-abort request unchanged.
+        # 2.1.263 and older drop the dangling tool_use on --continue and append
+        # the resume text to the task message, so the Router falls back to a new
+        # compact segment. Versions without the SIGINT record are not covered.
+        command = kill_process_tree_command(cli_process_pattern(_CLAUDE_PATH))
         try:
             await asyncio.to_thread(self.sandbox_client.execute, self.sandbox_id, command)
         except Exception as exc:

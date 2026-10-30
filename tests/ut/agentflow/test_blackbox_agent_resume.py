@@ -1,4 +1,4 @@
-"""Partial-resume behaviour of the black-box CLI agents.
+"""Partial-resume behaviour shared by the black-box CLI agents (OpenCode, Claude Code, Codex).
 
 On resume AgentFlow sets ``resume=True`` and passes the active-segment history as
 ``prompt``. A black-box CLI cannot ingest that history, so the agent must reload
@@ -11,6 +11,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from coda.agentflow.agent.claude_code.claude_code_agent import ClaudeCodeAgent
+from coda.agentflow.agent.codex.codex_agent import CodexAgent
 from coda.agentflow.agent.opencode.opencode_agent import OpenCodeAgent
 from coda.agentflow.sandbox.base import SandboxClient
 from coda.agentflow.utils import RESUME_PROMPT
@@ -30,6 +32,8 @@ _HISTORY = [
 # (agent class, CLI substring identifying the launch command, resume flag, marker path)
 _AGENTS = [
     pytest.param(OpenCodeAgent, " run ", "run --continue ", "/tmp/coda-opencode.started", id="opencode"),
+    pytest.param(ClaudeCodeAgent, "--print", "--print --continue ", "/tmp/coda-claude-code.started", id="claude_code"),
+    pytest.param(CodexAgent, " exec ", " resume --last ", "/tmp/coda-codex.started", id="codex"),
 ]
 
 
@@ -157,6 +161,8 @@ async def test_resume_without_cli_session_starts_fresh_from_initial_prompt(
     "agent_cls,running_flag,pattern",
     [
         pytest.param(OpenCodeAgent, "_opencode_running", r"/root/\.opencode/bin/[o]pencode( |$)", id="opencode"),
+        pytest.param(ClaudeCodeAgent, "_claude_running", "(^|/)[c]laude( |$)", id="claude_code"),
+        pytest.param(CodexAgent, "_codex_running", "(^|/)[c]odex( |$)", id="codex"),
     ],
 )
 async def test_close_kills_cli_process_tree_only_while_running(agent_cls, running_flag, pattern) -> None:
