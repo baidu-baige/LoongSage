@@ -26,11 +26,13 @@ from coda.agentflow import tokenizer_manager
 from coda.agentflow.tokenizer_manager import (
     DEEPSEEK_V4_MODEL_FAMILY,
     DEEPSEEK_V41_MODEL_FAMILY,
+    ThreadedTokenizerManager,
     _deepseek_official_family,
     _deepseek_v4_thinking_mode,
     _wrap_deepseek_v4_tokenizer,
 )
 from coda.agentflow.trajectory_store import Segment, Trajectory, TrajectoryStore, TrajectoryStatus, Triplet
+from tests.ut.agentflow.fake_tokenizers import FakeQwenTokenizer
 
 
 @pytest.mark.parametrize(
@@ -129,21 +131,10 @@ def test_deepseek_v4_empty_system_is_only_bos() -> None:
         FakeDeepSeekV4Tokenizer(), DEEPSEEK_V4_MODEL_FAMILY
     )
 
-    async def apply_chat_template(messages, **kwargs):
-        return tokenizer.apply_chat_template(messages, **kwargs)
+    manager = ThreadedTokenizerManager(tokenizer, num_workers=1)
 
-    parser = TrajectoryParser(
-        trajectory_store=TrajectoryStore(),
-        tokenizer_manager=SimpleNamespace(
-            model_family="deepseek_v4",
-            think_tags=("<think>", "</think>"),
-            apply_chat_template=apply_chat_template,
-        ),
-    )
-
-    system_prompt_len = asyncio.run(parser._get_system_prompt_len())
-
-    assert system_prompt_len == len("<｜begin▁of▁sentence｜>".encode())
+    assert manager.dummy_prefix_message == {"role": "system", "content": ""}
+    assert manager.dummy_prefix == list("<｜begin▁of▁sentence｜>".encode())
 
 
 def test_deepseek_v4_first_turn_encodes_tools_in_system_prompt() -> None:
@@ -155,7 +146,6 @@ def test_deepseek_v4_first_turn_encodes_tools_in_system_prompt() -> None:
         return tokenizer.apply_chat_template(messages, **kwargs)
 
     manager = SimpleNamespace(
-        system_prompt_len=len("<｜begin▁of▁sentence｜>".encode()),
         model_family="deepseek_v4",
         think_tags=("<think>", "</think>"),
         apply_chat_template=apply_chat_template,
@@ -197,7 +187,8 @@ def test_deepseek_v4_continuation_strips_only_bos() -> None:
         return tokenizer.apply_chat_template(messages, **kwargs)
 
     manager = SimpleNamespace(
-        system_prompt_len=len("<｜begin▁of▁sentence｜>".encode()),
+        dummy_prefix_message={"role": "system", "content": ""},
+        dummy_prefix=list("<｜begin▁of▁sentence｜>".encode()),
         model_family="deepseek_v4",
         think_tags=("<think>", "</think>"),
         apply_chat_template=apply_chat_template,
@@ -223,39 +214,37 @@ def test_deepseek_v4_continuation_strips_only_bos() -> None:
     full_ids = asyncio.run(manager.apply_chat_template(messages, add_generation_prompt=True))
     continuation_ids = asyncio.run(parser._tokenize_delta_messages(messages[1:]))
 
-    assert continuation_ids == full_ids[manager.system_prompt_len:]
+    assert continuation_ids == full_ids[len(manager.dummy_prefix):]
     assert bytes(continuation_ids).decode().startswith("\n\n<｜DSML｜tool_calls>")
     assert "<tool_result>/repo</tool_result>" in bytes(continuation_ids).decode()
 
 
 def test_tokenize_delta_falls_back_to_dummy_user_for_qwen35_style_template() -> None:
-    """Templates that reject system-only conversations (Qwen3.5) use the verl-style fallback."""
-    async def apply_chat_template(messages, add_generation_prompt=True, tools=None, **kwargs):
-        if not any(m.get("role") == "user" for m in messages):
-            raise ValueError("Qwen3.5 requires at least one user message")
-        ids = []
-        for message in messages:
-            ids.extend([1] if message["role"] == "user" else [2, 3])
-        if add_generation_prompt:
-            ids.append(9)
-        return ids
-
+    """Templates that reject system-only conversations (Qwen3.5) render the delta behind an empty user."""
+    manager = ThreadedTokenizerManager(FakeQwenTokenizer(), num_workers=1)
     parser = TrajectoryParser(
         trajectory_store=TrajectoryStore(),
-        tokenizer_manager=SimpleNamespace(apply_chat_template=apply_chat_template),
+        tokenizer_manager=manager,
+        reasoning_parser=False,
+        tool_call_parser=False,
     )
     delta = [
         {"role": "assistant", "content": "a"},
         {"role": "tool", "content": "r"},
     ]
 
-    delta_ids = asyncio.run(parser._tokenize_delta_messages(delta))
+    try:
+        delta_ids = asyncio.run(parser._tokenize_delta_messages(delta))
+    finally:
+        manager.shutdown()
 
-    # dummy user prefix ([1]) is stripped; failure of the system-only probe is cached
-    assert delta_ids == [2, 3, 2, 3, 9]
-    assert parser._system_prompt_len == -1
-    assert parser._dummy_user_prefix_len == 1
-    assert asyncio.run(parser._tokenize_delta_messages(delta)) == [2, 3, 2, 3, 9]
+    # the empty user message's render is stripped
+    assert manager.dummy_prefix_message == {"role": "user", "content": ""}
+    assert manager.tokenizer.decode(delta_ids) == (
+        "<|im_start|>assistant\n<think>\n\n</think>\n\na<|im_end|>\n"
+        "<|im_start|>user\n<tool_response>\nr\n</tool_response><|im_end|>\n"
+        "<|im_start|>assistant\n<think>\n"
+    )
 
 
 def test_deepseek_v4_process_initializer_wraps_worker_tokenizer(tmp_path) -> None:
@@ -277,7 +266,7 @@ def test_deepseek_v4_process_initializer_wraps_worker_tokenizer(tmp_path) -> Non
 
 def make_parser() -> TrajectoryParser:
     """Create a parser with the minimum tokenizer stub needed for construction."""
-    tokenizer = SimpleNamespace(system_prompt_len=0)
+    tokenizer = SimpleNamespace()
     return TrajectoryParser(
         trajectory_store=TrajectoryStore(),
         tokenizer_manager=tokenizer,
@@ -290,7 +279,6 @@ def test_parser_sampling_params_keep_special_tokens_only_for_deepseek_v4(
     model_family, expected_skip_special_tokens
 ) -> None:
     tokenizer_manager = SimpleNamespace(
-        system_prompt_len=0,
         model_family=model_family,
     )
     middleware = ParserMiddleware(
@@ -338,7 +326,7 @@ def test_parser_owns_temperature(
             ),
         ),
         trajectory_store=TrajectoryStore(),
-        tokenizer_manager=SimpleNamespace(system_prompt_len=0),
+        tokenizer_manager=SimpleNamespace(),
     )
     payload = json.loads(
         middleware._build_generate_body(
@@ -375,7 +363,7 @@ def test_responses_context_limited_length_triggers_compaction_retry() -> None:
             rollout=SimpleNamespace(eval=SimpleNamespace(temperature=None)),
         ),
         trajectory_store=store,
-        tokenizer_manager=SimpleNamespace(system_prompt_len=0),
+        tokenizer_manager=SimpleNamespace(),
         ds_configs={
             0: SimpleNamespace(max_response_len_per_trajectory=1, completion_params={"top_p": 0.1}),
             1: ds_config,
@@ -529,7 +517,6 @@ def make_deepseek_v4_parser(model_dir: str | None) -> TrajectoryParser:
     return TrajectoryParser(
         trajectory_store=TrajectoryStore(),
         tokenizer_manager=SimpleNamespace(
-            system_prompt_len=1,
             tokenizer=SimpleNamespace(chat_template=None, name_or_path=model_dir),
         ),
     )
@@ -593,7 +580,7 @@ def make_sglang_parser(**kwargs) -> TrajectoryParser:
     """Parser wired to the SGLang reasoning/tool-call detectors."""
     return TrajectoryParser(
         trajectory_store=TrajectoryStore(),
-        tokenizer_manager=SimpleNamespace(system_prompt_len=0),
+        tokenizer_manager=SimpleNamespace(),
         **kwargs,
     )
 
@@ -646,7 +633,6 @@ def test_unset_parsers_auto_detect_from_chat_template() -> None:
     parser = TrajectoryParser(
         trajectory_store=TrajectoryStore(),
         tokenizer_manager=SimpleNamespace(
-            system_prompt_len=0,
             tokenizer=SimpleNamespace(
                 chat_template=QWEN3_CHAT_TEMPLATE,
                 get_vocab=lambda: {},
@@ -765,7 +751,6 @@ def test_build_turn_input_caches_tools_for_follow_up_turns() -> None:
     parser = TrajectoryParser(
         trajectory_store=TrajectoryStore(),
         tokenizer_manager=SimpleNamespace(
-            system_prompt_len=0,
             apply_chat_template=apply_chat_template,
         ),
     )
@@ -967,7 +952,9 @@ def make_prefix_parser():
     return TrajectoryParser(
         trajectory_store=TrajectoryStore(),
         tokenizer_manager=SimpleNamespace(
-            system_prompt_len=0,
+            # One fake id per message, so the empty system message renders to one id.
+            dummy_prefix_message={"role": "system", "content": ""},
+            dummy_prefix=[0],
             apply_chat_template=apply_chat_template,
         ),
     )

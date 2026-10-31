@@ -190,4 +190,8 @@ def compute_advantages(
     """
     advantage_fn = get_advantage(config.advantage_estimator)
     advantages = advantage_fn(config, rollout_data)
+    if config.advantage_estimator == "sft":
+        # SFT's advantage is a constant 1, so adv_zero_ratio carries no signal
+        # and the DP all-reduce below would be wasted.
+        return advantages, {}
     return advantages, _advantage_metrics(advantages)

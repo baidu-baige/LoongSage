@@ -1073,7 +1073,6 @@ class FakeTokenizerManager:
 
     def __init__(self) -> None:
         self.tokenizer = object()
-        self.system_prompt_len = 0
 
     async def apply_chat_template(self, messages, *, add_generation_prompt=True, tools=None):
         return [101, 102, 103]

@@ -1,0 +1,48 @@
+# @package _global_
+# Qwen3-4B SFT, single H800 node (8 GPUs). No inference engine is started.
+# Launch: bash examples/start.sh qwen3_4b/sft_h800_1node
+#   run_mode=sft overrides colocate, trainer.use_rollout_log_probs, the RL-only switches, eval and
+#   num_trajectories_per_prompt (sft_sampler.DEFAULT_SETTINGS / DATA_SOURCE_DEFAULT_SETTINGS)
+#   and warns when this config says otherwise.
+# Fill in the two ??? below, or override them on the command line:
+#   hf_model_path                         HF weight dir of Qwen3-4B
+#   data_source.dataset.prompt_data_path  .jsonl/.parquet whose "messages" column holds
+#                                         OpenAI-style conversations, e.g.
+#     {"messages": [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]}
+#   Tool schemas for a row can be put in its metadata as {"tools": [...]}.
+defaults:
+  - /default
+  - _self_
+
+run_mode: sft
+checkpoint_path: ./checkpoints
+hf_model_path: ???
+total_steps: 100
+
+data_source:
+  dataset:
+    prompt_data_path: ???
+    input_key: messages
+    label_key: null
+  num_prompts_per_step: 64       # global batch size (conversations per optimizer step)
+  num_trajectories_per_prompt: 1
+  sft_max_seq_len: 16384         # truncate each rendered conversation to this many tokens
+
+trainer:
+  mini_batch_size: 64            # == num_prompts_per_step: one optimizer step per training step
+  max_tokens_per_gpu: 20480
+  use_dynamic_batch_size: true
+
+megatron:
+  model:
+    tensor_model_parallel_size: 2
+    pipeline_model_parallel_size: 1
+    virtual_pipeline_model_parallel_size: null
+    context_parallel_size: 1
+    expert_model_parallel_size: 1
+    expert_tensor_parallel_size: 1
+
+algorithm:
+  advantage_estimator: sft
+  policy_loss: sft
+  loss_agg_mode: token-mean

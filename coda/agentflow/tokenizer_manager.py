@@ -1,4 +1,8 @@
-"""Tokenizer execution manager for CPU-bound chat-template and encode calls."""
+"""Tokenizer execution manager for CPU-bound chat-template and encode calls.
+
+The manager also probes the chat template's dummy prefix and generation prompt, and
+tokenizes SFT conversations with their assistant loss masks.
+"""
 
 from __future__ import annotations
 
@@ -30,6 +34,9 @@ DEEPSEEK_OFFICIAL_ENCODER_MODULES = {
     DEEPSEEK_V41_MODEL_FAMILY: "sglang.srt.entrypoints.openai.encoding_dsv41",
     DEEPSEEK_V4_MODEL_FAMILY: "sglang.srt.entrypoints.openai.encoding_dsv4",
 }
+# Probe messages: the dummy prefix and generation prompt are read off their renders.
+_EMPTY_SYSTEM = {"role": "system", "content": ""}
+_EMPTY_USER = {"role": "user", "content": ""}
 
 
 def _deepseek_v4_thinking_mode(generation_prompt_kwargs: Mapping[str, Any]) -> str:
@@ -144,7 +151,11 @@ def _init_process_tokenizer(model_path: str, custom_chat_template: str | None) -
 
 
 def _ensure_token_list(obj: Any) -> list[int]:
-    """Normalize tokenizer outputs to a plain list of ints."""
+    """Normalize tokenizer outputs into a flat ``list[int]``.
+
+    This handles Transformers 4/5 differences where ``apply_chat_template(tokenize=True)``
+    may return either ``list[int]`` or a ``BatchEncoding``/mapping with ``input_ids``.
+    """
     if hasattr(obj, "keys") and "input_ids" in obj:
         return _ensure_token_list(obj["input_ids"])
     if isinstance(obj, dict):
@@ -229,7 +240,18 @@ def _decode_process(token_ids: list[int], *, skip_special_tokens: bool) -> str:
 # ---------------------------------------------------------------------------
 
 class BaseTokenizerManager(ABC):
-    """Async tokenizer interface with common metadata."""
+    """Async tokenizer interface with common metadata.
+
+    Attributes:
+        dummy_prefix_message: Empty message a continuation message is rendered behind:
+            an empty system message, or an empty user message when the chat template
+            rejects a system-only conversation (Qwen3.5 needs a user message).
+        dummy_prefix: Token ids ``dummy_prefix_message`` renders to, e.g. a lone BOS token
+            (DeepSeek) or an empty system / user turn; cut off every render behind it.
+        generation_prompt: Token ids ``add_generation_prompt=True`` appends to open an
+            assistant reply: the assistant header plus anything pre-filled after it.
+            Not trained at the start of an assistant message.
+    """
 
     def __init__(
         self,
@@ -256,6 +278,138 @@ class BaseTokenizerManager(ABC):
         self.think_end_ids = _ensure_token_list(
             tokenizer.encode(self.think_tags[1], add_special_tokens=False)
         )
+        self.dummy_prefix_message, self.dummy_prefix = self._get_dummy_prefix()
+        self.generation_prompt = self._get_generation_prompt()
+        logger.info(
+            "probed from chat template: dummy_prefix=%r (empty %s message) generation_prompt=%r",
+            tokenizer.decode(self.dummy_prefix),
+            self.dummy_prefix_message["role"],
+            tokenizer.decode(self.generation_prompt),
+        )
+
+    def _render(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        add_generation_prompt: bool = False,
+    ) -> list[int]:
+        """Render ``messages`` to token ids in the calling thread, with ``generation_prompt_kwargs``."""
+        return _ensure_token_list(
+            self.tokenizer.apply_chat_template(
+                messages,
+                tools=tools,
+                add_generation_prompt=add_generation_prompt,
+                tokenize=True,
+                **self.generation_prompt_kwargs,
+            )
+        )
+
+    def _get_dummy_prefix(self) -> tuple[dict[str, Any], list[int]]:
+        """Probe ``dummy_prefix_message`` and the ``dummy_prefix`` it renders to.
+
+        empty system message, unless the chat template rejects a system-only conversation
+        (Qwen3.5 requires at least one user message); then an empty user message.
+
+        Returns:
+            ``(dummy_prefix_message, dummy_prefix)``.
+
+        Raises:
+            Exception: The chat template rejects the empty user message too.
+        """
+        try:
+            return _EMPTY_SYSTEM, self._render([_EMPTY_SYSTEM])
+        except Exception as exc:
+            logger.warning(
+                "chat template rejects a system-only conversation (%s); "
+                "continuation messages are rendered behind an empty user message", exc
+            )
+            return _EMPTY_USER, self._render([_EMPTY_USER])
+
+    def _get_generation_prompt(self) -> list[int]:
+        """Probe ``generation_prompt``: what ``add_generation_prompt=True`` appends to an empty user message.
+
+        Raises:
+            ValueError: If ``add_generation_prompt=True`` changes the rendered messages
+                instead of appending to them; the probed tokens would be wrong.
+        """
+        rendered = self._render([_EMPTY_USER])
+        renderd_with_generation_prompt = self._render([_EMPTY_USER], add_generation_prompt=True)
+        if renderd_with_generation_prompt[: len(rendered)] != rendered:
+            raise ValueError(
+                "chat-template probe: add_generation_prompt=True rewrites the rendered messages "
+                f"instead of appending to them: {self.tokenizer.decode(rendered)!r} -> "
+                f"{self.tokenizer.decode(renderd_with_generation_prompt)!r}"
+            )
+        return renderd_with_generation_prompt[len(rendered) :]
+
+    def tokenize(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+    ) -> tuple[list[int], list[int]]:
+        """Return the SFT ``(input_ids, loss_mask)`` of a conversation, in the calling thread.
+
+        The messages before the first assistant message (at least one) are the prompt,
+        rendered at once with ``tools`` as an RL first turn is.  Every later message is
+        rendered behind ``dummy_prefix_message`` with ``dummy_prefix`` cut off, as an RL
+        continuation turn is, and the renders are concatenated.  Assistant messages are
+        trained except for the ``generation_prompt`` they open with; all other messages
+        are context.
+
+        Templates that render a message depending on the messages around it make the
+        concatenation differ from the whole conversation rendered at once: Qwen3 gives
+        only the final assistant turn a think block, DeepSeek in thinking mode drops the
+        reasoning of earlier turns.  The concatenation is trained on as is; it is not
+        compared with the whole render.
+
+        Args:
+            messages: OpenAI-style conversation; only ``role == "assistant"`` messages are trained.
+            tools: Tool schemas the chat template renders with the prompt, if any.
+
+        Returns:
+            ``input_ids`` and a same-length 0/1 ``loss_mask``; both empty for no messages.
+
+        Raises:
+            Exception: The chat template rejects the prompt (Qwen3.5 given no user message
+                before the first assistant message) or a message rendered behind
+                ``dummy_prefix_message`` (Qwen3.5 given a system message after the first).
+        """
+        if not messages:
+            return [], []
+        prompt_len = len(messages)
+        for index, message in enumerate(messages):
+            if message.get("role") == "assistant":
+                prompt_len = index
+                break
+        prompt_len = max(prompt_len, 1)
+        input_ids = self._render(messages[:prompt_len], tools)
+        loss_mask = [0] * len(input_ids)
+        for index, message in enumerate(messages[prompt_len:], start=prompt_len):
+            message_ids, message_mask = self._tokenize_single_message(index, message)
+            input_ids += message_ids
+            loss_mask += message_mask
+        return input_ids, loss_mask
+
+    def _tokenize_single_message(
+        self, index: int, message: dict[str, Any]
+    ) -> tuple[list[int], list[int]]:
+        """Tokenize one message behind ``dummy_prefix_message``; return its ids and loss mask."""
+        input_ids = self._render([self.dummy_prefix_message, message])
+        role = message.get("role")
+        if input_ids[: len(self.dummy_prefix)] != self.dummy_prefix:
+            logger.warning(
+                f"message {index} ({role}) renders as {self.tokenizer.decode(input_ids)!r}, "
+                f"which does not start with the dummy prefix {self.tokenizer.decode(self.dummy_prefix)!r}"
+            )
+        input_ids = input_ids[len(self.dummy_prefix) :]
+
+        loss_mask = [0] * len(input_ids)
+        if role != "assistant":
+            return input_ids, loss_mask
+        # mask out the generation prompt, as verl does
+        prompt_len = len(self.generation_prompt)
+        loss_mask[prompt_len:] = [1] * (len(input_ids) - prompt_len)
+        return input_ids, loss_mask
 
     @abstractmethod
     async def apply_chat_template(

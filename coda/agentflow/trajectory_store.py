@@ -231,7 +231,8 @@ class Trajectory(PydanticModel):
     # True for eval-dataset trajectories (routed out of the training batch).
     is_eval: bool = False
 
-    prompt: str | list[dict[str, str]] | dict[str, Any] = ""
+    # Dataset row at input_key: the prompt (RL) or the full conversation (SFT).
+    prompt: str | list[dict[str, Any]] | dict[str, Any] = ""
     label: Any = None
 
     # Retry counter for this trajectory (0 = first attempt).

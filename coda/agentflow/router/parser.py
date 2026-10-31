@@ -268,11 +268,6 @@ class TrajectoryParser:
         self.think_tags = getattr(tokenizer_manager, "think_tags", DEFAULT_THINK_TAGS)
         self.think_end_ids: list[int] = list(getattr(tokenizer_manager, "think_end_ids", []))
         self.think_start_ids: list[int] = list(getattr(tokenizer_manager, "think_start_ids", []))
-        # Length of the template prelude for an empty system message, computed lazily
-        # on the first continuation turn (not at tokenizer init). -1 caches "the chat
-        # template rejects a system-only conversation" (e.g. Qwen3.5).
-        self._system_prompt_len: int | None = None
-        self._dummy_user_prefix_len: int | None = None
         gen_kwargs: dict = getattr(tokenizer_manager, "generation_prompt_kwargs", {}) or {}
         self.enable_thinking: bool = bool(gen_kwargs.get("enable_thinking", True))
         # Auto-detection reads the chat template + tokenizer vocab (or the model config
@@ -696,74 +691,23 @@ class TrajectoryParser:
             tools=tools,
         )
 
-    async def _get_system_prompt_len(self) -> int | None:
-        """Length of the template prelude rendered for an empty system message.
-
-        Computed lazily on the first continuation turn instead of at tokenizer-manager
-        init. Returns None when the chat template rejects a system-only conversation
-        (e.g. Qwen3.5 requires at least one user message); either outcome is cached.
-        """
-        if self._system_prompt_len is None:
-            try:
-                sys_ids = await self.tokenizer_manager.apply_chat_template(
-                    [{"role": "system", "content": ""}],
-                    add_generation_prompt=False,
-                    tools=None,
-                )
-                self._system_prompt_len = len(sys_ids)
-            except Exception as exc:
-                logger.warning(
-                    "Failed to compute system prompt length (%s); "
-                    "continuation turns will use the dummy-user fallback", exc
-                )
-                self._system_prompt_len = -1
-        return None if self._system_prompt_len < 0 else self._system_prompt_len
-
     async def _tokenize_delta_messages(self, new_messages: list[dict[str, Any]]) -> list[int]:
         """Tokenize continuation messages, stripping the shared template prelude.
 
-        Mirrors verl's chat-template helpers (verl/utils/tokenizer/chat_template.py):
-        render the delta behind an empty system message and strip its rendered length;
-        when the template rejects that (e.g. Qwen3.5), fall back to rendering behind a
-        dummy user message and strip that prefix instead. Tools are omitted because
-        they are already encoded in trajectory.tokens from the first turn.
+        The delta is rendered behind the tokenizer manager's ``dummy_prefix_message``
+        (an empty system message, or an empty user message when the chat template
+        rejects a system-only conversation, e.g. Qwen3.5) and its ``dummy_prefix`` is
+        cut off. Tools are omitted because they are already encoded in
+        trajectory.tokens from the first turn.
         """
-        system_prompt_len = await self._get_system_prompt_len()
-        if system_prompt_len is not None:
-            try:
-                # Route through _tokenize_messages so assistant tool_call arguments
-                # get normalized for the template, same as full-conversation renders.
-                token_ids = await self._tokenize_messages(
-                    [{"role": "system", "content": ""}, *new_messages],
-                    tools=None,
-                )
-                if len(token_ids) >= system_prompt_len:
-                    return token_ids[system_prompt_len:]
-                return token_ids
-            except Exception as exc:
-                logger.warning(
-                    "Empty-system delta tokenization failed (%s); "
-                    "retrying with a dummy user prefix", exc
-                )
-        return await self._tokenize_delta_with_dummy_user(new_messages)
-
-    async def _tokenize_delta_with_dummy_user(
-        self, new_messages: list[dict[str, Any]]
-    ) -> list[int]:
-        """Qwen3.5-style fallback: prefix a dummy user turn, then strip its tokens."""
-        dummy_user = [{"role": "user", "content": [{"type": "text", "text": ""}]}]
-        if self._dummy_user_prefix_len is None:
-            prefix_ids = await self.tokenizer_manager.apply_chat_template(
-                dummy_user,
-                add_generation_prompt=False,
-                tools=None,
-            )
-            self._dummy_user_prefix_len = len(prefix_ids)
+        manager = self.tokenizer_manager
+        # Route through _tokenize_messages so assistant tool_call arguments
+        # get normalized for the template, same as full-conversation renders.
         token_ids = await self._tokenize_messages(
-            [*dummy_user, *new_messages],
+            [manager.dummy_prefix_message, *new_messages],
             tools=None,
         )
-        return token_ids[self._dummy_user_prefix_len:]
+        return token_ids[len(manager.dummy_prefix):]
 
     def _normalize_messages(
         self, messages: list[dict[str, Any]], *, strip_think: bool = True

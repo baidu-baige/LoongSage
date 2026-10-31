@@ -158,7 +158,7 @@ Below are our main plans for upcoming work. Discussions and contributions via Is
 - [ ] PPO support
 - [ ] MTP / DSpark
 - [ ] Multi-data-source and multi-agent support in fully asynchronous mode
-- [ ] SFT support
+- [x] SFT support (`run_mode: sft`, see `conf/qwen3_4b/sft_h800_1node.yaml`)
 - [ ] LORA support
 - [ ] Distributed storage for multi-teacher weights
 - [ ] Omni-modal support

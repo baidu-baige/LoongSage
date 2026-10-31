@@ -1,6 +1,6 @@
 # Default configuration parameters for Coda. Users shall not edit this file.
 
-run_mode: default  # or "train-only" or "rollout-only"
+run_mode: default  # or "train-only" or "rollout-only" or "sft"
 seed: 42
 colocate: true
 checkpoint_path: ???  # Training model ckpt base dir: both output and resume input. The latest step is found via latest_checkpointed_iteration.txt.
@@ -64,6 +64,8 @@ data_source:
     name: ???
   teacher_name: ""
   max_response_len_per_trajectory: 32768  # cap on response-area tokens (LLM replies + tool responses) per attempt. Single-turn uses this as request max_tokens; multi-turn agents receive it and choose their own per-call max_tokens.
+  # run_mode=sft only: keep the first sft_max_seq_len tokens of each rendered conversation (null = no limit).
+  sft_max_seq_len: null
   num_prompts_per_step: 64
   num_trajectories_per_prompt: 8
   completion_params: {}

@@ -19,6 +19,7 @@ def _make_config(
     cfg = {
         "log_level": log_level,
         "colocate": colocate,
+        "run_mode": "default",
         "trainer": {
             "num_gpus_per_node": trainer_gpus_per_node,
             "num_nodes": trainer_num_nodes,
