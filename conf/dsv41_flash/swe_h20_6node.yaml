@@ -147,9 +147,9 @@ megatron:
     lr: 1.0e-6
     chunked_optimizer_state_offload: true
     optimizer_state_offload_fraction: 1.0
-    # Stage the fp32 masters per chunk too. QAT keeps
-    # a full fp32 master and these ranks have DP=1, so the default full-window restore puts the
-    # whole ~45 GiB/rank master on GPU during optimizer.step().
+    # Stage the fp32 masters per chunk too. Without this, the full fp32 master is loaded
+    # onto GPU all at once during optimizer.step() instead of chunk by chunk, using an
+    # extra ~45 GiB/rank.
     optimizer_state_offload_chunk_masters: true
 
 algorithm:
