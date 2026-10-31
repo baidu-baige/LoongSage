@@ -200,6 +200,7 @@ megatron:
     chunked_optimizer_state_offload: false
     optimizer_state_offload_fraction: 1.0
     optimizer_state_offload_chunk_size_mb: 1024
+    optimizer_state_offload_chunk_masters: false
   scheduler:
     lr_warmup_steps: 0
     lr_decay_steps: 1
