@@ -99,7 +99,7 @@ class FakeQwenTokenizer(FakeCharTokenizer):
     the empty think block with ``enable_thinking: false``.  ``BaseTokenizerManager`` probes
     this suffix at runtime, so overriding it exercises the probe branches.  Like
     Qwen3.5's template, it rejects messages without a user message and a system
-    message anywhere but first.
+    message anywhere but first, and merges consecutive tool results into one user turn.
     """
 
     gen_prompt_suffix = "<think>\n"
@@ -126,7 +126,14 @@ class FakeQwenTokenizer(FakeCharTokenizer):
                     body += f"\n<tool_call>{call['function']['name']}</tool_call>"
                 parts.append(f"<|im_start|>assistant\n{body}<|im_end|>\n")
             elif role == "tool":
-                parts.append(f"<|im_start|>user\n<tool_response>\n{content}\n</tool_response><|im_end|>\n")
+                # Like the real templates, consecutive tool results share one user turn.
+                opens = index == 0 or messages[index - 1]["role"] != "tool"
+                closes = index == len(messages) - 1 or messages[index + 1]["role"] != "tool"
+                parts.append(
+                    ("<|im_start|>user" if opens else "")
+                    + f"\n<tool_response>\n{content}\n</tool_response>"
+                    + (f"{QWEN_IM_END}\n" if closes else "")
+                )
             else:
                 parts.append(f"<|im_start|>{role}\n{content}<|im_end|>\n")
         if add_generation_prompt:

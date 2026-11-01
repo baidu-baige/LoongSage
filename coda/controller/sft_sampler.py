@@ -14,7 +14,7 @@ from typing import Any
 
 from omegaconf import DictConfig, OmegaConf
 
-from coda.agentflow.tokenizer_manager import ThreadedTokenizerManager, _load_chat_template, load_tokenizer
+from coda.agentflow.tokenizer_manager import create_tokenizer_manager
 from coda.agentflow.trajectory_store import Segment, Trajectory, TrajectoryGroup, TrajectoryStatus
 from coda.data_factory.data_source import DataSource
 from coda.utils.tracking import track
@@ -139,22 +139,13 @@ class SFTSampler:
     wrapper as the RL AgentFlow so SFT and RL see identical prompts.
     """
 
-    def __init__(self, config: DictConfig, datasources: list[DataSource], tokenizer: Any = None):
+    def __init__(self, config: DictConfig, datasources: list[DataSource]):
         self.config = config
         self.datasources = datasources
-        tokenizer_cfg = config.agentflow.tokenizer
-        if tokenizer is None:
-            tokenizer = load_tokenizer(
-                config.hf_model_path,
-                _load_chat_template(tokenizer_cfg.custom_chat_template_path),
-            )
-        self.tokenizer = tokenizer
-        # tokenize() runs in the calling thread; the manager's thread pool never gets a task.
-        self.tokenizer_manager = ThreadedTokenizerManager(
-            tokenizer,
-            num_workers=1,
-            generation_prompt_kwargs=dict(tokenizer_cfg.generation_prompt_kwargs or {}),
-        )
+        # Built exactly as AgentFlow builds it.  tokenize() runs in the calling thread,
+        # so the manager's worker pool never gets a task.
+        self.tokenizer_manager = create_tokenizer_manager(config.agentflow.tokenizer, config.hf_model_path)
+        self.tokenizer = self.tokenizer_manager.tokenizer
         self._logged_sample = False
         # {step: sft/* summary}; like RolloutSampler.metrics, only the current step is kept.
         self.metrics: dict[int, dict[str, float]] = {}

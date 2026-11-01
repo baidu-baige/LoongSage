@@ -78,6 +78,8 @@ class DeepseekV41Adapter(QATAdapter):
 
     def validate(self, config) -> None:
         rollout = config.rollout
+        if config.run_mode == "sft":
+            return
         if rollout.backend != "sglang":
             raise NotImplementedError(f"DeepSeek-V4.1 QAT is only verified for the SGLang rollout, got {rollout.backend}")
         args, env = rollout.sglang_args, rollout.get("env_vars") or {}

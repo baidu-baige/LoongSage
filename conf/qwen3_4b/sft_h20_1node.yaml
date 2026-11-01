@@ -1,15 +1,14 @@
 # @package _global_
-# Qwen3-4B SFT, single H800 node (8 GPUs). No inference engine is started.
-# Launch: bash examples/start.sh qwen3_4b/sft_h800_1node
-#   run_mode=sft overrides colocate, trainer.use_rollout_log_probs, the RL-only switches, eval and
-#   num_trajectories_per_prompt (sft_sampler.DEFAULT_SETTINGS / DATA_SOURCE_DEFAULT_SETTINGS)
-#   and warns when this config says otherwise.
-# Fill in the two ??? below, or override them on the command line:
-#   hf_model_path                         HF weight dir of Qwen3-4B
-#   data_source.dataset.prompt_data_path  .jsonl/.parquet whose "messages" column holds
-#                                         OpenAI-style conversations, e.g.
-#     {"messages": [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]}
-#   Tool schemas for a row can be put in its metadata as {"tools": [...]}.
+#
+# Qwen3-4B SFT, single H20 node (8 GPUs). No inference engine is started.
+#
+#   hf download Qwen/Qwen3-4B --local-dir /root/Qwen3-4B
+#   hf download HuggingFaceH4/no_robots --repo-type=dataset --include "data/train-*" --local-dir /root/no_robots
+#
+#   bash examples/start.sh qwen3_4b/sft_h20_1node \
+#     hf_model_path=/root/Qwen3-4B \
+#     data_source.dataset.prompt_data_path=/root/no_robots
+#
 defaults:
   - /default
   - _self_

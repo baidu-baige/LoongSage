@@ -694,9 +694,9 @@ class TrajectoryParser:
     async def _tokenize_delta_messages(self, new_messages: list[dict[str, Any]]) -> list[int]:
         """Tokenize continuation messages, stripping the shared template prelude.
 
-        The delta is rendered behind the tokenizer manager's ``dummy_prefix_message``
+        The delta is rendered behind the tokenizer manager's ``non_assistant_prefix_message``
         (an empty system message, or an empty user message when the chat template
-        rejects a system-only conversation, e.g. Qwen3.5) and its ``dummy_prefix`` is
+        rejects a system-only conversation, e.g. Qwen3.5) and its ``non_assistant_prefix`` is
         cut off. Tools are omitted because they are already encoded in
         trajectory.tokens from the first turn.
         """
@@ -704,10 +704,21 @@ class TrajectoryParser:
         # Route through _tokenize_messages so assistant tool_call arguments
         # get normalized for the template, same as full-conversation renders.
         token_ids = await self._tokenize_messages(
-            [manager.dummy_prefix_message, *new_messages],
+            [manager.non_assistant_prefix_message, *new_messages],
             tools=None,
         )
-        return token_ids[len(manager.dummy_prefix):]
+        prefix = manager.non_assistant_prefix
+        if token_ids[: len(prefix)] != prefix:
+            # Cutting a prefix the render does not start with corrupts the delta; the
+            # SFT tokenizer raises here, the router only reports it for now.
+            logger.warning(
+                "[tokenize_delta] messages %s render as %r, which does not start with the "
+                "non-assistant prefix %r; the delta tokens are wrong",
+                [m.get("role") for m in new_messages],
+                manager.tokenizer.decode(token_ids),
+                manager.tokenizer.decode(prefix),
+            )
+        return token_ids[len(prefix):]
 
     def _normalize_messages(
         self, messages: list[dict[str, Any]], *, strip_think: bool = True

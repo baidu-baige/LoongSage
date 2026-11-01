@@ -133,8 +133,8 @@ def test_deepseek_v4_empty_system_is_only_bos() -> None:
 
     manager = ThreadedTokenizerManager(tokenizer, num_workers=1)
 
-    assert manager.dummy_prefix_message == {"role": "system", "content": ""}
-    assert manager.dummy_prefix == list("<｜begin▁of▁sentence｜>".encode())
+    assert manager.non_assistant_prefix_message == {"role": "system", "content": ""}
+    assert manager.non_assistant_prefix == list("<｜begin▁of▁sentence｜>".encode())
 
 
 def test_deepseek_v4_first_turn_encodes_tools_in_system_prompt() -> None:
@@ -187,8 +187,8 @@ def test_deepseek_v4_continuation_strips_only_bos() -> None:
         return tokenizer.apply_chat_template(messages, **kwargs)
 
     manager = SimpleNamespace(
-        dummy_prefix_message={"role": "system", "content": ""},
-        dummy_prefix=list("<｜begin▁of▁sentence｜>".encode()),
+        non_assistant_prefix_message={"role": "system", "content": ""},
+        non_assistant_prefix=list("<｜begin▁of▁sentence｜>".encode()),
         model_family="deepseek_v4",
         think_tags=("<think>", "</think>"),
         apply_chat_template=apply_chat_template,
@@ -214,12 +214,12 @@ def test_deepseek_v4_continuation_strips_only_bos() -> None:
     full_ids = asyncio.run(manager.apply_chat_template(messages, add_generation_prompt=True))
     continuation_ids = asyncio.run(parser._tokenize_delta_messages(messages[1:]))
 
-    assert continuation_ids == full_ids[len(manager.dummy_prefix):]
+    assert continuation_ids == full_ids[len(manager.non_assistant_prefix):]
     assert bytes(continuation_ids).decode().startswith("\n\n<｜DSML｜tool_calls>")
     assert "<tool_result>/repo</tool_result>" in bytes(continuation_ids).decode()
 
 
-def test_tokenize_delta_falls_back_to_dummy_user_for_qwen35_style_template() -> None:
+def test_tokenize_delta_falls_back_to_empty_user_for_qwen35_style_template() -> None:
     """Templates that reject system-only conversations (Qwen3.5) render the delta behind an empty user."""
     manager = ThreadedTokenizerManager(FakeQwenTokenizer(), num_workers=1)
     parser = TrajectoryParser(
@@ -239,7 +239,7 @@ def test_tokenize_delta_falls_back_to_dummy_user_for_qwen35_style_template() -> 
         manager.shutdown()
 
     # the empty user message's render is stripped
-    assert manager.dummy_prefix_message == {"role": "user", "content": ""}
+    assert manager.non_assistant_prefix_message == {"role": "user", "content": ""}
     assert manager.tokenizer.decode(delta_ids) == (
         "<|im_start|>assistant\n<think>\n\n</think>\n\na<|im_end|>\n"
         "<|im_start|>user\n<tool_response>\nr\n</tool_response><|im_end|>\n"
@@ -945,16 +945,17 @@ def make_prefix_parser():
 
     async def apply_chat_template(messages, **kwargs):
         counter["n"] += 1
-        # Distinct, deterministic fake ids per call so segments are easy to tell apart.
+        # Distinct, deterministic fake ids per call so segments are easy to tell apart;
+        # the first message always renders to id 0, the non-assistant prefix below.
         base = counter["n"] * 1000
-        return [base + i for i in range(len(messages))]
+        return [0] + [base + i for i in range(1, len(messages))]
 
     return TrajectoryParser(
         trajectory_store=TrajectoryStore(),
         tokenizer_manager=SimpleNamespace(
             # One fake id per message, so the empty system message renders to one id.
-            dummy_prefix_message={"role": "system", "content": ""},
-            dummy_prefix=[0],
+            non_assistant_prefix_message={"role": "system", "content": ""},
+            non_assistant_prefix=[0],
             apply_chat_template=apply_chat_template,
         ),
     )

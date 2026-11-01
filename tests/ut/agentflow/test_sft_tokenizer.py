@@ -52,9 +52,9 @@ def _spans(tokenizer, messages, tools=None, **template_kwargs):
 def test_qwen_probes(tokenizer, generation_prompt):
     """The template rejects a system-only conversation, so the empty user message is the prefix."""
     manager = _manager(tokenizer)
-    assert manager.dummy_prefix_message == {"role": "user", "content": ""}
-    assert tokenizer.decode(manager.dummy_prefix) == "<|im_start|>user\n<|im_end|>\n"
-    assert tokenizer.decode(manager.generation_prompt) == generation_prompt
+    assert manager.non_assistant_prefix_message == {"role": "user", "content": ""}
+    assert tokenizer.decode(manager.non_assistant_prefix) == "<|im_start|>user\n<|im_end|>\n"
+    assert tokenizer.decode(manager.assistant_prefix) == "<|im_start|>user\n<|im_end|>\n" + generation_prompt
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +83,40 @@ def test_multi_turn_trains_every_assistant_turn():
     ]
 
 
+def test_rejects_assistant_first_conversation():
+    messages = [{"role": "assistant", "content": "hello"}]
+    with pytest.raises(ValueError, match="must not start with an assistant message"):
+        _manager(FakeQwenTokenizer()).tokenize(messages)
+
+
+class _MappingArgumentsQwenTokenizer(FakeQwenTokenizer):
+    """Renders tool_call arguments with ``.items()``, as Qwen3.5's ``arguments|items`` does."""
+
+    def render(self, messages, tools, add_generation_prompt, **kwargs) -> str:
+        text = super().render(messages, tools, add_generation_prompt, **kwargs)
+        for msg in messages:
+            for call in msg.get("tool_calls") or []:
+                text += "".join(f"<{k}={v}>" for k, v in call["function"]["arguments"].items())
+        return text
+
+
+def test_json_string_tool_call_arguments_render_as_mappings():
+    """OpenAI-style string arguments are parsed for the template; the input stays as given."""
+    def conversation(arguments):
+        call = {"id": "c1", "type": "function", "function": {"name": "f", "arguments": arguments}}
+        return [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": "", "tool_calls": [call]},
+            {"role": "tool", "tool_call_id": "c1", "content": "r"},
+            {"role": "assistant", "content": "done"},
+        ]
+
+    manager = _manager(_MappingArgumentsQwenTokenizer())
+    messages = conversation('{"x": 1}')
+    assert manager.tokenize(messages) == manager.tokenize(conversation({"x": 1}))
+    assert messages == conversation('{"x": 1}')
+
+
 def test_concatenated_messages_equal_the_whole_render():
     messages = [
         {"role": "system", "content": "sys"},
@@ -109,6 +143,51 @@ def test_tool_turns_are_context_only():
         EMPTY_REASONING + "\n<tool_call>get_weather</tool_call>" + TURN_END,
         EMPTY_REASONING + "It is sunny." + TURN_END,
     ]
+
+
+def test_parallel_tool_results_render_as_one_turn():
+    """Consecutive tool messages render together, as an RL continuation turn does, so the
+    template merges them into one user turn instead of opening one per message."""
+    calls = [{"function": {"name": "ls", "arguments": {}}}, {"function": {"name": "pwd", "arguments": {}}}]
+    messages = [
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": "", "tool_calls": calls},
+        {"role": "tool", "content": "OUT_A"},
+        {"role": "tool", "content": "OUT_B"},
+        {"role": "assistant", "content": "done"},
+    ]
+    tokenizer = FakeQwenTokenizer()
+    ids, _ = _manager(tokenizer).tokenize(messages)
+    assert ids == tokenizer.apply_chat_template(messages)
+    assert "OUT_A\n</tool_response>\n<tool_response>\nOUT_B" in tokenizer.decode(ids)
+
+
+class _MappingArgumentsQwenTokenizer(FakeQwenTokenizer):
+    """Like Qwen3.5's template (``arguments|items``), rejects tool-call arguments that are not a mapping."""
+
+    def render(self, messages, tools, add_generation_prompt, **kwargs) -> str:
+        for msg in messages:
+            for call in msg.get("tool_calls") or []:
+                if not isinstance(call["function"].get("arguments", {}), dict):
+                    raise TypeError("Can only get item pairs from a mapping.")
+        return super().render(messages, tools, add_generation_prompt, **kwargs)
+
+
+def test_json_string_tool_call_arguments_are_parsed():
+    """OpenAI-format rows keep arguments as JSON strings; they are parsed for the template,
+    as ``TrajectoryParser`` does, without changing the caller's messages."""
+    call = {"function": {"name": "bash", "arguments": '{"command": "ls"}'}}
+    messages = [
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": "", "tool_calls": [call]},
+        {"role": "tool", "content": "OUT"},
+        {"role": "assistant", "content": "done"},
+    ]
+    assert _spans(_MappingArgumentsQwenTokenizer(), messages) == [
+        EMPTY_REASONING + "\n<tool_call>bash</tool_call>" + TURN_END,
+        EMPTY_REASONING + "done" + TURN_END,
+    ]
+    assert call["function"]["arguments"] == '{"command": "ls"}'
 
 
 def test_prefilled_think_tag_is_not_trained_but_reasoning_is():
@@ -168,9 +247,11 @@ def test_newline_after_closing_token_is_trained():
 
 def test_deepseek_probes_bos_and_no_generation_prompt():
     """The encoder ends every trailing user message with the assistant header itself."""
-    manager = _manager(FakeDeepSeekV4Tokenizer())
-    assert manager.tokenizer.decode(manager.dummy_prefix) == "<｜begin▁of▁sentence｜>"
-    assert manager.generation_prompt == []
+    tokenizer = FakeDeepSeekV4Tokenizer()
+    manager = _manager(tokenizer)
+    assert tokenizer.decode(manager.non_assistant_prefix) == "<｜begin▁of▁sentence｜>"
+    # No generation prompt follows the empty user message: its render already ends with the header.
+    assert tokenizer.decode(manager.assistant_prefix) == "<｜begin▁of▁sentence｜><｜User｜><｜Assistant｜></think>"
 
 
 def test_deepseek_chat_mode_trains_content_and_eos():
@@ -222,6 +303,22 @@ def test_deepseek_tool_result_turns_are_context_only():
     assert _spans(FakeDeepSeekV4Tokenizer(), messages) == ["call" + EOS, "final" + EOS]
 
 
+def test_deepseek_consecutive_tool_results_render_as_one_turn():
+    """Parallel tool results are rendered together, as the router's delta tokenization
+    does, so the encoder merges them into one user turn as in the whole render."""
+    messages = [
+        {"role": "user", "content": "u"},
+        {"role": "assistant", "content": "call"},
+        {"role": "tool", "content": "OUT1"},
+        {"role": "tool", "content": "OUT2"},
+        {"role": "assistant", "content": "final"},
+    ]
+    tokenizer = FakeDeepSeekV4Tokenizer()
+    ids, mask = _manager(tokenizer).tokenize(messages)
+    assert ids == tokenizer.apply_chat_template(messages)
+    assert decode_trainable_tokens(tokenizer, ids, mask) == ["call" + EOS, "final" + EOS]
+
+
 # ---------------------------------------------------------------------------
 # Optional: real HF tokenizer (fake tokenizers cannot catch BPE quirks)
 # ---------------------------------------------------------------------------
@@ -244,7 +341,11 @@ def test_real_tokenizer_trains_answers_but_not_generation_prompt():
     ]
     ids, mask = manager.tokenize(messages)
     spans = decode_trainable_tokens(tokenizer, ids, mask)
-    generation_prompt = tokenizer.decode(manager.generation_prompt)
+    empty_user = [{"role": "user", "content": ""}]
+    rendered = tokenizer.apply_chat_template(empty_user, tokenize=True)
+    generation_prompt = tokenizer.decode(
+        tokenizer.apply_chat_template(empty_user, tokenize=True, add_generation_prompt=True)[len(rendered):]
+    )
 
     # One span per assistant turn, without the generation prompt.
     assert len(spans) == 2

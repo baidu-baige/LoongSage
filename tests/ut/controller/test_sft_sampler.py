@@ -21,8 +21,12 @@ from tests.ut.agentflow.fake_tokenizers import DS_BOS, FakeDeepSeekV4Tokenizer, 
 
 DEFAULT_YAML = Path(__file__).resolve().parents[3] / "conf" / "default.yaml"
 
+# hf_model_path -> fake tokenizer that the patched load_tokenizer returns for it.
+FAKE_TOKENIZERS = {"fake-qwen": FakeQwenTokenizer, "fake-deepseek-v4": FakeDeepSeekV4Tokenizer}
+
 SFT_OVERRIDES = {
     "run_mode": "sft",
+    "hf_model_path": "fake-qwen",
     "algorithm": {"policy_loss": "sft", "advantage_estimator": "sft"},
     "data_source": {"num_trajectories_per_prompt": 1},
 }
@@ -57,11 +61,19 @@ def tracked(monkeypatch):
     return calls
 
 
+@pytest.fixture(autouse=True)
+def fake_load_tokenizer(monkeypatch):
+    """Serve ``FAKE_TOKENIZERS[hf_model_path]`` instead of loading a model from disk."""
+    monkeypatch.setattr(
+        "coda.agentflow.tokenizer_manager.load_tokenizer",
+        lambda model_path, custom_chat_template=None: FAKE_TOKENIZERS[model_path](),
+    )
+
+
 def make_sampler(groups=(), max_seq_len=None):
     return SFTSampler(
         make_sft_config(data_source={"sft_max_seq_len": max_seq_len}),
         [FakeDataSource(list(groups))],
-        tokenizer=FakeQwenTokenizer(),
     )
 
 
@@ -422,7 +434,6 @@ def test_trainable_suffix_length(mask, expected):
 
 
 def test_deepseek_thinking_multi_turn_uses_generation_prompt_kwargs():
-    tokenizer = FakeDeepSeekV4Tokenizer()
     messages = [
         {"role": "user", "content": "q1"},
         {"role": "assistant", "content": "a1", "reasoning_content": "r1"},
@@ -430,9 +441,11 @@ def test_deepseek_thinking_multi_turn_uses_generation_prompt_kwargs():
         {"role": "assistant", "content": "a2", "reasoning_content": "r2"},
     ]
     config = make_sft_config(
+        hf_model_path="fake-deepseek-v4",
         agentflow={"tokenizer": {"generation_prompt_kwargs": {"thinking": True}}},
     )
-    sampler = SFTSampler(config, [FakeDataSource([make_group(messages)])], tokenizer=tokenizer)
+    sampler = SFTSampler(config, [FakeDataSource([make_group(messages)])])
+    tokenizer = sampler.tokenizer
     traj = sampler(step=1)[0].trajectories[0]
 
     # Each message is rendered on its own in thinking mode: every user message ends with
@@ -456,7 +469,7 @@ def test_call_concatenates_datasources_in_config_order():
         {"num_prompts_per_step": 2, "num_trajectories_per_prompt": 1},
         {"num_prompts_per_step": 1, "num_trajectories_per_prompt": 1},
     ])
-    sampler = SFTSampler(config, [ds_a, ds_b], tokenizer=FakeQwenTokenizer())
+    sampler = SFTSampler(config, [ds_a, ds_b])
 
     groups = sampler(step=5)
 
@@ -476,7 +489,7 @@ def test_sft_max_seq_len_applies_per_data_source():
         {"num_prompts_per_step": 1, "num_trajectories_per_prompt": 1, "sft_max_seq_len": full - 1},
         {"num_prompts_per_step": 1, "num_trajectories_per_prompt": 1, "sft_max_seq_len": None},
     ])
-    sampler = SFTSampler(config, [ds_a, ds_b], tokenizer=FakeQwenTokenizer())
+    sampler = SFTSampler(config, [ds_a, ds_b])
 
     groups = sampler(step=1)
 
@@ -489,7 +502,7 @@ def test_datasource_count_must_match_config():
         {"num_prompts_per_step": 1, "num_trajectories_per_prompt": 1},
         {"num_prompts_per_step": 1, "num_trajectories_per_prompt": 1},
     ])
-    sampler = SFTSampler(config, [FakeDataSource([make_group(MESSAGES)])], tokenizer=FakeQwenTokenizer())
+    sampler = SFTSampler(config, [FakeDataSource([make_group(MESSAGES)])])
     with pytest.raises(ValueError):
         sampler(step=1)
 
