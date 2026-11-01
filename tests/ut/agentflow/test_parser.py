@@ -1,6 +1,7 @@
 """Unit tests for ``coda.agentflow.router.parser``."""
 
 import asyncio
+import base64
 import copy
 import json
 from types import SimpleNamespace
@@ -20,7 +21,12 @@ pytest.importorskip(
     reason="sglang.srt.parser.template_detection is unavailable in this sglang build",
 )
 
-from coda.agentflow.router.parser import TrajectoryParser, TurnInputContext
+from coda.agentflow.router.parser import (
+    TrajectoryParser,
+    TurnInputContext,
+    decode_generate_body,
+    deserialize_routed_experts,
+)
 from coda.agentflow.router.parser_middleware import ParserMiddleware
 from coda.agentflow import tokenizer_manager
 from coda.agentflow.tokenizer_manager import (
@@ -497,6 +503,88 @@ def test_append_routed_experts_keeps_single_row_unchanged() -> None:
     parser._append_routed_experts(trajectory, new_chunk)
 
     assert torch.equal(trajectory.rollout_routed_experts, new_chunk)
+
+
+def _b64(t: torch.Tensor) -> str:
+    return base64.b64encode(t.contiguous().numpy().tobytes()).decode()
+
+
+@pytest.mark.parametrize("wire_dtype", ["int32", "int16", "uint8"])
+def test_deserialize_routed_experts_compacts_to_uint8(wire_dtype: str) -> None:
+    rows = torch.tensor([[1, 255], [7, 0]], dtype=getattr(torch, wire_dtype))
+    out = deserialize_routed_experts(_b64(rows), 2, wire_dtype)
+    assert out.dtype == torch.uint8
+    assert torch.equal(out.long(), rows.long())
+
+
+def test_deserialize_routed_experts_keeps_wide_ids_and_rejects_bad_sizes() -> None:
+    rows = torch.tensor([[300, 1]], dtype=torch.int32)
+    assert deserialize_routed_experts(_b64(rows), 1).dtype == torch.int16
+    with pytest.raises(ValueError):
+        deserialize_routed_experts(_b64(rows), 3)
+
+
+def test_decode_generate_body_splits_logprobs_and_appends_terminal_row() -> None:
+    rows = torch.tensor([[1, 2], [3, 4], [5, 6]], dtype=torch.int32)
+    body = json.dumps({
+        "text": "hi",
+        "meta_info": {
+            "weight_version": "1",
+            "prompt_tokens": 3,
+            "completion_tokens": 2,
+            "output_token_logprobs": [[-0.1, 101, None], [-0.2, 102, None]],
+            "routed_experts": _b64(rows),
+        },
+    }).encode()
+
+    response_json, experts = decode_generate_body(body, routed_experts_start_len=1, r3_enabled=True)
+
+    meta = response_json["meta_info"]
+    assert "routed_experts" not in meta and "output_token_logprobs" not in meta
+    assert torch.equal(experts, torch.tensor([[1, 2], [3, 4], [5, 6], [5, 6]], dtype=torch.uint8))
+    payload, _, _ = make_parser().build_assistant_message(response_json, 1, routed_experts=experts)
+    assert payload.response_ids == [101, 102] and payload.logprobs == [-0.1, -0.2]
+    assert payload.routed_experts is experts
+
+
+def test_append_routed_experts_grows_buffer_in_place() -> None:
+    """Continuation writes into spare capacity instead of re-copying the whole map."""
+    parser = make_parser()
+    trajectory = Trajectory(trajectory_id="traj-buf", prompt_id="p", tokens=list(range(8)))
+    parser._append_routed_experts(trajectory, torch.zeros(8, 2, dtype=torch.uint8))
+    trajectory.tokens.extend([8, 9])
+    parser._append_routed_experts(trajectory, torch.ones(3, 2, dtype=torch.uint8))
+    first = trajectory.rollout_routed_experts
+    trajectory.tokens.extend([10])
+    parser._append_routed_experts(trajectory, torch.full((2, 2), 2, dtype=torch.uint8))
+
+    merged = trajectory.rollout_routed_experts
+    assert merged.untyped_storage().data_ptr() == first.untyped_storage().data_ptr()
+    assert merged[:, 0].tolist() == [0] * 7 + [1, 1, 2, 2]
+
+
+def test_compact_segment_reuses_parent_r3_prefix() -> None:
+    """A compact segment copies the routing rows of the prefix it shares with its parent."""
+    parser = make_parser()
+    parser.accumulate_reasoning = True
+    trajectory = Trajectory(
+        trajectory_id="traj-reuse",
+        prompt_id="p",
+        tokens=[1, 2, 3, 4, 5],
+        segments=[Segment(token_start=0, token_end=5, segment_id=0, origin="compact")],
+        rollout_routed_experts=torch.arange(10, dtype=torch.uint8).reshape(5, 2),
+    )
+
+    assert parser._r3_reuse_from_parent(trajectory, 0, [1, 2, 3, 9, 9, 9]) == (3, 0)
+    trajectory.segments[0].origin = "root"
+    assert parser._r3_reuse_from_parent(trajectory, 0, [1, 2, 3, 9]) == (0, 0)
+
+    trajectory.segments[0].origin = "compact"
+    trajectory.tokens.extend([1, 2, 3, 9])
+    chunk = torch.full((1, 2), 99, dtype=torch.uint8)  # rows from start_len=3 (+terminal)
+    parser._append_routed_experts(trajectory, chunk, True, reuse_len=3, reuse_from=0)
+    assert trajectory.rollout_routed_experts[5:8].tolist() == [[0, 1], [2, 3], [4, 5]]
+    assert trajectory.rollout_routed_experts.size(0) == len(trajectory.tokens)
 
 
 def test_build_assistant_message_decodes_weight_version() -> None:

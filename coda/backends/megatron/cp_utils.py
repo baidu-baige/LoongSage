@@ -264,8 +264,13 @@ def prepare_routing_replay_data(
     routed_experts_list: list[torch.Tensor],
     model_config: TransformerConfig,
     pad_multiplier: int = 128,
+    device: torch.device | int | None = None,
 ) -> torch.Tensor | None:
-    """CP/TP-slice routed experts for the whole batch, matching the model's packed inputs."""
+    """CP/TP-slice routed experts for the whole batch, matching the model's packed inputs.
+
+    Packing runs where the inputs live (CPU for the compact uint8 map). With *device*, only
+    this rank's slice is moved there and widened to int64, the dtype Megatron's top-k uses.
+    """
     tp_size = mpu.get_tensor_model_parallel_world_size()
     tp_rank = mpu.get_tensor_model_parallel_rank()
 
@@ -274,14 +279,15 @@ def prepare_routing_replay_data(
     cp_partition_mode: CPPartitionMode = model_config.cp_partition_mode
 
     def pad_func(tensor: torch.Tensor, pad_len: int) -> torch.Tensor:
+        # int64 arange: a uint8 one would wrap before the modulo.
         pad_tensor = (
             torch.arange(
                 pad_len * tensor.size(1) * tensor.size(2),
                 device=tensor.device,
-                dtype=tensor.dtype,
+                dtype=torch.long,
             ).reshape((pad_len, tensor.size(1), tensor.size(2)))
             % num_moe_experts
-        )
+        ).to(tensor.dtype)
         return torch.cat([tensor, pad_tensor], dim=0)
 
     packed, _ = slice_cp_packed(
@@ -296,6 +302,8 @@ def prepare_routing_replay_data(
         end = seqlen // tp_size * (tp_rank + 1)
         packed = packed[start:end]
 
+    if device is not None:
+        packed = packed.to(device=device, dtype=torch.long)
     return packed
 
 

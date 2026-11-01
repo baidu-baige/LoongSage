@@ -6,8 +6,11 @@ import json
 import logging
 import traceback
 from collections import Counter, defaultdict
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from typing import Any, Callable, cast
 
+import orjson
 from fastapi import status
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -18,7 +21,7 @@ from starlette.types import ASGIApp
 from coda.agentflow.tokenizer_manager import DEEPSEEK_OFFICIAL_ENCODER_MODULES
 from coda.agentflow.trajectory_store import TrajectoryStore
 from coda.agentflow.utils import CONTEXT_LENGTH_EXCEEDED, build_request_id
-from .parser import TrajectoryParser, TurnInputContext
+from .parser import TrajectoryParser, TurnInputContext, decode_generate_body
 from .protocols import PROTOCOL_ADAPTERS, ProtocolAdapter
 
 logger = logging.getLogger(__name__)
@@ -44,6 +47,8 @@ class ParserMiddleware(BaseHTTPMiddleware):
         tool_call_parser: ParserConfig = None,
         inflight_requests: Any = None,
         ds_configs: dict[int, Any] | None = None,
+        r3_reuse_parent_prefix: bool = True,
+        r3_decode_workers: int = 0,
     ):
         super().__init__(app)
         from coda.agentflow.router.router import filter_headers
@@ -55,6 +60,11 @@ class ParserMiddleware(BaseHTTPMiddleware):
         self.ds_configs = ds_configs
         self._trajectory_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._trajectory_lock_refs: Counter[str] = Counter()
+        # Body parse + R3 decode off the router event loop (0 = decode inline).
+        self._decode_pool = (
+            ProcessPoolExecutor(max_workers=r3_decode_workers)
+            if r3_enabled and r3_decode_workers > 0 else None
+        )
         self.parser = TrajectoryParser(
             trajectory_store=trajectory_store,
             tokenizer_manager=tokenizer_manager,
@@ -62,6 +72,7 @@ class ParserMiddleware(BaseHTTPMiddleware):
             r3_enabled=r3_enabled,
             reasoning_parser=reasoning_parser,
             tool_call_parser=tool_call_parser,
+            r3_reuse_parent_prefix=r3_reuse_parent_prefix,
         )
 
     async def dispatch(self, request: Request, call_next):
@@ -172,7 +183,7 @@ class ParserMiddleware(BaseHTTPMiddleware):
                 # 2. Forward to LLM worker and parse response
                 response = await call_next(request)
                 response_body = await self._read_response_body(response)
-                parsed_response = self._parse_generate_response(
+                parsed_response = await self._parse_generate_response(
                     response, response_body, turn_ctx, trajectory_id
                 )
                 if isinstance(parsed_response, Response):
@@ -297,7 +308,7 @@ class ParserMiddleware(BaseHTTPMiddleware):
             payload["return_routed_experts"] = True
             payload["routed_experts_start_len"] = routed_experts_start_len
 
-        return json.dumps(payload).encode("utf-8")
+        return orjson.dumps(payload)
 
     async def _read_response_body(self, response: Response) -> bytes:
         # Buffer all chunks from the LLM worker's StreamingResponse. Currently we wait for
@@ -310,7 +321,20 @@ class ParserMiddleware(BaseHTTPMiddleware):
             return b"".join(chunks)
         return response.body
 
-    def _parse_generate_response(
+    async def _decode_body(
+        self, body: bytes, routed_experts_start_len: int
+    ) -> tuple[dict[str, Any], Any]:
+        """Run decode_generate_body in the pool when configured, else inline."""
+        if self._decode_pool is not None:
+            try:
+                return await asyncio.get_running_loop().run_in_executor(
+                    self._decode_pool, decode_generate_body, body, routed_experts_start_len, True
+                )
+            except BrokenProcessPool as e:
+                logger.warning("[parse] R3 decode pool broken (%s); decoding inline", e)
+        return decode_generate_body(body, routed_experts_start_len, self.r3_enabled)
+
+    async def _parse_generate_response(
         self,
         response: Response,
         body: bytes,
@@ -323,8 +347,10 @@ class ParserMiddleware(BaseHTTPMiddleware):
         or a raw Response passthrough on error/non-2xx.
         """
         try:
-            response_json = json.loads(body.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
+            response_json, routed_experts = await self._decode_body(
+                body, turn_ctx.routed_experts_start_len
+            )
+        except json.JSONDecodeError:
             logger.warning("[parse] upstream payload non-JSON for %s: %s", trajectory_id, body[:200])
             return Response(content=body, status_code=response.status_code,
                             headers=self._filter_headers(dict(response.headers)),
@@ -352,7 +378,8 @@ class ParserMiddleware(BaseHTTPMiddleware):
                             media_type=response.media_type)
 
         payload, assistant_message, finish_reason_override = self.parser.build_assistant_message(
-            response_json, turn_ctx.routed_experts_start_len, turn_ctx.tools
+            response_json, turn_ctx.routed_experts_start_len, turn_ctx.tools,
+            routed_experts=routed_experts,
         )
         if response_json.get("choices"):
             response_json["choices"][0]["message"] = assistant_message

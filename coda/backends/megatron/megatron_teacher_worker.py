@@ -17,7 +17,7 @@ from megatron.core import parallel_state as mpu
 from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
 from omegaconf import DictConfig, OmegaConf
 
-from coda.backends.megatron.model import forward_teacher
+from coda.backends.megatron.model import forward_teacher, prune_router_replay_instances
 from coda.algorithms.kl_policy import build_kl_policies
 from coda.backends.megatron.data import (
     concat_rollout_batch,
@@ -185,6 +185,13 @@ class MegatronTeacherWorker(BaseTeacherWorker):
             # load_weights=False left randomly initialized real tensors; overwrite
             # them wholesale, same as the student's resume path.
             load_model_weights(self.model, ckpt_dir)
+        if getattr(provider, "moe_enable_routing_replay", False):
+            # Also drops the routers of previously loaded teachers.
+            dropped, kept = prune_router_replay_instances(self.model)
+            logger.info(
+                "[Teacher rank %s] R3: pruned %d orphan RouterReplay instances, kept %d",
+                self.rank, dropped, kept,
+            )
         self.active_teacher_idx = teacher_idx
         logger.info(
             "[Teacher rank %s] teacher %s loaded (source=%s)",
@@ -396,9 +403,12 @@ class MegatronTeacherWorker(BaseTeacherWorker):
                                policies=list(self.kl_policies.values()))
 
     def _move_rollout_data_to_device(self, rollout_data: RolloutBatch):
-        """Move core tensor fields to the current CUDA device for teacher forward."""
+        """Move core tensor fields to the current CUDA device for teacher forward.
+
+        rollout_routed_experts stays on CPU; setup_routing_replay moves it per micro-batch.
+        """
         device = torch.cuda.current_device()
-        for field in ("tokens", "loss_masks", "rollout_log_probs", "rollout_routed_experts"):
+        for field in ("tokens", "loss_masks", "rollout_log_probs"):
             if rollout_data.get(field):
                 rollout_data[field] = [t.to(device) for t in rollout_data[field]]
         return rollout_data

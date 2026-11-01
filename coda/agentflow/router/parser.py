@@ -1,13 +1,16 @@
 """Utilities for parsing RL trajectories."""
 
-import base64
+import contextlib
 import copy
+import gc
 import logging
 import uuid
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Literal
 
+import orjson
+import pybase64
 import torch
 from pydantic import ValidationError
 from sglang.srt.entrypoints.openai.protocol import Tool
@@ -182,6 +185,10 @@ class TurnInputContext:
     start_new_segment: bool
     raw_new_messages: list[dict[str, Any]]
     routed_experts_start_len: int = 0
+    # New segment only: copy this many R3 rows from routed_experts_reuse_from instead of
+    # having SGLang re-send them (see _r3_reuse_from_parent).
+    routed_experts_reuse_len: int = 0
+    routed_experts_reuse_from: int = 0
     tools: list[dict[str, Any]] | None = None
 
     # --- Segment-tree addressing (new) ---
@@ -212,16 +219,149 @@ class LLMGenerateResponse:
     routed_experts: torch.Tensor | None = None
 
 
-def deserialize_routed_experts(b64_str: str, num_entries: int) -> torch.Tensor:
-    """Decode SGLang base64+int32 bytes to a 2D torch.Tensor of shape [num_entries, block_size]."""
-    raw = base64.b64decode(b64_str)
-    flat = torch.frombuffer(bytearray(raw), dtype=torch.int32)
-    tensor = flat.reshape(num_entries, -1)
-    logger.debug(
-        "r3_deserialize: entries=%d shape=%s trajectory=%s",
-        num_entries, list(tensor.shape), tensor[0, :8].tolist() if len(tensor) > 0 else [],
+# Wire dtypes SGLang may report in meta_info["routed_experts_dtype"]; absent means int32.
+_R3_WIRE_DTYPES = {"int32": torch.int32, "int16": torch.int16, "uint8": torch.uint8}
+
+# Spare rows (fraction of the needed rows) added when the routing buffer grows.
+_R3_GROWTH = 0.125
+
+# meta_info key for output_token_logprobs already split by parse_generate_json.
+_SPLIT_LOGPROBS_KEY = "_split_output_token_logprobs"
+
+
+def _compact_expert_ids(t: torch.Tensor) -> torch.Tensor:
+    """Store expert ids in the narrowest dtype that holds them (uint8 for <=256 experts)."""
+    if t.dtype == torch.uint8:
+        return t
+    if t.numel() == 0:
+        return t.to(torch.uint8)
+    lo, hi = int(t.min()), int(t.max())
+    if lo < 0:
+        raise ValueError(f"negative expert id {lo} in routed_experts")
+    if hi <= 255:
+        return t.to(torch.uint8)
+    if hi <= 32767:
+        return t.to(torch.int16)
+    return t
+
+
+def deserialize_routed_experts(b64_str: str, num_entries: int, dtype: str = "int32") -> torch.Tensor:
+    """Decode SGLang base64 routing bytes to a compact [num_entries, layers * topk] tensor."""
+    torch_dtype = _R3_WIRE_DTYPES.get(dtype)
+    if torch_dtype is None:
+        raise ValueError(f"unsupported routed_experts_dtype {dtype!r}")
+    raw = pybase64.b64decode(b64_str)
+    itemsize = torch_dtype.itemsize
+    if num_entries <= 0 or len(raw) % (num_entries * itemsize) != 0:
+        raise ValueError(
+            f"routed_experts payload of {len(raw)} bytes does not split into "
+            f"{num_entries} rows of {dtype}"
+        )
+    flat = torch.frombuffer(bytearray(raw), dtype=torch_dtype)
+    return _compact_expert_ids(flat.reshape(num_entries, -1))
+
+
+def _r3_append_rows(base: torch.Tensor, keep: int, *parts: torch.Tensor) -> torch.Tensor:
+    """``torch.cat([base[:keep], *parts])`` that writes into spare capacity of base's buffer.
+
+    The returned tensor is a prefix view of a larger buffer, so a turn costs O(new rows)
+    instead of O(trajectory). Rows past ``keep`` are never visible through any returned
+    view, so overwriting them is safe.
+    """
+    if any(p.dtype != base.dtype or p.shape[1:] != base.shape[1:] for p in parts):
+        return torch.cat([base[:keep], *parts], dim=0)
+    need = keep + sum(p.size(0) for p in parts)
+    row_bytes = max(base[0:1].numel(), 1) * base.element_size()
+    storage = base.untyped_storage()
+    capacity = storage.nbytes() // row_bytes
+    if base.storage_offset() == 0 and base.is_contiguous() and capacity >= need:
+        buf = base.new_empty(0).set_(storage, 0, (capacity, *base.shape[1:]))
+    else:
+        capacity = need + int(need * _R3_GROWTH)
+        buf = base.new_empty((capacity, *base.shape[1:]))
+        buf[:keep].copy_(base[:keep])
+    pos = keep
+    for p in parts:
+        buf[pos:pos + p.size(0)].copy_(p)
+        pos += p.size(0)
+    return buf[:need]
+
+
+@contextlib.contextmanager
+def _gc_paused():
+    """Keep the cyclic GC from running inside the block."""
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        yield
+    finally:
+        if was_enabled:
+            gc.enable()
+
+
+def parse_generate_json(body: bytes) -> dict[str, Any]:
+    """Parse an SGLang /generate body and split output_token_logprobs into two flat lists.
+
+    The per-token ``[logprob, id, None]`` lists are freed with GC paused, before any young
+    collection can promote them into the generations that full collections walk.
+    """
+    with _gc_paused():
+        response_json = orjson.loads(body)
+        meta = response_json.get("meta_info") if isinstance(response_json, dict) else None
+        if isinstance(meta, dict):
+            items = meta.pop("output_token_logprobs", None)
+            if items:
+                meta[_SPLIT_LOGPROBS_KEY] = (
+                    [float(item[0]) for item in items],
+                    [int(item[1]) for item in items],
+                )
+            del items
+    return response_json
+
+
+def _decode_response_r3(meta: dict[str, Any], routed_experts_start_len: int) -> torch.Tensor | None:
+    """Pop and decode meta_info["routed_experts"], appending the synthetic terminal row.
+
+    SGLang captures positions [start_len, seqlen - 1); the extra row keeps the shape that
+    _append_routed_experts expects (its value is overwritten there).
+    """
+    b64 = meta.pop("routed_experts", None)
+    if not b64:
+        return None
+    entries = (
+        meta.get("prompt_tokens", 0) + meta.get("completion_tokens", 0) - 1 - routed_experts_start_len
     )
-    return tensor
+    if entries <= 0:
+        logger.warning("[r3] non-positive entry count (%d); skipping", entries)
+        return None
+    tensor = deserialize_routed_experts(b64, entries, meta.get("routed_experts_dtype") or "int32")
+    return torch.cat([tensor, tensor[-1:]], dim=0)
+
+
+def decode_generate_body(
+    body: bytes, routed_experts_start_len: int, r3_enabled: bool
+) -> tuple[dict[str, Any], torch.Tensor | None]:
+    """Parse a /generate body and decode its R3 rows. Picklable, so it can run in a process pool."""
+    response_json = parse_generate_json(body)
+    routed_experts = None
+    if r3_enabled and isinstance(response_json, dict):
+        routed_experts = _decode_response_r3(
+            response_json.get("meta_info") or {}, routed_experts_start_len
+        )
+    return response_json, routed_experts
+
+
+def _common_prefix_len(a: list[int], b: list[int], n: int, chunk: int = 4096) -> int:
+    """Length of the common prefix of a[:n] and b[:n], comparing chunk-sized slices in C."""
+    lo = 0
+    while lo < n:
+        hi = min(lo + chunk, n)
+        if a[lo:hi] != b[lo:hi]:
+            while a[lo] == b[lo]:
+                lo += 1
+            return lo
+        lo = hi
+    return n
 
 
 def _parse_weight_version(raw: Any) -> int:
@@ -259,11 +399,13 @@ class TrajectoryParser:
         r3_enabled: bool = False,
         reasoning_parser: str | bool | dict[str, Any] | None = None,
         tool_call_parser: str | bool | dict[str, Any] | None = None,
+        r3_reuse_parent_prefix: bool = True,
     ):
         self.trajectory_store = trajectory_store
         self.tokenizer_manager = tokenizer_manager
         self.accumulate_reasoning = accumulate_reasoning
         self.r3_enabled = r3_enabled
+        self.r3_reuse_parent_prefix = r3_reuse_parent_prefix
         self.model_family = getattr(tokenizer_manager, "model_family", None)
         self.think_tags = getattr(tokenizer_manager, "think_tags", DEFAULT_THINK_TAGS)
         self.think_end_ids: list[int] = list(getattr(tokenizer_manager, "think_end_ids", []))
@@ -429,17 +571,49 @@ class TrajectoryParser:
                                trajectory.trajectory_id, len(input_ids))
         # Comparison form, same as the case-1 store.
         trajectory.metadata[_NORMALIZED_HISTORY_KEY] = self._history_compare_form(trajectory, normalized_messages)
+        reuse_len, reuse_from = self._r3_reuse_from_parent(trajectory, active_id, input_ids)
         return TurnInputContext(
             delta_prompt_ids=input_ids,
             input_ids=input_ids,
             start_new_segment=True,
             raw_new_messages=copy.deepcopy(messages),
+            routed_experts_start_len=reuse_len,
+            routed_experts_reuse_len=reuse_len,
+            routed_experts_reuse_from=reuse_from,
             tools=turn_tools,
             target_segment_id=len(trajectory.segments),
             new_segment_parent_id=active_id,
             new_segment_origin="compact",
             new_segment_depth=0,
         )
+
+    def _r3_reuse_from_parent(
+        self, trajectory: Trajectory, parent_id: int, input_ids: list[int]
+    ) -> tuple[int, int]:
+        """R3 rows a new segment can copy from its parent: ``(reuse_len, parent_row_start)``.
+
+        Routing is causal, so positions whose tokens match the parent's prefix route the same
+        and SGLang only needs to send rows from ``reuse_len`` on. Off when think was pruned
+        (stored tokens no longer match the routed context) and for a root parent: siblings
+        share the root prompt, and SGLang may serve another sibling's cached routing for it.
+        """
+        experts = trajectory.rollout_routed_experts
+        if (
+            not self.r3_enabled
+            or not self.r3_reuse_parent_prefix
+            or not self.accumulate_reasoning
+            or experts is None
+        ):
+            return 0, 0
+        parent = trajectory.segments[parent_id]
+        if parent.origin == "root":
+            return 0, 0
+        parent_tokens = trajectory.tokens[parent.token_start:parent.token_end]
+        # Leave out the parent's synthetic terminal row and at least one row for SGLang.
+        n = min(len(parent_tokens), len(input_ids), experts.size(0) - parent.token_start) - 1
+        if n <= 0:
+            return 0, 0
+        return _common_prefix_len(parent_tokens, input_ids, n), parent.token_start
 
     async def _build_continuation_input(
         self,
@@ -483,50 +657,30 @@ class TrajectoryParser:
         response_json: dict[str, Any],
         routed_experts_start_len: int = 0,
         tools: list[dict[str, Any]] | None = None,
+        routed_experts: torch.Tensor | None = None,
     ) -> tuple[LLMGenerateResponse, dict[str, Any], str | None]:
         """Decode LLM worker response and build the assistant message.
 
         Extracts response_ids/logprobs, applies reasoning and tool_call parsing,
         and returns (payload, assistant_message, finish_reason_override).
+        ``routed_experts`` is the R3 chunk already decoded by decode_generate_body; when
+        absent, a base64 map still in meta_info is decoded here.
         """
         meta = response_json.get("meta_info") or {}
-        output_token_logprobs = meta.get("output_token_logprobs") or []
-        if not output_token_logprobs:
+        split = meta.pop(_SPLIT_LOGPROBS_KEY, None)
+        if split is not None:
+            logprobs, response_ids = split
+        else:
+            output_token_logprobs = meta.get("output_token_logprobs") or []
+            logprobs = [float(item[0]) for item in output_token_logprobs]
+            response_ids = [int(item[1]) for item in output_token_logprobs]
+        if not response_ids:
             raise ValueError("output_token_logprobs missing from llm worker response")
-        logprobs = [float(item[0]) for item in output_token_logprobs]
-        response_ids = [int(item[1]) for item in output_token_logprobs]
 
         weight_version = _parse_weight_version(meta.get("weight_version"))
         generated_text: str = response_json.get("text") or ""
-        routed_experts = None
-        routed_experts_b64 = meta.get("routed_experts")
-        if routed_experts_b64 and self.r3_enabled:
-            prompt_tokens = meta.get("prompt_tokens", 0)
-            completion_tokens = meta.get("completion_tokens", 0)
-            # sglang captures routing for positions [start_len, seqlen - 1),
-            # dropping the terminal position Re-append a synthetic terminal row 
-            # so downstream replay (segment offset math, _append_routed_experts) 
-            # sees the same shape it always has. The terminal value is irrelevant: 
-            # _append_routed_experts overwrites it via merged[-1].copy_(merged[-2]).
-            serialized_entries = (
-                prompt_tokens + completion_tokens - 1 - routed_experts_start_len
-            )
-            logger.info(
-                "[build_assistant_message] r3: prompt=%d completion=%d start=%d -> %d entries (+1 terminal)",
-                prompt_tokens, completion_tokens, routed_experts_start_len, serialized_entries,
-            )
-            if serialized_entries > 0:
-                routed_experts = deserialize_routed_experts(
-                    routed_experts_b64, serialized_entries
-                )
-                routed_experts = torch.cat(
-                    [routed_experts, routed_experts[-1:].clone()], dim=0
-                )
-            else:
-                logger.warning(
-                    "[build_assistant_message] r3: non-positive entry count (%d); skipping",
-                    serialized_entries,
-                )
+        if routed_experts is None and self.r3_enabled:
+            routed_experts = _decode_response_r3(meta, routed_experts_start_len)
 
         payload = LLMGenerateResponse(
             generated_text=generated_text,
@@ -655,7 +809,9 @@ class TrajectoryParser:
 
         if self.r3_enabled and payload.routed_experts is not None:
             self._append_routed_experts(
-                trajectory, payload.routed_experts, turn_ctx.start_new_segment
+                trajectory, payload.routed_experts, turn_ctx.start_new_segment,
+                reuse_len=turn_ctx.routed_experts_reuse_len,
+                reuse_from=turn_ctx.routed_experts_reuse_from,
             )
         segment_messages = copy.deepcopy(turn_ctx.raw_new_messages + [assistant_message])
         active_id = trajectory.active_segment_id
@@ -1148,21 +1304,25 @@ class TrajectoryParser:
         trajectory: Trajectory,
         routed_experts_chunk: torch.Tensor,
         start_new_segment: bool = False,
+        reuse_len: int = 0,
+        reuse_from: int = 0,
     ) -> None:
         """Extend the rollout routing map with a new turn's chunk.
 
         Continuation strips the previous synthetic terminal (SGLang re-captures that
         position as a prompt token this turn). A new segment must NOT strip it: its
         prompt is re-tokenized fresh, so that placeholder is never re-captured — keep it
-        so shape[0] stays aligned with len(tokens) per segment.
+        so shape[0] stays aligned with len(tokens) per segment. With ``reuse_len`` the new
+        segment's first rows are copied from ``base[reuse_from:reuse_from + reuse_len]``.
         """
         base = trajectory.rollout_routed_experts
         if base is None:
             merged = routed_experts_chunk.clone()
         elif start_new_segment:
-            merged = torch.cat([base, routed_experts_chunk], dim=0)
+            reused = (base[reuse_from:reuse_from + reuse_len],) if reuse_len > 0 else ()
+            merged = _r3_append_rows(base, base.size(0), *reused, routed_experts_chunk)
         else:
-            merged = torch.cat([base[:-1], routed_experts_chunk], dim=0)
+            merged = _r3_append_rows(base, base.size(0) - 1, routed_experts_chunk)
         if merged.size(0) > 1:
             merged[-1].copy_(merged[-2])
         trajectory.rollout_routed_experts = merged

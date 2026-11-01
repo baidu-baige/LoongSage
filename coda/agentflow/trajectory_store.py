@@ -1,12 +1,116 @@
 """Trajectory data models and store for AgentFlow."""
 
+from array import array
 from enum import Enum
 import logging
 from typing import Any, Literal
 
 from pydantic import BaseModel as PydanticModel, Field
+from pydantic_core import core_schema
 
 logger = logging.getLogger(__name__)
+
+
+class _PackedSeq(array):
+    """Per-token sequence packed in an ``array`` that behaves like a ``list``.
+
+    A list of N ints is N GC-visible pointers that every full collection walks; with
+    long-context trajectories that made gen2 pauses take seconds. Slices read as lists,
+    writes accept any iterable, ``==`` compares with lists, and copy/pickle keep the type.
+    """
+
+    __slots__ = ()
+    _TYPECODE = "q"
+
+    def __new__(cls, values: Any = ()):
+        if isinstance(values, array) and values.typecode == cls._TYPECODE:
+            obj = super().__new__(cls, cls._TYPECODE)
+            obj.frombytes(values.tobytes())
+            return obj
+        return super().__new__(cls, cls._TYPECODE, values)
+
+    @classmethod
+    def _from_bytes(cls, data: bytes) -> "_PackedSeq":
+        obj = super().__new__(cls, cls._TYPECODE)
+        obj.frombytes(data)
+        return obj
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return super().__getitem__(index).tolist()
+        return super().__getitem__(index)
+
+    def __setitem__(self, index, value) -> None:
+        if isinstance(index, slice) and not (
+            isinstance(value, array) and value.typecode == self._TYPECODE
+        ):
+            value = array(self._TYPECODE, value)
+        super().__setitem__(index, value)
+
+    def extend(self, values) -> None:
+        if not (isinstance(values, array) and values.typecode == self._TYPECODE):
+            values = array(self._TYPECODE, values)
+        super().extend(values)
+
+    def __iadd__(self, values):
+        self.extend(values)
+        return self
+
+    def __add__(self, other):
+        return self.tolist() + list(other)
+
+    def __radd__(self, other):
+        return list(other) + self.tolist()
+
+    def __eq__(self, other) -> bool:
+        if isinstance(other, array):
+            return array.__eq__(self, other)
+        if isinstance(other, (list, tuple)):
+            return len(self) == len(other) and self.tolist() == list(other)
+        return NotImplemented
+
+    def __ne__(self, other) -> bool:
+        eq = self.__eq__(other)
+        return eq if eq is NotImplemented else not eq
+
+    __hash__ = None
+
+    def __repr__(self) -> str:
+        return repr(self.tolist())
+
+    def __copy__(self):
+        return type(self)(self)
+
+    def __deepcopy__(self, memo):
+        return type(self)(self)
+
+    def __reduce_ex__(self, protocol):
+        # array's own __reduce_ex__ rebuilds via cls(typecode, list) for protocol < 3.
+        return (type(self)._from_bytes, (self.tobytes(),))
+
+    @classmethod
+    def __get_pydantic_core_schema__(cls, source_type, handler):
+        def validate(value):
+            return value if type(value) is cls else cls(value)
+
+        return core_schema.no_info_plain_validator_function(
+            validate,
+            serialization=core_schema.plain_serializer_function_ser_schema(lambda v: v.tolist()),
+        )
+
+
+class IntSeq(_PackedSeq):
+    """Packed int64 sequence (token ids, masks, weight versions)."""
+
+    __slots__ = ()
+    _TYPECODE = "q"
+
+
+class FloatSeq(_PackedSeq):
+    """Packed float64 sequence (log-probs, token rewards)."""
+
+    __slots__ = ()
+    _TYPECODE = "d"
 
 
 class TrajectoryStatus(str, Enum):
@@ -249,7 +353,7 @@ class Trajectory(PydanticModel):
     # --- Core training arrays ---
     # All token ids concatenated across turns (initial_prompt + all subsequent tokens).
     # Length = initial_prompt_len + response_len.
-    tokens: list[int] = Field(default_factory=list)
+    tokens: IntSeq = Field(default_factory=IntSeq)
 
     # Final train mask in response space: 1 = include this token in loss, 0 = ignore it.
     # Zeros may come from non-trainable context tokens (tool outputs / rebuilt prompts /
@@ -259,16 +363,16 @@ class Trajectory(PydanticModel):
     # Length = response_len = len(tokens) - initial_prompt_len.
     # Includes ALL tokens after the initial prompt — tool outputs and re-appearing
     # context tokens (P_dup, S_dup) from Summary Reset are present but with mask=0.
-    loss_masks: list[int] = Field(default_factory=list)
+    loss_masks: IntSeq = Field(default_factory=IntSeq)
 
     # Log-probabilities, length = response_len (same as loss_masks).
     # LLM-generated positions: real log-probability (≤ 0).
     # All other positions (tool outputs, re-appearing prompt/summary tokens): 0.0.
-    rollout_log_probs: list[float] = Field(default_factory=list)
+    rollout_log_probs: FloatSeq = Field(default_factory=FloatSeq)
 
     # Weight version for each response-space token, aligned with rollout_log_probs.
     # Non-LLM positions use -1.
-    rollout_weight_versions: list[int] = Field(default_factory=list)
+    rollout_weight_versions: IntSeq = Field(default_factory=IntSeq)
 
     rollout_routed_experts: Any = None
 
@@ -282,7 +386,7 @@ class Trajectory(PydanticModel):
 
     # Shape = len(rollout_log_probs) = response_len.
     # All zeros except the very last position = final_reward.
-    token_rewards: list[float] = Field(default_factory=list)
+    token_rewards: FloatSeq = Field(default_factory=FloatSeq)
 
     # --- Auxiliary ---
     # Plaintext messages grouped by segment, keyed by segment_id. chat_completions[sid]
