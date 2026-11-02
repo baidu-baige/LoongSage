@@ -1,4 +1,8 @@
-"""Tokenizer execution manager for CPU-bound chat-template and encode calls."""
+"""Tokenizer execution manager for CPU-bound chat-template and encode calls.
+
+The manager also probes the chat template's non-assistant / assistant prefixes, and
+tokenizes SFT conversations with their assistant loss masks.
+"""
 
 from __future__ import annotations
 
@@ -30,6 +34,9 @@ DEEPSEEK_OFFICIAL_ENCODER_MODULES = {
     DEEPSEEK_V41_MODEL_FAMILY: "sglang.srt.entrypoints.openai.encoding_dsv41",
     DEEPSEEK_V4_MODEL_FAMILY: "sglang.srt.entrypoints.openai.encoding_dsv4",
 }
+# Probe messages: the prefixes are read off their renders.
+_EMPTY_SYSTEM = {"role": "system", "content": ""}
+_EMPTY_USER = {"role": "user", "content": ""}
 
 
 def _deepseek_v4_thinking_mode(generation_prompt_kwargs: Mapping[str, Any]) -> str:
@@ -144,7 +151,11 @@ def _init_process_tokenizer(model_path: str, custom_chat_template: str | None) -
 
 
 def _ensure_token_list(obj: Any) -> list[int]:
-    """Normalize tokenizer outputs to a plain list of ints."""
+    """Normalize tokenizer outputs into a flat ``list[int]``.
+
+    This handles Transformers 4/5 differences where ``apply_chat_template(tokenize=True)``
+    may return either ``list[int]`` or a ``BatchEncoding``/mapping with ``input_ids``.
+    """
     if hasattr(obj, "keys") and "input_ids" in obj:
         return _ensure_token_list(obj["input_ids"])
     if isinstance(obj, dict):
@@ -229,7 +240,19 @@ def _decode_process(token_ids: list[int], *, skip_special_tokens: bool) -> str:
 # ---------------------------------------------------------------------------
 
 class BaseTokenizerManager(ABC):
-    """Async tokenizer interface with common metadata."""
+    """Async tokenizer interface with common metadata.
+
+    Attributes:
+        non_assistant_prefix_message: Empty message a continuation message is rendered behind:
+            an empty system message, or an empty user message when the chat template
+            rejects a system-only conversation (Qwen3.5 needs a user message).
+        non_assistant_prefix: Token ids ``non_assistant_prefix_message`` renders to, e.g. a lone BOS token
+            (DeepSeek) or an empty system / user turn; cut off every render behind it.
+        assistant_prefix: Token ids of an empty user message rendered with the
+            generation prompt (the assistant header plus anything pre-filled after it);
+            an assistant message is rendered behind the empty user message and this
+            prefix is cut off, leaving what the model generates.
+    """
 
     def __init__(
         self,
@@ -256,6 +279,181 @@ class BaseTokenizerManager(ABC):
         self.think_end_ids = _ensure_token_list(
             tokenizer.encode(self.think_tags[1], add_special_tokens=False)
         )
+        self.non_assistant_prefix_message, self.non_assistant_prefix = self._get_non_assistant_prefix()
+        self.assistant_prefix = self._render([_EMPTY_USER], add_generation_prompt=True)
+        logger.info(
+            "probed from chat template: non_assistant_prefix=%r (empty %s message) assistant_prefix=%r",
+            tokenizer.decode(self.non_assistant_prefix),
+            self.non_assistant_prefix_message["role"],
+            tokenizer.decode(self.assistant_prefix),
+        )
+
+    def _render(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        add_generation_prompt: bool = False,
+    ) -> list[int]:
+        """Render ``messages`` to token ids in the calling thread, with ``generation_prompt_kwargs``."""
+        return _ensure_token_list(
+            self.tokenizer.apply_chat_template(
+                messages,
+                tools=tools,
+                add_generation_prompt=add_generation_prompt,
+                tokenize=True,
+                **self.generation_prompt_kwargs,
+            )
+        )
+
+    def _get_non_assistant_prefix(self) -> tuple[dict[str, Any], list[int]]:
+        """Probe ``non_assistant_prefix_message`` and the ``non_assistant_prefix`` it renders to.
+
+        empty system message, unless the chat template rejects a system-only conversation
+        (Qwen3.5 requires at least one user message); then an empty user message.
+
+        Returns:
+            ``(non_assistant_prefix_message, non_assistant_prefix)``.
+
+        Raises:
+            Exception: The chat template rejects the empty user message too.
+        """
+        try:
+            return _EMPTY_SYSTEM, self._render([_EMPTY_SYSTEM])
+        except Exception as exc:
+            logger.warning(
+                "chat template rejects a system-only conversation (%s); "
+                "continuation messages are rendered behind an empty user message", exc
+            )
+            return _EMPTY_USER, self._render([_EMPTY_USER])
+
+    def tokenize(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+    ) -> tuple[list[int], list[int]]:
+        """Return the SFT ``(input_ids, loss_mask)`` of a conversation, in the calling thread.
+
+        The conversation is cut into the pieces an RL rollout produces: each turn of
+        consecutive non-assistant messages is a prompt, each assistant message a
+        response.  The first turn is rendered at once with ``tools`` (an RL first turn);
+        each later turn behind ``non_assistant_prefix_message`` with ``non_assistant_prefix`` cut off (an
+        RL continuation turn, as the router's delta tokenization does).  A turn followed
+        by an assistant message ends with the generation prompt, so it is context.
+        An assistant message is rendered behind an empty user message, which makes it
+        the turn after the last user query, and ``assistant_prefix`` is cut off: the
+        rest is what the model generates after the generation prompt, and is trained.
+
+        Templates that render a message depending on the messages around it make the
+        concatenation differ from the whole conversation rendered at once: Qwen and
+        DeepSeek drop the reasoning of history turns, while here every assistant
+        message keeps its own.  The concatenation is trained on as is.
+
+        Args:
+            messages: OpenAI-style conversation; only ``role == "assistant"`` messages are trained.
+                Not modified; assistant tool_call arguments given as JSON strings are parsed
+                into mappings before rendering, as the router does.
+            tools: Tool schemas the chat template renders with the prompt, if any.
+
+        Returns:
+            ``input_ids`` and a same-length 0/1 ``loss_mask``; both empty for no messages.
+
+        Raises:
+            ValueError: The conversation starts with an assistant message; a continuation
+                turn does not render behind ``non_assistant_prefix`` so cutting it off would corrupt
+                the context; or an assistant message does not render as a continuation of the
+                generation prompt, e.g. it carries ``reasoning_content`` while the generation
+                prompt pre-fills an empty think block (Qwen with ``enable_thinking: false``).
+            Exception: The chat template rejects the prompt (Qwen3.5 given no user message
+                before the first assistant message) or a turn rendered behind
+                ``non_assistant_prefix_message`` (Qwen3.5 given a system message after the first).
+        """
+        if not messages:
+            return [], []
+        # Imported here, not at module level: importing sglang registers its own
+        # DeepseekV41Config with transformers' AutoConfig, replacing Megatron-Bridge's,
+        # in every process that imports this module (train workers via coda.custom).
+        from sglang.srt.entrypoints.openai.serving_chat import (  # noqa: PLC0415
+            normalize_assistant_tool_call_arguments,
+        )
+
+        # As the router's _tokenize_messages: chat templates expect assistant tool_call
+        # arguments as a mapping (Qwen3.5 iterates them with ``|items``) while the data
+        # stores OpenAI-style JSON strings, so a copy is normalized for rendering.
+        messages = copy.deepcopy(messages)
+        for message in messages:
+            normalize_assistant_tool_call_arguments(message)
+        # The prompt is the messages before the first assistant message; a conversation
+        # must not start with an assistant message, so there is at least one.
+        prompt_len = next(
+            (index for index, message in enumerate(messages) if message.get("role") == "assistant"),
+            len(messages),
+        )
+        if prompt_len == 0:
+            raise ValueError("conversation must not start with an assistant message")
+        turns: list[list[dict[str, Any]]] = [messages[:prompt_len]]
+        for message in messages[prompt_len:]:
+            if message.get("role") == "assistant" or turns[-1][-1].get("role") == "assistant":
+                turns.append([message])
+            else:
+                turns[-1].append(message)
+
+        input_ids: list[int] = []
+        loss_mask: list[int] = []
+        for index, turn in enumerate(turns):
+            if turn[0].get("role") == "assistant":
+                turn_ids = self._tokenize_assistant_message(turn[0])
+                trained = 1
+            else:
+                # A non-assistant turn followed by an assistant message ends with the generation prompt
+                # that opens that reply, as an RL turn does; the last turn of a conversation that ends
+                # without a reply (or has no assistant message at all) does not.
+                opens_reply = index + 1 < len(turns)
+                if index == 0:
+                    turn_ids = self._render(turn, tools, add_generation_prompt=opens_reply)
+                else:
+                    turn_ids = self._tokenize_non_assistant_messages(turn, add_generation_prompt=opens_reply)
+                trained = 0
+            input_ids += turn_ids
+            loss_mask += [trained] * len(turn_ids)
+        return input_ids, loss_mask
+
+    def _tokenize_non_assistant_messages(
+        self, messages: list[dict[str, Any]], *, add_generation_prompt: bool
+    ) -> list[int]:
+        """Tokenize non-assistant messages behind ``non_assistant_prefix_message``, as an RL continuation turn.
+
+        Same rendering as the router's ``_tokenize_delta_messages`` (render behind
+        ``non_assistant_prefix_message``, then cut ``non_assistant_prefix`` off); kept separate
+        because the router runs async, and its delta can carry an assistant message.
+
+        Raises:
+            ValueError: The messages rendered behind ``non_assistant_prefix_message`` do not start
+                with ``non_assistant_prefix``, so cutting it off would corrupt the context.
+        """
+        input_ids = self._render([self.non_assistant_prefix_message, *messages], add_generation_prompt=add_generation_prompt)
+        if input_ids[: len(self.non_assistant_prefix)] != self.non_assistant_prefix:
+            raise ValueError(
+                f"messages {[m.get('role') for m in messages]} render as {self.tokenizer.decode(input_ids)!r}, "
+                f"which does not start with the non-assistant prefix {self.tokenizer.decode(self.non_assistant_prefix)!r}"
+            )
+        return input_ids[len(self.non_assistant_prefix) :]
+
+    def _tokenize_assistant_message(self, message: dict[str, Any]) -> list[int]:
+        """Tokenize one assistant message as the model generates it after the generation prompt.
+
+        Raises:
+            ValueError: The message rendered behind an empty user message does not start
+                with ``assistant_prefix``.
+        """
+        input_ids = self._render([_EMPTY_USER, message])
+        if input_ids[: len(self.assistant_prefix)] != self.assistant_prefix:
+            raise ValueError(
+                f"assistant message renders as {self.tokenizer.decode(input_ids)!r}, which does not "
+                f"continue the generation prompt {self.tokenizer.decode(self.assistant_prefix)!r}; "
+                "reasoning_content must match the thinking mode in generation_prompt_kwargs: "
+                "drop it when thinking is disabled, provide it when thinking is enabled"
+            )
+        return input_ids[len(self.assistant_prefix) :]
 
     @abstractmethod
     async def apply_chat_template(

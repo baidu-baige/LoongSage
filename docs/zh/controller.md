@@ -335,7 +335,7 @@ Rollout-only 不代表不需要训练 backend 的配置。数据切分和 batch 
 ```
 
 Train-only 不创建 `RolloutManager` 和 `RolloutSampler`，因此整个流程里没有权重传输通道，也没有一次
-`_update_weights` 调用；`_post_train_weight_version()` 只把 `weight_version` 计数往前推，供 checkpoint
+`_update_weights` 调用；每步训练后只把 `weight_version` 计数加一，供 checkpoint
 记录使用。它要求磁盘数据的结构与当前训练配置兼容，包括 DP 切分、mini batch 和轨迹字段。
 
 ### 轨迹到训练 batch

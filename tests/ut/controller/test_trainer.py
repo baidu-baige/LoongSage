@@ -310,6 +310,16 @@ class TestTrainerValidateConfig:
 
         self._trainer(config)._validate_config()
 
+    def test_sft_mode_runs_sft_checks(self):
+        """run_mode=sft routes through validate_sft_config (rules tested in test_sft_sampler)."""
+        config = make_minimal_config(
+            run_mode="sft",
+            algorithm={"policy_loss": "grpo", "advantage_estimator": "grpo"},
+        )
+
+        with pytest.raises(ValueError, match="run_mode=sft requires algorithm.policy_loss=sft"):
+            self._trainer(config)._validate_config()
+
 
 class TestTrainerValidateReadOnlyCkptPaths:
     """ref / teacher dist checkpoint dirs are checked before GPUs are reserved.
@@ -380,15 +390,6 @@ class TestTrainerValidateReadOnlyCkptPaths:
             ],
         })
         self._validate(config)
-
-
-class TestWeightVersionHelpers:
-    """Tests for trainer-side rollout weight version helpers."""
-
-    def test_post_train_weight_version_advances_from_current_version(self):
-        trainer = object.__new__(Trainer)
-
-        assert trainer._post_train_weight_version(7) == 8
 
 
 class TestBatchDiskRoundTrip:
