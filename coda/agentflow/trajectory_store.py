@@ -48,6 +48,7 @@ class _PackedSeq(array):
         super().__setitem__(index, value)
 
     def extend(self, values) -> None:
+        """Append values, converting a non-matching iterable to this packed typecode first."""
         if not (isinstance(values, array) and values.typecode == self._TYPECODE):
             values = array(self._TYPECODE, values)
         super().extend(values)
@@ -90,6 +91,7 @@ class _PackedSeq(array):
 
     @classmethod
     def __get_pydantic_core_schema__(cls, source_type, handler):
+        """Pydantic schema: validate incoming values into this type, serialize as a plain list."""
         def validate(value):
             return value if type(value) is cls else cls(value)
 

@@ -246,7 +246,17 @@ def _compact_expert_ids(t: torch.Tensor) -> torch.Tensor:
 
 
 def deserialize_routed_experts(b64_str: str, num_entries: int, dtype: str = "int32") -> torch.Tensor:
-    """Decode SGLang base64 routing bytes to a compact [num_entries, layers * topk] tensor."""
+    """Decode SGLang base64 routing bytes to a compact [num_entries, layers * topk] tensor.
+
+    Args:
+        b64_str: base64-encoded routed-expert bytes from ``meta_info["routed_experts"]``.
+        num_entries: number of rows (captured token positions) the payload must split into.
+        dtype: wire dtype SGLang reported ("int32" / "int16" / "uint8"); decides the item size.
+
+    Returns:
+        A ``[num_entries, layers * topk]`` tensor, down-cast to the narrowest dtype that holds
+        the expert ids (uint8 for <=256 experts, int16 otherwise).
+    """
     torch_dtype = _R3_WIRE_DTYPES.get(dtype)
     if torch_dtype is None:
         raise ValueError(f"unsupported routed_experts_dtype {dtype!r}")
@@ -265,8 +275,8 @@ def _r3_append_rows(base: torch.Tensor, keep: int, *parts: torch.Tensor) -> torc
     """``torch.cat([base[:keep], *parts])`` that writes into spare capacity of base's buffer.
 
     The returned tensor is a prefix view of a larger buffer, so a turn costs O(new rows)
-    instead of O(trajectory). Rows past ``keep`` are never visible through any returned
-    view, so overwriting them is safe.
+    instead of O(trajectory). This overwrites rows at and after ``keep`` in base's storage,
+    so the caller must not keep using ``base`` or any view of it after the call.
     """
     if any(p.dtype != base.dtype or p.shape[1:] != base.shape[1:] for p in parts):
         return torch.cat([base[:keep], *parts], dim=0)
@@ -338,13 +348,41 @@ def _decode_response_r3(meta: dict[str, Any], routed_experts_start_len: int) -> 
     return torch.cat([tensor, tensor[-1:]], dim=0)
 
 
+def is_passthrough_response(response_json: dict[str, Any]) -> bool:
+    """True when a /generate body must be returned verbatim instead of parsed.
+
+    Covers error bodies (an "error" field with no generated text) and aborted requests
+    (``meta_info.finish_reason.type == "abort"``). R3 decode must be skipped for these,
+    since their payloads can be malformed and decoding would raise instead of passing through.
+    """
+    if "error" in response_json and not response_json.get("text"):
+        return True
+    finish_reason = (response_json.get("meta_info") or {}).get("finish_reason") or {}
+    return isinstance(finish_reason, dict) and finish_reason.get("type") == "abort"
+
+
 def decode_generate_body(
     body: bytes, routed_experts_start_len: int, r3_enabled: bool
 ) -> tuple[dict[str, Any], torch.Tensor | None]:
-    """Parse a /generate body and decode its R3 rows. Picklable, so it can run in a process pool."""
+    """Parse a /generate body and decode its R3 rows. Picklable, so it can run in a process pool.
+
+    Args:
+        body: raw SGLang /generate response bytes.
+        routed_experts_start_len: first captured token position, used to size the R3 rows.
+        r3_enabled: decode routed experts only when true and the body is not a passthrough
+            (error / abort) response.
+
+    Returns:
+        ``(response_json, routed_experts)``. ``routed_experts`` is None when R3 is disabled,
+        absent, or the body is a passthrough response.
+    """
     response_json = parse_generate_json(body)
     routed_experts = None
-    if r3_enabled and isinstance(response_json, dict):
+    if (
+        r3_enabled
+        and isinstance(response_json, dict)
+        and not is_passthrough_response(response_json)
+    ):
         routed_experts = _decode_response_r3(
             response_json.get("meta_info") or {}, routed_experts_start_len
         )

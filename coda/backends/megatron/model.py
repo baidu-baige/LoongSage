@@ -122,12 +122,18 @@ def setup_routing_replay(config: DictConfig, batch: dict, model_chunk: torch.nn.
     Only sets replay data for the RouterReplay instances belonging to the current model_chunk's vp_stage. 
     """
     model_config = get_model_config(model_chunk)
+    seqs = batch.get("rollout_routed_experts")
+    if seqs is None:
+        raise RuntimeError(
+            "use_rollout_routing_replay is on but this batch has no rollout_routed_experts "
+            "(some Segments in the DP shard lack R3 data; see put_dp_shards_to_ray)"
+        )
     # Rows arrive as read-only numpy views of the Ray object store (see put_dp_shards_to_ray).
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message="The given NumPy array is not writable")
         rollout_routed_experts = [
             torch.as_tensor(seq).reshape(len(seq), model_config.num_layers, model_config.moe_router_topk)
-            for seq in batch.get("rollout_routed_experts")
+            for seq in seqs
         ]
 
     packed_experts = prepare_routing_replay_data(

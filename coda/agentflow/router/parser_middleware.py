@@ -21,7 +21,7 @@ from starlette.types import ASGIApp
 from coda.agentflow.tokenizer_manager import DEEPSEEK_OFFICIAL_ENCODER_MODULES
 from coda.agentflow.trajectory_store import TrajectoryStore
 from coda.agentflow.utils import CONTEXT_LENGTH_EXCEEDED, build_request_id
-from .parser import TrajectoryParser, TurnInputContext, decode_generate_body
+from .parser import TrajectoryParser, TurnInputContext, decode_generate_body, is_passthrough_response
 from .protocols import PROTOCOL_ADAPTERS, ProtocolAdapter
 
 logger = logging.getLogger(__name__)
@@ -49,6 +49,7 @@ class ParserMiddleware(BaseHTTPMiddleware):
         ds_configs: dict[int, Any] | None = None,
         r3_reuse_parent_prefix: bool = True,
         r3_decode_workers: int = 0,
+        shutdown_callbacks: list | None = None,
     ):
         super().__init__(app)
         from coda.agentflow.router.router import filter_headers
@@ -65,6 +66,8 @@ class ParserMiddleware(BaseHTTPMiddleware):
             ProcessPoolExecutor(max_workers=r3_decode_workers)
             if r3_enabled and r3_decode_workers > 0 else None
         )
+        if self._decode_pool is not None and shutdown_callbacks is not None:
+            shutdown_callbacks.append(self._close_decode_pool)
         self.parser = TrajectoryParser(
             trajectory_store=trajectory_store,
             tokenizer_manager=tokenizer_manager,
@@ -321,18 +324,30 @@ class ParserMiddleware(BaseHTTPMiddleware):
             return b"".join(chunks)
         return response.body
 
+    def _close_decode_pool(self) -> None:
+        """Shut down the R3 decode pool once; later requests fall back to inline decoding."""
+        pool, self._decode_pool = self._decode_pool, None
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
+
     async def _decode_body(
-        self, body: bytes, routed_experts_start_len: int
+        self, body: bytes, routed_experts_start_len: int, status_code: int
     ) -> tuple[dict[str, Any], Any]:
-        """Run decode_generate_body in the pool when configured, else inline."""
+        """Run decode_generate_body in the pool when configured, else inline.
+
+        R3 is decoded only for successful (<400) responses; decode_generate_body additionally
+        skips error/abort passthrough bodies, so a malformed R3 payload cannot raise here.
+        """
+        r3_enabled = self.r3_enabled and status_code < status.HTTP_400_BAD_REQUEST
         if self._decode_pool is not None:
             try:
                 return await asyncio.get_running_loop().run_in_executor(
-                    self._decode_pool, decode_generate_body, body, routed_experts_start_len, True
+                    self._decode_pool, decode_generate_body, body, routed_experts_start_len, r3_enabled
                 )
             except BrokenProcessPool as e:
-                logger.warning("[parse] R3 decode pool broken (%s); decoding inline", e)
-        return decode_generate_body(body, routed_experts_start_len, self.r3_enabled)
+                logger.error("[parse] R3 decode pool broken (%s); disabling pool, decoding inline", e)
+                self._close_decode_pool()
+        return decode_generate_body(body, routed_experts_start_len, r3_enabled)
 
     async def _parse_generate_response(
         self,
@@ -348,7 +363,7 @@ class ParserMiddleware(BaseHTTPMiddleware):
         """
         try:
             response_json, routed_experts = await self._decode_body(
-                body, turn_ctx.routed_experts_start_len
+                body, turn_ctx.routed_experts_start_len, response.status_code
             )
         except json.JSONDecodeError:
             logger.warning("[parse] upstream payload non-JSON for %s: %s", trajectory_id, body[:200])
@@ -367,11 +382,11 @@ class ParserMiddleware(BaseHTTPMiddleware):
         # /abort_request. In both cases SGLang returns HTTP 200 with finish_reason.type == "abort"
         # (running-batch: FINISH_ABORT(status_code=None), waiting-queue: _handle_abort_req path).
         # Skip writing to TrajectoryStore to avoid partial/empty data.
-        _finish_reason = (response_json.get("meta_info") or {}).get("finish_reason") or {}
-        if isinstance(_finish_reason, dict) and _finish_reason.get("type") == "abort":
+        if is_passthrough_response(response_json):
+            _finish_reason = (response_json.get("meta_info") or {}).get("finish_reason") or {}
             logger.warning(
                 "[parse] upstream aborted request for %s: %s",
-                trajectory_id, _finish_reason.get("message", ""),
+                trajectory_id, _finish_reason.get("message", "") if isinstance(_finish_reason, dict) else "",
             )
             return Response(content=body, status_code=response.status_code,
                             headers=self._filter_headers(dict(response.headers)),
