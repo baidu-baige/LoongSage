@@ -26,6 +26,7 @@ from coda.agentflow.router.parser import (
     TurnInputContext,
     decode_generate_body,
     deserialize_routed_experts,
+    is_passthrough_response,
 )
 from coda.agentflow.router.parser_middleware import ParserMiddleware
 from coda.agentflow import tokenizer_manager
@@ -545,6 +546,34 @@ def test_decode_generate_body_splits_logprobs_and_appends_terminal_row() -> None
     payload, _, _ = make_parser().build_assistant_message(response_json, 1, routed_experts=experts)
     assert payload.response_ids == [101, 102] and payload.logprobs == [-0.1, -0.2]
     assert payload.routed_experts is experts
+
+
+def test_decode_generate_body_skips_r3_for_abort_with_malformed_payload() -> None:
+    """An aborted response with an unparsable R3 payload must not raise; experts is None."""
+    body = json.dumps({
+        "text": "",
+        "meta_info": {
+            "prompt_tokens": 3,
+            "completion_tokens": 2,
+            "routed_experts": "not-valid-base64-rows",
+            "finish_reason": {"type": "abort", "message": "cancelled"},
+        },
+    }).encode()
+
+    response_json, experts = decode_generate_body(body, routed_experts_start_len=1, r3_enabled=True)
+
+    assert experts is None
+    assert is_passthrough_response(response_json)
+
+
+def test_decode_generate_body_skips_r3_for_error_response() -> None:
+    """An error body (no generated text) is passthrough: R3 decode is skipped."""
+    body = json.dumps({"error": "bad request", "meta_info": {}}).encode()
+
+    response_json, experts = decode_generate_body(body, routed_experts_start_len=1, r3_enabled=True)
+
+    assert experts is None
+    assert is_passthrough_response(response_json)
 
 
 def test_append_routed_experts_grows_buffer_in_place() -> None:
