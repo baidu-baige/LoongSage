@@ -24,6 +24,8 @@ TURN_END = IM_END + "\n"
 EMPTY_REASONING = "\n</think>\n\n"
 EOS = "<｜end▁of▁sentence｜>"
 
+pytestmark = pytest.mark.usefixtures("stub_sglang_serving_chat")
+
 
 def _manager(tokenizer, generation_prompt_kwargs=None):
     """Tokenizer manager whose ``tokenize`` runs in the calling thread."""
