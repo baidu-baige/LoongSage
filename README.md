@@ -18,8 +18,9 @@ A production-grade, high-efficiency Agentic RL framework for frontier LLMs with 
   <img src="https://img.shields.io/badge/code-16k%20lines-brightgreen.svg" alt="LOC">
   <img src="https://img.shields.io/badge/training-Megatron--Core-76B900.svg" alt="Megatron-Core">
   <img src="https://img.shields.io/badge/rollout-SGLang-orange.svg" alt="SGLang">
-  <a href="https://github.com/baidu-baige/LoongSage/issues/25"><img src="https://img.shields.io/badge/WeChat-Group-07C160.svg?logo=wechat&logoColor=white" alt="WeChat Group"></a>
 </p>
+
+Join our <a href="https://github.com/baidu-baige/LoongSage/issues/25"><img src="https://img.shields.io/badge/WeChat-Group-07C160.svg?logo=wechat&logoColor=white" alt="WeChat Group" style="vertical-align: middle;"></a> community
 
 </div>
 
