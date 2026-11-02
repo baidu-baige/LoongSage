@@ -13,14 +13,19 @@
 A production-grade, high-efficiency Agentic RL framework for frontier LLMs with validated recipes.
 
 <p>
-  <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"></a>
-  <img src="https://img.shields.io/badge/python-3.12-blue.svg" alt="Python">
-  <img src="https://img.shields.io/badge/code-16k%20lines-brightgreen.svg" alt="LOC">
-  <img src="https://img.shields.io/badge/training-Megatron--Core-76B900.svg" alt="Megatron-Core">
-  <img src="https://img.shields.io/badge/rollout-SGLang-orange.svg" alt="SGLang">
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg?style=flat-square" alt="License"></a>
+  <img src="https://img.shields.io/badge/python-3.12-blue.svg?style=flat-square" alt="Python">
+  <img src="https://img.shields.io/badge/code-16k%20lines-brightgreen.svg?style=flat-square" alt="LOC">
+  <img src="https://img.shields.io/badge/training-Megatron--Core-76B900.svg?style=flat-square" alt="Megatron-Core">
+  <img src="https://img.shields.io/badge/rollout-SGLang-orange.svg?style=flat-square" alt="SGLang">
+  <a href="https://hub.docker.com/r/loongsage/loongsage"><img src="https://img.shields.io/docker/pulls/loongsage/loongsage.svg?style=flat-square&logo=docker&logoColor=white" alt="Docker Pulls"></a>
 </p>
 
-Join our <a href="https://github.com/baidu-baige/LoongSage/issues/25"><img src="https://img.shields.io/badge/WeChat-Group-07C160.svg?logo=wechat&logoColor=white" alt="WeChat Group" style="vertical-align: middle;"></a> community
+<p>
+  <a href="https://github.com/baidu-baige/LoongSage/issues/25"><img src="https://img.shields.io/badge/WeChat_Group-07C160?style=for-the-badge&logo=wechat&logoColor=white" alt="Join WeChat Group"></a>
+  <a href="https://www.zhihu.com/people/loongsage"><img src="https://img.shields.io/badge/Follow_on_Zhihu-0084FF?style=for-the-badge&logo=zhihu&logoColor=white" alt="Follow on Zhihu"></a>
+  <a href="mailto:loongsage@baidu.com"><img src="https://img.shields.io/badge/Email_Us-D14836?style=for-the-badge&logo=maildotru&logoColor=white" alt="Email Us"></a>
+</p>
 
 </div>
 
