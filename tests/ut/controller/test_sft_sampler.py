@@ -21,6 +21,8 @@ from tests.ut.agentflow.fake_tokenizers import DS_BOS, FakeDeepSeekV4Tokenizer, 
 
 DEFAULT_YAML = Path(__file__).resolve().parents[3] / "conf" / "default.yaml"
 
+pytestmark = pytest.mark.usefixtures("stub_sglang_serving_chat")
+
 # hf_model_path -> fake tokenizer that the patched load_tokenizer returns for it.
 FAKE_TOKENIZERS = {"fake-qwen": FakeQwenTokenizer, "fake-deepseek-v4": FakeDeepSeekV4Tokenizer}
 

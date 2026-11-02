@@ -15,9 +15,10 @@
 <p>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"></a>
   <img src="https://img.shields.io/badge/python-3.12-blue.svg" alt="Python">
-  <img src="https://img.shields.io/badge/code-14k%20lines-brightgreen.svg" alt="LOC">
+  <img src="https://img.shields.io/badge/code-16k%20lines-brightgreen.svg" alt="LOC">
   <img src="https://img.shields.io/badge/training-Megatron--Core-76B900.svg" alt="Megatron-Core">
   <img src="https://img.shields.io/badge/rollout-SGLang-orange.svg" alt="SGLang">
+  <a href="https://github.com/baidu-baige/LoongSage/issues/25"><img src="https://img.shields.io/badge/WeChat-Group-07C160.svg?logo=wechat&logoColor=white" alt="WeChat Group"></a>
 </p>
 
 </div>

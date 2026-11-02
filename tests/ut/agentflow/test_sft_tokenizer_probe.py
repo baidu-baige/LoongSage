@@ -25,6 +25,8 @@ from tests.ut.agentflow.fake_tokenizers import (
 # A ChatML assistant message's own render ends with "\n" after ``<|im_end|>``; as in verl it is trained.
 TURN_END = IM_END + "\n"
 
+pytestmark = pytest.mark.usefixtures("stub_sglang_serving_chat")
+
 # pytest.param(factory, kwargs, non_assistant_prefix, assistant_prefix, id=...), both decoded;
 # every template here accepts a system-only conversation, so ``non_assistant_prefix`` is the
 # render of an empty system message.  ``assistant_prefix`` is an empty user message plus the
