@@ -67,3 +67,32 @@ data_source:
 ```
 
 多数据源配置下，每个 `data_sources[i]` 可以选择不同的 reward。
+
+## 4. 组级打分（`group_rm`）
+
+有些 reward 需要同时看到一个 prompt 的全部回答，例如由 LLM judge 排序，或在组内做归一化。实现 `async def group_rm(messages, label, contexts, **kwargs) -> list[Reward]`，并设置 `reward.group_rm: true`：
+
+```python
+@register_reward("length-rank")
+class LengthRankReward(RewardFunction):
+    async def group_rm(self, messages: list[list[dict]], label, contexts: list[dict], **kwargs) -> list[Reward]:
+        lengths = [len(m[-1].get("content") or "") for m in messages]
+        order = sorted(range(len(lengths)), key=lengths.__getitem__)
+        rank = {idx: pos for pos, idx in enumerate(order)}
+        return [Reward(final_reward=rank[i] / max(len(lengths) - 1, 1)) for i in range(len(lengths))]
+```
+
+```yaml
+data_source:
+  reward:
+    name: length-rank
+    group_rm: true
+```
+
+- `messages[i]` 和 `contexts[i]`（即 `Trajectory.model_dump()`）对应第 i 条 trajectory，`label` 由整组共享。按相同顺序为每条 trajectory 返回一个 `Reward`。
+- `group_rm` 必须是 `async def`。它在 AgentFlow 的 event loop 上被 await，函数内的阻塞调用会卡住所有 rollout；阻塞或 CPU 密集的逻辑请用 `await asyncio.to_thread(...)` 包起来。
+- 单轮和多轮模式下，都在整组 trajectory 结束后调用一次；打分完成前，该组不会交给 trainer。如果同时实现了 `__call__`，会先逐条执行 `__call__`，再由 `group_rm` 覆盖结果；逐条的分数可以在 `contexts[i]["reward"]` 中读到。
+- 抛异常或返回值不合法时，整组标记为 FAILED，由 `status` filter 丢弃。
+- 含 aborted 或 failed trajectory 的组不打分。partial rollout 续跑后，组内全部完成时打分一次；abort 前已经打过分的组不会重复打分。
+- 配置了 `agentflow.dump_trajectory_path` 时，每条 trajectory 的 JSON 仍在 `__call__` 之后 dump，其中的 `reward` 是 `__call__` 的结果（只实现 `group_rm` 时为占位的 0）。`group_rm` 的结果另外追加到同目录的 `group_rm.jsonl`，每组一行，包含 `prompt_id`、`status`（`ok`/`failed`）、`error`，以及每条 trajectory 的 `trajectory_id`、`attempt_id`、`reward`、`is_correct`、`is_valid`、`extra_info`；按 `trajectory_id` 与 JSON 文件对应。
+- 限制：`group_rm` 执行时 sandbox 已经释放。

@@ -871,3 +871,136 @@ class TestObservability:
         assert queue.group_size_of("100") == 2
 
         assert queue.group_size_of("999") == 0
+
+
+class TestGroupRm:
+    """Tests for the group_rm claim / commit / release protocol."""
+
+    @staticmethod
+    def _fill(queue: TrajQueue, status=None, metadata=None) -> None:
+        from coda.agentflow.trajectory_store import TrajectoryStatus
+        for tid in ("1", "2"):
+            queue.add(Trajectory(
+                trajectory_id=tid, prompt_id="100", prompt="t",
+                status=status or TrajectoryStatus.COMPLETED, metadata=dict(metadata or {}),
+            ))
+
+    def test_unscored_group_is_not_ready(self):
+        queue = TrajQueue(group_sizes={0: 2}, group_rm_ds={0})
+        self._fill(queue)
+        assert queue.pop_group() is None
+        assert queue.pop_group("100") is None
+        assert queue.pop_all_group() == []
+        assert queue.wait_for_group(timeout=0.05) is None
+
+    def test_commit_makes_group_ready_with_scored_copies(self):
+        queue = TrajQueue(group_sizes={0: 2}, group_rm_ds={0})
+        self._fill(queue)
+        trajs = queue.claim_group_rm("100")
+        assert [t.trajectory_id for t in trajs] == ["1", "2"]
+        for t in trajs:
+            t.reward = 0.5
+        queue.commit_group_rm("100", trajs)
+
+        group = queue.wait_for_group(timeout=1.0)
+        assert [t.reward for t in group.trajectories] == [0.5, 0.5]
+        assert queue.is_empty()
+
+    def test_claim_only_once(self):
+        queue = TrajQueue(group_sizes={0: 2}, group_rm_ds={0})
+        self._fill(queue)
+        assert queue.claim_group_rm("100") is not None
+        assert queue.claim_group_rm("100") is None
+
+    def test_incomplete_group_not_claimed(self):
+        queue = TrajQueue(group_sizes={0: 2}, group_rm_ds={0})
+        queue.add(Trajectory(trajectory_id="1", prompt_id="100", prompt="t"))
+        assert queue.claim_group_rm("100") is None
+
+    def test_release_allows_reclaim(self):
+        queue = TrajQueue(group_sizes={0: 2}, group_rm_ds={0})
+        self._fill(queue)
+        queue.claim_group_rm("100")
+        queue.release_group_rm("100")
+        assert queue.pop_group() is None
+        assert queue.claim_group_rm("100") is not None
+
+    def test_aborted_member_skips_scoring(self):
+        from coda.agentflow.trajectory_store import TrajectoryStatus
+        queue = TrajQueue(group_sizes={0: 2}, group_rm_ds={0})
+        self._fill(queue, status=TrajectoryStatus.ABORTED)
+        assert queue.claim_group_rm("100") is None
+        assert queue.pop_group() is not None
+
+    def test_already_scored_group_skips_scoring(self):
+        from coda.agentflow.trajectory_queue import GROUP_RM_SCORED_KEY
+        queue = TrajQueue(group_sizes={0: 2}, group_rm_ds={0})
+        self._fill(queue, metadata={GROUP_RM_SCORED_KEY: True})
+        assert queue.claim_group_rm("100") is None
+        assert queue.pop_group() is not None
+
+    def test_commit_after_drain_is_dropped(self):
+        queue = TrajQueue(group_sizes={0: 2}, group_rm_ds={0})
+        self._fill(queue)
+        trajs = queue.claim_group_rm("100")
+        assert len(queue.pop_all()) == 2
+        queue.commit_group_rm("100", trajs)
+        assert queue.is_empty()
+        assert queue.pop_group() is None
+
+    def test_other_data_sources_unaffected(self):
+        queue = TrajQueue(group_sizes={0: 2, 1: 2}, group_rm_ds={1})
+        self._fill(queue)
+        assert queue.claim_group_rm("100") is None
+        assert queue.pop_group() is not None
+
+    def test_aborted_group_is_scored_after_resume(self):
+        """abort -> drain -> resume: the group is scored once it is fully COMPLETED."""
+        from coda.agentflow.trajectory_store import TrajectoryStatus
+        queue = TrajQueue(group_sizes={0: 2}, group_rm_ds={0})
+        t1 = Trajectory(trajectory_id="1", prompt_id="100", prompt="t", status=TrajectoryStatus.COMPLETED)
+        t2 = Trajectory(trajectory_id="2", prompt_id="100", prompt="t", status=TrajectoryStatus.ABORTED)
+
+        # abort: the group completes with an ABORTED member and is released unscored
+        queue.add(t1)
+        queue.add(t2)
+        assert queue.claim_group_rm("100") is None
+
+        # cleanup: pop_all drains the group and clears the scored mark
+        drained = queue.pop_all()
+        assert {t.trajectory_id for t in drained} == {"1", "2"}
+
+        # resume: t1 is re-emitted as is, t2 finishes and comes back COMPLETED
+        queue.add(t1)
+        assert queue.claim_group_rm("100") is None  # incomplete
+        queue.add(t2.model_copy(update={"status": TrajectoryStatus.COMPLETED}))
+        assert queue.pop_group() is None  # not ready before scoring
+
+        trajs = queue.claim_group_rm("100")
+        assert [t.trajectory_id for t in trajs] == ["1", "2"]
+        for t in trajs:
+            t.reward = 1.0
+        queue.commit_group_rm("100", trajs)
+        group = queue.pop_group()
+        assert [t.reward for t in group.trajectories] == [1.0, 1.0]
+
+    def test_scored_group_keeps_rewards_after_resume(self):
+        """A group scored before an abort is not scored again when re-emitted."""
+        from coda.agentflow.trajectory_queue import GROUP_RM_SCORED_KEY
+        queue = TrajQueue(group_sizes={0: 2}, group_rm_ds={0})
+        self._fill(queue)
+        trajs = queue.claim_group_rm("100")
+        for t in trajs:
+            t.reward = 0.7
+            t.metadata[GROUP_RM_SCORED_KEY] = True
+        queue.commit_group_rm("100", trajs)
+
+        # cleanup drains the scored group before any consumer pops it
+        drained = queue.pop_all()
+
+        # resume re-emits both members unchanged
+        for t in drained:
+            queue.add(t)
+        assert queue.claim_group_rm("100") is None
+        group = queue.pop_group()
+        assert [t.reward for t in group.trajectories] == [0.7, 0.7]

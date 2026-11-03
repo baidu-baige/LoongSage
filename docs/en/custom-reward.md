@@ -67,3 +67,32 @@ data_source:
 ```
 
 With multiple data sources, each `data_sources[i]` may select a different reward.
+
+## 4. Group Reward (`group_rm`)
+
+Some rewards need every response of a prompt at once, for example an LLM judge that ranks them or a score normalized within the group. Implement `async def group_rm(messages, label, contexts, **kwargs) -> list[Reward]` and set `reward.group_rm: true`:
+
+```python
+@register_reward("length-rank")
+class LengthRankReward(RewardFunction):
+    async def group_rm(self, messages: list[list[dict]], label, contexts: list[dict], **kwargs) -> list[Reward]:
+        lengths = [len(m[-1].get("content") or "") for m in messages]
+        order = sorted(range(len(lengths)), key=lengths.__getitem__)
+        rank = {idx: pos for pos, idx in enumerate(order)}
+        return [Reward(final_reward=rank[i] / max(len(lengths) - 1, 1)) for i in range(len(lengths))]
+```
+
+```yaml
+data_source:
+  reward:
+    name: length-rank
+    group_rm: true
+```
+
+- `messages[i]` and `contexts[i]` (`Trajectory.model_dump()`) belong to the i-th trajectory; `label` is shared by the group. Return one `Reward` per trajectory, in the same order.
+- `group_rm` must be `async def`. It is awaited on the AgentFlow event loop, so blocking calls there stall every rollout; wrap blocking or CPU-heavy work in `await asyncio.to_thread(...)`.
+- It runs once all trajectories of the group have finished, in both single-turn and multi-turn mode. Until then the group is not handed to the trainer. If `__call__` is also implemented, it runs per trajectory first and `group_rm` overrides its result; per-trajectory rewards are visible in `contexts[i]["reward"]`.
+- An exception or a malformed return value marks the whole group FAILED, so the `status` filter drops it.
+- Groups containing an aborted or failed trajectory are not scored. After partial rollout resumes them, the completed group is scored once; a group already scored before the abort is not scored again.
+- With `agentflow.dump_trajectory_path` set, each trajectory's JSON is still dumped after `__call__`, so its `reward` is the `__call__` result (the placeholder 0 for group_rm-only rewards). The `group_rm` result is appended to `group_rm.jsonl` in the same directory, one line per group with `prompt_id`, `status` (`ok`/`failed`), `error`, and each trajectory's `trajectory_id`, `attempt_id`, `reward`, `is_correct`, `is_valid` and `extra_info`; join it with the JSON files on `trajectory_id`.
+- Limitations: sandboxes are already released when `group_rm` runs.

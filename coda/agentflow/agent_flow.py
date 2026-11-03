@@ -22,7 +22,7 @@ from coda.agentflow.trajectory_store import (
     TrajectoryStore,
     TrajectoryStatus,
 )
-from coda.agentflow.trajectory_queue import TrajQueue
+from coda.agentflow.trajectory_queue import GROUP_RM_SCORED_KEY, TrajQueue
 from coda.agentflow.tokenizer_manager import (
     BaseTokenizerManager,
     create_tokenizer_manager,
@@ -75,9 +75,12 @@ class AgentFlow:
     def __init__(self, config: Any):
         self.config = config
         group_sizes: dict[int, int] = {}
+        group_rm_ds: set[int] = set()
         for ds_index, ds_cfg in enumerate(self.config.data_sources):
             group_sizes[ds_index] = int(ds_cfg.num_trajectories_per_prompt)
-        self.traj_queue = TrajQueue(group_sizes=group_sizes) 
+            if ds_cfg.reward.get("group_rm", False):
+                group_rm_ds.add(ds_index)
+        self.traj_queue = TrajQueue(group_sizes=group_sizes, group_rm_ds=group_rm_ds)
         self.retry_limit = self.config.rollout.retry_limit
         self.accumulate_reasoning = self.config.agentflow.router.accumulate_reasoning
         self.r3_enabled = self.config.trainer.use_rollout_routing_replay
@@ -638,6 +641,39 @@ class AgentFlow:
         except Exception as exc:
             logger.warning("[%s] Failed to dump trajectory: %s", traj.trajectory_id, exc)
 
+    def _dump_group_rm(
+        self,
+        prompt_id: str,
+        trajs: list[Trajectory],
+        base_dir: str,
+        rewards: list[Reward] | None = None,
+        error: str | None = None,
+    ) -> None:
+        """Append one group_rm result line to <base_dir>/<run_timestamp>/group_rm.jsonl.
+
+        The per-trajectory JSON from _post_process_reward still holds the __call__
+        reward; this line records the group_rm result that overrode it.
+        """
+        try:
+            dump_dir = os.path.join(base_dir, self._run_timestamp)
+            os.makedirs(dump_dir, exist_ok=True)
+            entries = []
+            for i, traj in enumerate(trajs):
+                entry = {"trajectory_id": traj.trajectory_id, "attempt_id": traj.attempt_id}
+                if rewards is not None:
+                    entry.update(reward=rewards[i].final_reward, is_correct=traj.is_correct,
+                                 is_valid=rewards[i].is_valid, extra_info=rewards[i].extra_info)
+                entries.append(entry)
+            record = {
+                "prompt_id": prompt_id,
+                "status": "failed" if error else "ok",
+                "error": error,
+                "trajectories": entries,
+            }
+            with open(os.path.join(dump_dir, "group_rm.jsonl"), "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        except Exception as exc:
+            logger.warning("[%s] Failed to dump group_rm result: %s", prompt_id, exc)
     async def _emit_terminal_trajectory(self, trajectory: Trajectory) -> None:
         """Push a terminal trajectory to the queue and remove it from the store.
         Eval trajectories share this queue; RolloutSampler splits them out by is_eval.
@@ -653,6 +689,58 @@ class AgentFlow:
             # Delete unconditionally: even if the queue write fails the trajectory
             # should not remain in the store (the write error is already logged by the caller).
             self.trajectory_store.delete([trajectory.trajectory_id])
+        if trajectory.ds_index in self.traj_queue.group_rm_ds:
+            await self._run_group_rm(trajectory.prompt_id, trajectory.ds_index)
+
+    async def _run_group_rm(self, prompt_id: str, ds_index: int) -> None:
+        """Score a prompt group with group_rm once this emit has completed it.
+
+        Does nothing unless claim_group_rm hands over the group. The group stays
+        invisible to queue consumers until commit_group_rm. A failed group_rm
+        marks the whole group FAILED (dropped by the status filter).
+        """
+        trajs = self.traj_queue.claim_group_rm(prompt_id)
+        if trajs is None:
+            return
+        dump_path = self.config.agentflow.dump_trajectory_path
+        try:
+            rewards = await self.ds_reward_fns[ds_index].group_rm(
+                [copy.deepcopy(_active_chat(t)) for t in trajs],
+                trajs[0].label,
+                [t.model_dump() for t in trajs],
+                max_tokens=int(self.ds_configs[ds_index].max_response_len_per_trajectory),
+            )
+            if len(rewards) != len(trajs) or not all(isinstance(r, Reward) for r in rewards):
+                raise ValueError(f"group_rm must return {len(trajs)} Reward objects, got {rewards!r}")
+        except asyncio.CancelledError:
+            self.traj_queue.release_group_rm(prompt_id)
+            raise
+        except Exception as exc:
+            logger.warning("[%s] group_rm failed, marking group FAILED: %s\n%s",
+                           prompt_id, exc, traceback.format_exc())
+            for traj in trajs:
+                traj.status = TrajectoryStatus.FAILED
+            if dump_path:
+                self._dump_group_rm(prompt_id, trajs, dump_path, error=repr(exc))
+            self.traj_queue.commit_group_rm(prompt_id, trajs)
+            return
+        for traj, reward in zip(trajs, rewards):
+            traj.reward = reward.final_reward
+            traj.is_correct = (
+                reward.is_correct if reward.is_correct is not None else reward.final_reward > 0
+            )
+            if not reward.is_valid:
+                traj.masked_out = True
+            traj.metadata.update(reward.extra_info)
+            traj.metadata[GROUP_RM_SCORED_KEY] = True
+            n = len(traj.rollout_log_probs)
+            if n > 0:
+                traj.token_rewards = [0.0] * n
+                traj.token_rewards[-1] = reward.final_reward
+        if dump_path:
+            self._dump_group_rm(prompt_id, trajs, dump_path, rewards=rewards)
+        self.traj_queue.commit_group_rm(prompt_id, trajs)
+        logger.info("[%s] group_rm rewards=%s", prompt_id, [r.final_reward for r in rewards])
 
     async def _reemit_existing(self, traj: Trajectory) -> Reward:
         """Re-emit an already-terminal trajectory (partial rollout resume)."""

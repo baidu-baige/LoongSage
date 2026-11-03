@@ -62,6 +62,7 @@ data_source:
 
   reward:
     name: ???
+    group_rm: false  # true: score each prompt group with RewardFunction.group_rm once all its trajectories finish
   teacher_name: ""
   max_response_len_per_trajectory: 32768  # cap on response-area tokens (LLM replies + tool responses) per attempt. Single-turn uses this as request max_tokens; multi-turn agents receive it and choose their own per-call max_tokens.
   # run_mode=sft only: keep the first sft_max_seq_len tokens of each rendered conversation (null = no limit).

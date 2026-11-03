@@ -58,6 +58,7 @@ Switches that turn on the "rollout runs concurrently with training" pipeline. Se
 | --- | --- | --- | --- |
 | `agent.name` | `null` | Agent implementation name. `null` means single-turn (no agent); required for multi-turn. | Multi-turn agents must be registered via the registry; see [Custom Agent Development Guide](custom-agent.md). |
 | `reward.name` | `???` | Reward function name; must be registered in the registry — see [Custom Reward Function Development Guide](custom-reward.md). | Required. Other fields under `reward` are forwarded verbatim to the reward constructor. |
+| `reward.group_rm` | `false` | When true, `RewardFunction.group_rm` scores each prompt group once all its trajectories finish — see [Group Reward](custom-reward.md). | The reward must implement `async def group_rm`. |
 | `teacher_name` | `""` | Teacher name used by this data source (paired with OPD). | Empty string means no teacher; must match some `opd.teachers[].name`. |
 | `max_response_len_per_trajectory` | `32768` | Cap on response-area tokens (LLM replies + tool responses) per attempt. Single-turn uses this as request `max_tokens`; multi-turn agents receive this and pick their own per-call `max_tokens`. | Must be `<= max_total_tokens - prompt_len` on the inference engine. |
 | `num_prompts_per_step` | `64` | Number of prompt groups `B` consumed per training step. | `B × N` must be divisible by `trainer.mini_batch_size`, where `N = num_trajectories_per_prompt`; additionally `B % (dp_size × num_mini_batch) == 0` — see [11.9](#119-dp-and-batch-sizes). |
@@ -146,7 +147,7 @@ Agent-side Router and tokenizer settings, plus framework-level trajectory dumpin
 
 | Field | Default | Description | Constraints |
 | --- | --- | --- | --- |
-| `agentflow.dump_trajectory_path` | `""` | When non-empty, dump every trajectory to this directory for later replay / analysis. | — |
+| `agentflow.dump_trajectory_path` | `""` | When non-empty, dump every trajectory to this directory for later replay / analysis. Data sources with `reward.group_rm` also append group scores to `group_rm.jsonl` — see [Group Reward](custom-reward.md). | — |
 | `agentflow.router.ip` | `""` | Router listen IP. Empty means auto-resolve to the local routable IP at runtime. | Usually no manual configuration needed. |
 | `agentflow.router.port` | `0` | Router listen port. `0` means pick a free port at runtime. | — |
 | `agentflow.router.accumulate_reasoning` | `true` | Accumulate reasoning tokens into the context across multi-turn dialogues. | If disabled, reasoning content only affects the current turn. |

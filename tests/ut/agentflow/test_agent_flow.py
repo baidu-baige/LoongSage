@@ -741,6 +741,15 @@ class TestPostProcessReward:
             af._post_process_reward(traj.trajectory_id, 0, reward)
         mock_dump.assert_called_once()
 
+    def test_dumps_for_group_rm_data_source_too(self):
+        af, traj = self._setup()
+        af.config.agentflow.dump_trajectory_path = "/tmp/fake_dump"
+        af.traj_queue.group_rm_ds = {traj.ds_index}
+        reward = Reward(final_reward=1.0, is_valid=True)
+        with patch.object(af, "_dump_trajectory") as mock_dump:
+            af._post_process_reward(traj.trajectory_id, 0, reward)
+        mock_dump.assert_called_once()
+
 
 # ---------------------------------------------------------------------------
 # _dump_trajectory()
@@ -784,6 +793,126 @@ class TestEmitTerminalTrajectory:
 
         af.traj_queue.add.assert_called_once()
         assert "t1" not in af.trajectory_store.trajectory_data
+
+
+# ---------------------------------------------------------------------------
+# group_rm
+# ---------------------------------------------------------------------------
+
+def _make_group_rm_flow(group_rm) -> AgentFlow:
+    """AgentFlow whose ds 0 is scored by ``group_rm`` over groups of 2."""
+    from coda.agentflow.trajectory_queue import TrajQueue
+
+    reward_fn = MagicMock()
+    reward_fn.group_rm = group_rm
+    af = _make_agent_flow(reward_fn=reward_fn)
+    af.traj_queue = TrajQueue(group_sizes={0: 2}, group_rm_ds={0})
+    return af
+
+
+def _completed(tid: str) -> Trajectory:
+    traj = _make_trajectory(tid, TrajectoryStatus.COMPLETED)
+    traj.prompt_id = "p1"
+    traj.rollout_log_probs = [0.0, 0.0, 0.0]
+    traj.token_rewards = [0.0, 0.0, 0.0]
+    return traj
+
+
+class TestGroupRm:
+    @pytest.mark.asyncio
+    async def test_scores_group_after_last_emit(self):
+        group_rm = AsyncMock(return_value=[
+            Reward(final_reward=1.0, extra_info={"rank": 0}), Reward(final_reward=0.0)])
+        af = _make_group_rm_flow(group_rm)
+
+        await af._emit_terminal_trajectory(_completed("t1"))
+        group_rm.assert_not_called()
+        assert af.traj_queue.pop_group() is None
+
+        await af._emit_terminal_trajectory(_completed("t2"))
+        group_rm.assert_awaited_once()
+        messages, label, contexts = group_rm.await_args.args
+        assert len(messages) == 2 and label == "correct"
+        assert [c["trajectory_id"] for c in contexts] == ["t1", "t2"]
+        assert group_rm.await_args.kwargs["max_tokens"] == 512
+
+        group = af.traj_queue.pop_group()
+        t1, t2 = group.trajectories
+        assert (t1.reward, t1.is_correct, t1.token_rewards) == (1.0, True, [0.0, 0.0, 1.0])
+        assert (t2.reward, t2.is_correct) == (0.0, False)
+        assert t1.metadata["rank"] == 0 and t1.metadata["group_rm_scored"] is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("result", [
+        RuntimeError("judge down"),
+        [Reward(final_reward=1.0)],  # wrong length
+    ])
+    async def test_failure_marks_group_failed(self, result):
+        group_rm = AsyncMock(side_effect=result) if isinstance(result, Exception) \
+            else AsyncMock(return_value=result)
+        af = _make_group_rm_flow(group_rm)
+
+        await af._emit_terminal_trajectory(_completed("t1"))
+        await af._emit_terminal_trajectory(_completed("t2"))
+
+        group = af.traj_queue.pop_group()
+        assert [t.status for t in group.trajectories] == [TrajectoryStatus.FAILED] * 2
+
+    @pytest.mark.asyncio
+    async def test_cancel_releases_claim(self):
+        started = asyncio.Event()
+
+        async def slow_group_rm(*args, **kwargs):
+            started.set()
+            await asyncio.sleep(3600)
+
+        af = _make_group_rm_flow(slow_group_rm)
+        await af._emit_terminal_trajectory(_completed("t1"))
+        task = asyncio.create_task(af._emit_terminal_trajectory(_completed("t2")))
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert af.traj_queue.pop_group() is None
+        assert af.traj_queue.claim_group_rm("p1") is not None
+
+    @pytest.mark.asyncio
+    async def test_not_triggered_when_disabled(self):
+        af = _make_agent_flow()
+        af.traj_queue.group_rm_ds = set()
+        with patch.object(af, "_run_group_rm", new_callable=AsyncMock) as run_group_rm:
+            await af._emit_terminal_trajectory(_completed("t1"))
+        run_group_rm.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("group_rm", [
+        AsyncMock(return_value=[Reward(final_reward=1.0), Reward(final_reward=0.0)]),
+        AsyncMock(side_effect=RuntimeError("judge down")),
+    ])
+    async def test_appends_group_rm_jsonl(self, group_rm):
+        import json
+        af = _make_group_rm_flow(group_rm)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            af.config.agentflow.dump_trajectory_path = tmpdir
+            with patch.object(af, "_dump_trajectory") as mock_dump:
+                await af._emit_terminal_trajectory(_completed("t1"))
+                await af._emit_terminal_trajectory(_completed("t2"))
+            mock_dump.assert_not_called()  # full per-trajectory dumps happen in _post_process_reward only
+            path = os.path.join(tmpdir, af._run_timestamp, "group_rm.jsonl")
+            with open(path, encoding="utf-8") as f:
+                records = [json.loads(line) for line in f]
+        assert len(records) == 1
+        record = records[0]
+        assert record["prompt_id"] == "p1"
+        assert [t["trajectory_id"] for t in record["trajectories"]] == ["t1", "t2"]
+        if group_rm.side_effect is None:
+            assert record["status"] == "ok" and record["error"] is None
+            assert [t["reward"] for t in record["trajectories"]] == [1.0, 0.0]
+            assert [t["is_correct"] for t in record["trajectories"]] == [True, False]
+        else:
+            assert record["status"] == "failed" and "judge down" in record["error"]
+            assert "reward" not in record["trajectories"][0]
 
 
 # ---------------------------------------------------------------------------

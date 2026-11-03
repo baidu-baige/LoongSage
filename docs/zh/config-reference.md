@@ -58,6 +58,7 @@
 | --- | --- | --- | --- |
 | `agent.name` | `null` | Agent 实现名。`null` 表示 single-turn（无 agent），multi-turn 场景必填。 | multi-turn agent 需要通过 registry 注册；示例见 [自定义 Agent 开发指南](custom-agent.md)。 |
 | `reward.name` | `???` | Reward function 名，必须在 registry 中注册；见 [自定义 Reward 函数开发指南](custom-reward.md)。 | 必填；`reward` 节允许其它自定义字段透传给 reward 构造函数。 |
+| `reward.group_rm` | `false` | 为 true 时，整组 trajectory 结束后调用 `RewardFunction.group_rm` 统一打分；见 [组级打分](custom-reward.md)。 | reward 必须实现 `async def group_rm`。 |
 | `teacher_name` | `""` | 对该数据源使用的 teacher 名（配合 OPD）。 | 空串表示不使用 teacher；需与 `opd.teachers[].name` 匹配。 |
 | `max_response_len_per_trajectory` | `32768` | 单次 attempt 中「LLM 回复 + tool response」占用的 token 上限。single-turn 时作为请求 `max_tokens`；multi-turn 时下发给 agent，agent 自己决定每次调用的 `max_tokens`。 | 需要小于等于推理引擎允许的 `max_total_tokens - prompt_len`。 |
 | `num_prompts_per_step` | `64` | 每个训练 step 消耗的 prompt group 数量 `B`。 | 需满足 `B × N` 能被 `trainer.mini_batch_size` 整除，`N = num_trajectories_per_prompt`；还需 `B % (dp_size × num_mini_batch) == 0`，详见 [11.9](#119-dp-与-batch-尺寸)。 |
@@ -146,7 +147,7 @@ Agent 侧的 Router 与 tokenizer，以及 trajectory dump 等框架级能力。
 
 | 参数 | 默认 | 说明 | 约束 |
 | --- | --- | --- | --- |
-| `agentflow.dump_trajectory_path` | `""` | 非空时把每条 trajectory dump 到该目录，用于事后回放/分析。 | — |
+| `agentflow.dump_trajectory_path` | `""` | 非空时把每条 trajectory dump 到该目录，用于事后回放/分析。开启 `reward.group_rm` 的数据源还会把组级打分结果追加到 `group_rm.jsonl`，见 [组级打分](custom-reward.md)。 | — |
 | `agentflow.router.ip` | `""` | Router 监听 IP。为空时运行期自动解析本机路由 IP。 | 通常无需手动配置。 |
 | `agentflow.router.port` | `0` | Router 监听端口。`0` 表示运行期自动分配。 | — |
 | `agentflow.router.accumulate_reasoning` | `true` | 多轮对话中把 reasoning tokens 一并累积到上下文。 | 关闭时思考内容只在当轮生效。 |
