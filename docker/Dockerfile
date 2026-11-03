@@ -1,4 +1,4 @@
-FROM lmsysorg/sglang:v0.5.18
+FROM lmsysorg/sglang:v0.5.21
 
 WORKDIR /sgl-workspace
 
@@ -33,19 +33,16 @@ RUN ARCH="$(uname -m)" && case "$ARCH" in \
 # for dsv4
 RUN pip install --no-build-isolation git+https://github.com/Dao-AILab/fast-hadamard-transform.git@v1.1.0.post2
 RUN pip install nvidia-cuda-cccl==13.3.3.4.1
-RUN CPATH=/usr/local/lib/python3.12/dist-packages/nvidia/cu13/include/cccl pip install --no-build-isolation git+https://github.com/deepseek-ai/FlashMLA@nv_dev
+RUN CPATH=/opt/sglang/lib/python3.12/site-packages/nvidia/cu13/include/cccl pip install --no-build-isolation git+https://github.com/deepseek-ai/FlashMLA@nv_dev
 
 # for qwen3.8
 RUN pip install flash-linear-attention==0.5.2
 RUN MAX_JOBS=16 pip install -v --no-build-isolation "flash-attn-3 @ git+https://github.com/Dao-AILab/flash-attention@main#subdirectory=hopper"
 
-# for dsv41
-RUN rm -rf sglang && git clone https://github.com/sgl-project/sglang.git && cd sglang/python && git checkout 3a42fc5571 && pip install --no-deps --no-build-isolation -e .
-COPY patch/dsv41 /tmp/dsv41
-RUN cd /sgl-workspace/sglang && git apply /tmp/dsv41/sglang.patch
-RUN cd /sgl-workspace/Megatron-LM && git apply /tmp/dsv41/megatron-core.patch
-RUN cd /sgl-workspace/Megatron-Bridge && git apply /tmp/dsv41/megatron-bridge.patch
-RUN rm -rf /tmp/dsv41
-
 # loongsage
 RUN git clone https://github.com/baidu-baige/LoongSage.git && cd LoongSage && pip install --no-deps --no-build-isolation -e .
+
+# patch
+RUN cd /sgl-workspace/sglang && git apply ../LoongSage/docker/patch/sglang-0.5.21.patch
+RUN cd /sgl-workspace/Megatron-LM && git apply ../LoongSage/docker/patch/dsv41/megatron-core.patch
+RUN cd /sgl-workspace/Megatron-Bridge && git apply ../LoongSage/docker/patch/dsv41/megatron-bridge.patch

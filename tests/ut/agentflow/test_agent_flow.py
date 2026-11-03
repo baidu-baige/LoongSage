@@ -44,7 +44,7 @@ def _make_config(rollout_mode: str = "single_turn", retry_limit: int = 1) -> Mag
     ds = OmegaConf.create({
         "agent": {"name": "dummy_agent" if rollout_mode == "multi_turn" else ""},
         "reward": {},
-        "sandbox": {"type": "none"},
+        "sandbox": {"type": "none", "max_concurrency": 0},
         "max_response_len_per_trajectory": 512,
         "completion_params": {},
         "num_trajectories_per_prompt": 8,
@@ -151,9 +151,9 @@ class TestInit:
     def test_sandbox_clients_are_selected_by_data_source(self):
         cfg = _make_config(rollout_mode="multi_turn")
         cfg.data_sources = [
-            OmegaConf.create({**dict(cfg.data_sources[0]), "sandbox": {"type": "docker", "host": "one"}}),
-            OmegaConf.create({**dict(cfg.data_sources[0]), "sandbox": {"type": "docker", "host": "two"}}),
-            OmegaConf.create({**dict(cfg.data_sources[0]), "sandbox": {"type": "none"}}),
+            OmegaConf.create({**dict(cfg.data_sources[0]), "sandbox": {"type": "docker", "host": "one", "max_concurrency": 0}}),
+            OmegaConf.create({**dict(cfg.data_sources[0]), "sandbox": {"type": "docker", "host": "two", "max_concurrency": 0}}),
+            OmegaConf.create({**dict(cfg.data_sources[0]), "sandbox": {"type": "none", "max_concurrency": 0}}),
         ]
         first, second = MagicMock(), MagicMock()
 
@@ -892,7 +892,7 @@ class TestExecuteMultiTurn:
         ds = OmegaConf.create({
             "agent": {"name": "dummy_agent"},
             "reward": {},
-            "sandbox": {"type": "none"},
+            "sandbox": {"type": "none", "max_concurrency": 0},
             "max_response_len_per_trajectory": 512,
             "completion_params": {"top_p": 0.9},
         })
@@ -922,6 +922,90 @@ class TestExecuteMultiTurn:
 
         af.ds_agent_classes[0] = MagicMock(side_effect=build_agent)
         return agent_instance
+
+    async def _run_two_blocking_attempts(self, af: AgentFlow, traj: Trajectory) -> int:
+        """Start two concurrent attempts whose agents block; return how many got in before release."""
+        traj2 = _make_trajectory("t2", TrajectoryStatus.PENDING)
+        traj2.metadata["docker_image"] = "example/image:latest"
+        agent_instance = self._agent_completing(af, traj, Reward(final_reward=1.0, is_valid=True))
+        completed2 = traj2.model_copy(deep=True)
+        completed2.rollout_log_probs = [-0.1]
+        completed2.segments = [Segment(trainable=True)]
+        af.trajectory_store.add(traj2.trajectory_id, completed2)
+
+        release = asyncio.Event()
+
+        async def blocking_run(_payload):
+            await release.wait()
+            return Reward(final_reward=1.0, is_valid=True)
+
+        agent_instance.run_trajectory = AsyncMock(side_effect=blocking_run)
+        tasks = [asyncio.create_task(af._execute_multi_turn(t, 0)) for t in (traj, traj2)]
+        for _ in range(10):
+            await asyncio.sleep(0)
+        entered = af.ds_agent_classes[0].call_count
+        release.set()
+        rewards = await asyncio.gather(*tasks)
+        assert [r.final_reward for r in rewards] == [1.0, 1.0]
+        assert af.ds_agent_classes[0].call_count == 2
+        return entered
+
+    @pytest.mark.asyncio
+    async def test_max_concurrency_bounds_concurrent_attempts(self):
+        af, traj = self._setup()
+        af._ds_sandbox_sems[0] = asyncio.Semaphore(1)
+        assert await self._run_two_blocking_attempts(af, traj) == 1
+
+    @pytest.mark.asyncio
+    async def test_no_max_concurrency_is_unbounded(self):
+        af, traj = self._setup()
+        assert 0 not in af._ds_sandbox_sems
+        assert await self._run_two_blocking_attempts(af, traj) == 2
+
+    @pytest.mark.asyncio
+    async def test_max_concurrency_slot_released_on_cancel(self):
+        af, traj = self._setup()
+        af._ds_sandbox_sems[0] = asyncio.Semaphore(1)
+        agent_instance = self._agent_completing(af, traj, Reward(final_reward=1.0))
+
+        async def hang(_payload):
+            await asyncio.Event().wait()
+
+        agent_instance.run_trajectory = AsyncMock(side_effect=hang)
+        task = asyncio.create_task(af._execute_multi_turn(traj, 0))
+        for _ in range(10):
+            await asyncio.sleep(0)
+        assert af._ds_sandbox_sems[0].locked()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert not af._ds_sandbox_sems[0].locked()
+
+    @pytest.mark.parametrize("sandbox_cfg, client, expected", [
+        ({"type": "k8s", "max_concurrency": 3}, MagicMock(), 3),
+        ({"type": "k8s", "max_concurrency": 0}, MagicMock(), None),
+        ({"type": "none", "max_concurrency": 3}, None, None),
+    ])
+    def test_init_builds_sandbox_semaphore_from_config(self, sandbox_cfg, client, expected):
+        af = AgentFlow.__new__(AgentFlow)
+        af.config = MagicMock()
+        af.config.data_sources = [OmegaConf.create({
+            "agent": {"name": "dummy_agent"}, "reward": {}, "sandbox": sandbox_cfg,
+        })]
+        af.ds_configs, af.ds_sandbox_clients, af._ds_sandbox_sems = {}, {}, {}
+        af.ds_agent_classes, af.ds_reward_fns = {}, {}
+        with (
+            patch("coda.agentflow.agent_flow.create_sandbox_client", return_value=client) as create,
+            patch("coda.agentflow.agent_flow.get_agent_class", return_value=MagicMock()),
+            patch("coda.agentflow.agent_flow.create_reward_fn", return_value=None),
+        ):
+            af._init_per_datasource()
+        sem = af._ds_sandbox_sems.get(0)
+        assert (sem._value if sem else None) == expected
+        # max_concurrency is an AgentFlow option and must not reach the backend factory.
+        passed = create.call_args.args[0]
+        assert "max_concurrency" not in passed
+        assert passed["type"] == sandbox_cfg["type"]
 
     @pytest.mark.asyncio
     async def test_creates_new_sandbox_and_injects_client_and_id(self):
@@ -993,8 +1077,31 @@ class TestExecuteMultiTurn:
 
         reward_fn.prepare_sandbox.assert_not_called()
         client.create.assert_not_called()
-        metadata = agent.run_trajectory.call_args.args[0]["metadata"]
-        assert metadata["asset_digest"] == "trusted"
+        passed = agent.run_trajectory.call_args.args[0]
+        assert passed["metadata"]["asset_digest"] == "trusted"
+        assert passed["resume"] is True
+
+    @pytest.mark.asyncio
+    async def test_partial_resume_passes_history_and_initial_prompt(self):
+        """Resume hands agents the active-segment history plus the original dataset prompt."""
+        af, traj = self._setup()
+        traj.prompt = [{"role": "user", "content": "fix the bug"}]
+        history = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "fix the bug"},
+            {"role": "assistant", "content": "", "tool_calls": []},
+            {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+        ]
+        traj.chat_completions = {0: history}
+        agent = self._agent_completing(af, traj, Reward(final_reward=1.0))
+
+        await af._execute_multi_turn(traj, 0)
+
+        passed = agent.run_trajectory.call_args.args[0]
+        assert passed["prompt"] == history
+        assert passed["initial_prompt"] == [{"role": "user", "content": "fix the bug"}]
+        # History alone (e.g. a retry whose sandbox was released) is not a resume.
+        assert passed["resume"] is False
 
     @pytest.mark.asyncio
     async def test_reuses_pooled_sandbox_id_without_creating(self):
@@ -1194,7 +1301,7 @@ class TestExecuteSingleTurn:
         ds = OmegaConf.create({
             "agent": {"name": ""},
             "reward": {},
-            "sandbox": {"type": "none"},
+            "sandbox": {"type": "none", "max_concurrency": 0},
             "max_response_len_per_trajectory": 512,
             "completion_params": completion_params if completion_params is not None else {},
         })

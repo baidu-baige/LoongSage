@@ -380,6 +380,32 @@ class TestStatMetrics:
         # Both trajectories hit the budget (response_len == 4 >= 4) -> ratio 1.0.
         assert sampler.metrics[0]["rollout/response_length_clip_ratio"] == pytest.approx(1.0)
 
+    def test_stat_metrics_llm_response_length_excludes_tool_output(self):
+        """llm_response_length counts only LLM-generated tokens (weight_version >= 0),
+        while response_length counts the whole response space (incl. tool outputs)."""
+        from coda.controller.rollout_sampler import RolloutSampler
+
+        sampler = RolloutSampler(make_minimal_config(), Mock(), Mock())
+        # response space = 5 tokens; weight_version == -1 marks the 2 non-LLM
+        # (tool-output) positions, so only 3 tokens are真正的 LLM output.
+        trajs = [
+            create_test_trajectory(
+                trajectory_id=f"prompt_0_step0_traj_{i}",
+                prompt_id="prompt_0",
+                rollout_weight_versions=[-1, 0, 0, 0, -1],
+            )
+            for i in range(2)
+        ]
+        traj_group = TrajectoryGroup(prompt_id="prompt_0", trajectories=trajs)
+
+        sampler._stat_metrics(traj_group, step=0)
+
+        metrics = sampler.metrics[0]
+        assert metrics["rollout/response_length_mean"] == pytest.approx(5.0)
+        assert metrics["rollout/llm_response_length_mean"] == pytest.approx(3.0)
+        assert metrics["rollout/llm_response_length_max"] == 3
+        assert metrics["rollout/llm_response_length_min"] == 3
+
     def test_stat_metrics_turns_clip_ratio(self):
         """Test _stat_metrics reports turns_clip_ratio against agent.max_turns."""
         from coda.controller.rollout_sampler import RolloutSampler

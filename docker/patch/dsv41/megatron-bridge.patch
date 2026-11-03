@@ -17,10 +17,10 @@ index 968868c28..5b6346d98 100644
  ]
 diff --git a/src/megatron/bridge/models/deepseek/deepseek_v41_bridge.py b/src/megatron/bridge/models/deepseek/deepseek_v41_bridge.py
 new file mode 100644
-index 000000000..231bf500a
+index 000000000..3a5407f4d
 --- /dev/null
 +++ b/src/megatron/bridge/models/deepseek/deepseek_v41_bridge.py
-@@ -0,0 +1,155 @@
+@@ -0,0 +1,220 @@
 +# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 +#
 +# Licensed under the Apache License, Version 2.0 (the "License");
@@ -49,8 +49,10 @@ index 000000000..231bf500a
 +
 +import logging
 +
++import torch
 +from megatron.core.models.gpt.gpt_model import GPTModel
 +
++from megatron.bridge.models.conversion import quantization_utils
 +from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
 +from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
 +from megatron.bridge.models.conversion.param_mapping import AutoMapping, ColumnParallelMapping, ReplicatedMapping
@@ -121,6 +123,19 @@ index 000000000..231bf500a
 +        # V4.1 has no hash-routed MoE layers (unlike V4-Flash's leading 3).
 +        provider.moe_n_hash_layers = 0
 +
++        # V4.1 MoE routing is UNGROUPED (flat top-k over all routed experts), matching
++        # both inference engines (SGLang DSV4 override use_grouped_topk=False; DeepInfer
++        # bf16_mega_gate has no group concept) and the V4.1 checkpoint config (config.json
++        # omits n_group/topk_group). However DeepseekV41Config subclasses DeepseekV3Config,
++        # so it inherits V3's n_group=8 / topk_group=4 defaults; AutoBridge's generic
++        # CONFIG_MAPPING then maps those leaked defaults to moe_router_num_groups=8 /
++        # moe_router_group_topk=4, silently enabling DeepSeek-V3 node-limited routing on the
++        # train side only. That makes Megatron select experts from 4-of-8 groups while the
++        # rollout engine selects freely -> a systematic train/infer routing divergence (the
++        # dominant is_approx_k3_kl gap when routing-replay is off). Force ungrouped.
++        provider.moe_router_num_groups = None
++        provider.moe_router_group_topk = None
++
 +        # V4.1 runs its own tilelang sparse-MLA kernels inside the plugin, so it
 +        # must NOT go through megatron's cuDNN/tilelang DSA kernel backend.
 +        provider.dsa_kernel_backend = "none"
@@ -130,6 +145,56 @@ index 000000000..231bf500a
 +        provider.activation_func_clamp_value = getattr(hf_config, "swiglu_limit", provider.activation_func_clamp_value)
 +
 +        return provider
++
++    # ------------------------------------------------------------------
++    # Quantized checkpoint import / export
++    # ------------------------------------------------------------------
++
++    def maybe_modify_loaded_hf_weight(self, hf_param, hf_state_dict):
++        """Dequantize the original V4.1 checkpoint to bf16 on import.
++
++        Same as V4, except the FP8 block size comes from ``quantization_config.weight_block_size``
++        (32x32 for V4.1): the shared helper assumes 128x128, which on V4.1 scales still produces
++        a weight of the right shape but with the wrong scale per block. MXFP4 experts carry
++        their K-tile size in the scale geometry and need no change.
++        """
++        if isinstance(hf_param, dict):
++            return {k: self.maybe_modify_loaded_hf_weight(v, hf_state_dict) for k, v in hf_param.items()}
++        weight = hf_state_dict[hf_param]
++        scale_key = hf_param[: -len(".weight")] + ".scale"
++        if weight.dtype != torch.float8_e4m3fn or not hf_param.endswith(".weight") or scale_key not in hf_state_dict:
++            return quantization_utils.maybe_dequantize_hf_quantized_weight(hf_param, hf_state_dict)
++        scale = hf_state_dict[scale_key]
++        if scale.ndim != 2 or scale.shape[0] == weight.shape[0]:
++            # per-row K tiles (e.g. the engram embed table): no block-size assumption involved
++            return quantization_utils.maybe_dequantize_hf_quantized_weight(hf_param, hf_state_dict)
++        block = self._fp8_block_size()
++        expected = tuple(-(-d // block) for d in weight.shape)
++        if tuple(scale.shape) != expected:
++            raise RuntimeError(
++                f"{hf_param}: FP8 scale {tuple(scale.shape)} does not match {block}x{block} blocks of "
++                f"weight {tuple(weight.shape)} (expected {expected})"
++            )
++        return quantization_utils.dequantize_fp8_e4m3fn_with_scale(weight, scale, name=hf_param, block_size=block)
++
++    def _fp8_block_size(self) -> int:
++        qcfg = getattr(self.hf_config, "quantization_config", None) or {}
++        qcfg = qcfg if isinstance(qcfg, dict) else qcfg.to_dict()
++        block = qcfg.get("weight_block_size")
++        if not block or len(block) != 2 or block[0] != block[1]:
++            raise RuntimeError(f"DeepSeek-V4.1 FP8 import needs a square weight_block_size, got {block!r}")
++        return int(block[0])
++
++    def maybe_modify_converted_hf_weight(self, task, converted_weights_dict, hf_state_dict):
++        """Export plain (bf16) weights, also when the source checkpoint is quantized.
++
++        The V4 override re-quantizes against the source ``.scale`` geometry, which assumes 128x128
++        FP8 blocks (wrong for V4.1) and reads every source scale from disk on each export. Callers
++        that need the checkpoint format (e.g. an FP8/FP4 rollout) quantize the exported tensors
++        themselves; saved HF checkpoints are bf16 (``save_hf_pretrained`` drops
++        ``quantization_config``).
++        """
++        return converted_weights_dict
 +
 +    def mapping_registry(self) -> MegatronMappingRegistry:
 +        """V4 weight-name mapping, with the indexer entries replaced for V4.1 and
@@ -178,10 +243,10 @@ index 000000000..231bf500a
 +        return MegatronMappingRegistry(*base, *o_group_mapping, *indexer_mappings, *engram_mappings)
 diff --git a/src/megatron/bridge/models/deepseek/deepseek_v41_config.py b/src/megatron/bridge/models/deepseek/deepseek_v41_config.py
 new file mode 100644
-index 000000000..d48d535ea
+index 000000000..39faa8998
 --- /dev/null
 +++ b/src/megatron/bridge/models/deepseek/deepseek_v41_config.py
-@@ -0,0 +1,49 @@
+@@ -0,0 +1,65 @@
 +# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 +#
 +# Licensed under the Apache License, Version 2.0 (the "License");
@@ -214,11 +279,27 @@ index 000000000..d48d535ea
 +
 +
 +class DeepseekV41Config(DeepseekV3Config):
-+    """DeepSeek-V4.1 HF config (V3 schema + V4.1 fields carried as attributes)."""
++    """DeepSeek-V4.1 HF config (V3 schema + V4.1 fields carried as attributes).
++
++    Accepts both the flat schema and the ORIGINAL release schema, which wraps the text model
++    in ``text_config`` next to ``vision_config`` / ``quantization_config``. The wrapped form is
++    flattened into the text-only, MTP-free config the trainer builds: the text fields move to
++    the top level, ``vision_config`` is dropped, ``num_nextn_predict_layers`` is set to 0 and
++    the MTP entries of ``compress_ratios`` are cut. ``quantization_config`` is kept.
++    """
 +
 +    model_type = "deepseek_v41"
 +
 +    def __init__(self, **kwargs):
++        text = kwargs.pop("text_config", None)
++        kwargs.pop("vision_config", None)
++        if text is not None:
++            text = text if isinstance(text, dict) else text.to_dict()
++            kwargs.update({k: v for k, v in text.items() if k != "model_type"})
++            n_layers = kwargs["num_hidden_layers"]
++            if kwargs.get("compress_ratios") is not None:
++                kwargs["compress_ratios"] = list(kwargs["compress_ratios"])[:n_layers]
++            kwargs["num_nextn_predict_layers"] = 0
 +        # DeepseekV3Config.__init__ folds a top-level ``rope_theta`` into
 +        # ``rope_scaling``/``rope_parameters`` and drops the standalone attribute,
 +        # but the DeepSeek-V4 bridge reads ``hf_config.rope_theta`` eagerly. Preserve it.

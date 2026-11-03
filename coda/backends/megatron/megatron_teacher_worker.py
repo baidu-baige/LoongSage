@@ -49,7 +49,6 @@ class MegatronTeacherWorker(BaseTeacherWorker):
         self.kl_policies: dict = {}
         self.memory_pool = None
         self._weights_backuper: TensorBackuper | None = None
-        self._cpu_backup: list[tuple[torch.nn.Parameter, torch.Tensor]] = []
 
     @classmethod
     def validate_config(cls, config: DictConfig) -> DictConfig:
@@ -138,15 +137,15 @@ class MegatronTeacherWorker(BaseTeacherWorker):
         self._load_teacher_model(self.teacher_index_list[0])
         self.kl_policies = build_kl_policies(self.config)
 
-        # Only create backuper when multiple teachers need switching
+        # Holds one CPU snapshot per teacher: used for teacher switching and offload.
+        self._weights_backuper = TensorBackuper(
+            source_getter=lambda: (
+                (f"chunk{i}.{name}", param)
+                for i, m in enumerate(self.model)
+                for name, param in m.named_parameters()
+            ),
+        )
         if len(self.teacher_index_list) > 1:
-            self._weights_backuper = TensorBackuper(
-                source_getter=lambda: (
-                    (f"chunk{i}.{name}", param)
-                    for i, m in enumerate(self.model)
-                    for name, param in m.named_parameters()
-                ),
-            )
             self._weights_backuper.backup(str(self.teacher_index_list[0]))
 
             # Load and backup remaining teachers (reuse model structure)
@@ -238,24 +237,16 @@ class MegatronTeacherWorker(BaseTeacherWorker):
     @torch.no_grad()
     def onload(self):
         """Reload teacher model params to GPU from CPU pinned memory."""
-        if self._weights_backuper:
-            self._weights_backuper.restore(str(self.active_teacher_idx))
-        else:
-            for param, cpu_copy in self._cpu_backup:
-                param.data.storage().resize_(cpu_copy.numel())
-                param.data.copy_(cpu_copy, non_blocking=True)
-            torch.cuda.synchronize()
+        self._weights_backuper.restore(str(self.active_teacher_idx))
 
     @torch.no_grad()
     def offload(self):
         """Backup active teacher weights to CPU and free GPU memory."""
-        if self._weights_backuper is None and not self._cpu_backup:
-            for model in self.model or []:
-                for param in model.parameters():
-                    self._cpu_backup.append((param, param.data.cpu().pin_memory()))
-        for model in self.model or []:
-            for param in model.parameters():
-                param.data.storage().resize_(0)
+        # Teacher weights are frozen, so an existing snapshot of the active teacher stays valid.
+        tag = str(self.active_teacher_idx)
+        if tag not in self._weights_backuper.backup_tags:
+            self._weights_backuper.backup(tag)
+        self._weights_backuper.release()
         clear_memory()
     
     def compute_teacher(self, rollout_data_ref):

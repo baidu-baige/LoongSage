@@ -33,6 +33,7 @@ def _ds_bucket() -> dict:
         "rewards": [],
         "prompt_length": [],
         "response_len": [],
+        "llm_response_len": [],
         "num_turns": [],
         "compactions_per_trajectory": [],
         "response_clipped": 0,
@@ -41,6 +42,8 @@ def _ds_bucket() -> dict:
         "group_total": 0,
         "group_all_correct": 0,
         "group_all_wrong": 0,
+        # Custom "metric/<spec>" trajectory metadata: spec -> per-trajectory values.
+        "extra": {},
     }
 
 
@@ -62,10 +65,17 @@ def _accumulate_ds_metrics(bucket: dict, traj_group: TrajectoryGroup, data_sourc
         ds_cfg = data_sources[t.ds_index]
         response_len = len(t.rollout_log_probs)
         prompt_len = len(t.tokens) - response_len
+        # response_len counts the whole response space (LLM output + tool outputs +
+        # re-appearing context). llm_response_len counts only tokens the LLM actually
+        # generated: non-LLM positions carry rollout_weight_version == -1 (and this marker
+        # is independent of loss-mask off-policy filtering, so it is a faithful "pure model
+        # output" length).
+        llm_response_len = sum(1 for v in t.rollout_weight_versions if v >= 0)
 
         bucket["rewards"].append(t.reward)
         bucket["prompt_length"].append(prompt_len)
         bucket["response_len"].append(response_len)
+        bucket["llm_response_len"].append(llm_response_len)
         bucket["num_turns"].append(t.num_turns)
         max_response = ds_cfg.max_response_len_per_trajectory
         if max_response > 0 and response_len >= max_response:
@@ -80,6 +90,9 @@ def _accumulate_ds_metrics(bucket: dict, traj_group: TrajectoryGroup, data_sourc
         num_compact_segments = sum(1 for seg in t.segments if seg.origin == "compact")
         compaction_events = (num_compact_segments + 1) // 2
         bucket["compactions_per_trajectory"].append(compaction_events)
+
+        for spec, value in eval_utils.metadata_metrics(t.metadata).items():
+            bucket["extra"].setdefault(spec, []).append(value)
 
 
 def _summary_metrics(bucket: dict, key_prefix: str) -> dict[str, float]:
@@ -98,6 +111,7 @@ def _summary_metrics(bucket: dict, key_prefix: str) -> dict[str, float]:
     if n > 0:
         for name, field in (("reward", "rewards"),
                             ("response_length", "response_len"),
+                            ("llm_response_length", "llm_response_len"),
                             ("num_turns", "num_turns"),
                             ("compactions", "compactions_per_trajectory")):
             values = bucket[field]
@@ -110,6 +124,8 @@ def _summary_metrics(bucket: dict, key_prefix: str) -> dict[str, float]:
             sum(1 for v in bucket["compactions_per_trajectory"] if v > 0) / n
         )
         summary[f"{key_prefix}compaction_count"] = sum(bucket["compactions_per_trajectory"])
+        for name, value in eval_utils.reduce_metadata_metrics(bucket["extra"]).items():
+            summary[f"{key_prefix}{name}"] = value
 
     group_total = bucket["group_total"]
     if group_total > 0:

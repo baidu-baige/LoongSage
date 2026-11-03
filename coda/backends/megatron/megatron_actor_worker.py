@@ -31,6 +31,8 @@ from coda.backends.megatron.model import forward_only, train_minibatch, is_main_
 from coda.utils.tracking import time_tracker, track
 from coda.algorithms.kl_policy import build_kl_policies
 from coda.backends.megatron.teacher_lm_head import TeacherLMHeads
+from coda.backends.megatron import qat
+from coda.utils.hf_ckpt import save_like_source
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +49,11 @@ class MegatronActorWorker(MegatronTrainWorker):
             config.megatron.model.moe_enable_routing_replay = True
         if config.trainer.use_fp32_lm_head:
             config.megatron.keep_fp32_weights["output_layer"] = True
+        if config.trainer.qat:
+            # QAT snaps the bf16 params in place after each step. With param remainders the fp32
+            # master is the bf16 param plus an int16 remainder, so the snap would overwrite it too and
+            # drop every sub-grid update. Keep a separate fp32 master (+2 B/param).
+            config.megatron.optimizer.store_param_remainders = False
 
         if config.algorithm.is_correction.enable and config.trainer.use_rollout_log_probs:
             raise ValueError(
@@ -84,17 +91,31 @@ class MegatronActorWorker(MegatronTrainWorker):
         """Initialize the shared Megatron state, then the policy-specific parts.
 
         After the base steps:
+          8.5. Build the quantization plan of a quantized checkpoint (QAT snap + activation hooks)
           9. Build KL policy instances and set up teacher lm_heads
           10. Set up frozen reference model for ref-KL (weight hot-swap)
         """
         super().init(config, master_addr, master_port)
+
+        # Step 8.5: quantized checkpoint (FP8/FP4 rollout). The plan maps every Megatron param to
+        # the checkpoint's storage format; weight sync re-encodes into that format. With QAT, snap
+        # the loaded weights onto the grid (before any TensorBackuper snapshot) and hook the
+        # activation fake-quant.
+        self._quant = qat.QuantPlan(self.bridge, self.model, config.hf_model_path, config)
+        if self._quant.qat:
+            n = self._quant.snap_()
+            n_act = self._quant.register_activation_hooks()
+            logger.info(f"[Rank {self.rank}] QAT: snapped {n} params, {n_act} activation hooks")
+        elif self._quant.quantized:
+            logger.info(f"[Rank {self.rank}] Quantized checkpoint without QAT: weight sync re-encodes, no snapping")
 
         # Step 9: build KL policy instances and set up teacher lm_heads if an
         # active policy needs teacher logits (full_kl/full_jsd). The
         # TeacherLMHeads singleton owns the lm_head lifecycle (last PP stage only).
         self.kl_policies = self._init_kl_policies()
 
-        if config.algorithm.ref_kl.enable:
+        # forward-only also uses the backuper as its param offloader (no DDP buffers).
+        if self._forward_only or config.algorithm.ref_kl.enable:
             self._weights_backuper = TensorBackuper(
                 source_getter=lambda: (
                     (f"chunk{i}.{name}", param)
@@ -123,8 +144,30 @@ class MegatronActorWorker(MegatronTrainWorker):
 
         if hf:
             hf_dir = get_hf_dir(self.config.checkpoint_path, step)
-            self.bridge.save_hf_pretrained(self.model, hf_dir)
+            if self._quant.quantized:
+                self._save_hf_like_source(hf_dir)
+            else:
+                self.bridge.save_hf_pretrained(self.model, hf_dir)
             logger.info(f"[Rank {self.rank}] HF model exported for step={step}")
+
+    @torch.no_grad()
+    def _save_hf_like_source(self, hf_dir: str) -> None:
+        """Save the HF model in the source checkpoint's own (quantized) format: same files, names,
+        dtypes and config as ``hf_model_path``; untrained tensors (vision, MTP, ...) are copied."""
+        names = {
+            n for t in self.bridge.get_conversion_tasks(self.model) if t is not None for n in qat.hf_names(t.mapping)
+        }
+        gathered = [None] * torch.distributed.get_world_size()
+        torch.distributed.all_gather_object(gathered, sorted(names))  # EP ranks own different experts
+        expected = set().union(*map(set, gathered))
+        expected |= {q.scale_name for n, q in self._quant.ckpt.items() if n in expected}
+        hf_weights = self.bridge.export_hf_weights(self.model)
+        if torch.distributed.get_rank() == 0:
+            save_like_source(self._quant.encode(hf_weights), self.config.hf_model_path, hf_dir, expected)
+        else:
+            for _ in hf_weights:  # collectives
+                pass
+        torch.distributed.barrier()
 
     @override
     @torch.no_grad()
@@ -171,6 +214,8 @@ class MegatronActorWorker(MegatronTrainWorker):
                 "algorithm.ref_kl.enable=True requires either "
                 "ref_dist_ckpt_path or ref_hf_model_path to be set."
             )
+        if self._quant.qat:
+            self._quant.snap_()
 
         self._weights_backuper.backup("ref")     # snapshot ref weights
         self._weights_backuper.restore("actor")  # switch back to the student
@@ -244,6 +289,11 @@ class MegatronActorWorker(MegatronTrainWorker):
                 self._free_pg_fields(rollout_data, gkd_ratio)
 
             rollout_data["advantages"] = advantages
+
+        if self._forward_only:
+            # No optimizer: report the forward-side metrics (IS/k3, adv, ...) only.
+            self._track_metrics(step, rollout_data, {})
+            return
 
         # Train
         for m in self.model:
@@ -350,7 +400,10 @@ class MegatronActorWorker(MegatronTrainWorker):
             clear_memory()
         print_memory("before send huggingface weights")
         send_channel = create_sender_channel(channel_meta)
-        for name, tensor in self.bridge.export_hf_weights(self.model):
+        hf_weights = self.bridge.export_hf_weights(self.model)
+        if self._quant.quantized:
+            hf_weights = self._quant.encode(hf_weights)
+        for name, tensor in hf_weights:
             send_channel.send((name, tensor))
         send_channel.send(None, flush=True)
         if self.offloaded:
@@ -544,7 +597,6 @@ class MegatronActorWorker(MegatronTrainWorker):
         avg_metrics: dict[str, float] = {}
         n_minibatches = len(num_microbatches)
         for index in range(n_minibatches):
-            is_last_minibatch = index == n_minibatches - 1
             metrics = train_minibatch(
                 self.config,
                 step,
@@ -554,25 +606,28 @@ class MegatronActorWorker(MegatronTrainWorker):
                 self.scheduler,
                 num_microbatches=num_microbatches[index],
                 gkd_policy=self.kl_policies.get("gkd"),
+                qat_plan=self._quant if self._quant.qat else None,
             )
             if is_main_rank():
                 for k, v in metrics.items():
                     avg_metrics[k] = avg_metrics.get(k, 0.0) + v
                 logger.info(f"[Rank {self.rank}] step: {step}, minibatch: {index}, metrics: {metrics}")
-                if not is_last_minibatch:
-                    continue
-                # Average metrics across minibatches and track
-                for k in avg_metrics:
-                    avg_metrics[k] /= n_minibatches            
-                avg_metrics.update(rollout_data.get("m2po_metrics", {}))
-                avg_metrics.update(rollout_data.get("is_metrics", {}))
-                avg_metrics.update(rollout_data.get("kl_metrics", {}))
-                avg_metrics.update(rollout_data.get("adv_metrics", {}))
-                avg_metrics["train/segment_padding_count"] = global_padding_count
-                avg_metrics["train/segment_padding_ratio"] = global_padding_ratio
-                avg_metrics["perf/train_memory_allocated_max"] = \
-                    round(torch.cuda.max_memory_allocated() / (1024 * 1024 * 1024), 2)
-                avg_metrics["perf/train_memory_reserved_max"] = \
-                    round(torch.cuda.max_memory_reserved() / (1024 * 1024 * 1024), 2)
-                logger.info(f"[Rank {self.rank}] step: {step}, avg_metrics: {avg_metrics}")
-                track(avg_metrics, step)
+
+        for k in avg_metrics:
+            avg_metrics[k] /= n_minibatches
+        avg_metrics["train/segment_padding_count"] = global_padding_count
+        avg_metrics["train/segment_padding_ratio"] = global_padding_ratio
+        self._track_metrics(step, rollout_data, avg_metrics)
+
+    def _track_metrics(self, step, rollout_data: RolloutBatch, metrics: dict[str, float]):
+        """Merge the pre-train metrics from ``rollout_data`` into ``metrics`` and track (main rank only)."""
+        if not is_main_rank():
+            return
+        for key in ("m2po_metrics", "is_metrics", "kl_metrics", "adv_metrics"):
+            metrics.update(rollout_data.get(key, {}))
+        metrics["perf/train_memory_allocated_max"] = \
+            round(torch.cuda.max_memory_allocated() / (1024 * 1024 * 1024), 2)
+        metrics["perf/train_memory_reserved_max"] = \
+            round(torch.cuda.max_memory_reserved() / (1024 * 1024 * 1024), 2)
+        logger.info(f"[Rank {self.rank}] step: {step}, avg_metrics: {metrics}")
+        track(metrics, step)

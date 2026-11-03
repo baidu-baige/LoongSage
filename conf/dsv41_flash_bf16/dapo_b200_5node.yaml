@@ -1,15 +1,32 @@
 # @package _global_
 #
-# DAPO math on DeepSeek-V4.1-Flash-BF16, 5-node B200 (5 x 8 = 40 GPUs).
+# DAPO math with DeepSeek-V4.1-Flash on 5-node B200 (5 x 8 = 40 GPUs).
 #
-# Set before launching: checkpoint_path, hf_model_path, data_source.dataset.prompt_data_path.
-# hf_model_path must point at the BF16 HF checkpoint produced by
-#   examples/convert_dsv41_to_bf16.py.
-# Both checkpoint_path and hf_model_path must live on storage reachable by every node.
+# Download the model and dataset first, then convert the model to BF16 weights
+# for training:
 #
-# Launch:
-#   bash examples/start_ray_cluster.sh <master-ip>   # on every node first
-#   bash examples/start.sh dsv41_flash_bf16/dapo_b200_5node
+#   hf download deepseek-ai/DeepSeek-V4.1-Flash --local-dir /root/DeepSeek-V4.1-Flash
+#   hf download Haitao999/DAPO-Math-17k-unique --repo-type=dataset --local-dir /root/dapo-math
+#
+#   python examples/convert_dsv41_to_bf16.py \
+#     --src /root/DeepSeek-V4.1-Flash \
+#     --dst /root/DeepSeek-V4.1-Flash-BF16
+#
+# After conversion, launch the 5-node B200 preset dsv41_flash_bf16/dapo_b200_5node:
+# bring up the Ray cluster on every node and submit the training job from the head
+# node only.
+#
+#   # Run the same command on every machine
+#   bash examples/start_ray_cluster.sh <master-ip>
+#
+#   # Once the cluster is ready, run this on the head node only
+#   bash examples/start.sh dsv41_flash_bf16/dapo_b200_5node \
+#     checkpoint_path=/root/ckpt/dsv41_dapo \
+#     hf_model_path=/root/DeepSeek-V4.1-Flash-BF16 \
+#     data_source.dataset.prompt_data_path=/root/dapo-math
+#
+# checkpoint_path and hf_model_path must live on storage that every node can reach
+# through the same path.
 defaults:
   - /default
   - _self_

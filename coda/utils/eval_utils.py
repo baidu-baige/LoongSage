@@ -22,6 +22,46 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+METADATA_METRIC_PREFIX = "metric/"
+METADATA_METRIC_REDUCERS = {
+    "mean": lambda xs: sum(xs) / len(xs),
+    "min": min,
+    "max": max,
+}
+
+
+def metadata_metrics(metadata: dict | None) -> dict[str, float]:
+    """Numeric trajectory metadata keyed ``metric/<spec>`` as ``{spec: value}``."""
+    return {k[len(METADATA_METRIC_PREFIX):]: float(v) for k, v in (metadata or {}).items()
+            if k.startswith(METADATA_METRIC_PREFIX) and isinstance(v, (int, float))}
+
+
+def _parse_metric_spec(spec: str) -> tuple[str, list[str]]:
+    """``"x"`` -> ``("x", ["mean"])``; ``"min,max/x"`` -> ``("x", ["min", "max"])``."""
+    head, sep, name = spec.partition("/")
+    if sep and name:
+        reductions = [r.strip() for r in head.split(",") if r.strip()]
+        known = [r for r in reductions if r in METADATA_METRIC_REDUCERS]
+        if known and len(known) == len(reductions):
+            return name, list(dict.fromkeys(reductions))
+        if known:
+            unknown = sorted(set(reductions) - set(known))
+            raise ValueError(f"metric {METADATA_METRIC_PREFIX}{spec}: unknown reduction(s) {unknown}, "
+                             f"expected some of {list(METADATA_METRIC_REDUCERS)}")
+    return spec, ["mean"]
+
+
+def reduce_metadata_metrics(values_by_spec: dict[str, list[float]]) -> dict[str, float]:
+    """Reduce ``{spec: values}`` into ``{<name>_<reduction>: value}``."""
+    out: dict[str, float] = {}
+    for spec, values in values_by_spec.items():
+        if not values:
+            continue
+        name, reductions = _parse_metric_spec(spec)
+        for r in reductions:
+            out[f"{name}_{r}"] = float(METADATA_METRIC_REDUCERS[r](values))
+    return out
+
 
 def _std(xs: list[float]) -> float:
     """Sample standard deviation (0.0 for fewer than 2 values)."""
@@ -106,6 +146,14 @@ def compute_eval_metrics(eval_traj_groups: list[TrajectoryGroup]) -> dict[str, f
         label = f"ds{ds_index}"
         group_rewards = [[float(t.reward or 0.0) for t in g.trajectories] for g in traj_groups]
         ds_metrics = _dataset_metrics(label, group_rewards)
+        # Custom "metric/<spec>" trajectory metadata.
+        extra: dict[str, list[float]] = defaultdict(list)
+        for g in traj_groups:
+            for t in g.trajectories:
+                for spec, value in metadata_metrics(t.metadata).items():
+                    extra[spec].append(value)
+        for name, value in reduce_metadata_metrics(extra).items():
+            ds_metrics[f"eval/{label}_{name}"] = value
         metrics.update(ds_metrics)
         # Datasets with no samples report count=0; averaging their mean would
         # pull eval/mean down as if they had scored 0.

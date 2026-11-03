@@ -52,7 +52,7 @@ rollout:
   retry_limit: 5
   num_gpus_per_node: 8
   sglang_args:
-    mem_fraction_static: 0.8
+    mem_fraction_static: 0.75
     disable_cuda_graph: false
     tp_size: 8
     ep_size: 8

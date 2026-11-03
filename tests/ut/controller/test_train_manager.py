@@ -18,12 +18,14 @@ def make_minimal_config(**overrides):
     (``backend: megatron``) — so _validate_config raises without it.
     """
     base = {
+        "run_mode": "default",
         "trainer": {
             "backend": "megatron",
             "num_nodes": 1,
             "num_gpus_per_node": 1,
             "hf_model_path": "/tmp/fake_model",
             "checkpoint_path": "/tmp/fake_ckpt",
+            "forward_only": False,
         },
         "megatron": {
             "model": {
@@ -124,12 +126,17 @@ class TestPPOValidation:
             ({"algorithm": {"advantage_estimator": "grpo"}}, "critic.enable requires algorithm.advantage_estimator=gae"),
             ({"critic": {"critic_warmup": -1}}, "critic_warmup must be >= 0"),
             ({"opd": {"enable": True}}, "opd.enable"),
+            ({"trainer": {"forward_only": True}}, "does not support trainer.forward_only"),
             ({"data_sources": [{"num_trajectories_per_prompt": 4}]}, "num_trajectories_per_prompt == 1"),
         ],
     )
     def test_invalid_ppo_configs_raise(self, overrides, message):
         with pytest.raises(ValueError, match=message):
             validate_ppo(make_ppo_config(**overrides))
+
+    def test_rollout_only_accepts_gae_without_critic(self):
+        """Rollout-only turns the critic off but keeps the PPO estimator; it computes no advantages."""
+        validate_ppo(make_ppo_config(run_mode="rollout-only", critic={"enable": False}))
 
     def test_grpo_config_passes(self):
         validate_ppo(make_minimal_config())

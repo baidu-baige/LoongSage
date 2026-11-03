@@ -17,6 +17,156 @@ index 289c11286..35dc4c0d9 100644
      else:
          raise ValueError(
              f"Invalid experimental attention variant: {config.experimental_attention_variant}"
+diff --git a/megatron/core/optimizer/cpu_offloading/chunked_optimizer_state_offload.py b/megatron/core/optimizer/cpu_offloading/chunked_optimizer_state_offload.py
+index 930bf7f84..f259a144f 100644
+--- a/megatron/core/optimizer/cpu_offloading/chunked_optimizer_state_offload.py
++++ b/megatron/core/optimizer/cpu_offloading/chunked_optimizer_state_offload.py
+@@ -68,6 +68,12 @@ class ChunkedOptimizerStateOffloader:
+     optimizer and FP8 parameter-gather paths unchanged while still removing masters from the
+     forward/backward residency set.
+ 
++    With ``chunk_master_weights`` the optimizer-owned ``state['master_param']`` entries are
++    instead staged with the tensor states of their chunk, so the step never holds more than
++    two chunks of masters on GPU. This requires every master reader to be the optimizer step
++    itself (precision-aware FusedAdam without FP8/MXFP8 parameter staging); readers that need
++    the full master window (``ensure_master_for_param_sync``) are rejected.
++
+     Args:
+         optimizer: The external torch-compatible optimizer to execute.
+         master_params: MCore-owned FP32 master parameters. These objects also appear in
+@@ -84,8 +90,12 @@ class ChunkedOptimizerStateOffloader:
+             accounts for compact int16 parameter remainders.
+         d2h_stream: Optional transfer stream shared by related optimizer wrappers.
+         h2d_stream: Optional transfer stream shared by related optimizer wrappers.
++        chunk_master_weights: Stage optimizer-owned masters per chunk instead of as one
++            full window. Chunk sizes then also count master bytes.
+     """
+ 
++    _chunk_masters: bool = False
++
+     def __init__(
+         self,
+         optimizer: torch.optim.Optimizer,
+@@ -96,6 +106,7 @@ class ChunkedOptimizerStateOffloader:
+         optimizer_owned_master_dtypes: Mapping[torch.Tensor, torch.dtype] | None = None,
+         d2h_stream: torch.cuda.Stream | None = None,
+         h2d_stream: torch.cuda.Stream | None = None,
++        chunk_master_weights: bool = False,
+     ) -> None:
+         if chunk_size_bytes < 0:
+             raise ValueError(f"chunk_size_bytes must be non-negative, got {chunk_size_bytes}")
+@@ -150,6 +161,14 @@ class ChunkedOptimizerStateOffloader:
+                 raise ValueError(
+                     "optimizer_owned_master_dtypes requires an optimizer with master_weights"
+                 )
++        if chunk_master_weights and (
++            self._explicit_master_param_ids or not self._master_in_optimizer_state
++        ):
++            raise ValueError(
++                "chunk_master_weights requires optimizer-owned state['master_param'] masters "
++                "(precision-aware optimizer with master_weights) and no MCore-owned masters"
++            )
++        self._chunk_masters = chunk_master_weights
+ 
+         self._selected_params = self._select_params_for_offload()
+         self._selected_param_ids = {id(param) for param in self._selected_params}
+@@ -240,7 +259,11 @@ class ChunkedOptimizerStateOffloader:
+         oversized_param_count = 0
+         largest_oversized_param_bytes = 0
+         for param in params:
+-            param_bytes = self._estimated_state_bytes(param)
++            param_bytes = (
++                self._estimated_bundle_bytes(param)
++                if self._chunk_masters
++                else self._estimated_state_bytes(param)
++            )
+             if param_bytes > self.chunk_size_bytes:
+                 oversized_param_count += 1
+                 largest_oversized_param_bytes = max(largest_oversized_param_bytes, param_bytes)
+@@ -344,9 +367,16 @@ class ChunkedOptimizerStateOffloader:
+             and value.shape == param.shape
+         )
+ 
++    def _tracks_state(self, param: torch.Tensor, key: str, value: object) -> bool:
++        """Return whether this manager stages ``state[param][key]`` through its chunks."""
++
++        if self._chunk_masters and key == _MASTER_PARAM_KEY:
++            return isinstance(value, torch.Tensor) and value.shape == param.shape
++        return self._is_offloadable_state(param, key, value)
++
+     def _state_items_to_offload(self, param: torch.Tensor) -> Iterable[tuple[str, torch.Tensor]]:
+         for key, value in self.optimizer.state.get(param, {}).items():
+-            if self._is_offloadable_state(param, key, value) and value.is_cuda:
++            if self._tracks_state(param, key, value) and value.is_cuda:
+                 yield key, value
+ 
+     def _has_unregistered_cuda_state(self, params: Sequence[torch.Tensor]) -> bool:
+@@ -391,7 +421,7 @@ class ChunkedOptimizerStateOffloader:
+                 continue
+             adopted_keys = set()
+             for key, value in tuple(self.optimizer.state.get(param, {}).items()):
+-                if self._is_offloadable_state(param, key, value) and value.device.type == "cpu":
++                if self._tracks_state(param, key, value) and value.device.type == "cpu":
+                     if not value.is_pinned():
+                         pinned_value = self._new_cpu_buffer(value)
+                         pinned_value.copy_(value)
+@@ -570,7 +600,7 @@ class ChunkedOptimizerStateOffloader:
+                     if not self.is_param_offloaded(param):
+                         for state_name, state_value in tuple(value.items()):
+                             if (
+-                                self._is_offloadable_state(param, state_name, state_value)
++                                self._tracks_state(param, state_name, state_value)
+                                 and state_value.device.type == "cpu"
+                             ):
+                                 value[state_name] = state_value.to(
+@@ -615,7 +645,7 @@ class ChunkedOptimizerStateOffloader:
+         )
+ 
+     def _schedule_master_d2h(self) -> None:
+-        if not self._selected_params:
++        if not self._selected_params or self._chunk_masters:
+             return
+         self._validate_master_storage()
+         # A rerun or checkpoint can request offload after prefetch but before step().
+@@ -648,7 +678,11 @@ class ChunkedOptimizerStateOffloader:
+                     self.optimizer.state[param][state_key] = cpu_tensor
+ 
+     def _schedule_master_h2d(self) -> None:
+-        if not self._selected_params or self._master_h2d_event is not None:
++        if (
++            not self._selected_params
++            or self._chunk_masters
++            or self._master_h2d_event is not None
++        ):
+             return
+         self._validate_master_storage()
+ 
+@@ -800,6 +834,13 @@ class ChunkedOptimizerStateOffloader:
+     def ensure_master_for_param_sync(self) -> None:
+         """Ensure selected master weights are available for pre-forward FP8 staging."""
+ 
++        if self._chunk_masters:
++            if self._master_bindings_are_cuda():
++                return
++            raise RuntimeError(
++                "chunk_master_weights keeps masters CPU-resident outside the chunked optimizer "
++                "step; a full master window for parameter staging is not supported"
++            )
+         if self._master_weights_resident and self._master_h2d_event is None:
+             return
+         self._schedule_master_h2d()
+@@ -820,6 +861,11 @@ class ChunkedOptimizerStateOffloader:
+ 
+         if not self._selected_params:
+             return
++        if self._chunk_masters and not offload_master:
++            raise RuntimeError(
++                "chunk_master_weights stages masters with their state chunk; they cannot stay "
++                "GPU-resident while the state is offloaded"
++            )
+         if self._first_prefetch is not None:
+             self._wait_state_prefetch(self._first_prefetch)
+             self._first_prefetch = None
 diff --git a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py b/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
 index 45bf910f8..5c14957e4 100644
 --- a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
@@ -30,6 +180,58 @@ index 45bf910f8..5c14957e4 100644
                      param_to_fp32_param[orig_param] = param
  
                  if cpu_copy:
+diff --git a/megatron/core/optimizer/optimizer.py b/megatron/core/optimizer/optimizer.py
+index d22f6f9f4..f42bc979d 100644
+--- a/megatron/core/optimizer/optimizer.py
++++ b/megatron/core/optimizer/optimizer.py
+@@ -204,6 +204,7 @@ class MegatronOptimizer(ABC):
+             optimizer_owned_master_dtypes=optimizer_owned_master_dtypes,
+             d2h_stream=d2h_stream,
+             h2d_stream=h2d_stream,
++            chunk_master_weights=self.config.optimizer_state_offload_chunk_masters,
+         )
+ 
+     def set_optimizer_state_offload_deferred_lifecycle(
+diff --git a/megatron/core/optimizer/optimizer_config.py b/megatron/core/optimizer/optimizer_config.py
+index ecb471100..bc857b092 100644
+--- a/megatron/core/optimizer/optimizer_config.py
++++ b/megatron/core/optimizer/optimizer_config.py
+@@ -376,7 +376,15 @@ class OptimizerConfig:
+     """Target GPU staging-window size for optimizer tensor state, in MiB.
+ 
+     Zero restores all selected tensor state together. Master weights are restored in one full
+-    window and are not bounded by this value.
++    window and are not bounded by this value, unless optimizer_state_offload_chunk_masters.
++    """
++
++    optimizer_state_offload_chunk_masters: bool = False
++    """Stage optimizer-owned fp32 master weights per state chunk instead of as one full window.
++
++    Bounds the optimizer-step GPU peak by the chunk window (chunk sizes then also count master
++    bytes). Requires precision-aware Adam without FP8 parameters, where the optimizer step is
++    the only master reader.
+     """
+ 
+     optimizer_state_offload_fraction: float = 1.0
+@@ -501,6 +509,18 @@ class OptimizerConfig:
+             )
+         )
+ 
++        if self.optimizer_state_offload_chunk_masters:
++            assert (
++                self.chunked_optimizer_state_offload
++                and self.optimizer == 'adam'
++                and self.use_precision_aware_optimizer
++                and self.fp8_recipe is None
++                and not self.reuse_grad_buf_for_mxfp8_param_ag
++            ), (
++                "optimizer_state_offload_chunk_masters requires chunked_optimizer_state_offload "
++                "with precision-aware Adam and no FP8 parameters"
++            )
++
+         if self.fp8_recipe == "mxfp8":
+             if not self.reuse_grad_buf_for_mxfp8_param_ag:
+                 warnings.warn(
 diff --git a/megatron/core/tensor_parallel/mappings.py b/megatron/core/tensor_parallel/mappings.py
 index 1a3daa418..a3e145ec1 100644
 --- a/megatron/core/tensor_parallel/mappings.py

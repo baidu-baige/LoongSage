@@ -109,7 +109,8 @@ class ResourceScheduler:
         trainer_config = config.trainer
         rollout_config = config.rollout
 
-        if self.colocate:
+        # SFT runs no inference engines, so it only needs the trainer GPUs.
+        if self.colocate or config.run_mode == "sft":
             num_gpus = trainer_config.num_gpus_per_node * trainer_config.num_nodes
         else:
             assert rollout_config.backend == "sglang"
@@ -142,7 +143,7 @@ class ResourceScheduler:
             ).remote()
             try:
                 ip, gpu_ids = ray.get(probe.get_ip_and_gpu_id.remote())
-                return ip, gpu_ids[0] if gpu_ids else -1
+                return ip, int(gpu_ids[0]) if gpu_ids else -1
             except Exception as e:
                 last_exception = e
                 logging.warning(

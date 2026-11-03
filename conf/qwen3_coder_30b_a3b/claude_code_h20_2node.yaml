@@ -60,8 +60,6 @@ rollout:
     ep_size: 8
     mem_fraction_static: 0.6
     disable_cuda_graph: false
-  env_vars:
-    SGLANG_RMSNORM_NO_PDL: "1"
   use_fault_tolerance: true
 
 agentflow:

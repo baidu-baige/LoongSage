@@ -108,7 +108,7 @@ get_trajectory()        # 取出当前 attempt 的 Trajectory
 
 [tokenizer_manager.py](../../coda/agentflow/tokenizer_manager.py) 把 CPU 密集的 chat-template / encode / decode 封装成**异步接口**，用线程池（`ThreadedTokenizerManager`）或进程池（`ProcessTokenizerManager`）执行，避免阻塞 Router 的事件循环。`create_tokenizer_manager()` 按 `manager.mode` 选择后端。
 
-它还集中缓存与训练对齐必需的元数据：`think_start_ids`/`think_end_ids`（token 级裁剪 think 块用）、`model_family`、`think_tags` 等，对 DeepSeek-V4 会通过 `_wrap_deepseek_v4_tokenizer()` 自动包装 tokenizer 并缓存其 `thinking_mode`。**它是"rollout 采样序列"和"训练回放序列"共享的唯一 tokenize 真源**，避免文本二次 tokenize 造成错位。用于续轮裁掉 system 前缀的 `system_prompt_len` 并不在这里缓存，而是由 `TrajectoryParser` 首次用到时延迟计算并缓存（`parser.py:700-721`）。
+它还集中缓存与训练对齐必需的元数据：`think_start_ids`/`think_end_ids`（token 级裁剪 think 块用）、`model_family`、`think_tags` 等，对 DeepSeek-V4 会通过 `_wrap_deepseek_v4_tokenizer()` 自动包装 tokenizer 并缓存其 `thinking_mode`。**它是"rollout 采样序列"和"训练回放序列"共享的唯一 tokenize 真源**，避免文本二次 tokenize 造成错位。构造时它还会从 chat template 探测 `non_assistant_prefix`（一条空 system 消息的渲染；模板拒绝只有 system 的对话时，例如 Qwen3.5，改用一条空 user 消息，这条消息即 `non_assistant_prefix_message`）和 `assistant_prefix`（一条空 user 消息加 generation prompt 的渲染）。`TrajectoryParser` 把续轮消息放在 `non_assistant_prefix_message` 后面渲染并切掉 `non_assistant_prefix`；SFT 的 `tokenize()` 对 prompt 之后的非 assistant 消息也这样渲染，assistant 消息则放在空 user 消息后面渲染并切掉 `assistant_prefix`。
 
 > **DeepSeek-V4 解析路径**：dsv4 与其他模型走同一套 SGLang parser。由于它的 tokenizer 被 `_wrap_deepseek_v4_tokenizer()` 换成了官方 encoder，没有 Jinja 模板可供自动检测匹配，`parser.py` 会回退到按模型架构检测：当模板匹配无结果时，`_detect_parser_names()` 调用 `_detect_parser_names_from_arch()`，借助 SGLang 的 `_architecture_auto_parsers` 按 `config.json` 里的模型架构选出 parser key——因此 parser key 始终由 SGLang 定义，我们这侧不硬编码任何映射。请求侧唯一的特殊处理是 `skip_special_tokens=false`（保留 `<think>` 与 DSML 标记），末尾的 EOS 仍由 SGLang 默认的 `no_stop_trim` 行为裁剪。
 
@@ -169,7 +169,7 @@ Sandbox 配置属于数据源。agent 需要时直接通过注入的 client 创�
 1. `_prepare_attempt_template()` 准备本次提交的可变模板。partial rollout resume 且开启 `mask_offpolicy_in_partial_rollout` 时，会把已有 response token 的 `loss_masks` 全部置 0（旧版本 off-policy 前缀不参与 loss）；同时校验 `loss_masks` / `rollout_weight_versions` 的长度与 `rollout_log_probs` 一致，不一致直接抛 `ValueError`，避免带着损坏的对齐数据续跑。
 2. 每次 attempt 置状态 `GENERATING`，写入 store，然后按模式执行：
    - **`_execute_single_turn()`**：不建 agent，也不创建 sandbox；直接由 AgentFlow 向 Router 的 `/v1/chat/completions` 发一次请求，再从 store 取回 trajectory 交给 reward 函数打分。`context_length_exceeded` 会被当作“用部分响应”而非硬失败。
-   - **`_execute_multi_turn()`**：创建 agent，并注入数据源的 sandbox client 与续跑保留的 ID。定义了 `prepare_sandbox()` 的 reward 会在 agent 执行前完成准备。`finally` 先关闭 agent 自有资源，再保留或删除 sandbox。完成的 attempt 必须包含 rollout logprob 和至少一个可训练 segment。
+   - **`_execute_multi_turn()`**：配置了 `sandbox.max_concurrency` 时，先获取该数据源的并发名额，直到 attempt 结束、sandbox 删除后才释放。然后创建 agent，并注入数据源的 sandbox client 与续跑保留的 ID。定义了 `prepare_sandbox()` 的 reward 会在 agent 执行前完成准备。`finally` 先关闭 agent 自有资源，再保留或删除 sandbox。完成的 attempt 必须包含 rollout logprob 和至少一个可训练 segment。
 3. 成功：`_post_process_reward()` 写回 reward、置 `COMPLETED`、构造 `token_rewards`（仅最后一位为 `final_reward`；若 reward 带 `completion_rewards` 则按 triplet 逐轮赋值并做数量校验）、写入 `is_correct`（reward 未判定时回退为 `final_reward > 0`），emit 终态 trajectory，并通过 `DELETE /release_session` 释放 sticky 映射。
 4. 失败：置 `FAILED` 并通过 `POST /abort_session` 中止绑定 worker；重试耗尽则 emit 一条 `is_valid=False` 的 reward。由于命令可能只执行了一部分，重试前会删除 sandbox。只有 `rollout.partial=true` 下的取消会保留 sandbox 及其运行状态供续跑。
 
@@ -218,6 +218,7 @@ AgentFlow 相关配置集中在 `agentflow.*`、`rollout.*`、`data_sources[*]` 
 | `data_sources[i].num_trajectories_per_prompt` | 每个 prompt 采样的 trajectory 数（group 大小 `N`） |
 | `data_sources[i].completion_params` | Router 直接应用的原生 SGLang `sampling_params`（如 `top_p`、`top_k`） |
 | `data_sources[i].sandbox.type` | 每数据源的 sandbox 后端（`k8s` / `docker` / `none`） |
+| `data_sources[i].sandbox.max_concurrency` | 该数据源同时在用的 sandbox 上限（即并发 multi-turn attempt 数），超出的排队；`0` 不限 |
 | `data_sources[i].sandbox.working_dir` | sandbox 默认工作目录（k8s 默认 `/rl-sandbox`，可被 agent/metadata 覆盖） |
 | `data_sources[i].sandbox.command_exec_timeout_seconds` / `sandbox_creation_timeout_seconds` | 命令执行 / pod 创建超时 |
 | `data_sources[i].sandbox.kubeconfig` / `pod_manifest_path` | K8s sandbox 的 kubeconfig 与 pod manifest 路径 |

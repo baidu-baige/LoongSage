@@ -13,11 +13,18 @@
 面向前沿大模型的工业级高效 Agentic RL 框架，提供经过验证的训练配方
 
 <p>
-  <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"></a>
-  <img src="https://img.shields.io/badge/python-3.12-blue.svg" alt="Python">
-  <img src="https://img.shields.io/badge/code-14k%20lines-brightgreen.svg" alt="LOC">
-  <img src="https://img.shields.io/badge/training-Megatron--Core-76B900.svg" alt="Megatron-Core">
-  <img src="https://img.shields.io/badge/rollout-SGLang-orange.svg" alt="SGLang">
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg?style=flat-square" alt="License"></a>
+  <img src="https://img.shields.io/badge/python-3.12-blue.svg?style=flat-square" alt="Python">
+  <img src="https://img.shields.io/badge/code-16k%20lines-brightgreen.svg?style=flat-square" alt="LOC">
+  <img src="https://img.shields.io/badge/training-Megatron--Core-76B900.svg?style=flat-square" alt="Megatron-Core">
+  <img src="https://img.shields.io/badge/rollout-SGLang-orange.svg?style=flat-square" alt="SGLang">
+  <a href="https://hub.docker.com/r/loongsage/loongsage"><img src="https://img.shields.io/docker/pulls/loongsage/loongsage.svg?style=flat-square&logo=docker&logoColor=white" alt="Docker Pulls"></a>
+</p>
+
+<p>
+  <a href="https://github.com/baidu-baige/LoongSage/issues/25"><img src="https://img.shields.io/badge/WeChat_Group-07C160?style=for-the-badge&logo=wechat&logoColor=white" alt="加入微信群"></a>
+  <a href="https://www.zhihu.com/people/loongsage"><img src="https://img.shields.io/badge/Follow_on_Zhihu-0084FF?style=for-the-badge&logo=zhihu&logoColor=white" alt="在知乎上关注我们"></a>
+  <a href="mailto:loongsage@baidu.com"><img src="https://img.shields.io/badge/Email_Us-D14836?style=for-the-badge&logo=maildotru&logoColor=white" alt="发送邮件"></a>
 </p>
 
 </div>
@@ -56,6 +63,9 @@ ______________________________________________________________________
 
 ## 📰 最新动态 (News)
 
+- **[2026-10]** 支持 DeepSeek-V4.1-Flash [QAT 训练](conf/dsv41_flash/)，并新增 [RLCD2 训练配方](conf/rlcd2/)！
+- **[2026-10]** 技术报告 [*LoongSage: A Production-Grade, High-Efficiency Agentic RL Framework for Frontier LLMs with Validated Recipes*](https://arxiv.org/abs/2610.16352) 已在 arXiv 发布！
+- **[2026-09]** 原生支持黑盒智能体 OpenCode、Codex 与 Claude Code，无需改动智能体代码即可直接用于 RL 训练（配方见 [`conf/qwen3_coder_30b_a3b/`](conf/qwen3_coder_30b_a3b/)）！
 - **[2026-08]** LoongSage 正式开源！
 
 ______________________________________________________________________
@@ -154,7 +164,7 @@ ______________________________________________________________________
 - [ ] 低精度训练支持
 - [ ] MTP/DSpark
 - [ ] 全异步场景下的多数据源、多智能体支持
-- [ ] SFT能力支持
+- [x] SFT能力支持（`run_mode: sft`，示例见 `conf/qwen3_4b/sft_h20_1node.yaml`）
 - [ ] LORA能力支持
 - [ ] 多教师权重分布式存储
 - [ ] 全模态支持

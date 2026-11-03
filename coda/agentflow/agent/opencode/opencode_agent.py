@@ -12,7 +12,12 @@ from typing import Any, Callable
 from urllib.parse import urlparse
 
 from coda.agentflow.agent import BaseAgent, register_agent
-from coda.agentflow.utils import require_docker_image
+from coda.agentflow.utils import (
+    RESUME_PROMPT,
+    cli_process_pattern,
+    kill_process_tree_command,
+    require_docker_image,
+)
 from coda.reward.reward import Reward
 
 logger = logging.getLogger(__name__)
@@ -27,6 +32,9 @@ _CONFIG_PATH = "/root/.config/opencode/opencode.json"
 _PLUGIN_PATH = "/root/.config/opencode/coda-request-kind.js"
 _OPENCODE_PATH = "/root/.opencode/bin/opencode"
 _LOG_PATH = "/tmp/coda-opencode.log"
+# Written right before `opencode run` starts; its presence means this sandbox
+# holds an OpenCode session that a partial resume can continue.
+_STARTED_MARKER_PATH = "/tmp/coda-opencode.started"
 
 _REQUEST_KIND_PLUGIN = r'''
 export const CodaRequestKind = async ({ client, directory }) => ({
@@ -235,9 +243,26 @@ class OpenCodeAgent(BaseAgent):
             ),
         )
 
-        instruction = _instruction(trajectory.get("prompt", ""))
+        prompt = trajectory.get("prompt", "")
+        # Partial resume: reload OpenCode's own session from the retained sandbox
+        # so the model sees the full pre-abort history instead of a fresh task.
+        # The marker confirms the abort came after OpenCode actually started.
+        resume = bool(trajectory.get("resume"))
+        if resume:
+            marker = await asyncio.to_thread(
+                execute, f"test -f {shlex.quote(_STARTED_MARKER_PATH)}", workdir="/"
+            )
+            resume = marker.get("exit_code", -1) == 0
+        if resume:
+            session_args = "--continue"
+            message = RESUME_PROMPT
+            logger.info("[opencode] resuming session for %s", metadata.get("instance_id", "?"))
+        else:
+            session_args = "--title=coda"
+            message = _instruction(trajectory.get("initial_prompt", prompt))
         provider_id = _WIRE_PROVIDERS[self.wire_api][0]
         command = (
+            f"touch {shlex.quote(_STARTED_MARKER_PATH)} && "
             "OPENCODE_DISABLE_MODELS_FETCH=1 "
             "OPENCODE_DISABLE_AUTOUPDATE=1 "
             "OPENCODE_DISABLE_LSP_DOWNLOAD=1 "
@@ -245,8 +270,8 @@ class OpenCodeAgent(BaseAgent):
             f"OPENCODE_CONFIG={shlex.quote(_CONFIG_PATH)} "
             f"{shlex.quote(_OPENCODE_PATH)} "
             f"--model={provider_id}/{_MODEL_ID} run "
-            "--title=coda --dangerously-skip-permissions -- "
-            f"{shlex.quote(instruction)} </dev/null >{shlex.quote(_LOG_PATH)} 2>&1"
+            f"{session_args} --dangerously-skip-permissions -- "
+            f"{shlex.quote(message)} </dev/null >{shlex.quote(_LOG_PATH)} 2>&1"
         )
         # Mark the process as in flight so clear() can kill it on a partial
         # abort. Reset ONLY on a clean return (below), never in a finally, so a
@@ -258,9 +283,10 @@ class OpenCodeAgent(BaseAgent):
             tail = await asyncio.to_thread(execute, f"tail -n 100 {shlex.quote(_LOG_PATH)}", workdir=repo_path)
             output = (tail.get("stdout", "") + tail.get("stderr", ""))[-5000:]
             logger.warning(
-                "OpenCode exited with code %s for %s:\n%s",
+                "OpenCode exited with code %s for %s (resume=%s):\n%s",
                 result.get("exit_code"),
                 metadata.get("instance_id", "?"),
+                resume,
                 output,
             )
             raise RuntimeError(
@@ -276,15 +302,11 @@ class OpenCodeAgent(BaseAgent):
         )
 
     async def close(self) -> None:
-        """Kill a lingering OpenCode process and close shared resources."""
+        """Kill a lingering OpenCode process tree and close shared resources."""
         await super().close()
         if not self._opencode_running:
             return
-        kill_cmd = (
-            f"pkill -INT -f {shlex.quote(_OPENCODE_PATH)} 2>/dev/null || true; "
-            "sleep 1; "
-            f"pkill -KILL -f {shlex.quote(_OPENCODE_PATH)} 2>/dev/null || true"
-        )
+        kill_cmd = kill_process_tree_command(cli_process_pattern(_OPENCODE_PATH))
         try:
             await asyncio.to_thread(self.sandbox_client.execute, self.sandbox_id, kill_cmd)
         except Exception as exc:

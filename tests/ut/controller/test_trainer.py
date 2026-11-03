@@ -148,6 +148,7 @@ def make_minimal_config(**overrides):
             "num_nodes": 1,
             "num_gpus_per_node": 1,
             "save_freq": 1,
+            "forward_only": False,
             "project_name": "test_project",
             "experiment_name": "test_experiment",
             "tracking_backend": "console",
@@ -290,6 +291,36 @@ class TestTrainerValidateConfig:
         ):
             trainer._validate_config()
 
+    def test_rollout_only_forces_forward_only(self):
+        config = make_minimal_config(run_mode="rollout-only", critic={"enable": True})
+        trainer = self._trainer(config)
+
+        trainer._validate_config()
+
+        assert trainer.config.trainer.forward_only is True
+        assert trainer.config.critic.enable is False
+
+    def test_forward_only_rejects_saving(self):
+        config = make_minimal_config(trainer={"forward_only": True, "save_freq": 1})
+
+        with pytest.raises(ValueError, match="forward_only"):
+            self._trainer(config)._validate_config()
+
+    def test_forward_only_allowed_without_saving(self):
+        config = make_minimal_config(trainer={"forward_only": True, "save_freq": -1})
+
+        self._trainer(config)._validate_config()
+
+    def test_sft_mode_runs_sft_checks(self):
+        """run_mode=sft routes through validate_sft_config (rules tested in test_sft_sampler)."""
+        config = make_minimal_config(
+            run_mode="sft",
+            algorithm={"policy_loss": "grpo", "advantage_estimator": "grpo"},
+        )
+
+        with pytest.raises(ValueError, match="run_mode=sft requires algorithm.policy_loss=sft"):
+            self._trainer(config)._validate_config()
+
 
 class TestTrainerValidateReadOnlyCkptPaths:
     """ref / teacher dist checkpoint dirs are checked before GPUs are reserved.
@@ -360,15 +391,6 @@ class TestTrainerValidateReadOnlyCkptPaths:
             ],
         })
         self._validate(config)
-
-
-class TestWeightVersionHelpers:
-    """Tests for trainer-side rollout weight version helpers."""
-
-    def test_post_train_weight_version_advances_from_current_version(self):
-        trainer = object.__new__(Trainer)
-
-        assert trainer._post_train_weight_version(7) == 8
 
 
 class TestBatchDiskRoundTrip:

@@ -35,6 +35,7 @@ def make_minimal_config(**overrides):
             "use_rollout_log_probs": False,
             "use_rollout_routing_replay": False,
             "use_fp32_lm_head": False,
+            "qat": False,
             "use_dynamic_batch_size": True,
             "mini_batch_size": 1,
             "micro_batch_size": 1,
@@ -346,6 +347,7 @@ def test_offload_params_flag_tracks_where_params_live(monkeypatch, calls, expect
     monkeypatch.setattr(base_mod, "print_memory", lambda *a, **k: None)
     monkeypatch.setattr(base_mod, "clear_memory", lambda: None)
     worker = MegatronActorWorker.__new__(MegatronActorWorker)
+    worker._forward_only = False
     worker.offloaded = False
     worker.params_offloaded = False
     worker._offload_model = MagicMock()
@@ -389,6 +391,7 @@ def test_actor_advantages_source(monkeypatch, critic_enable):
         "algorithm": {"ref_kl": {"enable": False}, "m2po": {"enable": False}},
     })
     worker.model = [MagicMock()]
+    worker._forward_only = False
     worker._compute_is_correction = lambda step, data: {}
     worker._train_actor = lambda step, data: calls.append(("train", data["advantages"]))
 

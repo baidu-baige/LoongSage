@@ -60,7 +60,7 @@ See [docker_sandbox.py](../../coda/agentflow/sandbox/docker_sandbox.py) for a lo
 
 ## 3. Config Enablement
 
-Once registered, select the backend by name under the data source's `sandbox` block. Every field except `type` is passed to `from_config()`:
+Once registered, select the backend by name under the data source's `sandbox` block. Every field except `type` and `max_concurrency` (used by AgentFlow to cap this data source's sandbox concurrency; see the [config reference](./config-reference.md#33-sandbox-sub-node)) is passed to `from_config()`:
 
 ```yaml
 data_source:

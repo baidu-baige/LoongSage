@@ -60,7 +60,7 @@ class RemoteSandboxClient(SandboxClient):
 
 ## 3. 配置启用
 
-注册后，在数据源的 `sandbox` 配置块中按注册名选择后端。除 `type` 外的字段会交给 `from_config()`：
+注册后，在数据源的 `sandbox` 配置块中按注册名选择后端。除 `type` 和 `max_concurrency`（由 AgentFlow 用于限制该数据源的 sandbox 并发数，见[配置参考](./config-reference.md#33-sandbox-子节)）外的字段会交给 `from_config()`：
 
 ```yaml
 data_source:

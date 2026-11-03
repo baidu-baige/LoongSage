@@ -141,6 +141,14 @@ def flatten_config(src_cfg: dict) -> dict:
     out["architectures"] = ["DeepseekV41ForCausalLM"]
     # MTP layers are not exported by this cast (mtp.* tensors are dropped).
     out["num_nextn_predict_layers"] = 0
+    # ``compress_ratios`` is a per-layer KV compression list whose length must equal
+    # ``num_hidden_layers + num_nextn_predict_layers``. The source includes the trailing
+    # MTP entries; since the MTP layers are dropped above, trim them so DeepInfer's
+    # ``len(ratios) == n_layer + nextn`` check (hugging_face/config.py) holds.
+    ratios = out.get("compress_ratios")
+    n_layer = out.get("num_hidden_layers")
+    if isinstance(ratios, list) and isinstance(n_layer, int) and len(ratios) > n_layer:
+        out["compress_ratios"] = ratios[:n_layer]
     return out
 
 

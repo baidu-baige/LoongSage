@@ -31,6 +31,8 @@ CPU_SHM_MODE = True
 async_calls = AsyncCallsQueue(cpu_shm_mode=CPU_SHM_MODE)
 from megatron.core.utils import unwrap_model
 
+from coda.utils.memory_utils import clear_memory, print_memory
+
 logger = logging.getLogger(__name__)
 
 
@@ -48,6 +50,11 @@ def save_checkpoint(model, optimizer, scheduler, ckpt_path, async_save=False,
     sharded_state_dict["optimizer"] = optimizer.sharded_state_dict(sharded_state_dict, metadata=metadata)
     sharded_state_dict["scheduler"] = scheduler.state_dict()
     sharded_state_dict["rng_state"] = _get_rng_state()
+    # The save plan's gather_object lazily creates a WORLD NCCL communicator, whose buffers
+    # come from cudaMalloc, not the torch cache. Right after training the cache can hold
+    # nearly the whole GPU (incl. masters just moved to CPU above), so hand it back first.
+    clear_memory()
+    print_memory("before save checkpoint")
     state_dict_time = time.time()
     async_save_request = _save_dist_checkpointing(
         sharded_state_dict, ckpt_path, async_save=async_save, content_metadata=metadata,
@@ -342,11 +349,52 @@ def _load_dist_checkpointing(sharded_state_dict, ckpt_dir):
     )
 
 
+class _StreamToHost:
+    """Iterable over ``(write_item, tensor)`` that copies each GPU tensor to host only
+    when the writer reaches it, so at most one staged copy is alive at a time."""
+
+    def __init__(self, tensor_data):
+        self._tensor_data = tensor_data
+
+    def __iter__(self):
+        for item, tensor in self._tensor_data:
+            yield item, (tensor if tensor.is_cpu else tensor.to("cpu"))
+
+
+class _StreamingSyncSaveStrategy(TorchDistSaveShardedStrategy):
+    """Sync save without the up-front D2H staging of the whole rank shard.
+
+    The stock sync path (``execute_sync``) runs ``preload_tensors`` first, which copies
+    every GPU tensor of the rank (all model params, ~2 B/param) into pinned host memory
+    and holds it until the last byte is written. Here each tensor is copied to pageable
+    host memory right before it is written and freed after. CPU tensors (the chunked-
+    offloaded optimizer state) are written in place, as before.
+    """
+
+    def save(self, sharded_state_dict, checkpoint_dir):
+        request = self.async_save(sharded_state_dict, checkpoint_dir, async_strategy="mcore")
+        if request.preload_fn is not None:
+            rank, write_buckets, results_queue = request.async_fn_args
+            write_buckets = [
+                (path, storage_key, (bytes_data, _StreamToHost(tensor_data)))
+                for path, storage_key, (bytes_data, tensor_data) in write_buckets
+            ]
+            request = request._replace(
+                preload_fn=None, async_fn_args=(rank, write_buckets, results_queue)
+            )
+        request.execute_sync()
+
+
 def _save_dist_checkpointing(sharded_state_dict, ckpt_path, async_save=False, content_metadata=None):
     """Save a distributed checkpoint using FullyParallel strategy."""
     os.makedirs(ckpt_path, exist_ok=True)
+    base_strategy = (
+        TorchDistSaveShardedStrategy(cpu_shm_mode=CPU_SHM_MODE)
+        if async_save
+        else _StreamingSyncSaveStrategy()
+    )
     save_strategy = FullyParallelSaveStrategyWrapper(
-        TorchDistSaveShardedStrategy(cpu_shm_mode=CPU_SHM_MODE),
+        base_strategy,
         mpu.get_data_parallel_group(with_context_parallel=True),
     )
     return dist_checkpointing.save(sharded_state_dict, ckpt_path,

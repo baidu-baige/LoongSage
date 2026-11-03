@@ -69,13 +69,16 @@ class TrainManager:
                 raise ValueError(f"critic.critic_warmup must be >= 0, got {self.config.critic.critic_warmup}")
             if self.config.opd.enable:
                 raise ValueError("critic.enable and opd.enable cannot be used together yet.")
+            if self.config.trainer.forward_only:
+                raise ValueError("critic.enable does not support trainer.forward_only.")
             for idx, ds in enumerate(self.config.data_sources):
                 if int(ds.num_trajectories_per_prompt) != 1:
                     raise ValueError(
                         f"PPO (critic.enable) currently requires num_trajectories_per_prompt == 1, "
                         f"got {ds.num_trajectories_per_prompt} for data_sources[{idx}]."
                     )
-        elif estimator == "gae":
+        elif estimator == "gae" and self.config.run_mode != "rollout-only":
+            # Rollout-only computes no advantages (the trainer turns the critic off there).
             raise ValueError("algorithm.advantage_estimator=gae requires critic.enable=true.")
 
     # ── worker-pool helpers ──────────────────────────────────────────────

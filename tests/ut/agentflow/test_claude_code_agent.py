@@ -165,7 +165,8 @@ async def test_close_interrupts_running_process() -> None:
     await agent.close()
 
     assert any(
-        sid == "sbx-9" and "pkill" in command for sid, command, _ in client.executed
+        sid == "sbx-9" and "coda-kill" in command and "[c]laude" in command
+        for sid, command, _ in client.executed
     )
 
 

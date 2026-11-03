@@ -1,6 +1,6 @@
 # Default configuration parameters for Coda. Users shall not edit this file.
 
-run_mode: default  # or "train-only" or "rollout-only"
+run_mode: default  # or "train-only" or "rollout-only" or "sft"
 seed: 42
 colocate: true
 checkpoint_path: ???  # Training model ckpt base dir: both output and resume input. The latest step is found via latest_checkpointed_iteration.txt.
@@ -20,7 +20,10 @@ fully_async:
 # Default values for each entry in data_sources below. Every data_source_unit
 # inherits these defaults; per-unit overrides take precedence.
 data_source:
-  sandbox: {type: none}
+  sandbox:
+    type: none
+    # concurrent multi-turn attempts; 0 = unlimited.
+    max_concurrency: 0
   dataset:
     # Path to the prompt dataset file (.jsonl or .parquet), or to a directory containing such files
     # (all of them are read, in sorted path order).
@@ -61,6 +64,8 @@ data_source:
     name: ???
   teacher_name: ""
   max_response_len_per_trajectory: 32768  # cap on response-area tokens (LLM replies + tool responses) per attempt. Single-turn uses this as request max_tokens; multi-turn agents receive it and choose their own per-call max_tokens.
+  # run_mode=sft only: keep the first sft_max_seq_len tokens of each rendered conversation (null = no limit).
+  sft_max_seq_len: null
   num_prompts_per_step: 64
   num_trajectories_per_prompt: 8
   completion_params: {}
@@ -197,6 +202,7 @@ megatron:
     chunked_optimizer_state_offload: false
     optimizer_state_offload_fraction: 1.0
     optimizer_state_offload_chunk_size_mb: 1024
+    optimizer_state_offload_chunk_masters: false
   scheduler:
     lr_warmup_steps: 0
     lr_decay_steps: 1
@@ -313,6 +319,11 @@ trainer:
   use_rollout_log_probs: false
   use_rollout_routing_replay: false
   use_fp32_lm_head: false
+  # Forward-only train worker: skip DDP (no grad buffer) and the optimizer/scheduler.
+  # The worker only holds weights and syncs them to the rollout engines, so it never
+  # runs backward. Use for rollout-only / inference-only runs to avoid the (large)
+  # gradient buffer allocation. Must be false for any run that trains.
+  forward_only: false
   temperature: 1.0
   mini_batch_size: 64    # num_prompts_per_step x num_trajectories_per_prompt / mini_batch_size = num_mini_batch
   micro_batch_size: 8
@@ -327,6 +338,12 @@ trainer:
   async_save: true
   save_checkpoint: true   # Save distributed checkpoint.
   save_hf: false          # Also export HuggingFace-format weights to train_step_{step}/hf_model.
+  # QAT against a rollout serving the checkpoint's own block-scaled FP8/MXFP4 format
+  # (coda/backends/megatron/qat.py; recipes in conf/dsv41_flash/). Formats are read from the
+  # hf_model_path checkpoint; weight sync (and save_hf) re-encode into that format whenever the
+  # checkpoint is quantized, independent of this switch. true: snap the quantized weights onto the
+  # grid after every optimizer step and fake-quant the inputs of the linears the rollout runs as W8A8.
+  qat: false
   env_vars:
     # Inject per-rank env vars into the train worker Ray actors (runtime_env).
     PYTORCH_ALLOC_CONF: expandable_segments:True

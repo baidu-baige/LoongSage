@@ -265,6 +265,10 @@ def compute_advantages_and_returns(
     """
     advantage_fn = get_advantage(config.advantage_estimator)
     advantages, returns = advantage_fn(config, rollout_data)
+    if config.advantage_estimator == "sft":
+        # SFT's advantage is a constant 1, so adv_zero_ratio carries no signal
+        # and the DP all-reduce below would be wasted.
+        return advantages, returns, {}
     if config.use_masked_whiten:
         advantages = masked_whiten(advantages, rollout_data["raw_loss_masks"])
     return advantages, returns, _advantage_metrics(advantages, returns, rollout_data)

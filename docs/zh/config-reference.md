@@ -73,6 +73,7 @@ Sandbox 后端配置属于数据源，可在单数据源模板 `data_source.sand
 | 参数 | 默认 | 说明 | 约束 |
 | --- | --- | --- | --- |
 | `sandbox.type` | `none` | 当前数据源的 sandbox 后端。 | 可选 `none` / `k8s` / `docker` / 已注册的自定义类型；需要 sandbox 的 agent 必须选择非 `none` 后端。 |
+| `sandbox.max_concurrency` | `0` | 当前数据源同时在用的 sandbox 上限，即同时在跑的 multi-turn attempt 数；超出的 trajectory 排队等待，`0` 表示不限。 | 由 AgentFlow 消费，不传给后端；`type: none` 时不生效。一个名额覆盖 attempt 的整个 sandbox 生命周期（创建 → agent 执行 → 删除），排队时间不计入 `sandbox_creation_timeout_seconds`。 |
 | `sandbox.command_exec_timeout_seconds` | 未设置 | sandbox 内单次命令执行超时（秒）。 | 由后端决定；内置 K8s 后端的兜底值为 120 秒。 |
 | `sandbox.sandbox_creation_timeout_seconds` | 未设置 | sandbox 实例创建超时（秒）。 | 由后端决定；内置 K8s 后端的兜底值为 120 秒。 |
 | `sandbox.working_dir` | 未设置 | sandbox 内默认工作目录。 | K8s 后端默认 `/rl-sandbox`，Docker 后端默认 `/testbed`；agent 调用可按命令覆盖。 |
@@ -335,6 +336,7 @@ OPD（On-Policy Distillation）在 RL 流程中额外挂载若干 teacher 模型
 | `trainer.use_rollout_log_probs` | `false` | 使用推理引擎返回的 `rollout_log_probs` 替代训练侧重算的 `old_log_probs`。 | 与 IS correction、M2PO 互斥。 |
 | `trainer.use_rollout_routing_replay` | `false` | 使用推理端记录的 MoE routing 结果做 replay。 | 用于对齐推理/训练 MoE 路由。 |
 | `trainer.use_fp32_lm_head` | `false` | LM head 是否使用 FP32 计算。 | 数值敏感场景可开启。 |
+| `trainer.forward_only` | `false` | 训练 worker 只做前向：不包 DDP（不分配梯度 buffer），也不构建 optimizer / LR scheduler。worker 只持有权重并同步给 rollout 引擎，每步仍重算 `old_log_probs` 并上报 IS / k3 等前向指标，但不做反向和参数更新。适合只评估训推一致性或只采样的场景，可省下梯度 buffer 与优化器状态的显存。 | `run_mode: rollout-only` 时自动置为 `true`，同时把 `critic.enable` 置为 `false`。不能与 `critic.enable` 同时开启，否则启动报错。权重从不更新，因此不支持保存：开启时需 `trainer.save_freq <= 0`，否则启动报错。任何需要训练的任务都必须为 `false`。 |
 | `trainer.temperature` | `1.0` | 采样温度。eval 轮次在 `rollout.eval.temperature` 非 `null` 时改用后者。 | 由 Router 管理，`completion_params.temperature` 不生效。 |
 | `trainer.mini_batch_size` | `64` | 每次 optimizer step 消费的 trajectory 数 `M`。`num_mini_batch = (B × N) / M`。 | `(B × N) % M == 0`；且每个数据源需满足 `num_prompts_per_step % (dp_size × num_mini_batch) == 0`。两者都启动即校验，满足后 `M % dp_size == 0` 自动成立。详见 [11.9](#119-dp-与-batch-尺寸)。 |
 | `trainer.micro_batch_size` | `8` | 每张 GPU 单次前向的样本数。 | 仅当 `use_dynamic_batch_size: false` 时要求 `mini_batch_size % micro_batch_size == 0`；开启动态 batch 后本项失效。 |
@@ -347,6 +349,7 @@ OPD（On-Policy Distillation）在 RL 流程中额外挂载若干 teacher 模型
 | `trainer.async_save` | `true` | 异步保存 checkpoint（保存线程与训练主循环并发）。 | 见 [模型加载与保存](model-checkpointing.md)。 |
 | `trainer.save_checkpoint` | `true` | 是否保存 megatron 分布式 checkpoint。 | 关闭后仅在 `save_hf: true` 时能恢复。 |
 | `trainer.save_hf` | `false` | 是否额外导出 HuggingFace 格式权重到 `train_step_{step}/hf_model`。 | 便于下游推理直接加载。 |
+| `trainer.qat` | `false` | 量化感知训练（QAT），让训练前向与按 checkpoint 原始量化格式（块缩放 FP8 / MXFP4，ue8m0 scale）运行的 rollout 对齐。开启后，每次 optimizer step 之后把量化权重原地 snap 到量化网格上，并对 rollout 中做 W8A8 的 linear 的输入做激活 fake-quant。量化格式从 `hf_model_path` 的 safetensors header 读取。 | `hf_model_path` 必须是量化 checkpoint，否则启动报错。只要 checkpoint 是量化格式，无论本项是否开启，权重同步和 `save_hf` 都会编码回原始格式（`save_hf` 输出与源 checkpoint 同 shard、同 dtype）。目前只在 DeepSeek-V4.1 + SGLang rollout 上验证过，该模型的 rollout 设置会在启动时校验。配方见 `conf/dsv41_flash/`。 |
 | `trainer.env_vars` | `{}` | 训练 worker 环境变量。 | — |
 
 ## 11. 常见组合与约束速查

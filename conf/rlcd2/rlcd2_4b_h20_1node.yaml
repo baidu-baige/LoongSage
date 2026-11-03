@@ -1,0 +1,127 @@
+# @package _global_
+# RLCD² on StartLux-Decision-v1.1-4B-AutoThink, single 8-GPU H20 node:
+# GPU 0-5 training + colocated rollout, GPU 6-7 frozen scorers (SGLang). Run the commands from LoongSage/.
+#
+# 1. Download the model and the benchmark:
+#      hf download startlux-models/StartLux-Decision-v1.1-4B-AutoThink \
+#        --local-dir /root/StartLux-Decision-v1.1-4B-AutoThink
+#      hf download startlux-models/DecisionPivot --repo-type=dataset --local-dir /root/DecisionPivot
+#
+# 2. Start the frozen scorers on GPU 6,7 (prints the url list used below):
+#      coda/custom/rlcd2/tools/launch_scorer.sh 6,7 30106 /root/StartLux-Decision-v1.1-4B-AutoThink
+#
+# 3. Build the data with the official inference package, which renders the prompts
+#    (train.jsonl, eval.jsonl, eval_small.jsonl; keeps items with max p0 < 0.9):
+#      git clone https://github.com/StartLuxLabs/StartLux-Decision.git /root/StartLux-Decision
+#      RLCD2_INFER_DIR=/root/StartLux-Decision python3 coda/custom/rlcd2/tools/build_rlcd2_data.py \
+#        --bench /root/DecisionPivot --model /root/StartLux-Decision-v1.1-4B-AutoThink \
+#        --scorer-url http://127.0.0.1:30106,http://127.0.0.1:30107 --out /root/rlcd2_data
+#
+# 4. Train (Ray takes GPU 0-5 for training + rollout):
+#      bash examples/start.sh rlcd2/rlcd2_4b_h20_1node \
+#        hf_model_path=/root/StartLux-Decision-v1.1-4B-AutoThink \
+#        data_source.dataset.prompt_data_path=/root/rlcd2_data/train.jsonl \
+#        data_source.dataset.eval_prompt_data_path=/root/rlcd2_data/eval_small.jsonl \
+#        'data_source.reward.scorer_urls="http://127.0.0.1:30106,http://127.0.0.1:30107"'
+defaults:
+  - /default
+  - _self_
+
+checkpoint_path: "./checkpoints"
+hf_model_path: ???
+ref_hf_model_path: ${hf_model_path}
+colocate: true
+total_steps: 200
+
+data_source:
+  dataset:
+    prompt_data_path: ???
+    eval_prompt_data_path: ???
+    input_key: prompt
+    label_key: label
+  agent:
+    name: rlcd2
+  reward:
+    name: rlcd2
+    model_path: ${hf_model_path}
+    scorer_urls: ???
+    rule: decision_weighted
+    lam: 1.0e-4
+    budget: 3072
+    empty_tokens: 8
+    max_concurrency: 128
+  num_prompts_per_step: 48
+  num_trajectories_per_prompt: 8
+  max_response_len_per_trajectory: 4096
+  completion_params:
+    top_p: 0.95
+    top_k: 20
+    stop: "</think>"
+
+rollout:
+  num_gpus_per_node: 6
+  sglang_args:
+    mem_fraction_static: 0.7
+    disable_cuda_graph: false
+  sglang_replicas:
+    regular:
+      num_nodes: 1
+      num_gpus_per_replica: 1
+  eval:
+    interval: 10
+
+agentflow:
+  dump_trajectory_path: "log/trajectories"
+  router:
+    middleware:
+      parser:
+        reasoning_parser: false
+  tokenizer:
+    custom_chat_template_path: rlcd2/rlcd2_chat_template.jinja
+    generation_prompt_kwargs:
+      enable_thinking: true
+
+trainer:
+  num_gpus_per_node: 6
+  num_nodes: 1
+  temperature: 0.6
+  mini_batch_size: 384
+  max_tokens_per_gpu: 16384
+  use_dynamic_batch_size: true
+  use_fp32_lm_head: true
+  save_freq: 50
+  save_hf: true
+
+megatron:
+  model:
+    tensor_model_parallel_size: 2
+    pipeline_model_parallel_size: 1
+    mtp_num_layers: null
+    attention_backend: flash
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 1
+    freeze_vision_model: true
+    freeze_vision_projection: true
+  optimizer:
+    lr: 1.0e-6
+
+algorithm:
+  advantage_estimator: rlcd2
+  rlcd2_adv_clip: 5.0
+  policy_loss: grpo
+  loss_agg_mode: token-mean
+  clip_ratio_low: 0.2
+  clip_ratio_high: 0.2
+  clip_ratio_c: 1.0e9
+  ref_kl:
+    enable: true
+    coef: 1.0e-3
+    kl_type: k3
+    update_interval: -1
+  is_correction:
+    enable: true
+    action: mask
+    level: token
+    lower_bound: 0.5
+    upper_bound: 2

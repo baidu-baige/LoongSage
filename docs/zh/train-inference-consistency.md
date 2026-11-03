@@ -4,7 +4,7 @@
 
 框架分三层应对：
 
-1. **源头对齐**：TITO 全链路 token 传递、R3 路由回放、FP32 LM head，直接缩小 `π_train` 与 `π_rollout` 的差距；
+1. **源头对齐**：TITO 全链路 token 传递、R3 路由回放、FP32 LM head，以及推理侧跑量化 checkpoint 时的 QAT，直接缩小 `π_train` 与 `π_rollout` 的差距；
 2. **算法层修正**：IS correction / M2PO / OPSM，对残余偏差加权或屏蔽；
 3. **持续监控**：`train/is_approx_k3_kl` 等指标量化两个引擎间的偏差。
 
@@ -38,7 +38,41 @@ R3（[arXiv:2510.11370](https://arxiv.org/abs/2510.11370)）针对 MoE 模型：
 
 `trainer.use_fp32_lm_head: true` 会将输出层（LM head）的权重与计算保持在 FP32（等价于 `megatron.keep_fp32_weights` 配置 `output_layer`）。bf16 下 logits 的舍入误差经 softmax 后直接进入 log_probs，可能成为 dense 模型训推概率偏差的重要来源；以 FP32 计算 LM head 可以降低这部分误差，代价是输出层额外的显存与计算。
 
-## 4.算法层修正
+## 4.量化感知训练（QAT）
+
+当推理侧直接跑量化 checkpoint 时（例如 DeepSeek-V4.1-Flash 的发布权重：dense 层为 FP8 e4m3、每 32x32 一个 ue8m0 scale，routed experts 为 MXFP4），bf16 训练与量化推理之间的精度差会成为训推偏差的主要来源。`trainer.qat: true` 让训练前向看到与推理相同的数值：
+
+- **权重**：每次 optimizer step 之后，把 checkpoint 中以量化格式存储的那些权重原地替换为“量化再反量化”后的值，fp32 master 权重不受影响，继续累积未量化的更新（等价于直通估计）。权重同步时再量化一次，结果与训练前向用的权重逐位相同。
+- **激活**：对推理侧做 W8A8 的 linear，训练侧在输入上用 SGLang 自己的量化 kernel 做 fake-quant（per-token、每 32 个元素一组、ue8m0 scale），反向梯度直接透传。推理侧本来就用 bf16 激活的层（如 MXFP4 experts）不做处理。
+
+量化格式从 `hf_model_path` 的 safetensors header 自动识别，无需手工配置。只要 checkpoint 是量化格式，无论是否开启 QAT，权重同步和 `save_hf` 都会编码回原始格式，`save_hf` 的输出可以直接替换源 checkpoint 使用；开启 `trainer.qat` 只影响训练侧。
+
+使用方式：`hf_model_path` 直接指向原始量化 checkpoint（不需要转成 bf16），推理侧从同一目录启动。DeepSeek-V4.1 的配方见 [dapo_h20_6node.yaml](../../conf/dsv41_flash/dapo_h20_6node.yaml)，其中以下 rollout 设置是 QAT 的前提，启动时会校验：
+
+```yaml
+rollout:
+  env_vars:
+    SGLANG_DSV4_FP4_EXPERTS: "1"                        # routed experts 按 MXFP4 运行
+    SGLANG_SHARED_EXPERT_TP1: "1"                       # shared experts 不切分，保证 32x32 块完整
+    SGLANG_OPT_FP8_WO_A_GEMM: "0"                       # wo_a 保持 bf16 激活
+  sglang_args:
+    json_model_override_args: '{"vision_n_layers": 0}'  # 以纯文本模型启动，否则 R3 拿不到路由
+    moe_runner_backend: flashinfer_mxfp4
+    flashinfer_mxfp4_moe_precision: bf16                # experts 为 W4A16，B200 上默认是 W4A8
+    disable_shared_experts_fusion: true                 # shared experts 作为 dense FP8 linear 运行
+trainer:
+  qat: true
+```
+
+注意事项：
+
+- `hf_model_path` 不是量化 checkpoint 时，开启 `trainer.qat` 会直接报错；
+- 目前只在 DeepSeek-V4.1 + SGLang rollout 上验证过，暂不训练 MTP，也不支持 vision；
+- 开启 `save_hf` 时每次都会写出一整份 checkpoint（含未训练的 vision / MTP 权重），完整模型需预留数百 GB 磁盘；
+- 激活对齐的是量化函数，两侧 GEMM 的实现与累加顺序仍不同，残余偏差仍需第 5 节的算法层修正处理；
+- 想评估 QAT 的收益，可以设 `trainer.qat: false` 跑一组对照：推理侧同样跑量化权重，训练侧不做 QAT，对比两者的 `train/is_approx_k3_kl`。
+
+## 5.算法层修正
 
 源头对齐无法完全消除偏差（精度与算子实现的差异仍在），也不覆盖异步 / partial rollout 引入的权重版本差；残余部分由算法层处理，详见[训练算法](./training-algorithms.md)第 1.3 节：
 
@@ -47,13 +81,13 @@ R3（[arXiv:2510.11370](https://arxiv.org/abs/2510.11370)）针对 MoE 模型：
 
 另一条路线是 `trainer.use_rollout_log_probs: true`：直接以 `π_rollout` 作为行为策略参与 policy loss，让比率 `π_θ / π_rollout` 隐式吸收训推差，省去 `old_log_probs` 重算；该开关与 IS correction、M2PO 互斥。
 
-## 5.监控指标
+## 6.监控指标
 
 在非 pure-GKD、且训练侧计算了 `old_log_probs` 时，框架总会上报以下指标；其中 clip/nan 指标仅在 IS correction 启用时出现：
 
 | 指标 | 含义 | 解读 |
 | --- | --- | --- |
-| `train/is_approx_k3_kl` | `π_old` 与 `π_rollout` 之间的 k3 KL 估计 | 持续增大说明训推偏差在恶化，应检查 R3 / 精度设置，或加强算法层修正 |
+| `train/is_approx_k3_kl` | `π_old` 与 `π_rollout` 之间的 k3 KL 估计 | 持续增大说明训推偏差在恶化，应检查 R3 / 精度设置（推理侧跑量化权重时检查是否开启 QAT），或加强算法层修正 |
 | `train/is_clip_ratio`、`train/is_nan_ratio` | IS 权重越界与 log-ratio 钳位的 token 占比 | 偏高说明 bounds 过紧或偏差过大 |
 | `rollout/partial_ratio`、`rollout/partial_span_max` | trajectory 跨越权重版本的比例与最大跨度 | 异步 / partial 场景的离策略程度，见[全异步模式](./fully-async-mode.md) |
 

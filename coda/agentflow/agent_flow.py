@@ -85,13 +85,15 @@ class AgentFlow:
         self.partial_rollout_enabled = self.config.rollout.partial
         self.mask_offpolicy_in_partial_rollout = self.config.rollout.mask_offpolicy_in_partial_rollout
         self.trajectory_store = TrajectoryStore()
-        # One stateless backend client per data source, shared by every trajectory
-        # of that source. Live sandbox ids are retained per trajectory across
-        # partial resume, along with the opaque reward-preparation data — when the
-        # reward function has any — produced for that exact container.
+        # ds_sandbox_clients: one shared sandbox client per data source.
+        # _sandbox_ids / _sandbox_contexts: per-trajectory sandbox id and its
+        # prepare_sandbox result, kept so partial resume reuses the same sandbox.
         self.ds_sandbox_clients: dict[int, SandboxClient | None] = {}
         self._sandbox_ids: dict[str, str] = {}
         self._sandbox_contexts: dict[str, dict[str, Any]] = {}
+        # Optional per-data-source cap (sandbox.max_concurrency) on sandboxes in use,
+        # i.e. on concurrent multi-turn attempts of that source.
+        self._ds_sandbox_sems: dict[int, asyncio.Semaphore] = {}
         self.router = None
         self.tokenizer_manager: BaseTokenizerManager | None = None
         self._active_tasks: set[asyncio.Task] = set()
@@ -196,8 +198,12 @@ class AgentFlow:
             self.ds_configs[idx] = ds_cfg
             rollout_mode = get_rollout_mode(ds_cfg)
 
-            sandbox_config = ds_cfg.get("sandbox")
+            sandbox_config = dict(ds_cfg.sandbox)
+            max_concurrency = int(sandbox_config.pop("max_concurrency"))
             self.ds_sandbox_clients[idx] = create_sandbox_client(sandbox_config)
+            if self.ds_sandbox_clients[idx] is not None and max_concurrency > 0:
+                self._ds_sandbox_sems[idx] = asyncio.Semaphore(max_concurrency)
+                logger.info("[init] ds[%d] sandbox max_concurrency=%d", idx, max_concurrency)
 
             # Agent
             if rollout_mode == _ROLLOUT_SINGLE_TURN:
@@ -440,6 +446,17 @@ class AgentFlow:
         return attempt_traj_template
 
     async def _execute_multi_turn(self, traj: Trajectory, attempt_id: int) -> Reward:
+        """Execute one multi-turn attempt, bounded by the source's sandbox.max_concurrency.
+
+        The slot covers the attempt's whole sandbox lifetime (setup_sandbox or the
+        agent's own create -> run -> release), so it caps sandboxes in use. An
+        asyncio semaphore is released on cancellation, so abort() cannot leak slots.
+        """
+        sandbox_sem = self._ds_sandbox_sems.get(traj.ds_index)
+        async with sandbox_sem or contextlib.nullcontext():
+            return await self._run_multi_turn_attempt(traj, attempt_id)
+
+    async def _run_multi_turn_attempt(self, traj: Trajectory, attempt_id: int) -> Reward:
         """Execute one multi-turn attempt via an Agent instance."""
         ds_index = traj.ds_index
         ds_cfg = self.ds_configs[ds_index]
@@ -450,10 +467,11 @@ class AgentFlow:
         max_response_len_per_trajectory = int(ds_cfg.max_response_len_per_trajectory)
 
         sandbox_client = self.ds_sandbox_clients.get(ds_index)
-        # The preparation result belongs to that exact sandbox instance, so it is
-        # retained with it and never recomputed after a partial resume.
+        # Reuse the sandbox and its prepare_sandbox result on partial resume;
+        # re-preparing would snapshot the already-modified workspace.
         sandbox_id = self._sandbox_ids.get(traj.trajectory_id)
         sandbox_context = self._sandbox_contexts.get(traj.trajectory_id, {})
+        resume = sandbox_id is not None
         agent = None
         keep_sandbox = False
         try:
@@ -472,8 +490,10 @@ class AgentFlow:
             )
             reward = await agent.run_trajectory({
                 "prompt": copy.deepcopy(_active_chat(traj)),
+                "initial_prompt": copy.deepcopy(traj.prompt),
                 "label": copy.deepcopy(traj.label),
                 "metadata": {**copy.deepcopy(traj.metadata), **sandbox_context},
+                "resume": resume,
             })
 
             attempts = self.trajectory_store.get(
@@ -500,7 +520,6 @@ class AgentFlow:
                 if agent is not None:
                     await agent.close()
             finally:
-                # The agent creates its own sandbox when no prepare_sandbox exists.
                 if agent is not None:
                     sandbox_id = agent.sandbox_id
                 if sandbox_id is not None:

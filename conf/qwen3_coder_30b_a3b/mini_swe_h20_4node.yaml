@@ -77,8 +77,6 @@ rollout:
     # skip_server_warmup: false
     # enable_fp32_lm_head: false
     # max_prefill_tokens: 16384
-  # env_vars:
-  #   SGLANG_RMSNORM_NO_PDL: "1"
   use_fault_tolerance: true
 
 agentflow:

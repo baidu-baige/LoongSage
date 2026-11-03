@@ -46,7 +46,7 @@ from coda.utils.memory_utils import print_memory, clear_memory
 from coda.utils.checkpoint_utils import (
     DIST_CKPT_DIR_NAME, find_latest_ckpt_path, update_latest, get_ckpt_dir,
 )
-from coda.backends.megatron.checkpoint import load_checkpoint, save_checkpoint
+from coda.backends.megatron.checkpoint import load_checkpoint, load_model_weights, save_checkpoint
 from coda.utils.types import to_torch_dtype
 from coda.utils.tracking import configure_tracking
 from coda.backends.megatron.mixed_precision import KeepFP32Module
@@ -162,6 +162,10 @@ class MegatronTrainWorker(TrainWorker):
         super().init(config, master_addr, master_port)
         configure_tracking(config)
 
+        # Forward-only: the worker never runs backward, so it is built without DDP
+        # (no grad buffer) and without optimizer/scheduler.
+        self._forward_only = config.trainer.forward_only
+
         # Step 2: parallel groups
         parallel_state.initialize_model_parallel(
             tensor_model_parallel_size=config.megatron.model.tensor_model_parallel_size,
@@ -238,31 +242,27 @@ class MegatronTrainWorker(TrainWorker):
         )
         self.model = provider.provide_distributed_model(
             ddp_config=megatron_ddp_config,
-            wrap_with_ddp=True,
+            wrap_with_ddp=not self._forward_only,
             mixed_precision_wrapper=partial(KeepFP32Module, config.megatron.keep_fp32_weights)
         )
-        logger.info(f"[Rank {self.rank}] Model created via Megatron-bridge")
+        logger.info(
+            f"[Rank {self.rank}] Model created via Megatron-bridge "
+            f"(forward_only={self._forward_only}, wrap_with_ddp={not self._forward_only})"
+        )
 
-        # Step 6: create optimizer
-        optimizer_config_dict = OmegaConf.to_container(config.megatron.optimizer)
-        hints = get_type_hints(MegatronOptimizerConfig)
-        for k, v in optimizer_config_dict.items():
-            hint = hints.get(k)
-            if hint is torch.dtype or hint is Optional[torch.dtype]:
-                    optimizer_config_dict[k] = to_torch_dtype(v)
-        megatron_opt_config = MegatronOptimizerConfig(**optimizer_config_dict)
-        self.optimizer = get_megatron_optimizer(megatron_opt_config, self.model)
-        self._register_training_hooks()
-        logger.info(f"[Rank {self.rank}] Optimizer created")
-
-        # Step 7: create learning rate scheduler
-        scheduler_config = OmegaConf.to_container(config.megatron.scheduler)
-        self.scheduler = OptimizerParamScheduler(self.optimizer, **scheduler_config)
-        logger.info(f"[Rank {self.rank}] LR scheduler created")
+        # Steps 6-7: optimizer + LR scheduler (none in forward-only mode)
+        if self._forward_only:
+            self.optimizer = None
+            self.scheduler = None
+        else:
+            self._build_optimizer()
 
         # Step 8: load checkpoint if exists
         if has_checkpoint:
-            load_checkpoint(self.model, self.optimizer, self.scheduler, ckpt_dir)
+            if self._forward_only:
+                load_model_weights(self.model, ckpt_dir)
+            else:
+                load_checkpoint(self.model, self.optimizer, self.scheduler, ckpt_dir)
             logger.info(f"[Rank {self.rank}] Checkpoint loaded from {ckpt_dir}")
         self.offloaded = False
         self.params_offloaded = False
@@ -274,6 +274,23 @@ class MegatronTrainWorker(TrainWorker):
         ``provide_distributed_model``, i.e. before the DDP grad buffers and the
         optimizer are built from the model's parameters. No-op by default.
         """
+
+    def _build_optimizer(self):
+        """Create the Megatron optimizer, register its training hooks, and the LR scheduler."""
+        optimizer_config_dict = OmegaConf.to_container(self.config.megatron.optimizer)
+        hints = get_type_hints(MegatronOptimizerConfig)
+        for k, v in optimizer_config_dict.items():
+            hint = hints.get(k)
+            if hint is torch.dtype or hint is Optional[torch.dtype]:
+                optimizer_config_dict[k] = to_torch_dtype(v)
+        megatron_opt_config = MegatronOptimizerConfig(**optimizer_config_dict)
+        self.optimizer = get_megatron_optimizer(megatron_opt_config, self.model)
+        self._register_training_hooks()
+        logger.info(f"[Rank {self.rank}] Optimizer created")
+
+        scheduler_config = OmegaConf.to_container(self.config.megatron.scheduler)
+        self.scheduler = OptimizerParamScheduler(self.optimizer, **scheduler_config)
+        logger.info(f"[Rank {self.rank}] LR scheduler created")
 
     def _register_training_hooks(self):
         "following https://github.com/NVIDIA/Megatron-LM/blob/core_v0.16.0/megatron/training/training.py#L2546-L2565"
@@ -374,6 +391,8 @@ class MegatronTrainWorker(TrainWorker):
         ``move_params=False`` never brings offloaded parameters back.
         """
         print_memory(f"before offload (move_params={move_params})")
+        # Forward-only has no grads/optimizer to free, so the params are all there is to release.
+        move_params = move_params or self._forward_only
         self._offload_model(move_params=move_params, move_grads=True)
         self._move_optimizer("cpu")
         clear_memory()
@@ -383,6 +402,15 @@ class MegatronTrainWorker(TrainWorker):
 
     def _offload_model(self, move_params: bool = True, move_grads: bool = True):
         """Offload model parameters and gradients to CPU."""
+        if self._forward_only:
+            # No DDP buffers: snapshot the plain params under the active tag and free them.
+            # Weights never change in forward-only mode, so one snapshot stays valid
+            # (and with ref-KL the existing "actor" snapshot is reused as-is).
+            if move_params:
+                if self._active_model_tag not in self._weights_backuper.backup_tags:
+                    self._weights_backuper.backup(self._active_model_tag)
+                self._weights_backuper.release()
+            return
         for model in self.model:
             for buffer in model.buffers + model.expert_parallel_buffers:
                 buffer.offload_to_cpu(move_params, move_grads)
@@ -390,6 +418,10 @@ class MegatronTrainWorker(TrainWorker):
 
     def _onload_model(self, move_params: bool = True, move_grads: bool = True):
         """Onload model parameters and gradients from CPU."""
+        if self._forward_only:
+            if move_params:
+                self._weights_backuper.restore(self._active_model_tag)
+            return
         for model in self.model:
             for buffer in model.buffers + model.expert_parallel_buffers:
                 buffer.reload_from_cpu(move_params, move_grads)
@@ -429,6 +461,8 @@ class MegatronTrainWorker(TrainWorker):
         pinned CPU buffers (H2D is implicit in the next ``step()``; no onload
         branch). Moments are offloader-owned and skipped below.
         """
+        if self.optimizer is None:  # forward-only
+            return
         if device == "cpu":
             # Hand masters back to the offloader's pinned CPU buffers; they are
             # invisible to the loops below (shard_fp32_from_float16_groups is None).

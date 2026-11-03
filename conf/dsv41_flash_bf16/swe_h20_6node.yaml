@@ -1,15 +1,35 @@
 # @package _global_
 #
-# mini-swe / R2E-Gym on DeepSeek-V4.1-Flash-BF16, 6-node H20.
+# mini-swe / R2E-Gym on DeepSeek-V4.1-Flash, 6-node H20 (6 x 8 = 48 GPUs).
 #
-# Set before launching: checkpoint_path, hf_model_path, data_source.dataset.prompt_data_path.
-# hf_model_path must point at the BF16 HF checkpoint produced by
-#   examples/convert_dsv41_to_bf16.py.
-# Both checkpoint_path and hf_model_path must live on storage reachable by every node.
+# Download the model and dataset first, then convert the model to BF16 weights
+# for training:
 #
-# Launch:
-#   bash examples/start_ray_cluster.sh <master-ip>   # on every node first
-#   bash examples/start.sh dsv41_flash_bf16/swe_h20_6node
+#   hf download deepseek-ai/DeepSeek-V4.1-Flash --local-dir /root/DeepSeek-V4.1-Flash
+#   hf download R2E-Gym/R2E-Gym-Subset --repo-type=dataset --local-dir /root/R2E-Gym-Subset
+#
+#   python examples/convert_dsv41_to_bf16.py \
+#     --src /root/DeepSeek-V4.1-Flash \
+#     --dst /root/DeepSeek-V4.1-Flash-BF16
+#
+# After conversion, prepare the kubeconfig required by the K8s sandbox used for SWE
+# rollouts. Place it at k8s/kubeconfig.yaml (the path configured by this preset), or
+# override it on the command line. Then launch the 6-node H20 preset
+# dsv41_flash_bf16/swe_h20_6node: bring up the Ray cluster on every node and submit
+# the training job from the head node only.
+#
+#   # Run the same command on every machine
+#   bash examples/start_ray_cluster.sh <master-ip>
+#
+#   # Once the cluster is ready, run this on the head node only
+#   bash examples/start.sh dsv41_flash_bf16/swe_h20_6node \
+#     checkpoint_path=/root/ckpt/dsv41_swe \
+#     hf_model_path=/root/DeepSeek-V4.1-Flash-BF16 \
+#     data_source.dataset.prompt_data_path=/root/R2E-Gym-Subset \
+#     data_source.sandbox.kubeconfig=/path/to/kubeconfig.yaml
+#
+# checkpoint_path and hf_model_path must live on storage that every node can reach
+# through the same path.
 defaults:
   - /default
   - _self_
@@ -50,7 +70,7 @@ data_source:
 rollout:
   env_vars:
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE: "1"
-    SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT: "private"
+    SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT: "per_rank"
     SGLANG_DSV4_FP4_EXPERTS: "0"
     SGLANG_OPT_FP8_WO_A_GEMM: "0"
     SGLANG_OPT_FUSE_WQA_WKV: "0"

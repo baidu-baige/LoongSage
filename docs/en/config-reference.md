@@ -73,6 +73,7 @@ Sandbox backend configuration belongs to a data source. Set it on the single-sou
 | Field | Default | Description | Constraints |
 | --- | --- | --- | --- |
 | `sandbox.type` | `none` | Sandbox backend for this data source. | One of `none` / `k8s` / `docker` / a registered custom type. An agent that requires a sandbox needs a non-`none` backend. |
+| `sandbox.max_concurrency` | `0` | Maximum number of sandboxes this data source uses at once, i.e. concurrent multi-turn attempts; extra trajectories wait in a queue. `0` means unlimited. | Consumed by AgentFlow and not passed to the backend; has no effect with `type: none`. One slot covers an attempt's whole sandbox lifetime (create → agent run → delete), and queueing time does not count toward `sandbox_creation_timeout_seconds`. |
 | `sandbox.command_exec_timeout_seconds` | not set | Timeout for one command inside the sandbox (seconds). | Backend-specific; the built-in K8s fallback is 120 seconds. |
 | `sandbox.sandbox_creation_timeout_seconds` | not set | Sandbox-instance creation timeout (seconds). | Backend-specific; the built-in K8s fallback is 120 seconds. |
 | `sandbox.working_dir` | not set | Default working directory inside the sandbox. | Backend default: `/rl-sandbox` for K8s, `/testbed` for Docker. An agent may override it per command. |
@@ -329,6 +330,7 @@ The `trainer` node controls batch organization, precision, timeouts and checkpoi
 | `trainer.use_rollout_log_probs` | `false` | Use `rollout_log_probs` returned by the inference engine instead of re-computing `old_log_probs` on the training side. | Mutually exclusive with IS correction and M2PO. |
 | `trainer.use_rollout_routing_replay` | `false` | Replay MoE routing recorded on the inference side. | Used to align rollout / training MoE routing. |
 | `trainer.use_fp32_lm_head` | `false` | Compute the LM head in FP32. | Enable in precision-sensitive settings. |
+| `trainer.forward_only` | `false` | Run the train workers forward-only: no DDP wrapper (no gradient buffer) and no optimizer / LR scheduler. The workers only hold the weights and sync them to the rollout engines. Each step still recomputes `old_log_probs` and reports the forward-side metrics such as IS / k3, but runs no backward pass and no update. Use it for runs that only measure train-inference consistency or only sample; it saves the memory of the gradient buffer and optimizer state. | Forced to `true` when `run_mode: rollout-only`, which also sets `critic.enable` to `false`. Cannot be combined with `critic.enable`, otherwise startup fails. Weights never change, so saving is not supported: with this on, `trainer.save_freq` must be `<= 0`, otherwise startup fails. Must be `false` for any run that trains. |
 | `trainer.temperature` | `1.0` | Sampling temperature. Eval rounds use `rollout.eval.temperature` instead when it is not `null`. | Router owns this value; `completion_params.temperature` is ignored. |
 | `trainer.mini_batch_size` | `64` | Trajectories `M` consumed per optimizer step. `num_mini_batch = (B × N) / M`. | `(B × N) % M == 0`; and every data source must satisfy `num_prompts_per_step % (dp_size × num_mini_batch) == 0`. Both are validated at startup, after which `M % dp_size == 0` holds automatically. See [11.9](#119-dp-and-batch-sizes). |
 | `trainer.micro_batch_size` | `8` | Samples per forward per GPU. | Only when `use_dynamic_batch_size: false` is `mini_batch_size % micro_batch_size == 0` required; with dynamic batching this field is ignored. |
@@ -341,6 +343,7 @@ The `trainer` node controls batch organization, precision, timeouts and checkpoi
 | `trainer.async_save` | `true` | Save checkpoints asynchronously (saver thread runs concurrently with training). | See [Model Loading and Saving](model-checkpointing.md). |
 | `trainer.save_checkpoint` | `true` | Whether to save the megatron distributed checkpoint. | If disabled, recovery only works when `save_hf: true`. |
 | `trainer.save_hf` | `false` | Also export HuggingFace-format weights to `train_step_{step}/hf_model`. | Convenient for downstream inference. |
+| `trainer.qat` | `false` | Quantization-aware training (QAT): align the training forward with a rollout that serves the checkpoint's own quantization format (block-scaled FP8 / MXFP4 with ue8m0 scales). When on, the quantized weights are snapped in place onto the quantization grid after every optimizer step, and the inputs of the linears the rollout runs as W8A8 are fake-quantized. Formats are read from the safetensors headers of `hf_model_path`. | `hf_model_path` must be a quantized checkpoint, otherwise startup fails. Whenever the checkpoint is quantized, weight sync and `save_hf` encode back into the original format regardless of this switch (`save_hf` then writes the same shards and dtypes as the source checkpoint). Only verified on DeepSeek-V4.1 with the SGLang rollout; for this model the rollout settings are validated at startup. Recipes: `conf/dsv41_flash/`. |
 | `trainer.env_vars` | `{}` | Environment variables for training workers. | — |
 
 ## 11. Cross-field constraints cheatsheet
@@ -440,10 +443,3 @@ With OPD enabled there are four divisibility rules on the teacher side, all vali
 - [Custom RL Algorithm Development Guide](custom-algorithm.md) / [Custom KL Algorithm Development Guide](custom-kl.md) / [Custom Sliding Window Strategy Development Guide](custom-sliding-window.md): algorithm-side extension points
 - [On-Policy Distillation](on-policy-distillation.md): OPD in detail
 - [Train-Inference Consistency](train-inference-consistency.md): training / inference alignment
-
-
-
-
-
-
-
