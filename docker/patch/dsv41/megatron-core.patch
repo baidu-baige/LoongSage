@@ -2388,10 +2388,10 @@ index 000000000..44e352437
 +    return DeepSeekV4SparseAttention.apply(q, kv, attn_sink, topk_idxs, sm_scale)
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/tilelang_sparse_mla_bwd.py b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/tilelang_sparse_mla_bwd.py
 new file mode 100644
-index 000000000..b3b2d9c3d
+index 000000000..c3b19a363
 --- /dev/null
 +++ b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/tilelang_sparse_mla_bwd.py
-@@ -0,0 +1,282 @@
+@@ -0,0 +1,283 @@
 +# ruff: noqa
 +import tilelang
 +import torch
@@ -2400,8 +2400,6 @@ index 000000000..b3b2d9c3d
 +
 +@tilelang.jit(out_idx=[-1])
 +def preprocess(
-+    B,
-+    S,
 +    H,
 +    D,
 +    block_ND=32,
@@ -2411,6 +2409,9 @@ index 000000000..b3b2d9c3d
 +):
 +    assert dtype == T.bfloat16
 +    assert accum_dtype == T.float32
++    # Batch/seq are symbolic so one compiled kernel serves every packed length.
++    B = T.dynamic("batch")
++    S = T.dynamic("seq_len")
 +    shape = [B, S, H, D]
 +
 +    @T.prim_func
@@ -2438,8 +2439,6 @@ index 000000000..b3b2d9c3d
 +
 +@tilelang.jit(out_idx=[-1])
 +def postprocess(
-+    B,
-+    S_kv,
 +    D,
 +    block_N=64,
 +    threads=128,
@@ -2448,6 +2447,8 @@ index 000000000..b3b2d9c3d
 +):
 +    assert dtype == T.bfloat16
 +    assert accum_dtype == T.float32
++    B = T.dynamic("batch")
++    S_kv = T.dynamic("seq_len_kv")
 +    dkv_shape = [B, S_kv, D]
 +
 +    @T.prim_func
@@ -2473,9 +2474,6 @@ index 000000000..b3b2d9c3d
 +    },
 +)
 +def bwd(
-+    B,
-+    S,
-+    S_kv,
 +    H,
 +    D,
 +    topk,
@@ -2495,6 +2493,9 @@ index 000000000..b3b2d9c3d
 +        sm_scale = D ** (-0.5)
 +    sm_scale_mul_reciprocal_log2 = sm_scale * 1.44269504  # log2(e)
 +
++    B = T.dynamic("batch")
++    S = T.dynamic("seq_len")
++    S_kv = T.dynamic("seq_len_kv")
 +    q_shape = [B, S, H, D]
 +    kv_shape = [B, S_kv, D]
 +    o_shape = [B, S, H, D]
@@ -2663,9 +2664,9 @@ index 000000000..b3b2d9c3d
 +        topk_idxs = torch.cat([topk_idxs, pad], dim=-1).contiguous()
 +        topk = padded_topk
 +
-+    preprocess_kernel = preprocess(B, S, H, D)
-+    bwd_kernel = bwd(B, S, S_kv, H, D, topk, sm_scale)
-+    postprocess_kernel = postprocess(B, S_kv, D)
++    preprocess_kernel = preprocess(H, D)
++    bwd_kernel = bwd(H, D, topk, sm_scale)
++    postprocess_kernel = postprocess(D)
 +
 +    delta = preprocess_kernel(o, do)
 +    dkv = torch.zeros_like(kv, dtype=torch.float32)
