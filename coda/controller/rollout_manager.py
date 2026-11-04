@@ -4,6 +4,7 @@ This module provides classes for managing inference engines,
 including replicas and health monitoring.
 """
  
+import contextlib
 import dataclasses
 import logging
  
@@ -86,6 +87,8 @@ class RolloutManager:
 
         if all_init_handles:
             ray.get(all_init_handles)
+        for replica_group in replica_groups:
+            replica_group.mark_ready()
  
         return replica_groups
 
@@ -152,9 +155,21 @@ class RolloutManager:
     def onload_kv(self):
         """Onload only the KV cache for all rollout engines."""
         self.onload(tags=[GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH])
- 
+
     def recover_faulty_engines(self):
         """Restart any dead rollout engines and update num_new_engines for update_weights detection."""
+        # Wait for a kill the health monitor may have in progress.
+        with contextlib.ExitStack() as stack:
+            for r in self.replica_groups:
+                stack.enter_context(r.lock)
+            self._recover_faulty_engines()
+
+    def _recover_faulty_engines(self):
+        # Catch engines that died after the monitor's last probe.
+        for r, monitor in zip(self.replica_groups, self._health_monitors):
+            if monitor.is_checking_enabled():
+                r.kill_unresponsive_engines()
+
         # Record dead indices per replica before starting.
         dead_per_replica = [[i for i, engine in enumerate(r.all_engines) if engine is None] for r in
                             self.replica_groups]
@@ -166,6 +181,8 @@ class RolloutManager:
             all_handles.extend(handles)
         if all_handles:
             ray.get(all_handles)
+        for r in self.replica_groups:
+            r.mark_ready()
  
         # Post-recovery: offload then onload weights for newly created engines.
         release_handles = []

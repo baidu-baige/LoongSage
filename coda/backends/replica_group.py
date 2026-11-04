@@ -1,6 +1,7 @@
 """Replica group."""
 
 import logging
+import threading
  
 import ray
 from typing import Any
@@ -28,6 +29,9 @@ class ReplicaGroup:
 
         self.num_new_engines = 0
         self.all_engines = num_engines * [None]
+        self.ready = num_engines * [False]
+        # Shared by the health monitor thread and recovery.
+        self.lock = threading.RLock()
         # Bundle index (into scheduler.reorder_bundle_list) each engine slot was placed on.
         # Recorded on first allocation so a recovered engine lands back on the same GPUs.
         self.engine_bundle_indices: list[int | None] = num_engines * [None]
@@ -45,6 +49,27 @@ class ReplicaGroup:
     def engines(self):
         """Node-0 engines only (for multi-node serving)."""
         return self.all_engines[:: self._nodes_per_engine]
+
+    def _slots(self, rollout_engine_id: int) -> range:
+        """all_engines indices of one engine (one per node it spans)."""
+        return range(rollout_engine_id * self._nodes_per_engine, (rollout_engine_id + 1) * self._nodes_per_engine)
+
+    def is_ready(self, rollout_engine_id: int) -> bool:
+        """Whether every node of the engine has finished init()."""
+        return all(self.ready[i] for i in self._slots(rollout_engine_id))
+
+    def mark_ready(self) -> None:
+        """Record that the init() handles from start_engines() have all returned."""
+        self.ready = [engine is not None for engine in self.all_engines]
+
+    def kill_engine_with_lock(self, rollout_engine_id: int, engine) -> bool:
+        """Kill the engine unless its slot now holds a different actor. Returns True if killed."""
+        with self.lock:
+            if self.all_engines[self._slots(rollout_engine_id)[0]] is not engine:
+                logger.info(f"Rollout engine {rollout_engine_id} was already restarted, not killing it")
+                return False
+            self.kill_engine(rollout_engine_id=rollout_engine_id)
+            return True
  
     def start_engines(
         self,
@@ -127,23 +152,43 @@ class ReplicaGroup:
         Args:
             rollout_engine_id: The ID of the engine to kill.
         """
-        logger.info(f"Killing replica group {rollout_engine_id}...")
-        for i in range(
-            rollout_engine_id * self._nodes_per_engine,
-            (rollout_engine_id + 1) * self._nodes_per_engine,
-        ):
-            engine = self.all_engines[i]
-            if engine:
-                logger.info(f"Shutting down and killing engine at index {i}")
-                try:
-                    ray.get(engine.shutdown.remote())
-                    ray.kill(engine)
-                    logger.info(f"Successfully killed engine at index {i}")
-                except Exception as e:
-                    logger.warning(f"Fail to kill engine at index {i} (e: {e})")
-            else:
-                logger.info(f"Engine at index {i} is already None")
-            self.all_engines[i] = None
+        with self.lock:
+            logger.info(f"Killing replica group {rollout_engine_id}...")
+            for i in self._slots(rollout_engine_id):
+                self.ready[i] = False
+                engine = self.all_engines[i]
+                if engine:
+                    logger.info(f"Shutting down and killing engine at index {i}")
+                    try:
+                        ray.get(engine.shutdown.remote(), timeout=180)
+                    except Exception as e:
+                        logger.warning(f"Shutdown of engine at index {i} failed, killing it anyway (e: {e})")
+                    try:
+                        ray.kill(engine)
+                        logger.info(f"Successfully killed engine at index {i}")
+                    except Exception as e:
+                        logger.warning(f"Fail to kill engine at index {i} (e: {e})")
+                else:
+                    logger.info(f"Engine at index {i} is already None")
+                self.all_engines[i] = None
+
+    def kill_unresponsive_engines(self, timeout: float = 30.0) -> None:
+        """Probe every live engine once; kill the ones that do not answer."""
+        probes = []
+        for rollout_engine_id, engine in enumerate(self.engines):
+            if engine is None:
+                continue
+            ref = engine.health_generate.remote(timeout=timeout)
+            probes.append((rollout_engine_id, engine, ref))
+
+        for rollout_engine_id, engine, ref in probes:
+            try:
+                ray.get(ref, timeout=timeout + 60)
+            except Exception as e:
+                logger.error(
+                    f"Rollout engine {rollout_engine_id} did not answer a health probe, restarting it (e: {e})"
+                )
+                self.kill_engine_with_lock(rollout_engine_id, engine)
 
     def offload(self, tags: list[str] | None = None):
         """Fire release_memory_occupation on all engines (non-blocking).

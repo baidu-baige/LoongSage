@@ -279,6 +279,12 @@ class Router:
     async def add_worker(self, payload: WorkerPayload) -> JSONResponse:
         """Register a worker URL (and its attention-DP group count) for routing."""
         worker_url = payload.worker_url
+        if worker_url in self.dead_workers:
+            # A restarted engine took the port of an excluded one.
+            for slot in self._slots_of(worker_url):
+                self.slot_request_counts.pop(slot, None)
+            self.dead_workers.discard(worker_url)
+            del self.worker_dp_size[worker_url]
         if worker_url in self.worker_dp_size:
             return JSONResponse(
                 status_code=status.HTTP_409_CONFLICT,
@@ -391,6 +397,9 @@ class Router:
                     "status_code": response.status_code,
                     "error": response.text,
                 }
+            except httpx.ConnectError as exc:
+                logger.warning("[abort] worker %s unreachable, nothing to abort: %s", worker_url, exc)
+                return None
             except Exception as exc:
                 failure = {"worker": worker_url, "error": str(exc)}
 

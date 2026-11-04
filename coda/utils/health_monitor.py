@@ -56,6 +56,9 @@ class RolloutHealthMonitor:
         self._check_interval = 30
         self._check_timeout = 30
         self._check_first_wait = 60
+        self._max_consecutive_failures = 2
+        # rollout_engine_id -> (probed actor, consecutive failures)
+        self._consecutive_failures: dict[int, tuple[object, int]] = {}
         self._need_first_wait = True  # Need to wait after each resume
         self._is_checking_enabled = False  # Track if health checking should be active
 
@@ -121,6 +124,7 @@ class RolloutHealthMonitor:
             return
         logger.info("Resuming health monitor...")
         self._need_first_wait = True  # Need to wait after each resume
+        self._consecutive_failures.clear()
         self._pause_event.clear()
         self._is_checking_enabled = True
 
@@ -178,6 +182,9 @@ class RolloutHealthMonitor:
         if engine is None:
             logger.info(f"Skipping health check for engine {rollout_engine_id} (None)")
             return
+        if not self._replica_group.is_ready(rollout_engine_id):
+            logger.info(f"Skipping health check for engine {rollout_engine_id} (initializing)")
+            return
 
         # Record pause state before blocking call; pause/resume may happen during ray.get()
         was_paused = self._pause_event is not None and self._pause_event.is_set()
@@ -191,11 +198,22 @@ class RolloutHealthMonitor:
                     f"Health check failed, but paused/disabled, will not kill engine:{rollout_engine_id}."
                 )
                 return
+            last_engine, failures = self._consecutive_failures.get(rollout_engine_id, (None, 0))
+            failures = failures + 1 if last_engine is engine else 1
+            self._consecutive_failures[rollout_engine_id] = (engine, failures)
+            if failures < self._max_consecutive_failures:
+                logger.warning(
+                    f"Health check failed for rollout engine {rollout_engine_id} "
+                    f"({failures}/{self._max_consecutive_failures}), will retry. Exception: {e}"
+                )
+                return
             logger.error(
-                f"Health check failed for rollout engine {rollout_engine_id} "
+                f"Health check failed for rollout engine {rollout_engine_id} {failures} times in a row "
                 f"(ray timeout or error). Killing actor. Exception: {e}"
             )
-            self._replica_group.kill_engine(rollout_engine_id=rollout_engine_id)
+            self._consecutive_failures.pop(rollout_engine_id, None)
+            self._replica_group.kill_engine_with_lock(rollout_engine_id, engine)
         else:
+            self._consecutive_failures.pop(rollout_engine_id, None)
             logger.info(f"Health check passed for rollout engine {rollout_engine_id}")
 
