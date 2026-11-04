@@ -432,6 +432,9 @@ class RolloutSampler:
         ``rollout/*`` always covers the whole batch. With more than one data source
         configured, each source additionally reports ``rollout_per_ds/ds{ds_index}_*``.
         """
+        if any(t.status == TrajectoryStatus.FAILED for t in traj_group.trajectories):
+            return
+
         # Initialize metrics for this step (and free memory from previous steps).
         # Raw accumulators live at the top level; "per_ds" holds one bucket per source.
         if step not in self.metrics:
