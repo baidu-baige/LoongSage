@@ -7,8 +7,9 @@ Two formats, described by a :class:`QuantScheme` (``block`` = elements covered b
     e8m0 [O, I/bc]); two codes per byte, LOW nibble = even column.
 
 With ue8m0 scales ``dequant(quant(w))`` is exactly representable in bf16 and is a fixed point:
-re-quantizing a snapped tensor reproduces the same values, so snapping the training weights (QAT)
-and re-quantizing them at export time agree bit for bit.
+re-quantizing a snapped tensor with any quantizer on the same grid (same tiles, ceil-pow2 scale,
+round-to-nearest) reproduces the same values, so what the bridge re-quantizes at export time
+dequantizes to exactly the snapped training weights (QAT).
 
 :func:`read_ckpt_quant` recovers the per-tensor scheme of a safetensors checkpoint from its headers
 alone (dtype + shape of every ``X.weight`` / ``X.scale`` pair), without reading tensor data.
@@ -16,12 +17,11 @@ alone (dtype + shape of every ``X.weight`` / ``X.scale`` pair), without reading 
 
 from __future__ import annotations
 
-import json
-import os
-import struct
 from dataclasses import dataclass
 
 import torch
+
+from coda.utils.hf_ckpt import read_source_layout
 
 FP8_MAX = 448.0
 FP4_MAX = 6.0
@@ -53,15 +53,22 @@ def e8m0_to_float(scale: torch.Tensor) -> torch.Tensor:
 
 # ---------------------------------------------------------------- FP8 e4m3, (br, bc) tiles
 
-def quant_fp8_block(w: torch.Tensor, block: tuple[int, int] = (32, 32)) -> tuple[torch.Tensor, torch.Tensor]:
-    """[O, I] float -> (e4m3 [O, I], e8m0 [O/br, I/bc]); O, I must be multiples of the tile."""
+def _round_fp8_block(w: torch.Tensor, block: tuple[int, int]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """[O, I] -> (e4m3 [O/br, br, I/bc, bc], fp32 scale broadcastable to it, e8m0 [O/br, I/bc])."""
     (O, I), (br, bc) = w.shape, block
     assert O % br == 0 and I % bc == 0, f"fp8 {br}x{bc} blocks need aligned dims, got {tuple(w.shape)}"
     x = w.float().view(O // br, br, I // bc, bc)
     amax = x.abs().amax(dim=(1, 3)).clamp_min(AMAX_FLOOR)
     scale, scale_e8m0 = _exp_to_scale(_ceil_pow2_exponent(amax / FP8_MAX))
-    q = (x / scale[:, None, :, None]).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
-    return q.view(O, I), scale_e8m0
+    scale = scale[:, None, :, None]
+    q = (x / scale).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
+    return q, scale, scale_e8m0
+
+
+def quant_fp8_block(w: torch.Tensor, block: tuple[int, int] = (32, 32)) -> tuple[torch.Tensor, torch.Tensor]:
+    """[O, I] float -> (e4m3 [O, I], e8m0 [O/br, I/bc]); O, I must be multiples of the tile."""
+    q, _, scale_e8m0 = _round_fp8_block(w, block)
+    return q.view(w.shape), scale_e8m0
 
 
 def dequant_fp8_block(q: torch.Tensor, scale: torch.Tensor, dtype=torch.bfloat16) -> torch.Tensor:
@@ -81,14 +88,22 @@ def _round_e2m1(x: torch.Tensor) -> torch.Tensor:
     return torch.round(mag / step) * step * torch.sign(x)
 
 
-def quant_mxfp4(w: torch.Tensor, group: int = 32) -> tuple[torch.Tensor, torch.Tensor]:
-    """[O, I] float -> (int8 [O, I/2] packed e2m1, e8m0 [O, I/group]); I must be a multiple of group."""
+def _round_mxfp4(w: torch.Tensor, group: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """[O, I] -> (e2m1 grid values as fp32 [O, I/group, group], fp32 scale broadcastable to it,
+    e8m0 [O, I/group])."""
     O, I = w.shape
     assert I % group == 0, f"mxfp4 g{group} needs in-dim % {group} == 0, got {tuple(w.shape)}"
     x = w.float().view(O, I // group, group)
     amax = x.abs().amax(dim=-1).clamp_min(AMAX_FLOOR)
     scale, scale_e8m0 = _exp_to_scale(_ceil_pow2_exponent(amax / FP4_MAX))
-    v = _round_e2m1((x / scale[..., None]).clamp(-FP4_MAX, FP4_MAX)).view(O, I)
+    scale = scale[..., None]
+    return _round_e2m1((x / scale).clamp(-FP4_MAX, FP4_MAX)), scale, scale_e8m0
+
+
+def quant_mxfp4(w: torch.Tensor, group: int = 32) -> tuple[torch.Tensor, torch.Tensor]:
+    """[O, I] float -> (int8 [O, I/2] packed e2m1, e8m0 [O, I/group]); I must be a multiple of group."""
+    v, _, scale_e8m0 = _round_mxfp4(w, group)
+    v = v.view(w.shape)
     # magnitude -> code: grid is {0,.5,1,1.5,2,3,4,6}
     mag = v.abs()
     code = torch.where(mag <= 2.0, mag * 2, torch.where(mag <= 4.0, mag + 2, torch.full_like(mag, 7.0)))
@@ -128,8 +143,12 @@ class QuantScheme:
 
     @torch.no_grad()
     def snap_(self, w: torch.Tensor) -> torch.Tensor:
-        """Overwrite ``w`` in place with ``dequant(quant(w))``."""
-        w.copy_(self.dequant(*self.quant(w), dtype=w.dtype))
+        """Overwrite ``w`` in place with ``dequant(quant(w))``, computed without packing to codes."""
+        if self.kind == "fp8_block":
+            v, scale, _ = _round_fp8_block(w, self.block)
+        else:
+            v, scale, _ = _round_mxfp4(w, self.block[1])
+        w.copy_((v.float() * scale).view(w.shape))
         return w
 
 
@@ -145,24 +164,6 @@ class CkptQuant:
 _SCALE_SUFFIX = ".scale"
 
 
-def _safetensors_headers(path: str) -> dict[str, dict]:
-    """Tensor name -> {"dtype", "shape"} for a safetensors checkpoint dir (headers only)."""
-    index = os.path.join(path, "model.safetensors.index.json")
-    if os.path.exists(index):
-        with open(index) as f:
-            files = sorted(set(json.load(f)["weight_map"].values()))
-    else:
-        files = sorted(f for f in os.listdir(path) if f.endswith(".safetensors"))
-    out: dict[str, dict] = {}
-    for fname in files:
-        with open(os.path.join(path, fname), "rb") as f:
-            (n,) = struct.unpack("<Q", f.read(8))
-            header = json.loads(f.read(n))
-        header.pop("__metadata__", None)
-        out.update(header)
-    return out
-
-
 def read_ckpt_quant(path: str) -> dict[str, CkptQuant]:
     """Weight name -> :class:`CkptQuant` for every ``X.weight`` stored with an ``X.scale`` companion.
 
@@ -171,26 +172,26 @@ def read_ckpt_quant(path: str) -> dict[str, CkptQuant]:
     ``mxfp4`` groups of ``2*Ip/sI``. Only e8m0 scales are supported (raises otherwise), since only
     power-of-two scales make the snapped bf16 weights exact.
     """
-    headers = _safetensors_headers(path)
+    layout = read_source_layout(path)
     out: dict[str, CkptQuant] = {}
-    for scale_name, sh in headers.items():
+    for scale_name, sh in layout.items():
         if not scale_name.endswith(_SCALE_SUFFIX):
             continue
         name = scale_name[: -len(_SCALE_SUFFIX)] + ".weight"
-        wh = headers.get(name)
+        wh = layout.get(name)
         if wh is None:
             continue
-        if sh["dtype"] != "F8_E8M0" or len(sh["shape"]) != 2 or len(wh["shape"]) != 2:
+        if sh.dtype != "F8_E8M0" or len(sh.shape) != 2 or len(wh.shape) != 2:
             raise NotImplementedError(f"{name}: unsupported quantized layout weight={wh} scale={sh}")
-        (O, I), (sO, sI) = wh["shape"], sh["shape"]
-        if wh["dtype"] == "F8_E4M3":
+        (O, I), (sO, sI) = wh.shape, sh.shape
+        if wh.dtype == "F8_E4M3":
             kind, logical_i = "fp8_block", I
-        elif wh["dtype"] in ("I8", "U8") and sO == O:
+        elif wh.dtype in ("I8", "U8") and sO == O:
             kind, logical_i = "mxfp4", 2 * I
         else:
             raise NotImplementedError(f"{name}: unsupported quantized layout weight={wh} scale={sh}")
         if O % sO or logical_i % sI:
-            raise NotImplementedError(f"{name}: scale {sh['shape']} does not tile weight [{O}, {logical_i}]")
+            raise NotImplementedError(f"{name}: scale {list(sh.shape)} does not tile weight [{O}, {logical_i}]")
         scheme = QuantScheme(kind, (O // sO, logical_i // sI))
         out[name] = CkptQuant(scheme, scale_name, (O, logical_i))
     return out

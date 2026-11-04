@@ -104,6 +104,23 @@ def test_other_tiles_fixed_point(scheme):
     torch.testing.assert_close(scheme.snap_(snapped.clone()), snapped, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("scheme", [FP8, FP4, QuantScheme("fp8_block", (1, 32))])
+def test_bridge_requant_of_snapped_is_exact(scheme):
+    """The bridge's export quantizer (ties toward smaller magnitude, amax floor 2^-127 instead of
+    AMAX_FLOOR) reproduces snapped weights exactly, so the rollout gets the training weights."""
+    qu = pytest.importorskip("megatron.bridge.models.conversion.quantization_utils")
+    w = _rand(128, 256)
+    w[32:64, 64:128] *= 1e-6  # blocks below AMAX_FLOOR
+    snapped = scheme.snap_(w.clone())
+    _, s = scheme.quant(snapped)
+    like = torch.empty(s.shape, dtype=s.dtype, device="meta")
+    if scheme.kind == "mxfp4":
+        bq, bs = qu.quantize_mxfp4_e2m1_like_scale(snapped, like, block_size=scheme.block[1])
+    else:
+        bq, bs = qu.quantize_fp8_e4m3fn_like_scale(snapped, like, block_size=scheme.block[0])
+    torch.testing.assert_close(scheme.dequant(bq, bs, torch.float32), snapped.float(), rtol=0, atol=0)
+
+
 def test_read_ckpt_quant(tmp_path):
     from safetensors.torch import save_file
 

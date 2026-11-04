@@ -1,10 +1,11 @@
 """Save trained weights as a drop-in replacement of a source safetensors checkpoint.
 
 :func:`save_like_source` writes every tensor of the source checkpoint into the same shard files
-with the same names, dtypes and shapes: trained tensors come from the caller (already encoded
-into the source format, e.g. FP8 weight + ``.scale``), every other tensor (vision tower, MTP,
-untrained tables, ...) is byte-copied from the source. Non-weight files (config, tokenizer, code)
-and the index are copied verbatim, so the result loads exactly like the source checkpoint.
+with the same names, dtypes and shapes: trained tensors come from the caller (already quantized
+into the source format by the bridge export, e.g. FP8 weight + ``.scale``), every other tensor
+(vision tower, MTP, engram embed table, ...) is byte-copied from the source. Non-weight files
+(config, tokenizer, code) and the index are copied verbatim, so the result loads exactly like the
+source checkpoint.
 
 Shards are streamed: a trained tensor is buffered (on CPU) only until its shard is complete, and
 copied tensors are moved in fixed-size chunks without materializing them.
@@ -123,7 +124,8 @@ def save_like_source(named_tensors: Iterable[tuple[str, torch.Tensor]], src_dir:
     """Write ``out_dir`` as ``src_dir`` with the tensors in ``expected`` replaced.
 
     ``named_tensors`` must yield exactly the names in ``expected``, each in the source dtype/shape
-    (float tensors are cast to the source float dtype; quantized ones must already be encoded).
+    (float tensors are cast to the source float dtype; tensors the source stores quantized must
+    already arrive quantized, weight and ``.scale`` alike).
     """
     layout = read_source_layout(src_dir)
     unknown = sorted(expected - layout.keys())
