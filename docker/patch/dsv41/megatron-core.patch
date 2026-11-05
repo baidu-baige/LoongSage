@@ -2677,10 +2677,10 @@ index 000000000..c3b19a363
 +    return dq, dkv, d_attn_sink
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/tilelang_sparse_mla_fwd.py b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/tilelang_sparse_mla_fwd.py
 new file mode 100644
-index 000000000..643e4343a
+index 000000000..e8a833a58
 --- /dev/null
 +++ b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/tilelang_sparse_mla_fwd.py
-@@ -0,0 +1,190 @@
+@@ -0,0 +1,194 @@
 +# ruff: noqa
 +import tilelang
 +import torch
@@ -2692,6 +2692,10 @@ index 000000000..643e4343a
 +    pass_configs={
 +        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
 +        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
++        # With NI == 2 and num_stages == 1 (topk 128, the SWA-only layers) the pipeline is fully
++        # peeled; shared-memory reuse then places the reduce_sum AllReduce scratch on S_shared with
++        # no barrier before the S_shared store -> cross-warp race, wrong/nondeterministic o/lse.
++        tilelang.PassConfigKey.TL_DISABLE_SHARED_MEMORY_REUSE: True,
 +    },
 +)
 +def sparse_mqa_fwd(
