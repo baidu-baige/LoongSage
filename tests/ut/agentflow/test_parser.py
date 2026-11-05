@@ -601,30 +601,6 @@ def test_append_routed_experts_grows_buffer_in_place() -> None:
     assert merged[:, 0].tolist() == [0] * 7 + [1, 1, 2, 2]
 
 
-def test_compact_segment_reuses_parent_r3_prefix() -> None:
-    """A compact segment copies the routing rows of the prefix it shares with its parent."""
-    parser = make_parser()
-    parser.accumulate_reasoning = True
-    trajectory = Trajectory(
-        trajectory_id="traj-reuse",
-        prompt_id="p",
-        tokens=[1, 2, 3, 4, 5],
-        segments=[Segment(token_start=0, token_end=5, segment_id=0, origin="compact")],
-        rollout_routed_experts=torch.arange(10, dtype=torch.uint8).reshape(5, 2),
-    )
-
-    assert parser._r3_reuse_from_parent(trajectory, 0, [1, 2, 3, 9, 9, 9]) == (3, 0)
-    trajectory.segments[0].origin = "root"
-    assert parser._r3_reuse_from_parent(trajectory, 0, [1, 2, 3, 9]) == (0, 0)
-
-    trajectory.segments[0].origin = "compact"
-    trajectory.tokens.extend([1, 2, 3, 9])
-    chunk = torch.full((1, 2), 99, dtype=torch.uint8)  # rows from start_len=3 (+terminal)
-    parser._append_routed_experts(trajectory, chunk, True, reuse_len=3, reuse_from=0)
-    assert trajectory.rollout_routed_experts[5:8].tolist() == [[0, 1], [2, 3], [4, 5]]
-    assert trajectory.rollout_routed_experts.size(0) == len(trajectory.tokens)
-
-
 def test_build_assistant_message_decodes_weight_version() -> None:
     """Request-level SGLang weight_version should be decoded from meta_info."""
     parser = make_parser(r3_enabled=False)

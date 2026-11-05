@@ -136,9 +136,6 @@ agentflow:
     # R3 only. Processes that parse /generate bodies and decode routed experts off the
     # router event loop; 0 decodes inline.
     r3_decode_workers: 0
-    # R3 only. A new (compact) segment copies the routing rows of the prefix it shares with
-    # its parent instead of having SGLang re-send them.
-    r3_reuse_parent_prefix: true
     middleware:
       parser:
 

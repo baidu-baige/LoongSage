@@ -46,7 +46,6 @@ class ParserMiddleware(BaseHTTPMiddleware):
         tool_call_parser: ParserConfig = None,
         inflight_requests: Any = None,
         ds_configs: dict[int, Any] | None = None,
-        r3_reuse_parent_prefix: bool = True,
         r3_decode_workers: int = 0,
         shutdown_callbacks: list | None = None,
     ):
@@ -74,7 +73,6 @@ class ParserMiddleware(BaseHTTPMiddleware):
             r3_enabled=r3_enabled,
             reasoning_parser=reasoning_parser,
             tool_call_parser=tool_call_parser,
-            r3_reuse_parent_prefix=r3_reuse_parent_prefix,
         )
 
     async def dispatch(self, request: Request, call_next):

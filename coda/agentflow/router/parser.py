@@ -185,10 +185,6 @@ class TurnInputContext:
     start_new_segment: bool
     raw_new_messages: list[dict[str, Any]]
     routed_experts_start_len: int = 0
-    # New segment only: copy this many R3 rows from routed_experts_reuse_from instead of
-    # having SGLang re-send them (see _r3_reuse_from_parent).
-    routed_experts_reuse_len: int = 0
-    routed_experts_reuse_from: int = 0
     tools: list[dict[str, Any]] | None = None
 
     # --- Segment-tree addressing (new) ---
@@ -389,19 +385,6 @@ def decode_generate_body(
     return response_json, routed_experts
 
 
-def _common_prefix_len(a: list[int], b: list[int], n: int, chunk: int = 4096) -> int:
-    """Length of the common prefix of a[:n] and b[:n], comparing chunk-sized slices in C."""
-    lo = 0
-    while lo < n:
-        hi = min(lo + chunk, n)
-        if a[lo:hi] != b[lo:hi]:
-            while a[lo] == b[lo]:
-                lo += 1
-            return lo
-        lo = hi
-    return n
-
-
 def _parse_weight_version(raw: Any) -> int:
     """Validate the worker-reported rollout weight version.
 
@@ -437,13 +420,11 @@ class TrajectoryParser:
         r3_enabled: bool = False,
         reasoning_parser: str | bool | dict[str, Any] | None = None,
         tool_call_parser: str | bool | dict[str, Any] | None = None,
-        r3_reuse_parent_prefix: bool = True,
     ):
         self.trajectory_store = trajectory_store
         self.tokenizer_manager = tokenizer_manager
         self.accumulate_reasoning = accumulate_reasoning
         self.r3_enabled = r3_enabled
-        self.r3_reuse_parent_prefix = r3_reuse_parent_prefix
         self.model_family = getattr(tokenizer_manager, "model_family", None)
         self.think_tags = getattr(tokenizer_manager, "think_tags", DEFAULT_THINK_TAGS)
         self.think_end_ids: list[int] = list(getattr(tokenizer_manager, "think_end_ids", []))
@@ -609,49 +590,17 @@ class TrajectoryParser:
                                trajectory.trajectory_id, len(input_ids))
         # Comparison form, same as the case-1 store.
         trajectory.metadata[_NORMALIZED_HISTORY_KEY] = self._history_compare_form(trajectory, normalized_messages)
-        reuse_len, reuse_from = self._r3_reuse_from_parent(trajectory, active_id, input_ids)
         return TurnInputContext(
             delta_prompt_ids=input_ids,
             input_ids=input_ids,
             start_new_segment=True,
             raw_new_messages=copy.deepcopy(messages),
-            routed_experts_start_len=reuse_len,
-            routed_experts_reuse_len=reuse_len,
-            routed_experts_reuse_from=reuse_from,
             tools=turn_tools,
             target_segment_id=len(trajectory.segments),
             new_segment_parent_id=active_id,
             new_segment_origin="compact",
             new_segment_depth=0,
         )
-
-    def _r3_reuse_from_parent(
-        self, trajectory: Trajectory, parent_id: int, input_ids: list[int]
-    ) -> tuple[int, int]:
-        """R3 rows a new segment can copy from its parent: ``(reuse_len, parent_row_start)``.
-
-        Routing is causal, so positions whose tokens match the parent's prefix route the same
-        and SGLang only needs to send rows from ``reuse_len`` on. Off when think was pruned
-        (stored tokens no longer match the routed context) and for a root parent: siblings
-        share the root prompt, and SGLang may serve another sibling's cached routing for it.
-        """
-        experts = trajectory.rollout_routed_experts
-        if (
-            not self.r3_enabled
-            or not self.r3_reuse_parent_prefix
-            or not self.accumulate_reasoning
-            or experts is None
-        ):
-            return 0, 0
-        parent = trajectory.segments[parent_id]
-        if parent.origin == "root":
-            return 0, 0
-        parent_tokens = trajectory.tokens[parent.token_start:parent.token_end]
-        # Leave out the parent's synthetic terminal row and at least one row for SGLang.
-        n = min(len(parent_tokens), len(input_ids), experts.size(0) - parent.token_start) - 1
-        if n <= 0:
-            return 0, 0
-        return _common_prefix_len(parent_tokens, input_ids, n), parent.token_start
 
     async def _build_continuation_input(
         self,
@@ -849,9 +798,7 @@ class TrajectoryParser:
 
         if self.r3_enabled and payload.routed_experts is not None:
             self._append_routed_experts(
-                trajectory, payload.routed_experts, turn_ctx.start_new_segment,
-                reuse_len=turn_ctx.routed_experts_reuse_len,
-                reuse_from=turn_ctx.routed_experts_reuse_from,
+                trajectory, payload.routed_experts, turn_ctx.start_new_segment
             )
         segment_messages = copy.deepcopy(turn_ctx.raw_new_messages + [assistant_message])
         active_id = trajectory.active_segment_id
@@ -1344,23 +1291,19 @@ class TrajectoryParser:
         trajectory: Trajectory,
         routed_experts_chunk: torch.Tensor,
         start_new_segment: bool = False,
-        reuse_len: int = 0,
-        reuse_from: int = 0,
     ) -> None:
         """Extend the rollout routing map with a new turn's chunk.
 
         Continuation strips the previous synthetic terminal (SGLang re-captures that
         position as a prompt token this turn). A new segment must NOT strip it: its
         prompt is re-tokenized fresh, so that placeholder is never re-captured — keep it
-        so shape[0] stays aligned with len(tokens) per segment. With ``reuse_len`` the new
-        segment's first rows are copied from ``base[reuse_from:reuse_from + reuse_len]``.
+        so shape[0] stays aligned with len(tokens) per segment.
         """
         base = trajectory.rollout_routed_experts
         if base is None:
             merged = routed_experts_chunk.clone()
         elif start_new_segment:
-            reused = (base[reuse_from:reuse_from + reuse_len],) if reuse_len > 0 else ()
-            merged = _r3_append_rows(base, base.size(0), *reused, routed_experts_chunk)
+            merged = _r3_append_rows(base, base.size(0), routed_experts_chunk)
         else:
             merged = _r3_append_rows(base, base.size(0) - 1, routed_experts_chunk)
         if merged.size(0) > 1:
