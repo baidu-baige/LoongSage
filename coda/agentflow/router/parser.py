@@ -693,7 +693,6 @@ class TrajectoryParser:
     def build_assistant_message(
         self,
         response_json: dict[str, Any],
-        routed_experts_start_len: int = 0,
         tools: list[dict[str, Any]] | None = None,
         routed_experts: torch.Tensor | None = None,
     ) -> tuple[LLMGenerateResponse, dict[str, Any], str | None]:
@@ -701,8 +700,8 @@ class TrajectoryParser:
 
         Extracts response_ids/logprobs, applies reasoning and tool_call parsing,
         and returns (payload, assistant_message, finish_reason_override).
-        ``routed_experts`` is the R3 chunk already decoded by decode_generate_body; when
-        absent, a base64 map still in meta_info is decoded here.
+        ``routed_experts`` is the R3 chunk already decoded by decode_generate_body; it is
+        required when R3 is enabled.
         """
         meta = response_json.get("meta_info") or {}
         split = meta.pop(_SPLIT_LOGPROBS_KEY, None)
@@ -714,11 +713,14 @@ class TrajectoryParser:
             response_ids = [int(item[1]) for item in output_token_logprobs]
         if not response_ids:
             raise ValueError("output_token_logprobs missing from llm worker response")
+        if self.r3_enabled and routed_experts is None:
+            raise ValueError(
+                "R3 is enabled but the llm worker response has no usable routed_experts "
+                "(check SGLang return_routed_experts support)"
+            )
 
         weight_version = _parse_weight_version(meta.get("weight_version"))
         generated_text: str = response_json.get("text") or ""
-        if routed_experts is None and self.r3_enabled:
-            routed_experts = _decode_response_r3(meta, routed_experts_start_len)
 
         payload = LLMGenerateResponse(
             generated_text=generated_text,

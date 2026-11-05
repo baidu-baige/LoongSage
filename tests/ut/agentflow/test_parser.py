@@ -282,13 +282,13 @@ def test_deepseek_v4_process_initializer_wraps_worker_tokenizer(tmp_path) -> Non
     assert prompt.endswith("<｜Assistant｜></think>")
 
 
-def make_parser() -> TrajectoryParser:
+def make_parser(r3_enabled: bool = True) -> TrajectoryParser:
     """Create a parser with the minimum tokenizer stub needed for construction."""
     tokenizer = SimpleNamespace(system_prompt_len=0)
     return TrajectoryParser(
         trajectory_store=TrajectoryStore(),
         tokenizer_manager=tokenizer,
-        r3_enabled=True,
+        r3_enabled=r3_enabled,
     )
 
 
@@ -543,9 +543,18 @@ def test_decode_generate_body_splits_logprobs_and_appends_terminal_row() -> None
     meta = response_json["meta_info"]
     assert "routed_experts" not in meta and "output_token_logprobs" not in meta
     assert torch.equal(experts, torch.tensor([[1, 2], [3, 4], [5, 6], [5, 6]], dtype=torch.uint8))
-    payload, _, _ = make_parser().build_assistant_message(response_json, 1, routed_experts=experts)
+    payload, _, _ = make_parser().build_assistant_message(response_json, routed_experts=experts)
     assert payload.response_ids == [101, 102] and payload.logprobs == [-0.1, -0.2]
     assert payload.routed_experts is experts
+
+
+def test_build_assistant_message_rejects_missing_r3_when_enabled() -> None:
+    """With R3 on, a response without decoded routed experts must fail during rollout."""
+    with pytest.raises(ValueError, match="routed_experts"):
+        make_parser().build_assistant_message({
+            "text": "hi",
+            "meta_info": {"weight_version": "1", "output_token_logprobs": [[-0.1, 101]]},
+        })
 
 
 def test_decode_generate_body_skips_r3_for_abort_with_malformed_payload() -> None:
@@ -618,7 +627,7 @@ def test_compact_segment_reuses_parent_r3_prefix() -> None:
 
 def test_build_assistant_message_decodes_weight_version() -> None:
     """Request-level SGLang weight_version should be decoded from meta_info."""
-    parser = make_parser()
+    parser = make_parser(r3_enabled=False)
 
     payload, _, _ = parser.build_assistant_message({
         "text": "hi",
@@ -933,7 +942,7 @@ def test_build_assistant_message_splits_reasoning_and_tool_calls() -> None:
 
 def test_update_trajectory_records_weight_versions() -> None:
     """Trajectory bookkeeping should keep token-level versions aligned with logprobs."""
-    parser = make_parser()
+    parser = make_parser(r3_enabled=False)
     trajectory = Trajectory(
         trajectory_id="traj-version",
         prompt_id="prompt-0",
@@ -968,7 +977,7 @@ def test_update_trajectory_records_weight_versions() -> None:
 
 def test_build_assistant_message_rejects_negative_weight_version() -> None:
     """-1 is the prompt-token / unset sentinel, so it must not come back as a real version."""
-    parser = make_parser()
+    parser = make_parser(r3_enabled=False)
 
     with pytest.raises(ValueError, match="weight_version must be >= 0"):
         parser.build_assistant_message({
@@ -1010,7 +1019,7 @@ def test_append_triplet_preserves_zero_weight_version() -> None:
 @pytest.mark.parametrize("bad_version", [None, "abc"])
 def test_build_assistant_message_rejects_non_numeric_weight_version(bad_version: object) -> None:
     """Non-numeric weight_version values should fail fast."""
-    parser = make_parser()
+    parser = make_parser(r3_enabled=False)
 
     with pytest.raises(ValueError, match="weight_version must be int or str"):
         parser.build_assistant_message({
@@ -1442,7 +1451,7 @@ def test_append_triplet_subagent_placeholder_does_not_touch_flat_arrays() -> Non
 
 def test_update_trajectory_subagent_placeholder_skips_chat_and_weight_version() -> None:
     """Placeholder turns must not enter chat_completions or move weight-version scalars."""
-    parser = make_parser()
+    parser = make_parser(r3_enabled=False)
     trajectory = Trajectory(
         trajectory_id="traj-subagent-update",
         prompt_id="prompt-0",
