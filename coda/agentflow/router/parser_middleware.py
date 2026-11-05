@@ -2,7 +2,6 @@
 
 import asyncio
 import http
-import json
 import logging
 import traceback
 from collections import Counter, defaultdict
@@ -10,7 +9,7 @@ from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from typing import Any, Callable, cast
 
-import orjson
+import orjson as json
 from fastapi import status
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -237,7 +236,7 @@ class ParserMiddleware(BaseHTTPMiddleware):
             return adapter.build_streaming_response(final_content)
 
         return Response(
-            content=json.dumps(final_content).encode("utf-8"),
+            content=json.dumps(final_content),
             status_code=response.status_code,
             headers={"content-type": "application/json"},
             media_type="application/json",
@@ -311,7 +310,7 @@ class ParserMiddleware(BaseHTTPMiddleware):
             payload["return_routed_experts"] = True
             payload["routed_experts_start_len"] = routed_experts_start_len
 
-        return orjson.dumps(payload)
+        return json.dumps(payload)
 
     async def _read_response_body(self, response: Response) -> bytes:
         # Buffer all chunks from the LLM worker's StreamingResponse. Currently we wait for
@@ -393,8 +392,7 @@ class ParserMiddleware(BaseHTTPMiddleware):
                             media_type=response.media_type)
 
         payload, assistant_message, finish_reason_override = self.parser.build_assistant_message(
-            response_json, turn_ctx.routed_experts_start_len, turn_ctx.tools,
-            routed_experts=routed_experts,
+            response_json, turn_ctx.tools, routed_experts=routed_experts,
         )
         if response_json.get("choices"):
             response_json["choices"][0]["message"] = assistant_message

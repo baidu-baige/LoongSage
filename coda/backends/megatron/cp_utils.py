@@ -264,12 +264,12 @@ def prepare_routing_replay_data(
     routed_experts_list: list[torch.Tensor],
     model_config: TransformerConfig,
     pad_multiplier: int = 128,
-    device: torch.device | int | None = None,
 ) -> torch.Tensor | None:
     """CP/TP-slice routed experts for the whole batch, matching the model's packed inputs.
 
-    Packing runs where the inputs live (CPU for the compact uint8 map). With *device*, only
-    this rank's slice is moved there and widened to int64, the dtype Megatron's top-k uses.
+    Packing runs where the inputs live (CPU for the compact uint8 map). Only this rank's
+    slice is moved to the current CUDA device and widened to int64, the dtype Megatron's
+    top-k uses.
     """
     tp_size = mpu.get_tensor_model_parallel_world_size()
     tp_rank = mpu.get_tensor_model_parallel_rank()
@@ -302,9 +302,7 @@ def prepare_routing_replay_data(
         end = seqlen // tp_size * (tp_rank + 1)
         packed = packed[start:end]
 
-    if device is not None:
-        packed = packed.to(device=device, dtype=torch.long)
-    return packed
+    return packed.to(device=torch.cuda.current_device(), dtype=torch.long)
 
 
 def gather_and_reconstruct_cp(
