@@ -1,4 +1,4 @@
-FROM lmsysorg/sglang:v0.5.21
+FROM lmsysorg/sglang:v0.5.23
 
 WORKDIR /sgl-workspace
 
@@ -8,13 +8,12 @@ RUN pip config set global.break-system-packages true
 
 # compile
 RUN MAX_JOBS=128 pip install -v --no-build-isolation --config-settings "--build-option=--cpp_ext" --config-settings "--build-option=--cuda_ext" git+https://github.com/NVIDIA/apex.git
-RUN MAX_JOBS=128 pip install --no-build-isolation causal-conv1d==1.6.1 mamba-ssm==2.3.1
+RUN MAX_JOBS=128 pip install --no-build-isolation causal-conv1d==1.6.1
 RUN MAX_JOBS=128 NVTE_FRAMEWORK=pytorch NVTE_BUILD_THREADS_PER_JOB=4 pip install -v --no-build-isolation git+https://github.com/NVIDIA/TransformerEngine.git@v2.16
 
 # pip only
-RUN pip install ray[default]==2.54.0 omegaconf==2.3.1 hydra-core==1.3.4
-RUN pip install --ignore-installed mlflow==3.14.0
-RUN pip install wandb==0.28.0 weave==0.53.1
+RUN pip install ray[default]==2.54.0 hydra-core==1.3.8
+RUN pip install mlflow-skinny==3.16.0 wandb==0.28.0
 RUN pip install nvidia-resiliency-ext==0.6.0
 
 # git
@@ -32,7 +31,7 @@ RUN ARCH="$(uname -m)" && case "$ARCH" in \
 
 # for dsv4
 RUN pip install --no-build-isolation git+https://github.com/Dao-AILab/fast-hadamard-transform.git@v1.1.0.post2
-RUN pip install nvidia-cuda-cccl==13.3.3.4.1
+RUN pip install nvidia-cuda-cccl==13.3.4.3.1
 RUN CPATH=/opt/sglang/lib/python3.12/site-packages/nvidia/cu13/include/cccl pip install --no-build-isolation git+https://github.com/deepseek-ai/FlashMLA@nv_dev
 
 # for qwen3.8
@@ -46,6 +45,6 @@ RUN pip install qwen-vl-utils==0.0.14
 RUN git clone https://github.com/baidu-baige/LoongSage.git && cd LoongSage && pip install --no-deps --no-build-isolation -e .
 
 # patch
-RUN cd /sgl-workspace/sglang && git apply ../LoongSage/docker/patch/sglang-0.5.21.patch
+RUN cd /sgl-workspace/sglang && git apply ../LoongSage/docker/patch/sglang-0.5.23.patch
 RUN cd /sgl-workspace/Megatron-LM && git apply ../LoongSage/docker/patch/dsv41/megatron-core.patch
 RUN cd /sgl-workspace/Megatron-Bridge && git apply ../LoongSage/docker/patch/dsv41/megatron-bridge.patch
