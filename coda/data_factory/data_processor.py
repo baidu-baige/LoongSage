@@ -18,11 +18,13 @@ from array import array
 from typing import Any
 from collections import defaultdict
 
+import numpy as np
 import ray
 import torch
 
 from coda.agentflow.trajectory_store import TrajectoryGroup
 from coda.utils.seqlen_balancing import get_seqlen_balanced_partitions
+from coda.utils.tree_pack_utils import TREE_ATTN_PAIR_COST, TREE_LEVEL_COST
 
 
 logger = logging.getLogger(__name__)
@@ -45,6 +47,41 @@ def _get_group_partition_loads(groups: list[TrajectoryGroup]) -> list[int]:
     return [group.segment_count * token_scale + group.token_length for group in groups]
 
 
+def _lcp(a: np.ndarray, b: np.ndarray) -> int:
+    m = min(len(a), len(b))
+    diff = np.flatnonzero(a[:m] != b[:m])
+    return int(diff[0]) if diff.size else m
+
+
+def _tree_trajectory_cost(traj) -> float:
+    """Estimated tree cost of a trajectory packed as one tree (branch points as in
+    ``tree_batch.chain_branch_points``): nodes + attention pairs + GDN levels."""
+    tokens = np.asarray(traj.tokens)
+    nodes = pairs = 0.0
+    levels = 1
+    prev, prev_bp = None, 0
+    for seg in traj.segments:
+        if not seg.trainable:
+            continue
+        row = tokens[seg.token_start:seg.token_end]
+        n = len(row)
+        if n == 0:
+            continue
+        bp = 0 if prev is None else min(_lcp(prev, row), n - 1)
+        if bp == 0 or bp < prev_bp:
+            bp = 0                     # chain restart
+        nodes += n - bp
+        pairs += (n * (n + 1) - bp * (bp + 1)) / 2
+        levels += 1
+        prev, prev_bp = row, bp
+    return nodes + TREE_ATTN_PAIR_COST * pairs + TREE_LEVEL_COST * levels
+
+
+def _get_group_tree_loads(groups: list[TrajectoryGroup]) -> list[int]:
+    """Estimated tree cost per group (shared prefixes counted once)."""
+    return [int(sum(_tree_trajectory_cost(t) for t in g.trajectories)) for g in groups]
+
+
 class Box:
     """Lightweight wrapper that holds a single ray.ObjectRef.
 
@@ -60,8 +97,12 @@ def split_traj_group_by_dp(
     traj_groups: list[TrajectoryGroup],
     dp_size: int,
     num_mini_batch: int,
+    tree_cost: bool = False,
 ) -> list[list[TrajectoryGroup]]:
     """Split traj_groups by DP rank with ds_index-stratified balancing.
+
+    Load = Segment count then tokens, or with ``tree_cost`` the estimated tree cost (under
+    tree packing a rank's work follows its nodes).
 
     Guarantees:
     1. Each DP rank receives the same ds_index proportion
@@ -73,6 +114,7 @@ def split_traj_group_by_dp(
     3. Within each DP shard, further partition each ds group into num_mini_batch parts and interleave
     """
 
+    load_fn = _get_group_tree_loads if tree_cost else _get_group_partition_loads
     ds_groups = defaultdict(list)
     for group in traj_groups:
         ds_idx = group.trajectories[0].ds_index
@@ -82,7 +124,7 @@ def split_traj_group_by_dp(
     dp_shards = [[] for _ in range(dp_size)]
     for ds_idx in sorted(ds_groups.keys()):
         groups = ds_groups[ds_idx]
-        seqlen_list = _get_group_partition_loads(groups)
+        seqlen_list = load_fn(groups)
         index_parts = get_seqlen_balanced_partitions(seqlen_list, dp_size, equal_size=True)
         for rank, part in enumerate(index_parts):
             dp_shards[rank].extend([groups[i] for i in part])
@@ -96,7 +138,7 @@ def split_traj_group_by_dp(
         partitions_by_ds = {}
         for ds_idx in sorted(rank_ds_groups.keys()):
             groups = rank_ds_groups[ds_idx]
-            seqlen_list = _get_group_partition_loads(groups)
+            seqlen_list = load_fn(groups)
             index_parts = get_seqlen_balanced_partitions(seqlen_list, num_mini_batch, equal_size=True)
             partitions_by_ds[ds_idx] = [[groups[i] for i in part] for part in index_parts]
 

@@ -296,6 +296,30 @@ trainer:
   # runs backward. Use for rollout-only / inference-only runs to avoid the (large)
   # gradient buffer allocation. Must be false for any run that trains.
   forward_only: false
+  # Tree training: pack a trajectory's Segment rows so shared prefixes are computed once
+  # (training forward and the old-log-prob pass). Pays off when consecutive rows of a
+  # trajectory share long prefixes. Needs CP=1, no OPD, attention_backend=flash, dynamic
+  # batching and a model with explicit mRoPE position_ids; otherwise it falls back to rows
+  # with a warning.
+  tree_pack: false
+  # Tree cut points: min_cost (cheapest estimated cost) or greedy (fill each tree).
+  tree_cut: min_cost
+  # Node budget per tree micro-batch (null = max_tokens_per_gpu). Trees hold fewer
+  # activations per token than rows, so a larger budget usually fits; tune per parallel
+  # config and GPU memory.
+  tree_max_nodes_per_gpu: null
+  # Logit rows (response tokens) per tree and micro-batch (null = max_tokens_per_gpu, the
+  # row-wise logits size); bounds the last PP stage under large node budgets.
+  tree_max_lm_rows_per_gpu: null
+  # Run the LM head only on the loss rows (off automatically with MTP).
+  tree_lm_head_rows: true
+  # Log tree/r3_mismatch_* in training (diagnostic, CPU cost grows with R3 mismatches).
+  tree_r3_stats: true
+  # GDN core: tokens one serial call is worth vs re-read prefix tokens (0 = one call per
+  # tree depth). Same math either way.
+  tree_gdn_level_tokens: 16000
+  # Balance DP shards by estimated tree cost (train-only replays are rebalanced too).
+  tree_dp_balance: true
   temperature: 1.0
   mini_batch_size: 64    # num_prompts_per_step x num_trajectories_per_prompt / mini_batch_size = num_mini_batch
   micro_batch_size: 8

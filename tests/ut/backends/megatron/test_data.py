@@ -575,3 +575,136 @@ class TestGetDataIteratorDynamic:
         with patch("coda.backends.megatron.data.dist.all_reduce"):
             with pytest.raises(AssertionError):
                 _iter(cfg, MagicMock(), data)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# get_data_iterator — tree node budgets (trainer.tree_pack)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _caterpillar_rollout(n_traj: int, n_rows: int, spine0: int, grow: int, thorn: int) -> dict:
+    """Trajectories whose consecutive rows share a growing prefix (distinct values per traj)."""
+    tokens, tid = [], []
+    for t in range(n_traj):
+        base = 100_000 * (t + 1)
+        spine = list(range(base, base + spine0))
+        for k in range(n_rows):
+            spine = spine + list(range(base + 50_000 + k * grow, base + 50_000 + (k + 1) * grow))
+            th = list(range(base + 90_000 + k * thorn, base + 90_000 + (k + 1) * thorn))
+            tokens.append(torch.tensor(spine + th))
+            tid.append(t)
+    lengths = [int(x.numel()) for x in tokens]
+    return {"tokens": tokens, "loss_masks": [torch.ones(n) for n in lengths],
+            "total_lengths": lengths, "response_lengths": [thorn] * len(lengths),
+            "dp_local_traj_idx": tid}
+
+
+class TestGetDataIteratorTreeBudget:
+    def _cfg(self, budget, mbs, cut="min_cost", tree_cap=None, lm_cap=None, lm_rows=True):
+        cfg = MagicMock()
+        cfg.use_dynamic_batch_size = True
+        cfg.mini_batch_size = mbs
+        cfg.max_tokens_per_gpu = budget
+        opts = {"tree_cut": cut, "tree_max_nodes_per_gpu": tree_cap,
+                "tree_max_lm_rows_per_gpu": lm_cap, "tree_lm_head_rows": lm_rows}
+        cfg.get.side_effect = lambda k, d=None: opts.get(k, d)
+        return cfg
+
+    def _mbs(self, iterators, n):
+        return [iterators[0].get_next(["dp_local_traj_idx"])["dp_local_traj_idx"] for _ in range(n)], \
+            iterators[0].micro_batch_indices
+
+    def test_node_budget_needs_fewer_micro_batches_than_rows(self):
+        _set_parallel()
+        data = _caterpillar_rollout(4, n_rows=6, spine0=400, grow=100, thorn=50)
+        cfg = self._cfg(budget=2000, mbs=4)
+        with patch("coda.backends.megatron.data.dist.all_reduce"):
+            _, rows_mbs = _iter(cfg, MagicMock(), data)
+            it, tree_mbs = _iter(cfg, MagicMock(), data, tree_budget=True)
+        assert tree_mbs[0] < rows_mbs[0]
+        idx = it[0].micro_batch_indices
+        assert sorted(r for mb in idx for r in mb if r >= 0) == list(range(len(data["tokens"])))
+        for mb in idx:     # rows sorted, so a trajectory's rows stay in order inside each mb
+            assert mb == sorted(mb)
+
+    def test_groups_respect_node_budget(self):
+        from coda.backends.megatron.tree_batch import chain_branch_points
+        _set_parallel()
+        data = _caterpillar_rollout(2, n_rows=8, spine0=600, grow=200, thorn=100)
+        budget = 1800
+        with patch("coda.backends.megatron.data.dist.all_reduce"):
+            it, _ = _iter(self._cfg(budget, 2), MagicMock(), data, tree_budget=True)
+        for mb in it[0].micro_batch_indices:
+            toks = [data["tokens"][r] for r in mb]
+            bp = chain_branch_points(toks, [data["dp_local_traj_idx"][r] for r in mb])
+            nodes = sum(int(t.numel()) - b for t, b in zip(toks, bp))
+            assert nodes <= budget or len(mb) == 1, (mb, nodes)
+
+    def test_min_cost_cut_never_more_nodes_than_greedy(self):
+        from coda.backends.megatron.tree_batch import chain_branch_points
+        _set_parallel()
+        data = _caterpillar_rollout(3, n_rows=10, spine0=300, grow=250, thorn=120)
+        out = {}
+        for cut in ("greedy", "min_cost"):
+            with patch("coda.backends.megatron.data.dist.all_reduce"):
+                it, _ = _iter(self._cfg(2500, 3, cut), MagicMock(), data, tree_budget=True)
+            idx = it[0].micro_batch_indices
+            assert sorted(r for mb in idx for r in mb if r >= 0) == list(range(len(data["tokens"])))
+            nodes = 0
+            for mb in idx:
+                toks = [data["tokens"][r] for r in mb]
+                bp = chain_branch_points(toks, [data["dp_local_traj_idx"][r] for r in mb])
+                nodes += sum(int(t.numel()) - b for t, b in zip(toks, bp))
+            out[cut] = nodes
+        assert out["min_cost"] <= out["greedy"]
+
+    def test_unknown_cut_rejected(self):
+        _set_parallel()
+        data = _caterpillar_rollout(1, n_rows=3, spine0=50, grow=20, thorn=10)
+        with patch("coda.backends.megatron.data.dist.all_reduce"):
+            with pytest.raises(ValueError):
+                _iter(self._cfg(1000, 1, "bogus"), MagicMock(), data, tree_budget=True)
+
+    def test_tree_node_budget_overrides_token_budget(self):
+        _set_parallel()
+        data = _caterpillar_rollout(2, n_rows=8, spine0=600, grow=200, thorn=100)
+        with patch("coda.backends.megatron.data.dist.all_reduce"):
+            _, small = _iter(self._cfg(1800, 2), MagicMock(), data, tree_budget=True)
+            _, large = _iter(self._cfg(1800, 2, tree_cap=10**6), MagicMock(), data, tree_budget=True)
+            _, rows = _iter(self._cfg(1800, 2, tree_cap=10**6), MagicMock(), data)
+        assert large[0] < small[0]
+        # the tree budget does not touch row-wise (forward-only) batching
+        _set_parallel()
+        with patch("coda.backends.megatron.data.dist.all_reduce"):
+            _, rows_default = _iter(self._cfg(1800, 2), MagicMock(), data)
+        assert rows == rows_default
+
+    def _lm_rows(self, data, idx):
+        return [sum(data["response_lengths"][r] for r in mb if r >= 0) for mb in idx]
+
+    def test_logit_row_budget_caps_micro_batches(self):
+        """Large node budget, small logit-row budget: every micro-batch (and every tree)
+        stays within the logit rows, at the cost of more micro-batches."""
+        _set_parallel()
+        data = _caterpillar_rollout(2, n_rows=8, spine0=600, grow=200, thorn=100)
+        with patch("coda.backends.megatron.data.dist.all_reduce"):
+            it_free, free = _iter(self._cfg(1800, 2, tree_cap=10**6, lm_cap=10**6), MagicMock(),
+                                  data, tree_budget=True)
+            it, capped = _iter(self._cfg(1800, 2, tree_cap=10**6, lm_cap=300), MagicMock(), data,
+                               tree_budget=True)
+        idx = it[0].micro_batch_indices
+        assert sorted(r for mb in idx for r in mb if r >= 0) == list(range(len(data["tokens"])))
+        assert max(self._lm_rows(data, idx)) <= 300 < max(
+            self._lm_rows(data, it_free[0].micro_batch_indices))
+        assert capped[0] > free[0]
+
+    def test_logit_row_budget_defaults_to_token_budget_and_is_off_without_lm_rows(self):
+        _set_parallel()
+        data = _caterpillar_rollout(2, n_rows=8, spine0=600, grow=200, thorn=100)
+        with patch("coda.backends.megatron.data.dist.all_reduce"):
+            it, _ = _iter(self._cfg(250, 2, tree_cap=10**6), MagicMock(), data, tree_budget=True)
+            _, off = _iter(self._cfg(250, 2, tree_cap=10**6, lm_rows=False), MagicMock(), data,
+                           tree_budget=True)
+        assert max(self._lm_rows(data, it[0].micro_batch_indices)) <= 250
+        assert off[0] == 1          # nodes alone fit one micro-batch per mini-batch
+

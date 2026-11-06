@@ -40,8 +40,10 @@ from coda.backends.megatron.data import (
     get_data_iterator,
 )
 from coda.backends.megatron.model import (
-    forward_only, train_minibatch, is_main_rank, reduce_dict, prune_router_replay_instances,
+    forward_only, forward_only_uses_tree, train_minibatch, is_main_rank, reduce_dict,
+    prune_router_replay_instances, _uses_mrope,
 )
+from coda.utils.tree_pack_utils import tree_pack_unsupported_reason
 from coda.utils.tracking import (
     time_tracker, configure_tracking, track,
     install_train_metrics_aggregator,
@@ -84,6 +86,11 @@ class MegatronTrainWorker(TrainWorker):
 
         if config.trainer.use_rollout_routing_replay:
             config.megatron.model.moe_enable_routing_replay = True
+        if config.trainer.get("tree_pack", False):
+            reason = tree_pack_unsupported_reason(config)
+            if reason:
+                logger.warning("[tree_pack] disabled, training falls back to rows: %s", reason)
+                config.trainer.tree_pack = False
         if config.trainer.deterministic_mode:
             config.megatron.model.deterministic_mode = True
             config.megatron.model.cross_entropy_loss_fusion = False
@@ -276,6 +283,13 @@ class MegatronTrainWorker(TrainWorker):
             logger.info(
                 f"[Rank {self.rank}] R3: pruned {dropped} orphan RouterReplay instances, kept {kept}"
             )
+        if config.trainer.get("tree_pack", False):
+            if _uses_mrope(self.model[0]):
+                logger.info("[tree_pack] enabled: shared prefixes are computed once per micro-batch")
+            else:
+                logger.warning("[tree_pack] disabled, training falls back to rows: "
+                               "the model has no explicit mRoPE position_ids")
+                config.trainer.tree_pack = False
 
         # Steps 6-7: optimizer + LR scheduler (none in forward-only mode)
         if self._forward_only:
@@ -837,7 +851,8 @@ class MegatronTrainWorker(TrainWorker):
         Recovers the original Segment-row order under dynamic / padded batching.
         """
         data_iterator, num_microbatches_list = get_data_iterator(
-            self.config.trainer, self.model, rollout_data
+            self.config.trainer, self.model, rollout_data,
+            tree_budget=forward_only_uses_tree(self.config, pg_policy),
         )
 
         collected_all: dict[str, list[torch.Tensor]] = {}
@@ -979,7 +994,8 @@ class MegatronTrainWorker(TrainWorker):
             rollout_data: The complete rollout batch for this DP rank.
         """
         data_iterator, num_microbatches = get_data_iterator(
-            self.config.trainer, self.model, rollout_data
+            self.config.trainer, self.model, rollout_data,
+            tree_budget=bool(self.config.trainer.get("tree_pack", False)),
         )
         global_padding_count, global_padding_ratio = (
             data_iterator[0].get_global_padding_stats()

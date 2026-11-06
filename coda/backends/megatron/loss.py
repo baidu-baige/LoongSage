@@ -25,6 +25,7 @@ from coda.backends.megatron.cp_utils import (
     prepare_packed_seq_params,
     gather_and_slice_response,
 )
+from coda.backends.megatron.tree_loss import tree_compute_entropy, tree_compute_log_probs
 from megatron.core.packed_seq_params import PackedSeqParams
 
 # ════════════════════════════════════════════════════════════════════════
@@ -99,11 +100,20 @@ def loss_function(
 
     # Always compute entropy: reported as a metric in every mode and reused as
     # the entropy-loss term when entropy_coef != 0.
-    entropy_list = compute_entropy(
-        batch["total_lengths"], batch["response_lengths"],
-        output_tensor.clone(), temperature,
-        cp_partition_mode=cp_partition_mode,
-    )
+    # tree micro-batch: logits are per node, per-row responses are gathered
+    tree_idx = getattr(packed_seq_params, "tree_loss_index", None)
+    if tree_idx is not None:
+        # does not mutate output_tensor: no clone; metric-only (chunked, no grad) unless
+        # entropy enters the loss
+        entropy_list = tree_compute_entropy(
+            tree_idx, output_tensor, temperature,
+            metric_only=config.algorithm.entropy_coef == 0.0)
+    else:
+        entropy_list = compute_entropy(
+            batch["total_lengths"], batch["response_lengths"],
+            output_tensor.clone(), temperature,
+            cp_partition_mode=cp_partition_mode,
+        )
     entropy_sum = (torch.cat(entropy_list) * torch.cat(loss_masks)).sum().item()
     reported_metrics["train/entropy"] = entropy_sum
     collected["entropy"] = entropy_list
@@ -114,25 +124,30 @@ def loss_function(
 
     gkd_ratio = config.opd.gkd_ratio if config.opd.enable else 0.0
     pure_gkd = gkd_ratio == 1.0
+    if tree_idx is not None and gkd_ratio > 0:
+        raise NotImplementedError("tree_pack does not support OPD/GKD; it must fall back to rows")
     if not pure_gkd:
-        target_list = [
-            torch.cat([t[1:], t.new_full((1,), 0)])
-            for t in batch["tokens"]
-        ]
-        packed_targets, _ = prepare_packed_seq_params(
-            target_list, cp_partition_mode=cp_partition_mode,
-        )
+        if tree_idx is not None:
+            log_probs_list = tree_compute_log_probs(tree_idx, output_tensor, temperature)
+        else:
+            target_list = [
+                torch.cat([t[1:], t.new_full((1,), 0)])
+                for t in batch["tokens"]
+            ]
+            packed_targets, _ = prepare_packed_seq_params(
+                target_list, cp_partition_mode=cp_partition_mode,
+            )
 
-        log_probs_list = compute_log_probs(
-            packed_targets,
-            batch["total_lengths"],
-            batch["response_lengths"],
-            # compute_log_probs mutates logits in-place; clone only when the KL
-            # path below (gkd_ratio > 0) still needs the original output_tensor.
-            output_tensor.clone() if gkd_ratio > 0 else output_tensor,
-            temperature=temperature,
-            cp_partition_mode=cp_partition_mode,
-        )
+            log_probs_list = compute_log_probs(
+                packed_targets,
+                batch["total_lengths"],
+                batch["response_lengths"],
+                # compute_log_probs mutates logits in-place; clone only when the KL
+                # path below (gkd_ratio > 0) still needs the original output_tensor.
+                output_tensor.clone() if gkd_ratio > 0 else output_tensor,
+                temperature=temperature,
+                cp_partition_mode=cp_partition_mode,
+            )
         collected["log_probs"] = log_probs_list
         old_log_probs = (
             batch.get("rollout_log_probs")
