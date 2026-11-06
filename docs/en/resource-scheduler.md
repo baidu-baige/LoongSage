@@ -59,7 +59,7 @@ Note that when `num_bundles > 1`, the scheduler advances the cursor across all o
 ## 4. Return Value and Resource Declarations
 
 ```python
-prepared_actor, bundle_index = scheduler.schedule(ray_actor_cls, num_bundles=1, recover_bundle_index=-1)
+prepared_actor, bundle_index = scheduler.schedule(ray_actor_cls, num_bundles=1, bundle_index=-1)
 handle = prepared_actor.remote(...)   # the caller instantiates it
 ```
 
@@ -67,9 +67,12 @@ handle = prepared_actor.remote(...)   # the caller instantiates it
 
 One easily misread detail: `prepared_actor` is forced to `num_cpus=0.1, num_gpus=0.1`. These fractional values do not reflect real usage — GPU exclusivity is already guaranteed by the bundle partitioning, and declaring small values merely lets Ray's scheduler admit the actor while preventing actors on the same bundle from blocking each other on paper accounting. Consequently, **the GPU utilization numbers shown in the Ray dashboard do not reflect actual usage**.
 
-## 5. Failure Recovery
+## 5. Pinned Bundles: Failure Recovery and Co-located Groups
 
-When `recover_bundle_index >= 0` is passed, the scheduler bypasses the cursor logic and places the actor back on the bundle at that index. Rollout engines take this path during `start_engines(recover=True)` using the recorded `engine_bundle_indices[i]` ([`replica_group.py`](../../coda/backends/replica_group.py)), so a rebuilt engine returns to its original physical GPUs and the weight-transfer topology (same-GPU IPC / cross-GPU NCCL) stays unchanged.
+When `bundle_index >= 0` is passed, the scheduler skips the cursor logic, places the actor on the bundle at that index, and leaves the cursor unchanged. This path has two uses:
+
+- **Failure recovery**: rollout engines take this path during `start_engines(recover=True)` using the recorded `engine_bundle_indices[i]` ([`replica_group.py`](../../coda/backends/replica_group.py)). A rebuilt engine returns to its original physical GPUs, so the weight-transfer topology (same-GPU IPC / cross-GPU NCCL) stays unchanged.
+- **Co-located worker groups**: each critic rank is pinned to the bundle of the matching actor rank ([`train_manager.py`](../../coda/controller/train_manager.py)). Because the cursor does not move, rollout scheduling that follows is unaffected.
 
 ## 6. Probe: IP and Port Discovery
 
