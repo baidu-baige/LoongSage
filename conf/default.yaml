@@ -135,6 +135,9 @@ agentflow:
     proxy_timeout_seconds: 1800
     abort_timeout_seconds: 600
     max_connections: 512
+    # R3 only. Processes that parse /generate bodies and decode routed experts off the
+    # router event loop; 0 decodes inline.
+    r3_decode_workers: 0
     middleware:
       parser:
 

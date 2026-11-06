@@ -1,6 +1,8 @@
 """Unit tests for ``coda.agentflow.trajectory_store``."""
 
 from coda.agentflow.trajectory_store import (
+    FloatSeq,
+    IntSeq,
     Segment,
     Trajectory,
     TrajectoryGroup,
@@ -149,6 +151,26 @@ class TestTrajectoryModels:
         assert traj.tokens[turn2.token_start:turn2.token_end] == [101, 102, 103, 501, 502, 601, 602]
         assert traj.loss_masks[turn2.logprob_start:turn2.logprob_end] == [1, 1]
         assert traj.token_rewards[-1] == 1.0
+
+    def test_per_token_fields_are_packed_and_list_like(self) -> None:
+        """Per-token fields hold no GC-visible element objects but still behave like lists."""
+        import copy
+        import gc
+        import pickle
+
+        traj = Trajectory(trajectory_id="t", tokens=[1, 2, 3], rollout_log_probs=[-0.5])
+        assert isinstance(traj.tokens, IntSeq) and isinstance(traj.rollout_log_probs, FloatSeq)
+        assert gc.get_referents(traj.tokens) == [IntSeq]
+
+        traj.tokens.extend([4, 5])
+        traj.tokens[1:3] = [9]
+        del traj.tokens[0]
+        assert traj.tokens == [9, 4, 5] and traj.tokens[0:2] == [9, 4]
+        assert [0, *traj.tokens] == [0, 9, 4, 5]
+
+        for clone in (copy.deepcopy(traj), pickle.loads(pickle.dumps(traj)), traj.model_copy(deep=True)):
+            assert type(clone.tokens) is IntSeq and clone.tokens == [9, 4, 5]
+        assert traj.model_dump()["tokens"] == [9, 4, 5]
 
 class TestTrajectoryGroup:
     """Tests for TrajectoryGroup model."""

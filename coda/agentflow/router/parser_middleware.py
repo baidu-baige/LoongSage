@@ -2,12 +2,14 @@
 
 import asyncio
 import http
-import json
 import logging
 import traceback
 from collections import Counter, defaultdict
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from typing import Any, Callable, cast
 
+import orjson as json
 from fastapi import status
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -18,7 +20,7 @@ from starlette.types import ASGIApp
 from coda.agentflow.tokenizer_manager import DEEPSEEK_OFFICIAL_ENCODER_MODULES
 from coda.agentflow.trajectory_store import TrajectoryStore
 from coda.agentflow.utils import CONTEXT_LENGTH_EXCEEDED, build_request_id
-from .parser import TrajectoryParser, TurnInputContext
+from .parser import TrajectoryParser, TurnInputContext, decode_generate_body, is_passthrough_response
 from .protocols import PROTOCOL_ADAPTERS, ProtocolAdapter
 
 logger = logging.getLogger(__name__)
@@ -44,6 +46,8 @@ class ParserMiddleware(BaseHTTPMiddleware):
         tool_call_parser: ParserConfig = None,
         inflight_requests: Any = None,
         ds_configs: dict[int, Any] | None = None,
+        r3_decode_workers: int = 0,
+        shutdown_callbacks: list | None = None,
     ):
         super().__init__(app)
         from coda.agentflow.router.router import filter_headers
@@ -55,6 +59,13 @@ class ParserMiddleware(BaseHTTPMiddleware):
         self.ds_configs = ds_configs
         self._trajectory_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._trajectory_lock_refs: Counter[str] = Counter()
+        # Body parse + R3 decode off the router event loop (0 = decode inline).
+        self._decode_pool = (
+            ProcessPoolExecutor(max_workers=r3_decode_workers)
+            if r3_enabled and r3_decode_workers > 0 else None
+        )
+        if self._decode_pool is not None and shutdown_callbacks is not None:
+            shutdown_callbacks.append(self._close_decode_pool)
         self.parser = TrajectoryParser(
             trajectory_store=trajectory_store,
             tokenizer_manager=tokenizer_manager,
@@ -172,7 +183,7 @@ class ParserMiddleware(BaseHTTPMiddleware):
                 # 2. Forward to LLM worker and parse response
                 response = await call_next(request)
                 response_body = await self._read_response_body(response)
-                parsed_response = self._parse_generate_response(
+                parsed_response = await self._parse_generate_response(
                     response, response_body, turn_ctx, trajectory_id
                 )
                 if isinstance(parsed_response, Response):
@@ -223,7 +234,7 @@ class ParserMiddleware(BaseHTTPMiddleware):
             return adapter.build_streaming_response(final_content)
 
         return Response(
-            content=json.dumps(final_content).encode("utf-8"),
+            content=json.dumps(final_content),
             status_code=response.status_code,
             headers={"content-type": "application/json"},
             media_type="application/json",
@@ -297,7 +308,7 @@ class ParserMiddleware(BaseHTTPMiddleware):
             payload["return_routed_experts"] = True
             payload["routed_experts_start_len"] = routed_experts_start_len
 
-        return json.dumps(payload).encode("utf-8")
+        return json.dumps(payload)
 
     async def _read_response_body(self, response: Response) -> bytes:
         # Buffer all chunks from the LLM worker's StreamingResponse. Currently we wait for
@@ -310,7 +321,32 @@ class ParserMiddleware(BaseHTTPMiddleware):
             return b"".join(chunks)
         return response.body
 
-    def _parse_generate_response(
+    def _close_decode_pool(self) -> None:
+        """Shut down the R3 decode pool once; later requests fall back to inline decoding."""
+        pool, self._decode_pool = self._decode_pool, None
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
+
+    async def _decode_body(
+        self, body: bytes, routed_experts_start_len: int, status_code: int
+    ) -> tuple[dict[str, Any], Any]:
+        """Run decode_generate_body in the pool when configured, else inline.
+
+        R3 is decoded only for successful (<400) responses; decode_generate_body additionally
+        skips error/abort passthrough bodies, so a malformed R3 payload cannot raise here.
+        """
+        r3_enabled = self.r3_enabled and status_code < status.HTTP_400_BAD_REQUEST
+        if self._decode_pool is not None:
+            try:
+                return await asyncio.get_running_loop().run_in_executor(
+                    self._decode_pool, decode_generate_body, body, routed_experts_start_len, r3_enabled
+                )
+            except BrokenProcessPool as e:
+                logger.error("[parse] R3 decode pool broken (%s); disabling pool, decoding inline", e)
+                self._close_decode_pool()
+        return decode_generate_body(body, routed_experts_start_len, r3_enabled)
+
+    async def _parse_generate_response(
         self,
         response: Response,
         body: bytes,
@@ -323,8 +359,10 @@ class ParserMiddleware(BaseHTTPMiddleware):
         or a raw Response passthrough on error/non-2xx.
         """
         try:
-            response_json = json.loads(body.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
+            response_json, routed_experts = await self._decode_body(
+                body, turn_ctx.routed_experts_start_len, response.status_code
+            )
+        except json.JSONDecodeError:
             logger.warning("[parse] upstream payload non-JSON for %s: %s", trajectory_id, body[:200])
             return Response(content=body, status_code=response.status_code,
                             headers=self._filter_headers(dict(response.headers)),
@@ -341,18 +379,18 @@ class ParserMiddleware(BaseHTTPMiddleware):
         # /abort_request. In both cases SGLang returns HTTP 200 with finish_reason.type == "abort"
         # (running-batch: FINISH_ABORT(status_code=None), waiting-queue: _handle_abort_req path).
         # Skip writing to TrajectoryStore to avoid partial/empty data.
-        _finish_reason = (response_json.get("meta_info") or {}).get("finish_reason") or {}
-        if isinstance(_finish_reason, dict) and _finish_reason.get("type") == "abort":
+        if is_passthrough_response(response_json):
+            _finish_reason = (response_json.get("meta_info") or {}).get("finish_reason") or {}
             logger.warning(
                 "[parse] upstream aborted request for %s: %s",
-                trajectory_id, _finish_reason.get("message", ""),
+                trajectory_id, _finish_reason.get("message", "") if isinstance(_finish_reason, dict) else "",
             )
             return Response(content=body, status_code=response.status_code,
                             headers=self._filter_headers(dict(response.headers)),
                             media_type=response.media_type)
 
         payload, assistant_message, finish_reason_override = self.parser.build_assistant_message(
-            response_json, turn_ctx.routed_experts_start_len, turn_ctx.tools
+            response_json, turn_ctx.tools, routed_experts=routed_experts,
         )
         if response_json.get("choices"):
             response_json["choices"][0]["message"] = assistant_message

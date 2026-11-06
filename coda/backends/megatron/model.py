@@ -46,6 +46,7 @@ from coda.backends.megatron.kl_ctx import (
 )
 from megatron.core.transformer.transformer_block import get_num_layers_to_build
 from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
+from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 
 
@@ -120,9 +121,10 @@ def setup_routing_replay(config: DictConfig, batch: dict, model_chunk: torch.nn.
     Only sets replay data for the RouterReplay instances belonging to the current model_chunk's vp_stage. 
     """
     model_config = get_model_config(model_chunk)
+    # Rows arrive as read-only numpy views of the Ray object store (see put_dp_shards_to_ray).
     rollout_routed_experts = [
-        seq.reshape(seq.size(0), model_config.num_layers, model_config.moe_router_topk)
-        for seq in batch.get("rollout_routed_experts")
+        torch.as_tensor(seq).reshape(len(seq), model_config.num_layers, model_config.moe_router_topk)
+        for seq in batch["rollout_routed_experts"]
     ]
 
     packed_experts = prepare_routing_replay_data(rollout_routed_experts, model_config)
@@ -152,14 +154,52 @@ def setup_routing_replay(config: DictConfig, batch: dict, model_chunk: torch.nn.
     num_layers = get_num_layers_to_build(model_config, vp_stage=vp_stage)
     layer_offset = get_transformer_layer_offset(model_config, vp_stage=vp_stage)
     instances = RouterReplay.global_router_replay_instances
+    owned = _chunk_router_replay_ids(model_chunk)
     idx = instance_offset
     for layer_id in range(layer_offset, layer_offset + num_layers):
         if not _is_moe_layer(layer_id):
             continue
-        instances[idx].set_target_indices(packed_experts[:, layer_id])
+        # The mapping is positional; fail loudly if the list holds another model's routers.
+        inst = instances[idx] if idx < len(instances) else None
+        if inst is None or id(inst) not in owned or inst.layer_number != layer_id + 1:
+            raise RuntimeError(
+                f"R3: RouterReplay instance {idx} does not belong to layer {layer_id + 1} of "
+                f"this chunk ({len(instances)} instances); call prune_router_replay_instances "
+                "after building the model."
+            )
+        inst.set_target_indices(packed_experts[:, layer_id])
         idx += 1
 
     RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+
+
+def _chunk_router_replay_ids(model_chunk: torch.nn.Module) -> frozenset[int]:
+    """ids of the RouterReplay instances held by *model_chunk*'s routers (cached on it)."""
+    cached = getattr(model_chunk, "_router_replay_ids", None)
+    if cached is None:
+        cached = frozenset(
+            id(m.router_replay)
+            for m in model_chunk.modules()
+            if isinstance(m, TopKRouter) and getattr(m, "router_replay", None) is not None
+        )
+        model_chunk._router_replay_ids = cached
+    return cached
+
+
+def prune_router_replay_instances(model: Sequence[torch.nn.Module]) -> tuple[int, int]:
+    """Keep only the RouterReplay instances owned by *model*'s routers; returns (dropped, kept).
+
+    RouterReplay registers every instance in a class-level list, so routers of a decoder
+    that was built and then discarded stay in it. Megatron-Bridge's Qwen3-VL models do
+    that (GPTModel builds a block, then the VL model rebuilds it), which doubles the list
+    and shifts setup_routing_replay's positional mapping. Order is preserved.
+    """
+    owned = set().union(*(_chunk_router_replay_ids(chunk) for chunk in model))
+    instances = RouterReplay.global_router_replay_instances
+    kept = [inst for inst in instances if id(inst) in owned]
+    dropped = len(instances) - len(kept)
+    instances[:] = kept
+    return dropped, len(kept)
 
 # ════════════════════════════════════════════════════════════════════════
 # MRoPE position ids
