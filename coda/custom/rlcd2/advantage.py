@@ -11,7 +11,7 @@ from coda.algorithms.registry import register_advantage
 
 
 @register_advantage("rlcd2")
-def rlcd2_advantage(config, rollout_data) -> list[torch.Tensor]:
+def rlcd2_advantage(config, rollout_data) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
     rewards = rollout_data["rewards"]
     prompt_ids = rollout_data["prompt_id"]
     traj_idx = rollout_data["dp_local_traj_idx"]
@@ -34,4 +34,5 @@ def rlcd2_advantage(config, rollout_data) -> list[torch.Tensor]:
     device = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
     row_adv = traj_adv[torch.tensor(traj_idx, dtype=torch.long)].to(device)
     lengths = torch.tensor(response_lengths, dtype=torch.long, device=device)
-    return list(torch.repeat_interleave(row_adv, lengths).split(response_lengths))
+    advantages = list(torch.repeat_interleave(row_adv, lengths).split(response_lengths))
+    return advantages, advantages  # critic-free: returns are the advantages

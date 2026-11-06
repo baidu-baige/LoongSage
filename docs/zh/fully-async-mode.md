@@ -1,6 +1,6 @@
 # 全异步模式
 
-全异步模式将 rollout（采样）与训练部署在相互独立的机器资源上。rollout 在后台持续生成轨迹，训练流程从缓冲区取得一个 mini-batch 后即可立即进行训练。相较于默认的“整批 rollout 完成后再整批训练”，该模式能够重叠采样与训练，降低两类 GPU 的空闲时间；对于原本 colocate 模式下采样与训练耗时相近的任务，收益尤其明显。
+全异步模式将 rollout（采样）与训练部署在相互独立的机器资源上。rollout 在后台持续生成轨迹：trainer 训练第 `s` 个 step 时，rollout 已经在生产第 `s+1` 个 step 的数据；缓冲区里攒够一个 step 的 group 后，trainer 立即开始训练。相较于默认的“整批 rollout 完成后再整批训练”，该模式能够重叠采样与训练，降低两类 GPU 的空闲时间；对于原本 colocate 模式下采样与训练耗时相近的任务，收益尤其明显。
 
 需要注意的是，“全异步”并不意味着训练、权重更新和 checkpoint 保存之间完全没有同步边界。每个训练 step 结束时，系统仍会暂停 rollout，清理或等待未完成的请求，依据 `trainer.save_freq` 决定是否保存 checkpoint，将新权重同步至推理引擎，然后恢复后台生产。`stale_steps` 用于扩大当前未消费的 trajectory group 数量上限。设置此值越大，轨迹离策略的可能程度越大。由于 rollout 与训练使用的权重可能不同，建议结合 IS correction、M2PO 或 OPSM 等离策略保护机制使用。
 
@@ -24,7 +24,7 @@ python -m coda.controller.trainer --config-name qwen3_30b_a3b/dapo_h20_1node \
 | `run_mode` | `default` | 运行入口模式。 | 全异步仅支持 `default`，不支持 `train-only` 或 `rollout-only`。 |
 | `data_sources` | `[${data_source}]` | 实际参与运行的数据源列表。 | 当前全异步仅支持一个数据源。 |
 | `data_source.num_prompts_per_step` | `64` | 每个训练 step 计划消费的 prompt group 数量 `B`，也是滑动窗口的基准批量。每个 group 包含 `N` 条 trajectory。 | `B × N` 必须能被 `M` 整除，否则会报错。 |
-| `trainer.mini_batch_size` | `64` | 每次从 `PipelineBuffer` 取出 `M // N` 个完整 group，然后发起一次训练。 | 建议满足 `M % N == 0` 且 `(B × N) % M == 0`。 |
+| `trainer.mini_batch_size` | `64` | 每次 optimizer step 消费的 trajectory 数。trainer 每个 step 从 `PipelineBuffer` 取出全部 `B` 个 group，只发起一次训练，由 worker 切成 `(B × N) / M` 个 mini-batch，和同步模式一致。 | `(B × N) % M == 0`（启动时校验）。 |
 | `trainer.num_nodes`、`trainer.num_gpus_per_node` | `1`、`8` | 定义常驻的训练 GPU 池。 | 训练 GPU 总数为两者的乘积，且不与 rollout 复用。 |
 | `rollout.num_gpus_per_node`、`rollout.sglang_replicas.*` | 见默认配置 | 定义常驻的 SGLang GPU 池、replica 数量以及每个 replica 的 GPU 数。 | rollout 总 GPU 数按各 replica 类型的 `num_nodes × rollout.num_gpus_per_node` 求和。 |
 | `rollout.sampler.num_oversample` | `0` | 同步动态采样使用的额外派发量。 | 全异步必须为 `0`；额外的在途容量统一由 `stale_steps` 控制。 |
@@ -48,7 +48,7 @@ capacity = int(B * (1 + stale_steps))
 
 1. **rollout producer**：运行于独立线程及其事件循环中，从 datasource 读取 prompt group，并按照滑动窗口策略将其派发给 AgentFlow ，由AgentFlow对接推理引擎。
 2. **collector**：运行于另一个后台线程中。每条 terminal trajectory 完成（成功、失败或被取消）后，先进入 `TrajQueue`；collector 等待同一 prompt 的 `N` 条 trajectory 凑齐，经策略检查后执行过滤和统计，再将有效的完整 group 写入 `PipelineBuffer`。
-3. **trainer consumer**：运行于主线程中。每次从 `PipelineBuffer` 取出 `M // N` 个 group，整理为训练数据并执行一次 optimizer update；一个外层 step 共执行 `(B × N) // M` 次训练调用。
+3. **trainer consumer**：运行于主线程中。每个 step 从 `PipelineBuffer` 取出 `B` 个 group，整理为训练数据后只发起一次训练调用，由 worker 执行 `(B × N) / M` 次 optimizer update。
 
 两级 queue 将“trajectory 完成”和“训练消费”解耦：
 
@@ -59,12 +59,12 @@ capacity = int(B * (1 + stale_steps))
 
 一个训练 step 的同步关系如下：
 
-1. producer 与 collector 持续运行；trainer 根据需要等待并消费已完成的 group，随后执行若干 mini-batch 更新。
-2. trainer 完成 `(B × N) // M` 次取数和训练后调用 `pause()`。在推荐的整除配置下，此时恰好消费 `B × N` 条 trajectory。producer 停止派发新请求，并根据 `rollout.partial` 取消或等待未完成的请求；collector 已写入 `PipelineBuffer` 的完整 group 不会被清空，可供下一 step 使用。
+1. producer 与 collector 持续运行；trainer 等到有 `B` 个已完成的 group 后一次取出，并对整个 step 训练一次（worker 内部执行 `(B × N) / M` 次 optimizer update）。
+2. 训练完成后 trainer 调用 `pause()`。此时恰好消费 `B × N` 条 trajectory。producer 停止派发新请求，并根据 `rollout.partial` 取消或等待未完成的请求；collector 已写入 `PipelineBuffer` 的完整 group 不会被清空，可供下一 step 使用。
 3. 清理完成后，系统汇总本 step 的 rollout 指标，依据 `trainer.save_freq` 保存 checkpoint（保存时会额外记录 `PipelineBuffer` 中尚未消费的 prompt，以便恢复后重新生成），并同步最新模型权重。SGLang 会在更新前刷新旧权重对应的 prefix/KV cache。
 4. `resume()` 将 rollout step 加一；同步完成的新权重也会以递增的 `weight_version` 暴露给 SGLang，producer 随后继续生产。SGLang 返回的版本会记录在每个生成 token 以及 trajectory 的首尾版本字段中，用于监控和离策略修正。
 
-训练侧在同一 step 内可能执行多次 optimizer update。第一次计算 `old_log_probs` 时，系统会保存该 step 的 `old_actor` 快照；后续 mini-batch 临时切回该快照计算行为策略概率，再切回持续更新后的 actor，从而避免同一 step 内 old policy 随 mini-batch 漂移。
+训练侧在任何 optimizer update 之前，对整个 step 一次性计算 `old_log_probs`。此时 live actor 权重正好就是上一次推给 rollout 的策略，因此不需要额外的 old policy 快照。按 step 训练的代价是：不能在 rollout 补齐本 step 剩余数据的同时先训练前面的 mini-batch；跨 step 的重叠（训练第 `s` 步的同时 rollout 生产第 `s+1` 步）不受影响。
 
 ## 3.滑动窗口策略
 
@@ -132,15 +132,15 @@ seq - min_seq < B
 | `rollout/partial_restored_count` | step 清理时，被放回 datasource buffer 且属于完整 prompt group 的 trajectory 数量；仅在存在待回收数据时上报。 | “完整”表示同一 prompt 已凑齐 `N` 条 trajectory，并不代表每条 trajectory 都已完成生成。该值除以 `N` 即为恢复的 group 数量。 |
 | `rollout/partial_dropped_incomplete_count` | step 清理时，由于未凑齐 `N` 条而无法恢复并被丢弃的 trajectory 数量；仅在存在待回收数据时上报。 | 数值偏高说明 step 边界经常打断同一 prompt 的部分 trajectory。 |
 | `timing/pause_delay` | trainer 发出 pause 后，等待 producer 取消或等待请求、清空 `TrajQueue` 并重置策略所花费的总时间。 | 当 `rollout.partial: false` 时，该指标还包含等待全部在途请求完成的时间，数值可能较大。 |
-| `perf/wait_ratio` | trainer **非训练时间**占「等待 + 训练」时间之和的比例，即 `wait / (wait + timing/train)`。其中 `wait` 通过 `inverse_timer` 在训练区间之外累加（取数、处理 trajectory、teacher、flush、pause 等待等），仅用于派生该比例、不单独上报。 | 越高说明训练越常被 rollout 生产饿等，可考虑提升 rollout 并发或放宽 staleness。 |
+| `perf/wait_ratio` | trainer **非训练时间**占「等待 + 训练」时间之和的比例，即 `wait / (wait + timing/train)`。其中 `wait` 通过 `inverse_timer` 在训练区间之外累加（取数、处理 trajectory、teacher、pause 等待等），仅用于派生该比例、不单独上报。 | 越高说明训练越常被 rollout 生产饿等，可考虑提升 rollout 并发或放宽 staleness。 |
 
-此外，在全异步模式下，`timing/rollout`、`timing/process_traj`、`timing/teacher`（如启用）和 `timing/train` 表示一个外层 step 内所有 mini-batch 调用的**累计耗时**；`timing/step`、`timing/save_ckpt` 和 `timing/update_weights` 仍按外层 step 记录。
+此外，在全异步模式下，`timing/rollout`、`timing/process_traj`、`timing/teacher`（如启用）、`timing/train`、`timing/step`、`timing/save_ckpt` 和 `timing/update_weights` 都按 step 记录一次。
 
 与 colocate/同步模式相比，以下指标的统计方式或含义有所不同：
 
 - `rollout/partial_ratio` 与 `rollout/partial_span_max`：同步模式基于当前整批 accepted groups 统计；全异步模式则基于该 step 从 `PipelineBuffer` 中实际取出的 trajectory 统计。
-- `train/loss`、`train/pg_loss`、`train/entropy`、`train/grad_norm`、`train/approx_kl`、`train/clip_ratio`、`train/dual_clip_ratio`、`train/nan_ratio` 以及 `train/is_*` 等训练指标：全异步模式下，一个 step 会训练多个 mini-batch，因此 worker 会先缓存每次上报的数值，并在 step 结束时按命名规则聚合——`timing/*` 取总和、以 `_max` 结尾取最大、以 `_min` 结尾取最小、其余取算术平均；`perf/train_memory_allocated_max` 和 `perf/train_memory_reserved_max` 因此取最大值。同步/colocate 模式通常直接上报单次训练调用的结果。
-- `timing/rollout`：在全异步模式下，该指标主要表示 trainer 等待 `PipelineBuffer` 并取数的累计墙钟时间，而不是后台推理引擎完成整批生成的耗时。因此，应结合 buffer size 和 pause delay 综合分析。
+- `train/loss`、`train/pg_loss`、`train/entropy`、`train/grad_norm`、`train/approx_kl`、`train/clip_ratio`、`train/dual_clip_ratio`、`train/nan_ratio` 以及 `train/is_*` 等训练指标：全异步模式每个 step 只训练一次，因此这些指标的上报方式和同步/colocate 模式完全一致（由 worker 在本 step 的各 mini-batch 上取平均）。
+- `timing/rollout`：在全异步模式下，该指标主要表示 trainer 等待 `PipelineBuffer` 并取出本 step 数据的墙钟时间，而不是后台推理引擎完成整批生成的耗时。因此，应结合 buffer size 和 pause delay 综合分析。
 - 全异步模式不会执行 colocate 模式中的 `offload_rollout`、`onload_train`、`offload_train`、`onload_rollout_weights` 和 `onload_rollout_kv` 阶段，因此不会产生相应的 timing 指标。全异步模式在独立 GPU 上常驻模型，并在 step 边界直接更新 rollout 权重。
 
 ## 5.测试结果

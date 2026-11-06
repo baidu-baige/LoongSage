@@ -24,6 +24,10 @@ get_policy_loss = _POLICY_LOSS_REGISTRY.get
 
 
 # ── Advantage-estimator registry ────────────────────────────────────────
+# Estimators are called as ``fn(config.algorithm, rollout_data)`` and return
+# ``(advantages, returns)``: per-Segment tensors of shape ``(response_length,)``.
+# ``returns`` are the critic's value targets; critic-free estimators return
+# their advantages again.
 _ADVANTAGE_REGISTRY = Registry("advantage")
 register_advantage = _ADVANTAGE_REGISTRY.register
 get_advantage = _ADVANTAGE_REGISTRY.get

@@ -76,7 +76,7 @@ Same-GPU IPC requires no extra group; it performs point-to-point handle passing 
 
 ### 2.3. Sender Side: Bucket Aggregation and Streaming Conversion
 
-The training-side sending logic is centralized at [`megatron_train_worker.py:554-560`](../../coda/backends/megatron/megatron_train_worker.py):
+The training-side sending logic is centralized at [`megatron_actor_worker.py:352-355`](../../coda/backends/megatron/megatron_actor_worker.py#L352-L355):
 
 ```python
 send_channel = create_sender_channel(channel_meta)
@@ -194,7 +194,7 @@ Both sides of `async_update_weights` return lists of Ray `ObjectRef`s, and `_upd
 TransferMesh itself does not distinguish modes, but the scheduling context differs between the two modes, as reflected in [`Trainer.train_loop`](../../coda/controller/trainer.py):
 
 - **colocate mode** (rollout and trainer share the same GPU pool): because a single GPU cannot hold two full sets of model state simultaneously, "staggered scheduling" on the GPU is required before and after `update_weights`:
-  1. `train_manager.offload()`: offloads the training-side gradients and optimizer state to CPU, **but keeps parameters on GPU** (in [`megatron_train_worker.py:586`](../../coda/backends/megatron/megatron_train_worker.py), `move_params=False`, with the comment "keep params in gpu for latter update weights");
+  1. `train_manager.offload()`: offloads the training-side gradients and optimizer state to CPU, **but keeps parameters on GPU** (the sync loop calls it with the default `move_params=False`, see [`trainer.py:385`](../../coda/controller/trainer.py), so that `update_weights` can export straight from GPU);
   2. `rollout_manager.onload_weights()`: reloads SGLang's weight container onto GPU (`tags=[GPU_MEMORY_TYPE_WEIGHTS]`), while the KV cache remains on CPU;
   3. `_update_weights(...)`: performs the weight transfer through TransferMesh. At this point, same-GPU senders (trainer workers) and receivers (SGLang TP workers) automatically select the IPC zero-copy path;
   4. Once the transfer completes, if `offload()` was called earlier (`self.offloaded=True`), `update_weights` internally invokes `_offload_model(move_params=True, move_grads=False)` to fully offload the training parameters to CPU;
@@ -304,5 +304,5 @@ channel = create_channel(
 - [`MetaFrame` / `TensorSpec`](../../coda/transfer_mesh/protocol.py) — Bucket metadata protocol
 - [`ChannelMeta` / `create_sender_channel` / `create_receiver_channel`](../../coda/transfer_mesh/channel.py) — Channel input contract and in-process lifecycle (same `channel.py`)
 - [`Trainer._init_channel_meta` / `Trainer._update_weights`](../../coda/controller/trainer.py) — Top-level orchestration
-- [`MegatronTrainWorker.update_weights`](../../coda/backends/megatron/megatron_train_worker.py) — Training-side send
+- [`MegatronActorWorker.update_weights`](../../coda/backends/megatron/megatron_actor_worker.py) — Training-side send
 - [`SglangEngine.update_weights_from_channel`](../../coda/backends/sglang/engine.py) — Inference-side receive

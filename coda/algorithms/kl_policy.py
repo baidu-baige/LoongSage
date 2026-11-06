@@ -65,7 +65,7 @@ def build_kl_policies(config: DictConfig) -> dict[str, "KLPolicy"]:
     Meant to be called once at worker init; the returned dict is stored on the
     worker and passed into model functions.
     """
-    if not config.opd.get("enable"):
+    if not config.opd.enable:
         return {}
     policies: dict[str, KLPolicy] = {}
     if config.opd.pg_ratio > 0 and config.opd.gkd_ratio != 1:

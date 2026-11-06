@@ -292,12 +292,13 @@ class TestTrainerValidateConfig:
             trainer._validate_config()
 
     def test_rollout_only_forces_forward_only(self):
-        config = make_minimal_config(run_mode="rollout-only")
+        config = make_minimal_config(run_mode="rollout-only", critic={"enable": True})
         trainer = self._trainer(config)
 
         trainer._validate_config()
 
         assert trainer.config.trainer.forward_only is True
+        assert trainer.config.critic.enable is False
 
     def test_forward_only_rejects_saving(self):
         config = make_minimal_config(trainer={"forward_only": True, "save_freq": 1})

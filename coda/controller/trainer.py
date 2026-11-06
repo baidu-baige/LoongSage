@@ -24,7 +24,7 @@ from coda.controller.rollout_manager import RolloutManager
 from coda.controller.teacher_manager import TeacherManager
 from coda.controller.sft_sampler import SFTSampler, validate_config
 from coda.transfer_mesh import ChannelMeta
-from coda.utils.checkpoint_utils import get_tracker_file, resolve_dist_ckpt_dir
+from coda.utils.checkpoint_utils import get_tracker_file, resolve_dist_ckpt_dir, should_save
 from coda.utils.tracking import configure_tracking, time_marker, TimeMarkerAcc, track
 from coda.utils import logging_utils
 
@@ -84,13 +84,6 @@ class Trainer:
         self._validate_config()
         self.is_colocated = self.config.colocate
         self.is_fully_async = self.config.fully_async.enable
-        self.num_mini_batches = 0
-        if self.is_fully_async:
-            ds = self.config.data_sources[0]
-            self.num_mini_batches = (
-                int(ds.num_prompts_per_step) * int(ds.num_trajectories_per_prompt)
-                // self.config.trainer.mini_batch_size
-            )
         self._init_tracking()
 
         self.scheduler = ResourceScheduler(self.config)
@@ -138,8 +131,10 @@ class Trainer:
 
     def _validate_config(self) -> None:
         if self.config.run_mode == Mode.ROLLOUT_ONLY:
-            # Rollout-only never trains: build the train workers without DDP/optimizer.
+            # Rollout-only never trains: build the train workers without DDP/optimizer,
+            # and skip the critic (it only serves advantages / value updates).
             self.config.trainer.forward_only = True
+            self.config.critic.enable = False
         elif self.config.trainer.forward_only and self.config.trainer.save_freq > 0:
             raise ValueError(
                 "trainer.forward_only has no optimizer and never updates weights, "
@@ -314,7 +309,12 @@ class Trainer:
         self._finalize_training()
 
     async def _fully_async_train_loop(self, start_step: int, current_weight_version: int) -> None:
-        """Fully-async loop: a background rollout thread feeds mini-batches to the trainer.
+        """Fully-async loop: a background rollout thread keeps generating while the trainer trains.
+
+        Each step the trainer pulls the whole step's groups and trains once on
+        them (mini-batches are split inside the train worker, as in sync mode),
+        so the step-start weights are exactly the policy pushed to rollout at
+        the previous boundary.
 
         fully_async and colocate are mutually exclusive (see _validate_config),
         so there is no offload/onload handling here.
@@ -327,31 +327,27 @@ class Trainer:
         for step in range(start_step, self.config.total_steps + 1):
             with time_marker("step", step=step):
                 with TimeMarkerAcc(step=step) as timers:
-                    for _ in range(self.num_mini_batches):
-                        with timers("rollout"):
-                            groups = await self.rollout_sampler(step)
+                    with timers("rollout"):
+                        groups = await self.rollout_sampler(step)
 
-                        with timers("process_traj"):
-                            refs = self._process_traj_for_train(
-                                groups, Mode.DEFAULT, step,
-                                current_weight_version=current_weight_version,
-                            )
+                    with timers("process_traj"):
+                        refs = self._process_traj_for_train(
+                            groups, Mode.DEFAULT, step,
+                            current_weight_version=current_weight_version,
+                        )
 
-                        if self.teacher_manager is not None:
-                            with timers("teacher"):
-                                refs = self.teacher_manager.compute_teacher(refs)
+                    if self.teacher_manager is not None:
+                        with timers("teacher"):
+                            refs = self.teacher_manager.compute_teacher(refs)
 
-                        with timers.inverse_timer("wait"), timers("train"):
-                            ray.get(self.train_manager.async_train(step, refs))
-
-                    # collect train metrics
-                    ray.get(self.train_manager.async_flush_train_metrics())
+                    with timers.inverse_timer("wait"), timers("train"):
+                        ray.get(self.train_manager.async_train(step, refs))
 
                     with timers("pause_delay"):
                         self.rollout_sampler.pause()
 
                 # Fraction of the step the trainer spent NOT training (waiting
-                # for / preparing rollout data, flushing, pausing) vs training.
+                # for / preparing rollout data, pausing) vs training.
                 wait = timers.elapsed("wait")
                 train = timers.elapsed("train")
                 if wait + train > 0:
@@ -510,7 +506,7 @@ class Trainer:
 
                 if self.is_colocated:
                     with time_marker("offload_train", step=step):
-                        self.train_manager.offload()
+                        self.train_manager.offload(move_params=True)
 
         self._finalize_training()
 
@@ -632,10 +628,7 @@ class Trainer:
 
     def save_ckpt(self, step: int) -> None:
         """Save on cadence or at the final step, so training always ends with a save."""
-        save_freq = self.config.trainer.save_freq
-        if save_freq <= 0:
-            return
-        if step % save_freq != 0 and step != self.config.total_steps:
+        if not should_save(self.config, step):
             return
         save_checkpoint = self.config.trainer.save_checkpoint
         save_hf = self.config.trainer.save_hf

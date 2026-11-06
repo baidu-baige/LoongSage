@@ -32,6 +32,34 @@ _SWEBENCH_CONFIG_PATH = Path(minisweagent.__file__).parent / "config/benchmarks/
 _SWEBENCH_CONFIG: dict[str, Any] = yaml.safe_load(_SWEBENCH_CONFIG_PATH.read_text()) or {}
 
 
+def _disable_litellm_think_extraction() -> bool:
+    """Stop litellm from splitting a leading ``<think>...</think>`` out of ``message.content``.
+
+    litellm's response conversion moves such a block into ``reasoning_content`` and leaves only
+    the text after it in ``content``. The router stores the raw generation, think block included,
+    so the content mini-swe-agent echoes back no longer matches the router's history. The prefix
+    check then fails and the router opens a new segment. Replacing the helper with an identity
+    keeps ``content`` byte-identical to what the router returned. A response that carries an
+    explicit ``reasoning_content`` field is unaffected, since litellm only calls the helper when
+    that field is absent.
+
+    Returns True if the patch is active.
+    """
+    from litellm.litellm_core_utils.prompt_templates import common_utils
+
+    if getattr(common_utils, "_parse_content_for_reasoning", None) is None:
+        logger.warning(
+            "litellm has no _parse_content_for_reasoning; <think> blocks in message content "
+            "may be extracted by litellm and cause router prefix mismatches"
+        )
+        return False
+    common_utils._parse_content_for_reasoning = lambda message_text: (None, message_text)
+    return True
+
+
+_disable_litellm_think_extraction()
+
+
 class CodaLitellmModel(LitellmModel):
     """LitellmModel variant that preserves the assistant reply on FormatError."""
 
