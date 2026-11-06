@@ -74,6 +74,11 @@ _SENTINEL_TOOLS: list[Tool] = [Tool(type="function", function={"name": "_"})]
 # Parser fields SGLang's architecture-based detection can fill in.
 _PARSER_ATTRS = ("reasoning_parser", "tool_call_parser")
 
+# Tool-call parsers whose string parameters reach the tool verbatim. SGLang v0.5.23 strips
+# DeepSeek-V4.1 string parameters, dropping the leading/trailing newlines and indentation
+# that edit and write-file arguments depend on.
+_UNSTRIPPED_STRING_PARAM_TOOL_PARSERS = frozenset({"deepseekv41"})
+
 
 def _detect_parser_names_from_arch(model_path: str | None) -> tuple[str | None, str | None]:
     """Ask SGLang which parsers match the architecture in the model's ``config.json``.
@@ -727,6 +732,8 @@ class TrajectoryParser:
             tools=_to_sglang_tools(tools) or _SENTINEL_TOOLS,
             tool_call_parser=self._tool_call_parser_name,
         )
+        if self._tool_call_parser_name in _UNSTRIPPED_STRING_PARAM_TOOL_PARSERS:
+            parser.detector.strip_string_param_value = False
         # Forward calls whose name is absent from the schema instead of dropping them:
         # agents may omit "tools" on follow-up turns while the LLM keeps emitting markup,
         # and a silently dropped call would leave raw markup in the assistant content.

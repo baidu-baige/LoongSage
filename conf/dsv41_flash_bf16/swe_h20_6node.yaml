@@ -84,8 +84,7 @@ rollout:
     max_total_tokens: 10000000 #10M tokens
     disable_cuda_graph: false
     ep_size: 16
-    dp_size: 2
-    enable_dp_attention: true
+    attn_dp_size: 2
     attention_backend: dsv4
     moe_runner_backend: auto
     max_running_requests: 128

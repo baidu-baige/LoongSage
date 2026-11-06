@@ -68,8 +68,7 @@ rollout:
     max_total_tokens: 10000000 #10M tokens
     disable_cuda_graph: false
     ep_size: 8
-    #dp_size: 1
-    #enable_dp_attention: true
+    #attn_dp_size: 1
     attention_backend: dsv4
     max_running_requests: 128
   sglang_replicas:
