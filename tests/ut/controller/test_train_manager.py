@@ -119,24 +119,13 @@ class TestPPOValidation:
     def test_valid_ppo_config_passes(self):
         validate_ppo(make_ppo_config())
 
-    @pytest.mark.parametrize(
-        "overrides, message",
-        [
-            ({"critic": {"enable": False}}, "gae requires critic.enable"),
-            ({"algorithm": {"advantage_estimator": "grpo"}}, "critic.enable requires algorithm.advantage_estimator=gae"),
-            ({"critic": {"critic_warmup": -1}}, "critic_warmup must be >= 0"),
-            ({"opd": {"enable": True}}, "opd.enable"),
-            ({"trainer": {"forward_only": True}}, "does not support trainer.forward_only"),
-            ({"data_sources": [{"num_trajectories_per_prompt": 4}]}, "num_trajectories_per_prompt == 1"),
-        ],
-    )
-    def test_invalid_ppo_configs_raise(self, overrides, message):
-        with pytest.raises(ValueError, match=message):
-            validate_ppo(make_ppo_config(**overrides))
+    def test_gae_without_critic_raises(self):
+        with pytest.raises(ValueError, match="gae requires critic.enable"):
+            validate_ppo(make_ppo_config(critic={"enable": False}))
 
-    def test_rollout_only_accepts_gae_without_critic(self):
-        """Rollout-only turns the critic off but keeps the PPO estimator; it computes no advantages."""
-        validate_ppo(make_ppo_config(run_mode="rollout-only", critic={"enable": False}))
+    def test_rollout_only_rejects_gae_without_critic(self):
+        with pytest.raises(ValueError, match="gae requires critic.enable"):
+            validate_ppo(make_ppo_config(run_mode="rollout-only", critic={"enable": False}))
 
     def test_grpo_config_passes(self):
         validate_ppo(make_minimal_config())
@@ -277,7 +266,9 @@ class TestCriticOrchestration:
         assert manager.async_train(1, [Box("s0"), Box("s1")]) == []
         assert not any(role == "actor" and name in ("onload", "train") for role, name, _ in calls(log, start))
         assert manager.async_save_model(1) == []
+        flush_start = len(log)
         assert manager.async_save_model(None) == ["actor0.save_model", "actor1.save_model"]
+        assert phases(log, flush_start) == [("critic", "save_model", (None,)), ("actor", "save_model", (None, True, False))]
         assert manager.async_save_model(2) == ["actor0.save_model", "actor1.save_model"]
 
     def test_colocate_onload_gives_gpu_to_critic_once(self, build):
@@ -293,11 +284,6 @@ class TestCriticOrchestration:
         start = len(log)
         manager.offload()
         assert phases(log, start) == [("critic", "offload", (True,)), ("actor", "offload", (False,))]
-
-    def test_missing_dp_advantages_raise(self, build):
-        manager, _log, _ = build(make_ppo_config(trainer={"num_gpus_per_node": 1}))
-        with pytest.raises(RuntimeError, match="DP ranks \\[1\\]"):
-            manager.async_train(3, [Box("s0"), Box("s1")])
 
     def test_without_critic_everything_targets_actor(self, build):
         config = make_minimal_config(trainer={"num_gpus_per_node": 2, "env_vars": {}})

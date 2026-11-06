@@ -268,11 +268,9 @@ def loss_function(
         reported_metrics,
     )
 
-
 # ════════════════════════════════════════════════════════════════════════
 # PPO critic: value predictions and value loss
 # ════════════════════════════════════════════════════════════════════════
-
 
 def response_values(
     config: DictConfig,

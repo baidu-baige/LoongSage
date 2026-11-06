@@ -29,6 +29,10 @@ def make_critic_config(**overrides):
             },
             "scheduler": {"lr_warmup_steps": 3},
         },
+        trainer={"forward_only": False},
+        algorithm={"advantage_estimator": "gae"},
+        opd={"enable": False},
+        data_sources=[{"num_trajectories_per_prompt": 1}],
     )
     if overrides:
         cfg = OmegaConf.merge(cfg, OmegaConf.create(overrides))
@@ -66,6 +70,20 @@ class TestValidateConfig:
         twice = MegatronCriticWorker.validate_config(OmegaConf.create(OmegaConf.to_container(once)))
         assert OmegaConf.to_container(once) == OmegaConf.to_container(twice)
 
+    @pytest.mark.parametrize(
+        "overrides, message",
+        [
+            ({"algorithm": {"advantage_estimator": "grpo"}}, "critic.enable requires algorithm.advantage_estimator=gae"),
+            ({"critic": {"critic_warmup": -1}}, "critic_warmup must be >= 0"),
+            ({"opd": {"enable": True}}, "opd.enable"),
+            ({"trainer": {"forward_only": True}}, "does not support trainer.forward_only"),
+            ({"data_sources": [{"num_trajectories_per_prompt": 4}]}, "num_trajectories_per_prompt == 1"),
+        ],
+    )
+    def test_invalid_ppo_configs_raise(self, overrides, message):
+        with pytest.raises(ValueError, match=message):
+            MegatronCriticWorker.validate_config(make_critic_config(**overrides))
+
     def test_critic_checkpoint_dir_name(self):
         assert MegatronCriticWorker.CKPT_DIR_NAME == "critic_dist_ckpt"
         assert MegatronCriticWorker.CKPT_DIR_NAME != MegatronTrainWorker.CKPT_DIR_NAME
@@ -98,19 +116,33 @@ def test_init_rewrites_only_the_process_local_config(monkeypatch):
 
 
 @pytest.mark.parametrize("step, update_tracker", [(1, True), (2, True), (3, False)])
-def test_save_model_writes_tracker_only_during_warmup(step, update_tracker):
-    worker = make_worker()  # critic_warmup = 2
+@pytest.mark.parametrize("async_save", [True, False])
+def test_save_model_writes_tracker_only_during_warmup(step, update_tracker, async_save):
+    worker = make_worker(make_critic_config(trainer={"async_save": async_save}))  # critic_warmup = 2
     worker._save_dist_checkpoint = MagicMock()
 
     worker.save_model(step)
 
-    worker._save_dist_checkpoint.assert_called_once_with(step, async_save=False, update_tracker=update_tracker)
+    worker._save_dist_checkpoint.assert_called_once_with(
+        step, async_save=async_save, update_tracker=update_tracker
+    )
 
 
-def test_save_model_flush_and_disabled_are_noops():
+def test_save_model_flush_drains_async_saves(monkeypatch):
+    async_calls = MagicMock()
+    monkeypatch.setattr("coda.backends.megatron.megatron_train_worker.async_calls", async_calls)
     worker = make_worker()
     worker._save_dist_checkpoint = MagicMock()
+
     worker.save_model(None)
+
+    async_calls.maybe_finalize_async_calls.assert_called_once_with(blocking=True)
+    worker._save_dist_checkpoint.assert_not_called()
+
+
+def test_save_model_disabled_is_noop():
+    worker = make_worker()
+    worker._save_dist_checkpoint = MagicMock()
     worker.save_model(4, checkpoint=False)
     worker._save_dist_checkpoint.assert_not_called()
 

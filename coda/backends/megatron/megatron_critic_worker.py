@@ -53,7 +53,7 @@ class MegatronCriticWorker(MegatronTrainWorker):
 
     @classmethod
     def validate_config(cls, config):
-        """Shared Megatron validation, plus the critic's own optimizer / scheduler.
+        """Shared Megatron validation and PPO constraints, plus the critic's own optimizer / scheduler.
 
         ``critic.optimizer`` / ``critic.scheduler`` are configured independently
         of the actor's ``megatron.optimizer`` / ``megatron.scheduler``; only
@@ -61,6 +61,25 @@ class MegatronCriticWorker(MegatronTrainWorker):
         weight_decay.
         """
         config = super().validate_config(config)
+
+        estimator = config.algorithm.advantage_estimator
+        if estimator != "gae":
+            raise ValueError(
+                f"critic.enable requires algorithm.advantage_estimator=gae, got {estimator!r}."
+            )
+        if int(config.critic.critic_warmup) < 0:
+            raise ValueError(f"critic.critic_warmup must be >= 0, got {config.critic.critic_warmup}")
+        if config.opd.enable:
+            raise ValueError("critic.enable and opd.enable cannot be used together yet.")
+        if config.trainer.forward_only:
+            raise ValueError("critic.enable does not support trainer.forward_only.")
+        for idx, ds in enumerate(config.data_sources):
+            if int(ds.num_trajectories_per_prompt) != 1:
+                raise ValueError(
+                    f"PPO (critic.enable) currently requires num_trajectories_per_prompt == 1, "
+                    f"got {ds.num_trajectories_per_prompt} for data_sources[{idx}]."
+                )
+
         cls._finalize_optim_sched(config.critic.optimizer, config.critic.scheduler, config)
         return config
 
@@ -123,17 +142,23 @@ class MegatronCriticWorker(MegatronTrainWorker):
     @override
     @torch.no_grad()
     def save_model(self, step, checkpoint=True, hf=False):
-        """Save ``train_step_{step}/critic_dist_ckpt`` synchronously; no HF export.
+        """Save ``train_step_{step}/critic_dist_ckpt``; no HF export.
 
-        Saving is synchronous because the manager offloads the critic right
-        after. The shared tracker is written by whichever model saves last in a
+        Follows ``trainer.async_save``. An async save stages the tensors in host
+        memory before returning, so the manager can offload the critic right
+        after. ``step=None`` drains the pending async save.
+
+        The shared tracker is written by whichever model saves last in a
         step: the critic during warmup (``step <= critic_warmup``, the actor is
         not saved), the actor afterwards.
         """
-        if step is None or not checkpoint:
+        if step is None:
+            super().save_model(step)
+            return
+        if not checkpoint:
             return
         update_tracker = step <= int(self.config.critic.critic_warmup)
-        self._save_dist_checkpoint(step, async_save=False, update_tracker=update_tracker)
+        self._save_dist_checkpoint(step, async_save=self.config.trainer.async_save, update_tracker=update_tracker)
 
     @override
     def train(self, step, rollout_data_ref):

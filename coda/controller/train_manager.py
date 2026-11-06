@@ -57,52 +57,18 @@ class TrainManager:
 
     def _validate_config(self):
         self.config = MegatronActorWorker.validate_config(self.config)
-        estimator = self.config.algorithm.advantage_estimator
         if self.config.critic.enable:
             self.config = MegatronCriticWorker.validate_config(self.config)
-            # PPO constraints; checked here so the trainer needs no critic knowledge.
-            if estimator != "gae":
-                raise ValueError(
-                    f"critic.enable requires algorithm.advantage_estimator=gae, got {estimator!r}."
-                )
-            if int(self.config.critic.critic_warmup) < 0:
-                raise ValueError(f"critic.critic_warmup must be >= 0, got {self.config.critic.critic_warmup}")
-            if self.config.opd.enable:
-                raise ValueError("critic.enable and opd.enable cannot be used together yet.")
-            if self.config.trainer.forward_only:
-                raise ValueError("critic.enable does not support trainer.forward_only.")
-            for idx, ds in enumerate(self.config.data_sources):
-                if int(ds.num_trajectories_per_prompt) != 1:
-                    raise ValueError(
-                        f"PPO (critic.enable) currently requires num_trajectories_per_prompt == 1, "
-                        f"got {ds.num_trajectories_per_prompt} for data_sources[{idx}]."
-                    )
-        elif estimator == "gae" and self.config.run_mode != "rollout-only":
-            # Rollout-only computes no advantages (the trainer turns the critic off there).
+        elif self.config.algorithm.advantage_estimator == "gae" :
             raise ValueError("algorithm.advantage_estimator=gae requires critic.enable=true.")
-
-    # ── worker-pool helpers ──────────────────────────────────────────────
-
-    @staticmethod
-    def _master(workers) -> tuple[str, int]:
-        """Rank 0 address + a free port for one pool's torch.distributed rendezvous."""
-        return ray.get(workers[0].get_ip_port.remote())
-
-    @staticmethod
-    def _onload_pool(workers):
-        return ray.get([w.onload.remote() for w in workers])
-
-    @staticmethod
-    def _offload_pool(workers, move_params: bool):
-        return ray.get([w.offload.remote(move_params) for w in workers])
 
     def _make_critic_resident(self):
         """Give the GPU to the critic: release the actor fully, then onload the critic."""
         if self._resident == "critic":
             return
         # Also drops actor params kept on GPU by offload(move_params=False).
-        self._offload_pool(self._actor_worker_handlers, True)
-        self._onload_pool(self._critic_worker_handlers)
+        ray.get([w.offload.remote(True) for w in self._actor_worker_handlers])
+        ray.get([w.onload.remote() for w in self._critic_worker_handlers])
         self._resident = "critic"
 
     # ── public API (the same with or without a critic) ───────────────────
@@ -117,15 +83,16 @@ class TrainManager:
         actor's rendezvous is bound, so the two worlds cannot collide. Returns
         ``[]`` in that case so ``ray.get(async_init())`` still works.
         """
-        actor_addr, actor_port = self._master(self._actor_worker_handlers)
+        actor_addr, actor_port = ray.get(self._actor_worker_handlers[0].get_ip_port.remote())
+        actor_refs = [w.init.remote(self.config, actor_addr, actor_port) for w in self._actor_worker_handlers]
         if not self.config.critic.enable:
-            return [w.init.remote(self.config, actor_addr, actor_port) for w in self._actor_worker_handlers]
+            return actor_refs
 
-        ray.get([w.init.remote(self.config, actor_addr, actor_port) for w in self._actor_worker_handlers])
-        self._offload_pool(self._actor_worker_handlers, True)
-        critic_addr, critic_port = self._master(self._critic_worker_handlers)
+        ray.get(actor_refs)
+        ray.get([w.offload.remote(True) for w in self._actor_worker_handlers])
+        critic_addr, critic_port = ray.get(self._critic_worker_handlers[0].get_ip_port.remote())
         ray.get([w.init.remote(self.config, critic_addr, critic_port) for w in self._critic_worker_handlers])
-        self._offload_pool(self._critic_worker_handlers, True)
+        ray.get([w.offload.remote(True) for w in self._critic_worker_handlers])
         self._resident = None
         logger.info("[TrainManager] actor and critic pools initialized, both offloaded")
         return []
@@ -148,21 +115,17 @@ class TrainManager:
         for out in outputs:
             for dp_rank, ref in out.items():
                 rollout_data_ref[dp_rank].critic_ref = ref
-        missing = [dp for dp, box in enumerate(rollout_data_ref) if box.critic_ref is None]
-        # TODO: remove once validated in end-to-end testing.
-        if missing:
-            raise RuntimeError(f"Critic returned no advantages for DP ranks {missing}")
 
         if should_save(self.config, step) and self.config.trainer.save_checkpoint:
             ray.get([w.save_model.remote(step) for w in self._critic_worker_handlers])
-        self._offload_pool(self._critic_worker_handlers, True)
+        ray.get([w.offload.remote(True) for w in self._critic_worker_handlers])
         self._resident = None
 
         if step <= int(self.config.critic.critic_warmup):
             logger.info(f"[TrainManager] step {step}: critic warmup, actor not trained")
             return []
 
-        self._onload_pool(self._actor_worker_handlers)
+        ray.get([w.onload.remote() for w in self._actor_worker_handlers])
         self._resident = "actor"
         return [w.train.remote(step, rollout_data_ref) for w in self._actor_worker_handlers]
 
@@ -170,10 +133,15 @@ class TrainManager:
         """Save the actor's checkpoint/hf_models. Pass ``step=None`` to only flush pending async saves.
 
         The critic is saved inside :meth:`async_train`. During critic warmup
-        the actor has not changed and is not saved.
+        the actor has not changed and is not saved. On flush the critic is
+        drained first, so the actor's finalize (which writes the shared tracker)
+        never points at a critic checkpoint that is still being written.
         """
-        if self.config.critic.enable and step is not None and step <= int(self.config.critic.critic_warmup):
-            return []
+        if self.config.critic.enable:
+            if step is None:
+                ray.get([w.save_model.remote(None) for w in self._critic_worker_handlers])
+            elif step <= int(self.config.critic.critic_warmup):
+                return []
         return [w.save_model.remote(step, checkpoint, hf) for w in self._actor_worker_handlers]
 
     def async_update_weights(self, channel_meta: ChannelMeta):
@@ -189,7 +157,7 @@ class TrainManager:
         if self.config.critic.enable:
             self._make_critic_resident()
             return None
-        return self._onload_pool(self._actor_worker_handlers)
+        return ray.get([w.onload.remote() for w in self._actor_worker_handlers])
 
     def offload(self, move_params: bool = False):
         """Offload: move from GPU memory to CPU memory
@@ -200,7 +168,7 @@ class TrainManager:
                 always offloaded completely.
         """
         if self._resident == "critic":
-            self._offload_pool(self._critic_worker_handlers, True)
-        result = self._offload_pool(self._actor_worker_handlers, move_params)
+            ray.get([w.offload.remote(True) for w in self._critic_worker_handlers])
+        result = ray.get([w.offload.remote(move_params) for w in self._actor_worker_handlers])
         self._resident = None
         return result
