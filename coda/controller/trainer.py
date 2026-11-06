@@ -27,6 +27,7 @@ from coda.transfer_mesh import ChannelMeta
 from coda.utils.checkpoint_utils import get_tracker_file, resolve_dist_ckpt_dir
 from coda.utils.tracking import configure_tracking, time_marker, TimeMarkerAcc, track
 from coda.utils import logging_utils
+from coda.utils.tree_pack_utils import tree_pack_unsupported_reason
 
 logger = logging.getLogger(__name__)
 
@@ -542,6 +543,13 @@ class Trainer:
 
         self._finalize_training()
 
+    def _tree_dp_balance(self) -> bool:
+        """Split DP shards by estimated tree cost (tree packing, trainer.tree_dp_balance)."""
+        tr = self.config.trainer
+        # same fallback as the train worker (which also checks the model for mRoPE)
+        return (bool(tr.get("tree_pack", False)) and bool(tr.get("tree_dp_balance", True))
+                and tree_pack_unsupported_reason(self.config) is None)
+
     def _process_traj_for_train(
         self,
         batch: list[TrajectoryGroup],
@@ -553,6 +561,11 @@ class Trainer:
 
         if mode == Mode.TRAIN_ONLY:
             splited_batch = self._load_batch_from_disk(step)
+            if self._tree_dp_balance():
+                # dumps carry the ROLLOUT_ONLY split; rebalance it by tree cost
+                groups = [g for shard in splited_batch for g in shard]
+                n_mb = sum(len(g.trajectories) for g in groups) // self.config.trainer.mini_batch_size
+                splited_batch = split_traj_group_by_dp(groups, self.dp_size, n_mb, tree_cost=True)
             self._set_current_weight_version(splited_batch, current_weight_version)              
             splited_batch_refs = put_dp_shards_to_ray(splited_batch, self.dp_size)
             return splited_batch_refs
@@ -560,7 +573,8 @@ class Trainer:
         total_trajs = sum(len(g.trajectories) for g in batch)
         num_mini_batch = total_trajs // self.config.trainer.mini_batch_size
         self._set_current_weight_version(batch, current_weight_version)
-        splited_batch = split_traj_group_by_dp(batch, self.dp_size, num_mini_batch)
+        splited_batch = split_traj_group_by_dp(batch, self.dp_size, num_mini_batch,
+                                               tree_cost=self._tree_dp_balance())
 
         if mode == Mode.ROLLOUT_ONLY:
             self._save_batch_to_disk(splited_batch, step)

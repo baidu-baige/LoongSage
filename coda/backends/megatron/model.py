@@ -38,6 +38,8 @@ from coda.backends.megatron.cp_utils import (
     gather_and_slice_response,
 )
 from coda.backends.megatron.data import DataIterator
+from coda.backends.megatron.tree_batch import build_tree_microbatch
+from coda.backends.megatron.tree_loss import lm_head_rows, tree_compute_log_probs
 from coda.backends.megatron.loss import loss_function
 from coda.backends.megatron.logits_utils import compute_log_probs
 from coda.backends.megatron.kl_ctx import (
@@ -115,19 +117,23 @@ def _collect_loss_metrics(
 # Routing Replay Helpers
 # ════════════════════════════════════════════════════════════════════════
 
+def _r3_rows(batch: dict, model_chunk: torch.nn.Module) -> list[torch.Tensor]:
+    """Per-row routed experts reshaped to ``[seq, num_layers, topk]``.
+
+    Rows arrive as read-only numpy views of the Ray object store (see put_dp_shards_to_ray).
+    """
+    mc = get_model_config(model_chunk)
+    return [torch.as_tensor(seq).reshape(len(seq), mc.num_layers, mc.moe_router_topk)
+            for seq in batch["rollout_routed_experts"]]
+
+
 def setup_routing_replay(config: DictConfig, batch: dict, model_chunk: torch.nn.Module, model: Sequence):
     """
     Extract routing data from batch and setup Megatron RouterReplay for the current model chunk.
     Only sets replay data for the RouterReplay instances belonging to the current model_chunk's vp_stage. 
     """
     model_config = get_model_config(model_chunk)
-    # Rows arrive as read-only numpy views of the Ray object store (see put_dp_shards_to_ray).
-    rollout_routed_experts = [
-        torch.as_tensor(seq).reshape(len(seq), model_config.num_layers, model_config.moe_router_topk)
-        for seq in batch["rollout_routed_experts"]
-    ]
-
-    packed_experts = prepare_routing_replay_data(rollout_routed_experts, model_config)
+    packed_experts = prepare_routing_replay_data(_r3_rows(batch, model_chunk), model_config)
 
     # Determine which vp_stage this model_chunk corresponds to.
     # Megatron scheduler passes model[model_chunk_id] to forward_step_func,
@@ -232,6 +238,86 @@ def _get_position_ids(
     )
     return position_ids
 
+
+# ════════════════════════════════════════════════════════════════════════
+# Tree (shared-prefix) helpers
+# ════════════════════════════════════════════════════════════════════════
+
+def forward_only_uses_tree(config: DictConfig, pg_policy=None) -> bool:
+    """Whether forward-only passes use tree micro-batches.
+
+    Args:
+        config: Unified training configuration.
+        pg_policy: Active PG KL policy; it needs row-wise logits, so it disables tree.
+
+    Returns:
+        True when ``trainer.tree_pack`` is on and no PG policy is active. The train
+        worker's data iterator must use the same decision.
+    """
+    return bool(config.trainer.get("tree_pack", False)) and pg_policy is None
+
+
+def _install_tree_patches(config: DictConfig, model: Sequence) -> bool:
+    """Install the tree monkeypatches (idempotent). Returns whether the LM head runs on the
+    loss rows only (``tree_lm_head_rows``; off with MTP, which reads every position)."""
+    from coda.backends.megatron.tree_attn import install_attention_tree_patch
+    from coda.backends.megatron.tree_gdn import install_gdn_tree_patch
+    from coda.backends.megatron.tree_loss import install_lm_head_row_select
+
+    install_gdn_tree_patch(config.trainer.get("tree_gdn_level_tokens", None))
+    install_attention_tree_patch()
+    if not _uses_mrope(model[0]):
+        raise NotImplementedError("tree_pack requires a model with explicit mRoPE position_ids")
+    if not bool(config.trainer.get("tree_lm_head_rows", True)) or getattr(
+            get_model_config(model[0]), "mtp_num_layers", None):
+        return False
+    for chunk in model:
+        install_lm_head_row_select(chunk)
+    return True
+
+
+class _TreeChunkCache:
+    """Under VPP every model chunk runs ``forward_step`` on the same micro-batch: build its
+    tree once and share it. ``first`` marks the building call; entries are dropped after the
+    last chunk."""
+
+    def __init__(self, n_chunks: int):
+        self.n_chunks = n_chunks
+        self._entries: dict[int, list] = {}
+
+    def get(self, key: int, build: Callable[[], Any]) -> tuple[Any, bool]:
+        """Return ``(tree, first)`` for micro-batch ``key``, calling ``build`` on first use."""
+        entry = self._entries.get(key)
+        first = entry is None
+        if first:
+            entry = self._entries[key] = [build(), 0]
+        entry[1] += 1
+        if entry[1] >= self.n_chunks:
+            del self._entries[key]
+        return entry[0], first
+
+
+def _tree_lm_rows(packed_seq_params) -> torch.Tensor | None:
+    """LM-head rows of a tree micro-batch (None: every position)."""
+    idx = getattr(packed_seq_params, "tree_loss_index", None)
+    return None if idx is None else idx.lm_rows
+
+
+def _tree_microbatch(config, batch, tokens_list, model_chunk, cache, key, lm_rows_only,
+                     r3_stats):
+    """Tree micro-batch for ``batch`` (shared across VPP chunks) and the routing-replay batch
+    carrying its node routing. Returns ``(tmb, first, replay_batch)``."""
+    tmb, first = cache.get(key, lambda: build_tree_microbatch(
+        tokens_list, batch["response_lengths"], batch["dp_local_traj_idx"],
+        routed_rows=_r3_rows(batch, model_chunk) if config.trainer.use_rollout_routing_replay else None,
+        cp_partition_mode=config.megatron.model.cp_partition_mode,
+        restrict_lm_rows=lm_rows_only, r3_stats=r3_stats,
+    ))
+    replay_batch = batch if tmb.node_routing is None else {
+        **batch, "rollout_routed_experts": [tmb.node_routing.flatten(1)]}
+    return tmb, first, replay_batch
+
+
 # ════════════════════════════════════════════════════════════════════════
 # Forward-only
 # ════════════════════════════════════════════════════════════════════════
@@ -260,41 +346,58 @@ def forward_only(
     """
     # Detect teacher fields from rollout_data (populated by collect_teacher).
     teacher_keys = [k for k in data_iterator[0].rollout_data if k.startswith("teacher_")]
+    # Tree micro-batches here only when no PG-KL policy needs row-wise logits (KLCtx).
+    tree_pack = forward_only_uses_tree(config, pg_policy)
+    lm_rows_only = _install_tree_patches(config, model) if tree_pack else False
+    tree_cache = _TreeChunkCache(len(model))
 
     def forward_step_func(data_iter, model_chunk):
         # 1. Fetch micro-batch
         fetch_keys = ["tokens", "total_lengths", "response_lengths", "rollout_routed_experts"]
         fetch_keys += teacher_keys
+        if tree_pack:
+            fetch_keys.append("dp_local_traj_idx")
         batch = data_iter.get_next(fetch_keys)
         tokens_list: list[torch.Tensor] = batch["tokens"]
+        mb_key = data_iter.offset          # same micro-batch on every VPP chunk
 
         # 2. CP-slice and pack (partition mode threaded to keep zigzag/contiguous consistent)
         cp_partition_mode = config.megatron.model.cp_partition_mode
-        packed_tokens, packed_seq_params = prepare_packed_seq_params(
-            tokens_list, cp_partition_mode=cp_partition_mode,
-        )
-        target_list = [
-            torch.cat([t[1:], t.new_full((1,), 0)])
-            for t in tokens_list
-        ]
-        packed_targets, _ = prepare_packed_seq_params(
-            target_list, cp_partition_mode=cp_partition_mode,
-        )
-        position_ids = _get_position_ids(
-            model_chunk, tokens_list, packed_tokens, cp_partition_mode,
-        )
+        replay_batch = batch
+        if tree_pack:
+            # forward-only does not report tree stats
+            tmb, _, replay_batch = _tree_microbatch(config, batch, tokens_list, model_chunk,
+                                                    tree_cache, mb_key, lm_rows_only, False)
+            packed_tokens, packed_seq_params = tmb.tokens, tmb.packed_seq_params
+            position_ids = tmb.position_ids
+            packed_targets = None   # the tree loss index carries the targets
+        else:
+            packed_tokens, packed_seq_params = prepare_packed_seq_params(
+                tokens_list, cp_partition_mode=cp_partition_mode,
+            )
+            target_list = [
+                torch.cat([t[1:], t.new_full((1,), 0)])
+                for t in tokens_list
+            ]
+            packed_targets, _ = prepare_packed_seq_params(
+                target_list, cp_partition_mode=cp_partition_mode,
+            )
+            position_ids = _get_position_ids(
+                model_chunk, tokens_list, packed_tokens, cp_partition_mode,
+            )
 
         # Handle Routing Replay (Forward Only)
         if config.trainer.use_rollout_routing_replay:
-            setup_routing_replay(config, batch, model_chunk, model)
+            setup_routing_replay(config, replay_batch, model_chunk, model)
 
-        # 3. Model forward
-        output = model_chunk(
-            input_ids=packed_tokens.unsqueeze(0),
-            position_ids=position_ids,
-            attention_mask=None,
-            packed_seq_params=packed_seq_params,
-        )
+        # 3. Model forward (tree micro-batches: LM head on the loss rows only)
+        with lm_head_rows(_tree_lm_rows(packed_seq_params)):
+            output = model_chunk(
+                input_ids=packed_tokens.unsqueeze(0),
+                position_ids=position_ids,
+                attention_mask=None,
+                packed_seq_params=packed_seq_params,
+            )
 
         if config.trainer.use_rollout_routing_replay:
             RouterReplay.clear_global_indices()
@@ -337,6 +440,12 @@ def compute_forward_only_outputs(
     cp_partition_mode = config.megatron.model.cp_partition_mode
 
     collected = {}
+    tree_idx = getattr(packed_seq_params, "tree_loss_index", None)
+    if tree_idx is not None:
+        if pg_policy is not None:
+            raise NotImplementedError("tree forward-only does not support PG-KL policies")
+        collected["log_probs"] = tree_compute_log_probs(tree_idx, output_tensor, temperature)
+        return torch.tensor(0.0, device=output_tensor.device), collected
     collected["log_probs"] = compute_log_probs(
         packed_targets,
         total_lengths,
@@ -397,6 +506,11 @@ def train_minibatch(
     """
     # Detect teacher fields from rollout_data (populated by collect_teacher).
     teacher_keys = [k for k in data_iterator[0].rollout_data if k.startswith("teacher_")]
+    tree_pack = bool(config.trainer.get("tree_pack", False))
+    tree_r3_stats = bool(config.trainer.get("tree_r3_stats", True))
+    tree_stats: list[dict[str, float]] = []
+    lm_rows_only = _install_tree_patches(config, model) if tree_pack else False
+    tree_cache = _TreeChunkCache(len(model))
 
     # ── forward_step callback ──────────────────────────────────────────
 
@@ -420,32 +534,47 @@ def train_minibatch(
             "rollout_routed_experts",
             "ref_log_probs",
         ]
+        if tree_pack:
+            keys.append("dp_local_traj_idx")
         keys += teacher_keys
 
         batch = data_iter.get_next(keys)
         tokens_list: list[torch.Tensor] = batch["tokens"]
+        mb_key = data_iter.offset          # same micro-batch on every VPP chunk
 
         # 2. CP-slice and pack (partition mode threaded to keep zigzag/contiguous consistent)
         cp_partition_mode = config.megatron.model.cp_partition_mode
-        packed_tokens, packed_seq_params = prepare_packed_seq_params(
-            tokens_list,
-            cp_partition_mode=cp_partition_mode,
-        )
-        position_ids = _get_position_ids(
-            model_chunk, tokens_list, packed_tokens, cp_partition_mode,
-        )
+        replay_batch = batch
+        if tree_pack:
+            # the loss closure detects tree micro-batches via packed_seq_params
+            tmb, first, replay_batch = _tree_microbatch(
+                config, batch, tokens_list, model_chunk, tree_cache, mb_key, lm_rows_only,
+                tree_r3_stats)
+            packed_tokens, packed_seq_params = tmb.tokens, tmb.packed_seq_params
+            position_ids = tmb.position_ids
+            if first:
+                tree_stats.append(tmb.stats)
+        else:
+            packed_tokens, packed_seq_params = prepare_packed_seq_params(
+                tokens_list,
+                cp_partition_mode=cp_partition_mode,
+            )
+            position_ids = _get_position_ids(
+                model_chunk, tokens_list, packed_tokens, cp_partition_mode,
+            )
 
         # Handle Routing Replay (Train)
         if config.trainer.use_rollout_routing_replay:
-            setup_routing_replay(config, batch, model_chunk, model)
+            setup_routing_replay(config, replay_batch, model_chunk, model)
 
-        # 3. Model forward
-        output = model_chunk(
-            input_ids=packed_tokens.unsqueeze(0),
-            position_ids=position_ids,
-            attention_mask=None,
-            packed_seq_params=packed_seq_params,
-        )
+        # 3. Model forward (tree micro-batches: LM head on the loss rows only)
+        with lm_head_rows(_tree_lm_rows(packed_seq_params)):
+            output = model_chunk(
+                input_ids=packed_tokens.unsqueeze(0),
+                position_ids=position_ids,
+                attention_mask=None,
+                packed_seq_params=packed_seq_params,
+            )
         if config.trainer.use_rollout_routing_replay:
             RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_BACKWARD)
 
@@ -495,11 +624,34 @@ def train_minibatch(
             # master: validate_config turns off store_param_remainders under QAT.
             qat_plan.snap_()
 
-    return _collect_loss_metrics(
+    metrics = _collect_loss_metrics(
         config,
         losses,
         grad_norm.item(),
     )
+    if tree_stats:
+        _log_tree_stats(step, tree_stats, metrics)
+    return metrics
+
+
+def _log_tree_stats(step: int, tree_stats: list[dict[str, float]], metrics: dict) -> None:
+    """Sum the per-micro-batch tree stats, over DP ranks too on the last PP stage (like the
+    loss metrics); ratios are recomputed from the sums."""
+    tot: dict[str, float] = {}
+    for st in tree_stats:
+        for k, v in st.items():
+            if not k.endswith("_ratio"):
+                tot[k] = tot.get(k, 0.0) + v
+    if metrics:
+        tot = reduce_dict(tot, group=mpu.get_data_parallel_group())
+    tot["tree/node_ratio"] = tot["tree/nodes"] / max(tot["tree/row_tokens"], 1.0)
+    if "tree/r3_shared_tokens" in tot:
+        tot["tree/r3_mismatch_token_ratio"] = (
+            tot["tree/r3_mismatch_tokens"] / max(tot["tree/r3_shared_tokens"], 1.0))
+    logger.info("[tree_pack] step=%s micro_batches=%d %s", step, len(tree_stats),
+                " ".join(f"{k}={v:.4g}" for k, v in sorted(tot.items())))
+    if metrics:
+        metrics.update(tot)
 
 
 # ════════════════════════════════════════════════════════════════════════

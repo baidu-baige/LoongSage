@@ -297,6 +297,32 @@ def _get_min_num_microbatches(total_lengths: list[int], max_tokens_per_gpu: int)
     return len(batches)
 
 
+def _partition_items(nodes: list[int], lms: list[int] | None, k: int,
+                    lm_budget: int | None) -> list[list[int]]:
+    """Balanced partition into ``k`` micro-batches by cost (nodes / tokens); if a micro-batch
+    exceeds the logit-row budget, balance both loads (each normalized) instead."""
+    parts = get_seqlen_balanced_partitions(nodes, k, equal_size=False)
+    if lms is None or lm_budget is None or all(
+            sum(lms[i] for i in p) <= lm_budget for p in parts):
+        return parts
+    nb = max(max(nodes), 1)
+    key = [int(1e6 * (n / nb + m / lm_budget)) + 1 for n, m in zip(nodes, lms)]
+    return get_seqlen_balanced_partitions(key, k, equal_size=False)
+
+
+def _num_microbatches(nodes: list[int], lms: list[int] | None, node_budget: int,
+                           lm_budget: int | None) -> int:
+    """Fewest micro-batches (first-fit on cost) whose partition fits the logit-row budget."""
+    k = _get_min_num_microbatches(nodes, node_budget)
+    if lms is None or lm_budget is None:
+        return k
+    k = max(k, _get_min_num_microbatches(lms, lm_budget))
+    while k < len(nodes) and any(
+            sum(lms[i] for i in p) > lm_budget for p in _partition_items(nodes, lms, k, lm_budget)):
+        k += 1
+    return k
+
+
 def _trajectory_row_ranges(dp_local_traj_idxs: list[int]) -> list[tuple[int, int]]:
     """Group contiguous equal ``dp_local_traj_idx`` rows into [start, end) ranges.
 
@@ -314,11 +340,71 @@ def _trajectory_row_ranges(dp_local_traj_idxs: list[int]) -> list[tuple[int, int
     return ranges
 
 
+def _tree_items(
+    rollout_data: RolloutBatch,
+    mini_batch_ranges: list[tuple[int, int]],
+    max_budget: int,
+    cut: str = "min_cost",
+    lm_budget: int | None = None,
+) -> tuple[list[list[list[int]]], list[list[int]], list[list[int]]]:
+    """Per mini-batch: tree groups (row indices), their node counts and logit rows.
+
+    Each trajectory's chained rows are cut into trees of <= ``max_budget`` nodes (and
+    <= ``lm_budget`` response tokens); ``min_cost`` picks the cheapest cut points
+    (``plan_sequences_min_cost``), ``greedy`` fills each tree.
+    """
+    from coda.backends.megatron.tree_batch import chain_branch_points
+    from coda.backends.megatron.tree_pack import group_nodes, plan_sequences, plan_sequences_min_cost
+
+    if cut not in ("min_cost", "greedy"):
+        raise ValueError(f"tree cut must be 'min_cost' or 'greedy', got {cut!r}")
+    plan = plan_sequences_min_cost if cut == "min_cost" else plan_sequences
+
+    tokens = rollout_data["tokens"]
+    resp_lens = rollout_data["response_lengths"]
+    traj_ranges = _trajectory_row_ranges(rollout_data["dp_local_traj_idx"])
+    all_rows, all_costs, all_lms = [], [], []
+    stats = {"trajectories": 0, "trees": 0, "ideal_nodes": 0, "recompute_nodes": 0}
+    for s, e in mini_batch_ranges:
+        rows, costs, lms = [], [], []
+        for ts, te in traj_ranges:
+            if ts < s or te > e:
+                continue
+            toks = tokens[ts:te]
+            lens = [int(t.numel()) for t in toks]
+            bp = chain_branch_points(toks, [0] * len(toks))
+            resp = [int(resp_lens[r]) for r in range(ts, te)]
+            cuts = plan(lens, bp, max_budget, resp_lens=resp, lm_cap=lm_budget)
+            for a, b in cuts:
+                rows.append(list(range(ts + a, ts + b)))
+                costs.append(group_nodes(lens, bp, a, b))
+                lms.append(sum(resp[a:b]))
+            # every tree after the first recomputes its first row's shared prefix
+            stats["trajectories"] += 1
+            stats["trees"] += len(cuts)
+            stats["ideal_nodes"] += lens[0] + sum(n - p for n, p in zip(lens[1:], bp[1:]))
+            stats["recompute_nodes"] += sum(bp[a] for a, _ in cuts[1:])
+        all_rows.append(rows)
+        all_costs.append(costs)
+        all_lms.append(lms)
+    stats["nodes"] = stats["ideal_nodes"] + stats["recompute_nodes"]
+    stats["row_tokens"] = sum(int(t.numel()) for t in tokens)
+    logger.info(
+        "[tree_pack] plan: budget=%d trajectories=%d trees=%d row_tokens=%d nodes=%d "
+        "ideal_nodes=%d recompute_nodes=%d (%.1f%% of nodes)",
+        max_budget, stats["trajectories"], stats["trees"], stats["row_tokens"],
+        stats["nodes"], stats["ideal_nodes"], stats["recompute_nodes"],
+        100.0 * stats["recompute_nodes"] / max(stats["nodes"], 1),
+    )
+    return all_rows, all_costs, all_lms
+
+
 def get_data_iterator(
     config: DictConfig,
     model: torch.nn.Module | Sequence[torch.nn.Module],
     rollout_data: RolloutBatch,
     use_single_mini_batch: bool = False,
+    tree_budget: bool = False,
 ) -> tuple[list[DataIterator], list[int]]:
     """Build data iterators and per minibatch num_microbatches for a rollout.
 
@@ -330,6 +416,8 @@ def get_data_iterator(
         rollout_data: The complete rollout batch for this DP rank.
         use_single_mini_batch: Treat the whole DP shard as one mini-batch instead
             of splitting it by ``config.mini_batch_size``.
+        tree_budget: Tree packing: bin-pack groups of same-trajectory rows by node count
+            (and logit rows) instead of single rows by token count.
 
     Returns:
         ``(data_iterators, num_microbatches_list)``
@@ -416,41 +504,58 @@ def get_data_iterator(
     max_budget = config.max_tokens_per_gpu * cp_size
     all_num_microbatches: list[int] = []
 
-    # Partition each mini-batch's Segments into micro-batches
-    for start, end in mini_batch_ranges:
-        all_num_microbatches.append(
-            _get_min_num_microbatches(total_lengths[start:end], max_budget)
+    # Items to bin-pack: tree groups costed by nodes (tree mode) or single rows by tokens.
+    item_lms, lm_budget = None, None
+    if tree_budget:
+        tree_cap = config.get("tree_max_nodes_per_gpu", None)
+        if tree_cap:
+            max_budget = int(tree_cap) * cp_size
+        # With tree_lm_head_rows the fp32 logits follow the logit rows, not the nodes: cap
+        # them at what a row-wise micro-batch holds (largest allocation of the last PP stage).
+        if config.get("tree_lm_head_rows", True):
+            lm_cap = config.get("tree_max_lm_rows_per_gpu", None) or config.max_tokens_per_gpu
+            lm_budget = int(lm_cap) * cp_size
+        item_rows, item_costs, item_lms = _tree_items(
+            rollout_data, mini_batch_ranges, max_budget,
+            cut=str(config.get("tree_cut", "min_cost")), lm_budget=lm_budget,
         )
+    else:
+        item_rows = [[[r] for r in range(s, e)] for s, e in mini_batch_ranges]
+        item_costs = [list(total_lengths[s:e]) for s, e in mini_batch_ranges]
+
+    def _lms(i: int) -> list[int] | None:
+        return item_lms[i] if lm_budget is not None else None
+
+    # Partition each mini-batch's Segments into micro-batches
+    for i, costs in enumerate(item_costs):
+        all_num_microbatches.append(_num_microbatches(costs, _lms(i), max_budget, lm_budget))
 
     # Sync max num_microbatches across DP ranks
     num_microbatches_tensor = torch.tensor(all_num_microbatches, dtype=torch.int, device=torch.cuda.current_device())
     dist.all_reduce(num_microbatches_tensor, op=dist.ReduceOp.MAX, group=mpu.get_data_parallel_group())
 
     if vpp_size > 1:
-        # vpp requires the number of microbatches to be divisible by
-        # microbatch_group_size_per_vp_stage
-        _megatron_cfg = get_model_config(model[0])
-        microbatch_group_size_per_vp_stage = _megatron_cfg.microbatch_group_size_per_vp_stage
-        # Floor-divide to the nearest multiple of microbatch_group_size_per_vp_stage so
-        # that VPP scheduling constraints are satisfied.  This may reduce num_microbatches
-        # below the value required to keep each microbatch within max_budget, meaning
-        # individual microbatches could exceed the token budget and risk OOM.
-        num_microbatches_tensor = torch.clamp(
-            num_microbatches_tensor // microbatch_group_size_per_vp_stage * microbatch_group_size_per_vp_stage,
-            min=1,
-        )
+        # VPP needs a multiple of microbatch_group_size_per_vp_stage. Tree micro-batches are
+        # sized to their budgets, so round UP (extras are padding-only). Row-wise floors
+        # (at least 1), which may leave micro-batches over max_budget and risk OOM.
+        group_size = get_model_config(model[0]).microbatch_group_size_per_vp_stage
+        if tree_budget:
+            num_microbatches_tensor = (
+                (num_microbatches_tensor + group_size - 1) // group_size * group_size
+            )
+        else:
+            num_microbatches_tensor = torch.clamp(
+                num_microbatches_tensor // group_size * group_size, min=1,
+            )
 
     num_microbatches_list = num_microbatches_tensor.tolist()
 
     # Balance each micro-batch across steps
     micro_batch_indices = []
     for i, num_mbs in enumerate(num_microbatches_list):
-        start, end = mini_batch_ranges[i]
-        lengths = total_lengths[start:end]
+        lengths = item_costs[i]
         local_num_mbs = min(num_mbs, len(lengths))
-        partitions = get_seqlen_balanced_partitions(
-            lengths, local_num_mbs, equal_size=False
-        )
+        partitions = _partition_items(lengths, _lms(i), local_num_mbs, lm_budget)
 
         # Check for OOM risks after forced seqlen balancing with clamped num_mbs
         for j in range(local_num_mbs):
@@ -467,8 +572,16 @@ def get_data_iterator(
                     f"exceeds max_tokens_per_gpu * cp_size ({max_budget}) "
                     f"by {partition_token_sum - max_budget} tokens."
                 )
-            for k in range(len(partitions[j])):
-                partitions[j][k] += start
+            if lm_budget is not None and mpu.get_tensor_model_parallel_rank() == 0 \
+                    and mpu.get_pipeline_model_parallel_rank() == 0:
+                lm_sum = sum(item_lms[i][idx] for idx in partitions[j])
+                if lm_sum > lm_budget:
+                    logger.warning(
+                        "[tree_pack] DP rank %d minibatch %d microbatch %d: %d logit rows "
+                        "> budget %d (a single tree exceeds it)",
+                        mpu.get_data_parallel_rank(), i, j, lm_sum, lm_budget)
+            # items -> rows, kept in trajectory order inside each micro-batch
+            partitions[j] = sorted(r for it in partitions[j] for r in item_rows[i][it])
         partitions.extend([[-1]] * (num_mbs - local_num_mbs))
         micro_batch_indices.extend(partitions)
 
