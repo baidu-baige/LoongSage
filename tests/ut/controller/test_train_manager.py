@@ -221,15 +221,14 @@ class TestCriticOrchestration:
         assert manager.bundle_indices == [10, 11]
         assert scheduler.calls == [("actor", -1), ("actor", -1), ("critic", 10), ("critic", 11)]
 
-    def test_init_is_sequential_with_separate_masters(self, build):
+    def test_init_offloads_critic_then_inits_actor(self, build):
         config = make_ppo_config()
         manager, log, _ = build(config)
-        assert manager.async_init() == []
+        assert manager.async_init() == ["actor0.init", "actor1.init"]
         assert phases(log) == [
-            ("actor", "init", (config, "actor-host", 20000)),
-            ("actor", "offload", (True,)),
             ("critic", "init", (config, "critic-host", 20001)),
             ("critic", "offload", (True,)),
+            ("actor", "init", (config, "actor-host", 20000)),
         ]
         # The masters are passed explicitly, never written into the shared config.
         assert "master_addr" not in config.trainer
@@ -271,6 +270,15 @@ class TestCriticOrchestration:
         assert phases(log, flush_start) == [("critic", "save_model", (None,)), ("actor", "save_model", (None, True, False))]
         assert manager.async_save_model(2) == ["actor0.save_model", "actor1.save_model"]
 
+    def test_step_after_warmup_step_onloads_critic_again(self, build):
+        """A warmup step leaves neither pool resident, so the next step must onload the critic."""
+        manager, log, _ = build(make_ppo_config())
+        manager.async_train(1, [Box("s0"), Box("s1")])
+        manager.offload()
+        start = len(log)
+        manager.onload()
+        assert phases(log, start) == [("critic", "onload", ())]
+
     def test_colocate_onload_gives_gpu_to_critic_once(self, build):
         manager, log, _ = build(make_ppo_config())
         manager.onload()
@@ -278,12 +286,34 @@ class TestCriticOrchestration:
         manager.async_train(3, [Box("s0"), Box("s1")])
         assert ("critic", "onload", ()) not in calls(log, start)
 
-    def test_offload_releases_resident_critic_and_actor(self, build):
+    def test_offload_releases_only_the_resident_pool(self, build):
         manager, log, _ = build(make_ppo_config())
         manager.onload()
         start = len(log)
         manager.offload()
-        assert phases(log, start) == [("critic", "offload", (True,)), ("actor", "offload", (False,))]
+        assert phases(log, start) == [("critic", "offload", (True,))]
+
+    def test_offload_with_nothing_resident_is_noop(self, build):
+        manager, log, _ = build(make_ppo_config())
+        start = len(log)
+        assert manager.offload() is None
+        assert log[start:] == []
+
+    def test_resident_actor_is_released_before_critic_onloads(self, build):
+        manager, log, _ = build(make_ppo_config())
+        manager.async_init()
+        start = len(log)
+        manager.onload()
+        assert phases(log, start) == [("actor", "offload", (True,)), ("critic", "onload", ())]
+
+    def test_offloaded_actor_is_not_offloaded_again(self, build):
+        """After offload() the actor is not resident; releasing its params is the caller's job."""
+        manager, log, _ = build(make_ppo_config())
+        manager.async_init()
+        manager.offload(move_params=True)
+        start = len(log)
+        manager.onload()
+        assert phases(log, start) == [("critic", "onload", ())]
 
     def test_without_critic_everything_targets_actor(self, build):
         config = make_minimal_config(trainer={"num_gpus_per_node": 2, "env_vars": {}})

@@ -22,10 +22,13 @@ class TrainManager:
     """Manages the actor ``TrainWorker`` Ray actors and, for PPO, the critic ones.
 
     GPU sharing with a critic: both pools hold one rank per GPU and run one at
-    a time. ``_resident`` names the pool currently onloaded for training
-    (``None`` when neither is). The actor may still keep its parameters on GPU
-    while not resident (``offload(move_params=False)`` keeps them for weight
-    sync); they are released before the critic onloads.
+    a time. ``_resident`` names the pool that may still hold GPU memory
+    (``None`` when neither does); only that pool is offloaded before the other
+    is onloaded. ``offload(move_params=False)`` clears ``_resident`` but keeps
+    the actor's parameters on GPU for weight sync, and ``update_weights``
+    releases them afterwards. A caller that offloads without a following weight
+    sync must pass ``move_params=True``, or the parameters stay on GPU while
+    the critic onloads.
     """
     def __init__(self, config: DictConfig, resource_scheduler):
         self.config: DictConfig = config
@@ -63,39 +66,34 @@ class TrainManager:
             raise ValueError("algorithm.advantage_estimator=gae requires critic.enable=true.")
 
     def _make_critic_resident(self):
-        """Give the GPU to the critic: release the actor fully, then onload the critic."""
+        """Give the GPU to the critic: release the actor fully if resident, then onload the critic."""
         if self._resident == "critic":
             return
-        # Also drops actor params kept on GPU by offload(move_params=False).
-        ray.get([w.offload.remote(True) for w in self._actor_worker_handlers])
+        if self._resident == "actor":
+            ray.get([w.offload.remote(True) for w in self._actor_worker_handlers])
         ray.get([w.onload.remote() for w in self._critic_worker_handlers])
         self._resident = "critic"
 
     # ── public API (the same with or without a critic) ───────────────────
 
     def async_init(self):
-        """Initialize the train workers.
+        """Initialize the train workers; returns the actor's init refs.
 
-        Without a critic this is asynchronous. With a critic the two
-        pools are initialized one after the other, inside this call, so two
-        full models + optimizers never sit on the GPU together; each pool is
-        offloaded right after its init. The critic's port is picked after the
-        actor's rendezvous is bound, so the two worlds cannot collide. Returns
-        ``[]`` in that case so ``ray.get(async_init())`` still works.
+        With a critic, the critic pool is initialized and fully offloaded
+        inside this call first, so two full models + optimizers never sit on
+        the GPU together. The actor's port is picked after the critic's
+        rendezvous is bound, so the two worlds cannot collide. The actor is
+        then initialized asynchronously and stays resident on GPU.
         """
+        if self.config.critic.enable:
+            critic_addr, critic_port = ray.get(self._critic_worker_handlers[0].get_ip_port.remote())
+            ray.get([w.init.remote(self.config, critic_addr, critic_port) for w in self._critic_worker_handlers])
+            ray.get([w.offload.remote(True) for w in self._critic_worker_handlers])
+
         actor_addr, actor_port = ray.get(self._actor_worker_handlers[0].get_ip_port.remote())
         actor_refs = [w.init.remote(self.config, actor_addr, actor_port) for w in self._actor_worker_handlers]
-        if not self.config.critic.enable:
-            return actor_refs
-
-        ray.get(actor_refs)
-        ray.get([w.offload.remote(True) for w in self._actor_worker_handlers])
-        critic_addr, critic_port = ray.get(self._critic_worker_handlers[0].get_ip_port.remote())
-        ray.get([w.init.remote(self.config, critic_addr, critic_port) for w in self._critic_worker_handlers])
-        ray.get([w.offload.remote(True) for w in self._critic_worker_handlers])
-        self._resident = None
-        logger.info("[TrainManager] actor and critic pools initialized, both offloaded")
-        return []
+        self._resident = "actor"
+        return actor_refs
 
     def async_train(self, step, rollout_data_ref):
         """Training entry point; returns the actor's train refs.
@@ -157,18 +155,23 @@ class TrainManager:
         if self.config.critic.enable:
             self._make_critic_resident()
             return None
+        self._resident = "actor"
         return ray.get([w.onload.remote() for w in self._actor_worker_handlers])
 
     def offload(self, move_params: bool = False):
-        """Offload: move from GPU memory to CPU memory
+        """Offload the resident pool: move from GPU memory to CPU memory.
+
+        A no-op when neither pool is resident.
 
         Args:
             move_params: Also release the actor's parameters (see
                 ``MegatronTrainWorker.offload``). The critic, when resident, is
                 always offloaded completely.
         """
+        result = None
         if self._resident == "critic":
-            ray.get([w.offload.remote(True) for w in self._critic_worker_handlers])
-        result = ray.get([w.offload.remote(move_params) for w in self._actor_worker_handlers])
+            result = ray.get([w.offload.remote(True) for w in self._critic_worker_handlers])
+        elif self._resident == "actor":
+            result = ray.get([w.offload.remote(move_params) for w in self._actor_worker_handlers])
         self._resident = None
         return result

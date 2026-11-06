@@ -506,7 +506,7 @@ class Trainer:
 
                 if self.is_colocated:
                     with time_marker("offload_train", step=step):
-                        self.train_manager.offload()
+                        self.train_manager.offload(move_params=True)
 
         self._finalize_training()
 
