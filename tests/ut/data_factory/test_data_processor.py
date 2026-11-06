@@ -29,12 +29,24 @@ class _StubTensor(list):
             total += v
         return _StubScalar(total)
 
+    def __getitem__(self, index):
+        item = super().__getitem__(index)
+        return _StubTensor(item) if isinstance(index, slice) else item
+
+    def clone(self):
+        return _StubTensor(self)
+
+    def to(self, *args, **kwargs):
+        return self
+
 
 _torch_mod = types.ModuleType("torch")
 _torch_mod.long = "long"  # type: ignore[attr-defined]
 _torch_mod.int = "int"  # type: ignore[attr-defined]
 _torch_mod.int32 = "int32"  # type: ignore[attr-defined]
 _torch_mod.tensor = lambda data, dtype=None, device=None: _StubTensor(data)  # type: ignore[attr-defined]
+_torch_mod.frombuffer = lambda data, dtype=None: _StubTensor(data.tolist())  # type: ignore[attr-defined]
+_torch_mod.get_default_dtype = lambda: "float"  # type: ignore[attr-defined]
 _torch_mod.Tensor = _StubTensor  # type: ignore[attr-defined]
 _torch_cuda = types.ModuleType("torch.cuda")
 _torch_cuda.current_device = lambda: 0  # type: ignore[attr-defined]
@@ -219,6 +231,29 @@ class TestPutDpShardsToRay(unittest.TestCase):
         self.assertEqual(d["dp_local_traj_idx"], [0])
         self.assertEqual(d["total_lengths"], [4])
         self.assertEqual(set(d.keys()), _EXPECTED_ROLLOUT_KEYS)
+
+    def test_rows_are_compact_and_r3_ships_as_numpy(self):
+        import numpy as np
+        import torch
+
+        traj = _make_trajectory(
+            n_tokens=6, pid="p0",
+            rollout_routed_experts=torch.arange(12, dtype=torch.uint8).reshape(6, 2),
+        )
+        traj.segments = [
+            Segment(token_start=0, token_end=3, logprob_start=0, logprob_end=3),
+            Segment(token_start=3, token_end=6, logprob_start=3, logprob_end=6),
+        ]
+        mock_ray, captured = _fake_ray_put()
+        with patch("coda.data_factory.data_processor.ray", mock_ray):
+            put_dp_shards_to_ray([[TrajectoryGroup(prompt_id="p0", trajectories=[traj])]], dp_size=1)
+        d = captured[0]
+        experts = d["rollout_routed_experts"]
+        self.assertTrue(all(isinstance(e, np.ndarray) for e in experts))
+        self.assertEqual(experts[1].tolist(), [[6, 7], [8, 9], [10, 11]])
+        # Each row owns just its own slice, not the whole trajectory's storage.
+        self.assertEqual(d["tokens"][1].untyped_storage().nbytes(), 3 * 8)
+        self.assertEqual(d["tokens"][1].tolist(), [3, 4, 5])
 
 
 # ---------------------------------------------------------------------------

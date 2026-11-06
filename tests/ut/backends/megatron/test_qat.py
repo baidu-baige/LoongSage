@@ -83,7 +83,7 @@ GOOD_ROLLOUT = {"backend": "sglang", "env_vars": {"SGLANG_OPT_FP8_WO_A_GEMM": "0
 
 
 def _cfg(enable, rollout=GOOD_ROLLOUT):
-    return OmegaConf.create({"trainer": {"qat": enable}, "rollout": rollout})
+    return OmegaConf.create({"run_mode": "default", "trainer": {"qat": enable}, "rollout": rollout})
 
 
 def _plan(monkeypatch, m, enable, ckpt=CKPT, rollout=GOOD_ROLLOUT):
@@ -98,8 +98,10 @@ def test_plan_snap_and_hooks(monkeypatch):
     plan = _plan(monkeypatch, m, enable=True)
     assert plan.quantized and [n for n, _, _ in plan.snap_params] == ["wq_b.weight", "wo_a.weight", "experts.weight0"]
     assert [n for n, _, _ in plan.act_modules] == ["wq_b"]  # wo_a: bf16 act; experts: W4A16
-    assert plan.count_off_grid() == 3
-    assert plan.snap_() == 3 and plan.count_off_grid() == 0
+    before = [p.clone() for _, p, _ in plan.snap_params]
+    assert plan.snap_() == 3
+    for (_, p, scheme), b in zip(plan.snap_params, before):
+        assert not torch.equal(p, b) and torch.equal(p, scheme.snap_(b))
     assert torch.equal(m.norm.weight, keep)
 
 
@@ -127,25 +129,25 @@ def test_adapter_rejects_unmodeled_rollout(monkeypatch):
     _plan(monkeypatch, _toy(), enable=False, rollout=bad)  # no QAT -> no numerics constraints
 
 
-def test_encode(monkeypatch):
+def test_check_export(monkeypatch):
     m = _toy()
     plan = _plan(monkeypatch, m, enable=True)
     plan.snap_()
+    q, s = FP8.quant(m.wq_b.weight.data)
+    q4, s4 = FP4.quant(m.experts.weight0.data[:64])
     other = torch.randn(64).bfloat16()
-    out = dict(plan.encode([
-        ("layers.0.attn.wq_b.weight", m.wq_b.weight.data),
-        ("layers.0.ffn.experts.0.w1.weight", m.experts.weight0.data[:64]),
+    good = [
+        ("layers.0.attn.wq_b.weight", q), ("layers.0.attn.wq_b.scale", s),
+        ("layers.0.ffn.experts.0.w1.scale", s4), ("layers.0.ffn.experts.0.w1.weight", q4),  # any order
         ("layers.0.attn_norm.weight", other),
-    ]))
-    assert list(out) == ["layers.0.attn.wq_b.weight", "layers.0.attn.wq_b.scale", "layers.0.ffn.experts.0.w1.weight",
-                         "layers.0.ffn.experts.0.w1.scale", "layers.0.attn_norm.weight"]
-    assert out["layers.0.attn.wq_b.weight"].dtype == torch.float8_e4m3fn
-    assert out["layers.0.ffn.experts.0.w1.weight"].dtype == torch.int8
-    assert out["layers.0.attn_norm.weight"] is other
-    # decode back == snapped training weight (the rollout receives exactly the training weights)
-    assert torch.equal(FP8.dequant(out["layers.0.attn.wq_b.weight"], out["layers.0.attn.wq_b.scale"]), m.wq_b.weight)
-    assert torch.equal(FP4.dequant(out["layers.0.ffn.experts.0.w1.weight"], out["layers.0.ffn.experts.0.w1.scale"]),
-                       m.experts.weight0[:64])
+    ]
+    out = list(plan.check_export(good))
+    assert [n for n, _ in out] == [n for n, _ in good] and out[-1][1] is other
+    # bridge exported bf16 for a tensor the checkpoint stores quantized (same shape for FP8)
+    with pytest.raises(RuntimeError, match="must re-quantize"):
+        list(plan.check_export([("layers.0.attn.wq_b.weight", m.wq_b.weight.data)]))
+    with pytest.raises(RuntimeError, match="must re-quantize"):
+        list(plan.check_export([("layers.0.ffn.experts.0.w1.weight", m.experts.weight0.data[:64])]))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

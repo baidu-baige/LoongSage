@@ -14,6 +14,7 @@ This module provides three layers of functionality:
 from __future__ import annotations
 
 import logging
+from array import array
 from typing import Any
 from collections import defaultdict
 
@@ -25,6 +26,17 @@ from coda.utils.seqlen_balancing import get_seqlen_balanced_partitions
 
 
 logger = logging.getLogger(__name__)
+
+_ARRAY_TORCH_DTYPES = {"q": torch.int64, "d": torch.float64}
+
+
+def _seq_tensor(values: Any, dtype: torch.dtype | None = None) -> torch.Tensor:
+    """``torch.tensor(values, dtype)`` that reads IntSeq / FloatSeq as one buffer (copied)."""
+    src = _ARRAY_TORCH_DTYPES.get(values.typecode) if isinstance(values, array) else None
+    if src is None or not len(values):
+        return torch.tensor(values, dtype=dtype)
+    target = torch.get_default_dtype() if dtype is None else dtype
+    return torch.frombuffer(values, dtype=src).to(target, copy=True)
 
 
 def _get_group_partition_loads(groups: list[TrajectoryGroup]) -> list[int]:
@@ -138,17 +150,16 @@ def put_dp_shards_to_ray(dp_traj_groups_list: list[list[TrajectoryGroup]], dp_si
         metadata: list[dict] = []
         ds_indices: list[int] = []
 
-        device = torch.cuda.current_device()
         local_tid = 0
         for traj_group in dp_traj_groups:
             for traj in traj_group.trajectories:
-                traj_tokens = torch.tensor(traj.tokens, dtype=torch.long, device=device)
-                traj_loss_masks = torch.tensor(traj.loss_masks, dtype=torch.long, device=device)
-                traj_log_probs = torch.tensor(traj.rollout_log_probs, device=device)
-                traj_weight_versions = torch.tensor(
-                    traj.rollout_weight_versions, dtype=torch.int, device=device
-                )
-                traj_token_rewards = torch.tensor(traj.token_rewards, device=device)
+                # Built on CPU and cloned per row: torch pickles a view with its whole base
+                # storage, so un-cloned rows would ship the full trajectory once per row.
+                traj_tokens = _seq_tensor(traj.tokens, dtype=torch.long)
+                traj_loss_masks = _seq_tensor(traj.loss_masks, dtype=torch.long)
+                traj_log_probs = _seq_tensor(traj.rollout_log_probs)
+                traj_weight_versions = _seq_tensor(traj.rollout_weight_versions, dtype=torch.int)
+                traj_token_rewards = _seq_tensor(traj.token_rewards)
                 traj_experts = traj.rollout_routed_experts
 
                 # One training row per trainable Segment: slice the trajectory's flat
@@ -161,13 +172,13 @@ def put_dp_shards_to_ray(dp_traj_groups_list: list[list[TrajectoryGroup]], dp_si
                     ls, le = seg.logprob_start, seg.logprob_end
                     prompt_id.append(traj.prompt_id)
                     dp_local_traj_idx.append(local_tid)
-                    tokens.append(traj_tokens[ts:te])
-                    loss_masks.append(traj_loss_masks[ls:le])
-                    rollout_log_probs.append(traj_log_probs[ls:le])
-                    rollout_weight_versions.append(traj_weight_versions[ls:le])
-                    token_rewards.append(traj_token_rewards[ls:le])
+                    tokens.append(traj_tokens[ts:te].clone())
+                    loss_masks.append(traj_loss_masks[ls:le].clone())
+                    rollout_log_probs.append(traj_log_probs[ls:le].clone())
+                    rollout_weight_versions.append(traj_weight_versions[ls:le].clone())
+                    token_rewards.append(traj_token_rewards[ls:le].clone())
                     rollout_routed_experts.append(
-                        traj_experts[ts:te] if traj_experts is not None else None
+                        traj_experts[ts:te].clone() if traj_experts is not None else None
                     )
                     total_lengths.append(te - ts)
                     response_lengths.append(le - ls)
@@ -191,7 +202,9 @@ def put_dp_shards_to_ray(dp_traj_groups_list: list[list[TrajectoryGroup]], dp_si
             "ds_indices": ds_indices,
         }
         if rollout_routed_experts and all(experts is not None for experts in rollout_routed_experts):
-            rollout_data["rollout_routed_experts"] = rollout_routed_experts
+            # numpy goes through Ray zero-copy: every local rank maps one plasma copy
+            # instead of deserializing a private copy of the whole shard.
+            rollout_data["rollout_routed_experts"] = [t.numpy() for t in rollout_routed_experts]
         elif any(experts is None for experts in rollout_routed_experts):
             logger.info(
                 "Omitting rollout_routed_experts for DP shard because %d/%d Segments have no R3 data",

@@ -1,6 +1,7 @@
 """Unit tests for ``coda.agentflow.router.parser``."""
 
 import asyncio
+import base64
 import copy
 import json
 from types import SimpleNamespace
@@ -20,7 +21,13 @@ pytest.importorskip(
     reason="sglang.srt.parser.template_detection is unavailable in this sglang build",
 )
 
-from coda.agentflow.router.parser import TrajectoryParser, TurnInputContext
+from coda.agentflow.router.parser import (
+    TrajectoryParser,
+    TurnInputContext,
+    decode_generate_body,
+    deserialize_routed_experts,
+    is_passthrough_response,
+)
 from coda.agentflow.router.parser_middleware import ParserMiddleware
 from coda.agentflow import tokenizer_manager
 from coda.agentflow.tokenizer_manager import (
@@ -264,13 +271,13 @@ def test_deepseek_v4_process_initializer_wraps_worker_tokenizer(tmp_path) -> Non
     assert prompt.endswith("<｜Assistant｜></think>")
 
 
-def make_parser() -> TrajectoryParser:
+def make_parser(r3_enabled: bool = True) -> TrajectoryParser:
     """Create a parser with the minimum tokenizer stub needed for construction."""
     tokenizer = SimpleNamespace()
     return TrajectoryParser(
         trajectory_store=TrajectoryStore(),
         tokenizer_manager=tokenizer,
-        r3_enabled=True,
+        r3_enabled=r3_enabled,
     )
 
 
@@ -487,9 +494,104 @@ def test_append_routed_experts_keeps_single_row_unchanged() -> None:
     assert torch.equal(trajectory.rollout_routed_experts, new_chunk)
 
 
+def _b64(t: torch.Tensor) -> str:
+    return base64.b64encode(t.contiguous().numpy().tobytes()).decode()
+
+
+@pytest.mark.parametrize("wire_dtype", ["int32", "int16", "uint8"])
+def test_deserialize_routed_experts_compacts_to_uint8(wire_dtype: str) -> None:
+    rows = torch.tensor([[1, 255], [7, 0]], dtype=getattr(torch, wire_dtype))
+    out = deserialize_routed_experts(_b64(rows), 2, wire_dtype)
+    assert out.dtype == torch.uint8
+    assert torch.equal(out.long(), rows.long())
+
+
+def test_deserialize_routed_experts_keeps_wide_ids_and_rejects_bad_sizes() -> None:
+    rows = torch.tensor([[300, 1]], dtype=torch.int32)
+    assert deserialize_routed_experts(_b64(rows), 1).dtype == torch.int16
+    with pytest.raises(ValueError):
+        deserialize_routed_experts(_b64(rows), 3)
+
+
+def test_decode_generate_body_splits_logprobs_and_appends_terminal_row() -> None:
+    rows = torch.tensor([[1, 2], [3, 4], [5, 6]], dtype=torch.int32)
+    body = json.dumps({
+        "text": "hi",
+        "meta_info": {
+            "weight_version": "1",
+            "prompt_tokens": 3,
+            "completion_tokens": 2,
+            "output_token_logprobs": [[-0.1, 101, None], [-0.2, 102, None]],
+            "routed_experts": _b64(rows),
+        },
+    }).encode()
+
+    response_json, experts = decode_generate_body(body, routed_experts_start_len=1, r3_enabled=True)
+
+    meta = response_json["meta_info"]
+    assert "routed_experts" not in meta and "output_token_logprobs" not in meta
+    assert torch.equal(experts, torch.tensor([[1, 2], [3, 4], [5, 6], [5, 6]], dtype=torch.uint8))
+    payload, _, _ = make_parser().build_assistant_message(response_json, routed_experts=experts)
+    assert payload.response_ids == [101, 102] and payload.logprobs == [-0.1, -0.2]
+    assert payload.routed_experts is experts
+
+
+def test_build_assistant_message_rejects_missing_r3_when_enabled() -> None:
+    """With R3 on, a response without decoded routed experts must fail during rollout."""
+    with pytest.raises(ValueError, match="routed_experts"):
+        make_parser().build_assistant_message({
+            "text": "hi",
+            "meta_info": {"weight_version": "1", "output_token_logprobs": [[-0.1, 101]]},
+        })
+
+
+def test_decode_generate_body_skips_r3_for_abort_with_malformed_payload() -> None:
+    """An aborted response with an unparsable R3 payload must not raise; experts is None."""
+    body = json.dumps({
+        "text": "",
+        "meta_info": {
+            "prompt_tokens": 3,
+            "completion_tokens": 2,
+            "routed_experts": "not-valid-base64-rows",
+            "finish_reason": {"type": "abort", "message": "cancelled"},
+        },
+    }).encode()
+
+    response_json, experts = decode_generate_body(body, routed_experts_start_len=1, r3_enabled=True)
+
+    assert experts is None
+    assert is_passthrough_response(response_json)
+
+
+def test_decode_generate_body_skips_r3_for_error_response() -> None:
+    """An error body (no generated text) is passthrough: R3 decode is skipped."""
+    body = json.dumps({"error": "bad request", "meta_info": {}}).encode()
+
+    response_json, experts = decode_generate_body(body, routed_experts_start_len=1, r3_enabled=True)
+
+    assert experts is None
+    assert is_passthrough_response(response_json)
+
+
+def test_append_routed_experts_grows_buffer_in_place() -> None:
+    """Continuation writes into spare capacity instead of re-copying the whole map."""
+    parser = make_parser()
+    trajectory = Trajectory(trajectory_id="traj-buf", prompt_id="p", tokens=list(range(8)))
+    parser._append_routed_experts(trajectory, torch.zeros(8, 2, dtype=torch.uint8))
+    trajectory.tokens.extend([8, 9])
+    parser._append_routed_experts(trajectory, torch.ones(3, 2, dtype=torch.uint8))
+    first = trajectory.rollout_routed_experts
+    trajectory.tokens.extend([10])
+    parser._append_routed_experts(trajectory, torch.full((2, 2), 2, dtype=torch.uint8))
+
+    merged = trajectory.rollout_routed_experts
+    assert merged.untyped_storage().data_ptr() == first.untyped_storage().data_ptr()
+    assert merged[:, 0].tolist() == [0] * 7 + [1, 1, 2, 2]
+
+
 def test_build_assistant_message_decodes_weight_version() -> None:
     """Request-level SGLang weight_version should be decoded from meta_info."""
-    parser = make_parser()
+    parser = make_parser(r3_enabled=False)
 
     payload, _, _ = parser.build_assistant_message({
         "text": "hi",
@@ -801,7 +903,7 @@ def test_build_assistant_message_splits_reasoning_and_tool_calls() -> None:
 
 def test_update_trajectory_records_weight_versions() -> None:
     """Trajectory bookkeeping should keep token-level versions aligned with logprobs."""
-    parser = make_parser()
+    parser = make_parser(r3_enabled=False)
     trajectory = Trajectory(
         trajectory_id="traj-version",
         prompt_id="prompt-0",
@@ -836,7 +938,7 @@ def test_update_trajectory_records_weight_versions() -> None:
 
 def test_build_assistant_message_rejects_negative_weight_version() -> None:
     """-1 is the prompt-token / unset sentinel, so it must not come back as a real version."""
-    parser = make_parser()
+    parser = make_parser(r3_enabled=False)
 
     with pytest.raises(ValueError, match="weight_version must be >= 0"):
         parser.build_assistant_message({
@@ -878,7 +980,7 @@ def test_append_triplet_preserves_zero_weight_version() -> None:
 @pytest.mark.parametrize("bad_version", [None, "abc"])
 def test_build_assistant_message_rejects_non_numeric_weight_version(bad_version: object) -> None:
     """Non-numeric weight_version values should fail fast."""
-    parser = make_parser()
+    parser = make_parser(r3_enabled=False)
 
     with pytest.raises(ValueError, match="weight_version must be int or str"):
         parser.build_assistant_message({
@@ -1313,7 +1415,7 @@ def test_append_triplet_subagent_placeholder_does_not_touch_flat_arrays() -> Non
 
 def test_update_trajectory_subagent_placeholder_skips_chat_and_weight_version() -> None:
     """Placeholder turns must not enter chat_completions or move weight-version scalars."""
-    parser = make_parser()
+    parser = make_parser(r3_enabled=False)
     trajectory = Trajectory(
         trajectory_id="traj-subagent-update",
         prompt_id="prompt-0",

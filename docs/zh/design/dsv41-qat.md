@@ -27,8 +27,8 @@ DeepSeek-V4.1-Flash 的发布 checkpoint 本身就是量化格式：dense 层是
   │     └─ Megatron 训练 (bf16 params, fp32 master)
   │          ├─ [qat] 每次 optimizer.step 后：量化参数 snap 到网格上   (权重 QAT)
   │          ├─ [qat] W8A8 linear 的输入加 forward pre-hook fake-quant (激活 QAT)
-  │          ├─ update_weights：bridge 导出 bf16 → QuantPlan.encode → (q, scale) → TransferMesh
-  │          └─ save_hf：bridge 导出 → encode → save_like_source(按源 ckpt 逐 shard 重写)
+  │          ├─ update_weights：bridge 导出并重新量化 (q, scale) → QuantPlan.check_export → TransferMesh
+  │          └─ save_hf：bridge 导出 (q, scale) → save_like_source(按源 ckpt 逐 shard 重写并校验)
   │
   └─ SGLang 从同一目录启动 (vision_n_layers=0)，使用 ckpt 自带的 quantization_config
         └─ 热更新：dense FP8 走原生 weight_loader；MXFP4 experts 用 patch 做原地 interleave
@@ -45,7 +45,7 @@ DeepSeek-V4.1-Flash 的发布 checkpoint 本身就是量化格式：dense 层是
 | `fp8_block` | e4m3 `[O, I]` | e8m0 `[O/br, I/bc]` | attn wq_a/wq_b/wkv/wo_a/wo_b、indexer.wq_b、shared_experts w1/w2/w3、engram.wkv，均为 32x32；engram embed 表为 1x32 |
 | `mxfp4` | int8 `[O, I/2]`，每字节两个 e2m1，低 nibble 存偶数列 | e8m0 `[O, I/32]` | routed experts w1/w2/w3 |
 
-量化公式：`s = 2^ceil(log2(amax / qmax))`，FP8 的 qmax 取 448，FP4 取 6；之后用 RNE（round to nearest even）落到网格上。用这个量化器去量化 bf16 checkpoint，反量化值与原始 checkpoint 逐位相同。字节层面有少量差异：约 5% 的 fp8 块 scale 取了 s/2，fp4 会出现 -0 编码，但反量化后的数值一样。
+量化公式：`s = 2^ceil(log2(amax / qmax))`，FP8 的 qmax 取 448，FP4 取 6；之后用 RNE（round to nearest even）落到网格上。用这个量化器去量化 bf16 checkpoint，反量化值与原始 checkpoint 逐位相同。字节层面有少量差异：约 4% 的 fp8 块 scale 比官方 checkpoint 小一档（取了 s/2，code 相应翻倍；toy checkpoint 实测，各层在 0.3%–5.5% 之间，wq_a 最少）；官方 checkpoint 的 fp4 里有 -0 编码，我们输出 +0。反量化后的数值一样。
 
 `read_ckpt_quant(path)` 只读 safetensors header，从每一对 `X.weight` / `X.scale` 的 dtype 和 shape 推断格式，完整模型约 0.6 s：
 
@@ -59,7 +59,7 @@ DeepSeek-V4.1-Flash 的发布 checkpoint 本身就是量化格式：dense 层是
 
 `QuantPlan`（[coda/backends/megatron/qat.py](../../../coda/backends/megatron/qat.py)）不按层名匹配，而是遍历 `bridge.get_conversion_tasks(model)`。每个 task 给出 Megatron 参数对应的 HF 名字（mapping.hf_param），再拿这个名字去 `read_ckpt_quant` 的结果里查表：
 
-- 查得到：这个 tensor 在 checkpoint 中是量化存储的，标记 `quantized=True`，导出时需要编码。
+- 查得到：这个 tensor 在 checkpoint 中是量化存储的，标记 `quantized=True`，导出时由 `check_export` 校验 bridge 输出的格式。
 - 如果同时开了 `qat`，还会把这个参数加入 `snap_params`，并在需要时把对应模块加入 `act_modules`（见 3.4）。
 
 TP/EP 分片的正确性由 `_local_layout_ok` 保证：只有当本地分片是完整 HF tensor 的连续切片，并且切在 tile 边界上（按 dim-0 或 dim-1 切，GatedMLP 是 n 段 dim-0 拼接），对本地分片做 snap 才等价于对完整 tensor 做 snap。不满足时直接报错，比如 head 交错排布的 QKV，或者 Fused expert mapping。这类情况需要为该模型写 adapter。V4.1 在 TP4/8、EP 切分下全部满足条件。
@@ -76,7 +76,7 @@ TP/EP 分片的正确性由 `_local_layout_ok` 保证：只有当本地分片是
 
 - fp32 master 权重不做 snap，持续累积未量化的更新；bf16 模型参数每步都被覆盖成 Q(W)。所以前向看到的是 Q(W)，梯度作用在 master 上，效果等价于直通估计（STE），前向没有额外开销。
 - 不在前向里替换权重，是因为 TE linear 开启 `gradient_accumulation_fusion` 后，`main_grad` 绑定在具体的 param 对象上，替换 param 会破坏梯度累积。原地 `copy_` 不改变对象。
-- 由于不动点性质，导出时 `encode` 再量化一次，得到的就是训练前向用的那份权重。rollout 收到的权重与训练权重逐位一致。
+- 由于不动点性质，bridge 导出时再量化一次，得到的就是训练前向用的那份权重，rollout 收到的权重与训练权重逐位一致。前提是 bridge 的量化器与 `QuantScheme` 网格相同：同样的 tile、`s = 2^ceil(log2(amax/qmax))`、就近舍入。snap 后的值都在格点上，不会落在两个格点中间，所以舍入时平局的处理方式不影响结果。bridge 的 amax 下限是 2^-127，比 `AMAX_FLOOR` 小，对极小的块只会得到更细的 scale，格点值仍能精确表示。单测 `test_bridge_requant_of_snapped_is_exact` 直接调用 bridge 的量化函数验证这一点。
 
 ### 3.4 激活 QAT：使用 SGLang 自己的 kernel 做 fake-quant
 
@@ -116,7 +116,11 @@ B200 上 dense 层没有使用 Triton。原因：单个 GEMM 慢 5–15 倍；�
 
 ### 3.6 权重同步编码
 
-`update_weights` 中，只要 `QuantPlan.quantized` 为真（即 checkpoint 是量化格式），就执行 `hf_weights = self._quant.encode(hf_weights)`：bridge 导出的 bf16 tensor 如果在 checkpoint 中是量化存储的，就转成 `(name, q)` 和 `(scale_name, s)` 两项依次输出；其他 tensor 原样输出。这一步和 `trainer.qat` 无关，所以 `qat=false` 时得到的就是“FP8/FP4 rollout、不做 QAT”的 baseline。如果 checkpoint 是 bf16，plan 为空，走普通 bf16 同步。
+导出格式由 bridge 负责，与导入对称：`maybe_modify_loaded_hf_weight` 把量化权重反量化成 bf16，`maybe_modify_converted_hf_weight` 再按 checkpoint 的格式重新量化，对 checkpoint 中量化存储的 tensor 依次输出 `(name, q)` 和 `(scale_name, s)`，其他 tensor 原样输出。框架不做任何格式转换。这一步和 `trainer.qat` 无关，所以 `qat=false` 时得到的就是“FP8/FP4 rollout、不做 QAT”的 baseline。如果 checkpoint 是 bf16，plan 为空，走普通 bf16 同步。
+
+`QuantPlan.quantized` 为真时，`update_weights` 把导出流包一层 `QuantPlan.check_export`：按 3.1 的表检查 checkpoint 中量化存储的 weight，导出时必须是 e4m3 或 int8，shape 与 checkpoint 一致。这里只查表，不做计算。它防的是 bridge 静默导出 bf16：bridge 找不到 checkpoint 目录，或者某个模型的 bridge 没有实现 `maybe_modify_converted_hf_weight` 时，权重会原样以 bf16 导出；FP8 权重在 bf16 和 e4m3 下 shape 相同，rollout 端不一定能发现。scale 的 shape 由 bridge 直接取自 checkpoint header，几何由 bridge 的量化函数校验，scale 总是和 weight 成对输出，所以这里不再重复检查。因此一个模型只要 bridge 实现了这两个接口，qat=false 就能直接接入；再满足 3.2 的分片条件，就能开权重 QAT。
+
+V4.1 的导出实现见第 5 节：源 scale 只用到 shape 和 dtype（数值按 amax 重新计算），启动时从 header 读一次缓存起来，同步时不读 checkpoint。
 
 TransferMesh 以原始字节传输 fp8/e8m0/int8，不需要额外处理。SGLang 端的接收方式：
 
@@ -128,7 +132,7 @@ TransferMesh 以原始字节传输 fp8/e8m0/int8，不需要额外处理。SGLan
 当 checkpoint 为量化格式时，`save_model(hf=...)` 调用 `_save_hf_like_source`，最终执行 [coda/utils/hf_ckpt.py](../../../coda/utils/hf_ckpt.py) 中的 `save_like_source`：
 
 - 计算 expected 集合：对所有 rank 上 conversion task 的 HF 名字做 `all_gather_object` 后取并集（EP 下各 rank 持有不同的 experts），再加上对应的 `.scale`。
-- rank 0 消费 `encode(bridge.export_hf_weights(model))`，其他 rank 只负责参与导出所需的集合通信。
+- rank 0 直接消费 `bridge.export_hf_weights(model)`，其他 rank 只负责参与导出所需的集合通信。这里不套 `check_export`：下面逐 shard 重写时已经按源 checkpoint 校验了名字、dtype、shape，也会检查 scale 是否齐全。
 - 按源 checkpoint 逐个 shard 重写：header 字节原样复制；训练过的 tensor 写入新数据，dtype 和 shape 必须与源一致，float 会 cast 为源 dtype，量化 tensor 的 dtype 不一致时报错；其余 tensor（vision、aligner、MTP、`gate.bias_vl`、engram 表等）按 256 MB 分块从源文件复制。每个 shard 先写 `.tmp`，再 `os.replace`。
 - 非权重文件（config、tokenizer、index、encoding 代码等）原样复制。
 - 出现未知 tensor、重复 tensor 或缺失 tensor 时直接报错。
@@ -162,7 +166,7 @@ Dockerfile 会自动应用这两个补丁：
 
 - `DeepseekV41Config`：把 wrapped schema（`text_config`/`vision_config`）展平成纯文本配置，丢弃 vision，强制 `num_nextn_predict_layers=0`，并截断 `compress_ratios`。展平后与 bf16 目录的 config 完全一致（`quantization_config` 除外）。
 - `maybe_modify_loaded_hf_weight`：FP8 的块大小改为从 `quantization_config.weight_block_size` 读取。原代码把块大小写死为 128，导入 V4.1 的 32x32 时结果是错的，而且不报错，因为切片后 shape 恰好能对上。engram 表的 scale 是逐行的，走原来的通用路径。导入结果与 bf16 checkpoint 逐位一致。
-- `maybe_modify_converted_hf_weight`：导出纯 bf16，量化编码统一交给 coda 的 `encode`。
+- `maybe_modify_converted_hf_weight`：与 V4 一样导出 checkpoint 自己的格式，只 override 与 V4 不同的两处。一是 FP8 块大小取 `weight_block_size`（32），MXFP4 的分组大小从 scale 几何推出。二是源 `.scale` 只用 shape 和 dtype，在第一次导出时从 safetensors header 读出并缓存（`_source_quant_layout`），不像 V4 那样每次同步都从磁盘读 scale。格式判断按 header 里的 dtype 和 shape（I8/U8 → MXFP4，F8_E4M3 → FP8），不按名字。在 toy checkpoint 上验证过：snap 后的权重经 bridge 导出，反量化结果与 snap 值逐位相同。
 
 **`docker/patch/sglang-0.5.21.patch`**（与 QAT 相关的部分）
 
@@ -266,9 +270,9 @@ B200 toy 上用原始 checkpoint 启动，开和关的输出逐位相同（token
 | 文件 | 内容 |
 |---|---|
 | [coda/utils/quant_formats.py](../../../coda/utils/quant_formats.py) | 量化器、`QuantScheme`、`read_ckpt_quant` |
-| [coda/backends/megatron/qat.py](../../../coda/backends/megatron/qat.py) | `QuantPlan`（snap、激活 hook、encode）、adapter |
+| [coda/backends/megatron/qat.py](../../../coda/backends/megatron/qat.py) | `QuantPlan`（snap、激活 hook、check_export）、adapter |
 | [coda/utils/hf_ckpt.py](../../../coda/utils/hf_ckpt.py) | `save_like_source` |
-| [coda/backends/megatron/megatron_train_worker.py](../../../coda/backends/megatron/megatron_train_worker.py) | 构建 plan、ref 模型 snap、`update_weights` 编码、`_save_hf_like_source` |
+| [coda/backends/megatron/megatron_train_worker.py](../../../coda/backends/megatron/megatron_train_worker.py) | 构建 plan、ref 模型 snap、`update_weights` 导出校验、`_save_hf_like_source` |
 | [coda/backends/megatron/model.py](../../../coda/backends/megatron/model.py) | `train_minibatch` 在 step 后 snap |
 | [conf/dsv41_flash/](../../../conf/dsv41_flash/) | 配方 |
 | `docker/patch/dsv41/megatron-bridge.patch`、`docker/patch/sglang-0.5.21.patch` | 依赖的补丁 |

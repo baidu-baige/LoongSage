@@ -185,8 +185,9 @@ def get_rollout_data(rollout_data_ref) -> RolloutBatch:
         rollout_data.update(critic_data)
 
     device = torch.cuda.current_device()
+    # rollout_routed_experts stays on CPU; setup_routing_replay moves it per micro-batch.
     for field in (
-        "tokens", "loss_masks", "rollout_log_probs", "rollout_routed_experts", "raw_loss_masks",
+        "tokens", "loss_masks", "rollout_log_probs", "raw_loss_masks",
         *teacher_tensor_fields, *critic_tensor_fields,
     ):
         if rollout_data.get(field):

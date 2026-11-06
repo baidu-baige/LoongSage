@@ -88,6 +88,27 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
+## 📦 支持的模型 (Supported Models)
+
+训练侧通过 Megatron-Bridge 的 `AutoBridge` 加载模型，推理侧由 SGLang 提供服务，框架内没有针对单个模型的适配代码，因此理论上 Megatron-Bridge 与 SGLang 同时支持的模型均可训练。下表以外的模型可能需要自行调整并行与显存相关配置。
+
+以下模型已通过 [`conf/`](conf/) 中的配方验证：
+
+| 模型 | 配方 | 硬件（节点数 × 8 卡） |
+| :--- | :--- | :--- |
+| DeepSeek-V4.1-Flash（原始 FP8/MXFP4 权重，QAT） | [`dsv41_flash/`](conf/dsv41_flash/)：DAPO、SWE、SFT | H20 × 6 |
+| DeepSeek-V4.1-Flash（BF16） | [`dsv41_flash_bf16/`](conf/dsv41_flash_bf16/)：DAPO、SWE | B200 × 5–6，H20 × 6 |
+| DeepSeek-V4-Flash（BF16） | [`dsv4_flash_bf16/`](conf/dsv4_flash_bf16/)：DAPO、SWE | H20 × 6–8，GB200 × 8 |
+| Qwen3-30B-A3B | [`qwen3_30b_a3b/`](conf/qwen3_30b_a3b/)：DAPO、GSM8K、BCP、MOPD | H20 × 1 |
+| Qwen3-Coder-30B-A3B-Instruct | [`qwen3_coder_30b_a3b/`](conf/qwen3_coder_30b_a3b/)：Claude Code、Codex、OpenCode、mini-SWE | H20 × 2–4 |
+| Qwen3.8-27B | [`qwen3.8_27b/`](conf/qwen3.8_27b/)：DAPO | H20 × 1 |
+| Qwen3-4B | [`qwen3_4b/`](conf/qwen3_4b/)：DAPO、SFT | H800 × 1，H20 × 1 |
+| StartLux-Decision-v1.1-4B-AutoThink | [`rlcd2/`](conf/rlcd2/)：RLCD2 | H20 × 1 |
+
+QAT（`trainer.qat`）目前仅支持 DeepSeek-V4.1，其他模型均以 BF16 训练。
+
+______________________________________________________________________
+
 ## 🛠️ 安装指南 (Installation)
 
 推荐使用容器镜像运行，镜像内已严格对齐 CUDA、PyTorch、Megatron-Core、Megatron-Bridge、SGLang 与 Ray 的依赖版本，并已应用必要的 SGLang 补丁。

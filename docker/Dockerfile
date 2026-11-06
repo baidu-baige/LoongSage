@@ -39,6 +39,9 @@ RUN CPATH=/opt/sglang/lib/python3.12/site-packages/nvidia/cu13/include/cccl pip 
 RUN pip install flash-linear-attention==0.5.2
 RUN MAX_JOBS=16 pip install -v --no-build-isolation "flash-attn-3 @ git+https://github.com/Dao-AILab/flash-attention@main#subdirectory=hopper"
 
+# for qwen-vl
+RUN pip install qwen-vl-utils==0.0.14
+
 # loongsage
 RUN git clone https://github.com/baidu-baige/LoongSage.git && cd LoongSage && pip install --no-deps --no-build-isolation -e .
 

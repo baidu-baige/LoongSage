@@ -6,15 +6,17 @@ The quantization format of every tensor is read from the training checkpoint its
 through the bridge's conversion tasks, so nothing here is model specific; per-model rollout
 numerics that cannot be read from the checkpoint live in a small :class:`QATAdapter`.
 
-* Export (always, independent of QAT): :meth:`QuantPlan.encode` turns the bridge's bf16 export
-  back into the checkpoint format (weight + ``.scale``) for every tensor the checkpoint stores
-  quantized. A bf16 checkpoint yields an empty plan and plain bf16 export.
+* Export (always, independent of QAT): the bridge's ``maybe_modify_converted_hf_weight`` re-quantizes
+  its export into the checkpoint format (weight + ``.scale``) for every tensor the checkpoint stores
+  quantized, mirroring its import-time dequant; :meth:`QuantPlan.check_export` only checks that
+  those tensors arrive quantized. A bf16 checkpoint yields an empty plan and plain bf16 export.
 * Weight QAT -- "snap in place": after every optimizer step (and after any weight load) the bf16
   params of the quantized tensors are overwritten with ``dequant(quant(W))``. The fp32 master
   keeps accumulating un-quantized updates and the forward sees Q(W): an exact straight-through
   estimator with no forward-time cost and no interference with TE's fused wgrad accumulation
-  (param objects are never swapped). Snapped weights are a fixed point of the quantizer, so the
-  rollout receives exactly the training weights.
+  (param objects are never swapped). Snapped weights are a fixed point of any quantizer on the
+  same grid (same tiles, ue8m0 scale = ceil-pow2(amax / max), round-to-nearest), so the bridge's
+  export re-quantization hands the rollout exactly the training weights.
 * Activation QAT: forward pre-hooks fake-quantize the inputs of the linears the rollout runs as
   W8A8 (dynamic per-token, group = scale tile width, ue8m0) with SGLang's own kernel;
   straight-through backward. Temporary escape hatch: ``CODA_QAT_DISABLE_ACT=1`` (trainer env)
@@ -164,7 +166,7 @@ class QuantPlan:
     """Quantized-tensor bookkeeping for one Megatron model (see module docstring).
 
     ``quantized`` -- the checkpoint stores some trained tensors quantized, i.e. the rollout serves
-    that format and :meth:`encode` must be applied to every weight sync.
+    that format; the bridge exports it and :meth:`check_export` checks every weight sync.
     """
 
     def __init__(self, bridge, model_chunks: Sequence[torch.nn.Module], hf_model_path: str, config):
@@ -190,7 +192,7 @@ class QuantPlan:
             if not any(entries):
                 continue
             self.quantized = True
-            if task.param_weight is None or not self.qat:  # other PP stage / export-only
+            if task.param_weight is None or not self.qat:  # other PP stage / no QAT: nothing to snap
                 continue
             schemes = {e.scheme if e else None for e in entries}
             shapes = {e.shape if e else None for e in entries}
@@ -224,16 +226,6 @@ class QuantPlan:
             scheme.snap_(p.data)
         return len(self.snap_params)
 
-    @torch.no_grad()
-    def count_off_grid(self) -> int:
-        """Debug check: number of quantized params that are NOT on their grid."""
-        bad = 0
-        for name, p, scheme in self.snap_params:
-            if not torch.equal(scheme.snap_(p.data.clone()), p.data):
-                bad += 1
-                logger.warning(f"[QAT] param off-grid: {name}")
-        return bad
-
     # -- activation QAT
     def register_activation_hooks(self) -> int:
         """Hook the activation fake-quant. Returns #hooks; 0 when disabled via ``DISABLE_ACT_ENV``."""
@@ -245,13 +237,31 @@ class QuantPlan:
         return len(self.act_modules)
 
     # -- export
-    def encode(self, named_tensors: Iterable[tuple[str, torch.Tensor]]) -> Iterator[tuple[str, torch.Tensor]]:
-        """bf16 HF tensors -> checkpoint format: quantized weights are followed by their scale."""
+    def check_export(self, named_tensors: Iterable[tuple[str, torch.Tensor]]) -> Iterator[tuple[str, torch.Tensor]]:
+        """Pass the bridge's HF export through, checking that every tensor the checkpoint stores
+        quantized arrives quantized.
+
+        The bridge owns the export format: its ``maybe_modify_converted_hf_weight`` re-quantizes
+        into weight + ``.scale`` (scale shape taken from the checkpoint, geometry validated by its
+        quantizers), but returns bf16 unchanged when it cannot locate the checkpoint or when a
+        model's bridge has no such override. A bf16 FP8 weight has the same shape as the e4m3 one,
+        so the rollout may not notice; this makes the first sync fail instead.
+        """
         for name, t in named_tensors:
             entry = self.ckpt.get(name)
-            if entry is None:
-                yield name, t
-                continue
-            q, s = entry.scheme.quant(t)
-            yield name, q
-            yield entry.scale_name, s
+            if entry is not None:
+                dtypes, shape = _stored_weight(entry)
+                if t.dtype not in dtypes or tuple(t.shape) != shape:
+                    raise RuntimeError(
+                        f"[QAT] export {name}: got {t.dtype} {tuple(t.shape)}, the checkpoint stores {entry.scheme} "
+                        f"{shape}; the bridge's maybe_modify_converted_hf_weight must re-quantize it"
+                    )
+            yield name, t
+
+
+def _stored_weight(entry: CkptQuant) -> tuple[tuple[torch.dtype, ...], tuple[int, int]]:
+    """On-disk dtype(s) and shape of a quantized checkpoint weight."""
+    O, I = entry.shape
+    if entry.scheme.kind == "mxfp4":
+        return (torch.int8, torch.uint8), (O, I // 2)
+    return (torch.float8_e4m3fn,), (O, I)

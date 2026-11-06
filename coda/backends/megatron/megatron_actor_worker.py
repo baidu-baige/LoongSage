@@ -27,7 +27,9 @@ from coda.backends.megatron.data import (
     get_rollout_data,
     get_data_iterator,
 )
-from coda.backends.megatron.model import forward_only, train_minibatch, is_main_rank, reduce_dict
+from coda.backends.megatron.model import (
+    forward_only, train_minibatch, is_main_rank, reduce_dict, prune_router_replay_instances,
+)
 from coda.utils.tracking import time_tracker, track
 from coda.algorithms.kl_policy import build_kl_policies
 from coda.backends.megatron.teacher_lm_head import TeacherLMHeads
@@ -50,9 +52,10 @@ class MegatronActorWorker(MegatronTrainWorker):
         if config.trainer.use_fp32_lm_head:
             config.megatron.keep_fp32_weights["output_layer"] = True
         if config.trainer.qat:
-            # QAT snaps the bf16 params in place after each step. With param remainders the fp32
-            # master is the bf16 param plus an int16 remainder, so the snap would overwrite it too and
-            # drop every sub-grid update. Keep a separate fp32 master (+2 B/param).
+            # QAT snaps the bf16 params in place after each step. With param remainders (effective
+            # under the precision-aware optimizer, e.g. chunked optimizer offload) the fp32 master is
+            # the bf16 param plus an int16 remainder, so the snap would overwrite it too and drop
+            # every sub-grid update. Keep a separate fp32 master (+2 B/param).
             config.megatron.optimizer.store_param_remainders = False
 
         if config.algorithm.is_correction.enable and config.trainer.use_rollout_log_probs:
@@ -97,17 +100,24 @@ class MegatronActorWorker(MegatronTrainWorker):
         """
         super().init(config, master_addr, master_port)
 
-        # Step 8.5: quantized checkpoint (FP8/FP4 rollout). The plan maps every Megatron param to
-        # the checkpoint's storage format; weight sync re-encodes into that format. With QAT, snap
-        # the loaded weights onto the grid (before any TensorBackuper snapshot) and hook the
-        # activation fake-quant.
+        if config.trainer.use_rollout_routing_replay:
+            dropped, kept = prune_router_replay_instances(self.model)
+            logger.info(
+                f"[Rank {self.rank}] R3: pruned {dropped} orphan RouterReplay instances, kept {kept}"
+            )
+
+        # Step 8.5: quantized checkpoint (FP8/FP4 rollout). The plan records, from the checkpoint
+        # headers, which HF tensors are stored quantized and in which format; the bridge re-quantizes
+        # them on export and the plan only verifies the exported stream. With QAT, the matching
+        # Megatron params are snapped onto the grid (before any TensorBackuper snapshot) and the
+        # activation fake-quant hooks are registered.
         self._quant = qat.QuantPlan(self.bridge, self.model, config.hf_model_path, config)
         if self._quant.qat:
             n = self._quant.snap_()
             n_act = self._quant.register_activation_hooks()
             logger.info(f"[Rank {self.rank}] QAT: snapped {n} params, {n_act} activation hooks")
         elif self._quant.quantized:
-            logger.info(f"[Rank {self.rank}] Quantized checkpoint without QAT: weight sync re-encodes, no snapping")
+            logger.info(f"[Rank {self.rank}] Quantized checkpoint without QAT: bridge exports the checkpoint format, no snapping")
 
         # Step 9: build KL policy instances and set up teacher lm_heads if an
         # active policy needs teacher logits (full_kl/full_jsd). The
@@ -162,8 +172,8 @@ class MegatronActorWorker(MegatronTrainWorker):
         expected = set().union(*map(set, gathered))
         expected |= {q.scale_name for n, q in self._quant.ckpt.items() if n in expected}
         hf_weights = self.bridge.export_hf_weights(self.model)
-        if torch.distributed.get_rank() == 0:
-            save_like_source(self._quant.encode(hf_weights), self.config.hf_model_path, hf_dir, expected)
+        if torch.distributed.get_rank() == 0:  # save_like_source checks names/dtypes/shapes against the source
+            save_like_source(hf_weights, self.config.hf_model_path, hf_dir, expected)
         else:
             for _ in hf_weights:  # collectives
                 pass
@@ -401,8 +411,8 @@ class MegatronActorWorker(MegatronTrainWorker):
         print_memory("before send huggingface weights")
         send_channel = create_sender_channel(channel_meta)
         hf_weights = self.bridge.export_hf_weights(self.model)
-        if self._quant.quantized:
-            hf_weights = self._quant.encode(hf_weights)
+        if self._quant.quantized:  # the bridge re-quantizes to the checkpoint format; verify it
+            hf_weights = self._quant.check_export(hf_weights)
         for name, tensor in hf_weights:
             send_channel.send((name, tensor))
         send_channel.send(None, flush=True)

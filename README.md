@@ -88,6 +88,27 @@ Targeting ultra-large model scenarios, LoongSage adopts a structure of **Single-
 
 ______________________________________________________________________
 
+## 📦 Supported Models
+
+The training side loads models through Megatron-Bridge `AutoBridge`, and the rollout side serves them with SGLang. The framework has no per-model adaptation code, so in principle any model supported by both Megatron-Bridge and SGLang can be trained. Models outside the list below may need their parallelism and memory settings tuned.
+
+The following models have been validated with the recipes under [`conf/`](conf/):
+
+| Model | Recipes | Hardware (nodes × 8 GPUs) |
+| :--- | :--- | :--- |
+| DeepSeek-V4.1-Flash (original FP8/MXFP4 weights, QAT) | [`dsv41_flash/`](conf/dsv41_flash/): DAPO, SWE, SFT | H20 × 6 |
+| DeepSeek-V4.1-Flash (BF16) | [`dsv41_flash_bf16/`](conf/dsv41_flash_bf16/): DAPO, SWE | B200 × 5–6, H20 × 6 |
+| DeepSeek-V4-Flash (BF16) | [`dsv4_flash_bf16/`](conf/dsv4_flash_bf16/): DAPO, SWE | H20 × 6–8, GB200 × 8 |
+| Qwen3-30B-A3B | [`qwen3_30b_a3b/`](conf/qwen3_30b_a3b/): DAPO, GSM8K, BCP, MOPD | H20 × 1 |
+| Qwen3-Coder-30B-A3B-Instruct | [`qwen3_coder_30b_a3b/`](conf/qwen3_coder_30b_a3b/): Claude Code, Codex, OpenCode, mini-SWE | H20 × 2–4 |
+| Qwen3.8-27B | [`qwen3.8_27b/`](conf/qwen3.8_27b/): DAPO | H20 × 1 |
+| Qwen3-4B | [`qwen3_4b/`](conf/qwen3_4b/): DAPO, SFT | H800 × 1, H20 × 1 |
+| StartLux-Decision-v1.1-4B-AutoThink | [`rlcd2/`](conf/rlcd2/): RLCD2 | H20 × 1 |
+
+QAT (`trainer.qat`) currently supports only DeepSeek-V4.1. Other models train in BF16.
+
+______________________________________________________________________
+
 ## 🛠️ Installation
 
 It is recommended to run using a container image, as the dependencies for CUDA, PyTorch, Megatron-Core, Megatron-Bridge, SGLang, and Ray have been strictly aligned, and necessary SGLang patches have been applied.

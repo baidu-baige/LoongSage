@@ -398,7 +398,7 @@ class MegatronTeacherWorker(BaseTeacherWorker):
     def _move_rollout_data_to_device(self, rollout_data: RolloutBatch):
         """Move core tensor fields to the current CUDA device for teacher forward."""
         device = torch.cuda.current_device()
-        for field in ("tokens", "loss_masks", "rollout_log_probs", "rollout_routed_experts"):
+        for field in ("tokens", "loss_masks", "rollout_log_probs"):
             if rollout_data.get(field):
                 rollout_data[field] = [t.to(device) for t in rollout_data[field]]
         return rollout_data
