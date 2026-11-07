@@ -12,7 +12,7 @@ RUN MAX_JOBS=128 pip install --no-build-isolation causal-conv1d==1.6.1
 RUN MAX_JOBS=128 NVTE_FRAMEWORK=pytorch NVTE_BUILD_THREADS_PER_JOB=4 pip install -v --no-build-isolation git+https://github.com/NVIDIA/TransformerEngine.git@v2.16
 
 # pip only
-RUN pip install ray[default]==2.54.0 hydra-core==1.3.8
+RUN pip install ray[default]==2.55.1 hydra-core==1.3.8
 RUN pip install mlflow-skinny==3.16.0 wandb==0.28.0
 RUN pip install nvidia-resiliency-ext==0.6.0
 
@@ -31,8 +31,6 @@ RUN ARCH="$(uname -m)" && case "$ARCH" in \
 
 # for dsv4
 RUN pip install --no-build-isolation git+https://github.com/Dao-AILab/fast-hadamard-transform.git@v1.1.0.post2
-RUN pip install nvidia-cuda-cccl==13.3.4.3.1
-RUN CPATH=/opt/sglang/lib/python3.12/site-packages/nvidia/cu13/include/cccl pip install --no-build-isolation git+https://github.com/deepseek-ai/FlashMLA@nv_dev
 
 # for qwen3.8
 RUN pip install flash-linear-attention==0.5.2

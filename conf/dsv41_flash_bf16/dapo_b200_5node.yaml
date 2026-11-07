@@ -54,6 +54,12 @@ rollout:
     SGLANG_DSV4_FP4_EXPERTS: "0"
     SGLANG_OPT_FP8_WO_A_GEMM: "0"
     SGLANG_OPT_FUSE_WQA_WKV: "0"
+    # Else mHC split-weight caches make sglang reject online weight updates.
+    SGLANG_OPT_DEEPGEMM_HC_PRENORM: "0"
+    # With HC_PRENORM=0 the load-time mhc_pre prewarm (run on the first weight sync under
+    # load_format=dummy) hits a TileLang kernel without hc_hidden_size 20480. V4.1 forward never
+    # calls mhc_pre (hc_pre_from_prev_sublayer path), so this only skips that prewarm.
+    SGLANG_OPT_USE_TILELANG_MHC_PRE: "0"
     NCCL_CUMEM_ENABLE: "1"
   num_gpus_per_node: 8
   sglang_args:
@@ -61,6 +67,12 @@ rollout:
     disable_cuda_graph: false
     ep_size: 8
     attention_backend: dsv4
+    # Pin FlashMLA (V4 KV layout, which the trainer's kv_cache_roundtrip models); attention TP 1 on
+    # SM100 would auto-select flashmla_mega and switch to the V41 layout.
+    dsv4_attn_backend: flashmla
+    # 0.5.23 auto-enables this on TP-only V4.1; it is not numerically identical to full prefill and
+    # computes only the last SWA window rows in the tail layers, which misaligns R3 routed experts.
+    enable_decoder_swa_bounded_replay: false
     moe_runner_backend: auto
     max_running_requests: 128
   sglang_replicas:
