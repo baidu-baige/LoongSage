@@ -11,6 +11,7 @@ from coda.utils.quant_formats import (
     quant_fp8_block,
     quant_mxfp4,
     read_ckpt_quant,
+    scan_ckpt_quant,
 )
 
 FP8 = QuantScheme("fp8_block", (32, 32))
@@ -134,3 +135,16 @@ def test_read_ckpt_quant(tmp_path):
     assert got["a.weight"].scheme == FP8 and got["a.weight"].shape == (64, 96) and got["a.weight"].scale_name == "a.scale"
     assert got["e.weight"].scheme == FP4 and got["e.weight"].shape == (32, 64)
     assert got["t.weight"].scheme == QuantScheme("fp8_block", (1, 32))
+
+
+def test_scan_ckpt_quant_unsupported(tmp_path):
+    from safetensors.torch import save_file
+
+    w8, s8 = quant_fp8_block(_rand(64, 96))
+    save_file({"a.weight": w8, "a.scale": s8,
+               "m.weight": w8.clone(), "m.scale": torch.ones(1, 1)},  # fp32 scale (128x128-block FP8)
+              str(tmp_path / "model.safetensors"))
+    got, unsupported = scan_ckpt_quant(str(tmp_path))
+    assert set(got) == {"a.weight"} and set(unsupported) == {"m.weight"}
+    with pytest.raises(NotImplementedError, match="m.weight: unsupported quantized layout"):
+        read_ckpt_quant(str(tmp_path))

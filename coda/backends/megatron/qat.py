@@ -2,7 +2,7 @@
 
 The quantization format of every tensor is read from the training checkpoint itself
 (``trainer.hf_model_path``; the rollout boots from the same directory), see
-:func:`coda.utils.quant_formats.read_ckpt_quant`. Megatron params are matched to checkpoint tensors
+:func:`coda.utils.quant_formats.scan_ckpt_quant`. Megatron params are matched to checkpoint tensors
 through the bridge's conversion tasks, so nothing here is model specific; per-model rollout
 numerics that cannot be read from the checkpoint live in a small :class:`QATAdapter`.
 
@@ -44,7 +44,7 @@ from megatron.bridge.models.conversion.param_mapping import (
     RowParallelMapping,
 )
 
-from coda.utils.quant_formats import CkptQuant, QuantScheme, read_ckpt_quant
+from coda.utils.quant_formats import CkptQuant, QuantScheme, scan_ckpt_quant
 
 logger = logging.getLogger(__name__)
 
@@ -171,14 +171,16 @@ class QuantPlan:
 
     def __init__(self, bridge, model_chunks: Sequence[torch.nn.Module], hf_model_path: str, config):
         self.qat = bool(config.trainer.qat)
-        self.ckpt: dict[str, CkptQuant] = read_ckpt_quant(hf_model_path) if os.path.isdir(hf_model_path) else {}
+        self.ckpt: dict[str, CkptQuant]
+        self.ckpt, unsupported = scan_ckpt_quant(hf_model_path) if os.path.isdir(hf_model_path) else ({}, {})
         self.snap_params: list[tuple[str, torch.nn.Parameter, QuantScheme]] = []
         self.act_modules: list[tuple[str, torch.nn.Module, int]] = []
         self.quantized = False
         if not self.ckpt:
             if self.qat:
                 raise ValueError(f"trainer.qat needs a quantized checkpoint, {hf_model_path} has none")
-            return
+            if not unsupported:
+                return
         adapter = get_adapter(getattr(bridge.hf_pretrained.config, "architectures", None))
         if self.qat:
             adapter.validate(config)
@@ -188,6 +190,9 @@ class QuantPlan:
             if task is None:
                 continue
             names = hf_names(task.mapping)
+            bad = [n for n in names if n in unsupported]
+            if bad:
+                raise NotImplementedError(f"{task.param_name} <- {bad[0]}: {unsupported[bad[0]]}")
             entries = [self.ckpt.get(n) for n in names]
             if not any(entries):
                 continue
@@ -215,6 +220,13 @@ class QuantPlan:
                     raise NotImplementedError(f"[QAT] {task.param_name}: input of a fused norm+linear is pre-norm")
                 hooked.add(id(module))
                 self.act_modules.append((task.param_name[: -len(".weight")], module, scheme.block[1]))
+        # Reaching here means no conversion task maps an unsupported tensor.
+        if unsupported and torch.distributed.get_rank() == 0:
+            logger.info(
+                f"[QAT] skipping {len(unsupported)} unmapped tensors with an unsupported quantized layout "
+                f"(left as is in the checkpoint): {', '.join(sorted(unsupported)[:5])}"
+                f"{', ...' if len(unsupported) > 5 else ''}"
+            )
         if self.qat and not self.quantized:
             raise ValueError(f"trainer.qat: no trained tensor of {hf_model_path} is stored quantized")
 

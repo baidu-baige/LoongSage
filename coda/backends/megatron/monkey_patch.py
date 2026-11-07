@@ -5,8 +5,6 @@ any Megatron objects that depend on these patches are instantiated.
 """
 
 import importlib
-import sys
-from contextlib import contextmanager
 
 import torch
 from megatron.core import tensor_parallel
@@ -151,80 +149,6 @@ def _patch_fused_adam_fp32_master_remainder():
     FusedAdam.initialize_state = _patched_initialize_state
 
 
-def _patch_dsa_cudnn_default_stream():
-    """Fix cuDNN DSA silently dropping half the rows of its fp32 score matrix.
-
-    Symptom:
-      ``cudnn.DSA.indexer_forward_wrapper`` / ``dense_indexer_score_recompute_wrapper``
-      / ``dense_attn_score_recompute_wrapper`` return score matrices where whole
-      Q rows are still ``-inf``.  No error is raised.  The first call after
-      ``cute.compile`` is always correct; the drop starts at the second call, the
-      lost fraction grows with the buffer size, and the counts jitter between runs.
-      Downstream this shows up as inflated ``approx_kl`` / ``is_approx_k3_kl`` and
-      nonzero ``nan_ratio``.
-
-    Root cause:
-      ``cudnn/deepseek_sparse_attention/utils/runtime.py::resolve_stream(None)``
-      returns ``CUstream(0)``, because 0 is the handle PyTorch reports for its
-      default stream.  The CuTe kernel is then launched on raw handle 0 (the
-      legacy default stream), but every torch-side helper in the interface runs
-      inside ``torch_stream_context(CUstream(0))`` ==
-      ``torch.cuda.stream(torch.cuda.ExternalStream(0))``.
-
-      ``ExternalStream(0)`` does NOT round-trip to the default stream: PyTorch
-      treats ``stream_ptr=0`` as "no external stream given" and hands back a
-      stream from its pool -- a *different* one on every call.  So the interface's
-      ``out.fill_(float("-inf"))`` prefill runs concurrently with the kernel that
-      is supposed to fill ``out``, and the prefill's tail wipes out part of the
-      kernel's writes.
-
-      Corroboration: the backward wrappers pass ``backend_stream = None`` on SM90
-      (``indexer_backward/api.py``), which short-circuits the context manager --
-      and those are exactly the wrappers that do not exhibit the failure.
-
-    Fix: make ``torch_stream_context`` a no-op when the handle is 0, so the
-      prefill stays on the caller's default stream and is correctly ordered
-      before the kernel.  One rebind of ``utils.runtime.torch_stream_context`` is
-      enough as long as it happens before the first DSA call: the interface
-      modules that use it are imported lazily inside ``execute()`` and pick up
-      the patched function by name.  The ``sys.modules`` sweep is only a safety
-      net for the case where this module is imported late.
-
-    Without the patch, indexer_forward and dense indexer score calls corrupt their
-    output, as do THD packed multi-segment calls. The patch is also slightly
-    faster, because the unpatched path allocates a fresh pool stream on every call.
-    """
-    try:
-        from cudnn.deepseek_sparse_attention.utils import runtime as dsa_runtime
-    except ImportError:
-        # cuDNN DSA kernels are only present for DeepSeek-V4 style models.
-        return
-
-    original = dsa_runtime.torch_stream_context
-    if getattr(original, "_coda_default_stream_safe", False):
-        return
-
-    @contextmanager
-    def _safe_torch_stream_context(current_stream=None):
-        if current_stream is None or int(current_stream) == 0:
-            # handle 0 == torch's default stream; wrapping it in an
-            # ExternalStream would silently switch to a fresh pool stream.
-            yield
-            return
-        with torch.cuda.stream(torch.cuda.ExternalStream(int(current_stream))):
-            yield
-
-    _safe_torch_stream_context._coda_default_stream_safe = True
-    dsa_runtime.torch_stream_context = _safe_torch_stream_context
-
-    for name, module in list(sys.modules.items()):
-        if not name.startswith("cudnn.deepseek_sparse_attention") or module is None:
-            continue
-        for attr in ("torch_stream_context", "_torch_stream_context"):
-            if getattr(module, attr, None) is original:
-                setattr(module, attr, _safe_torch_stream_context)
-
-
 def _patch_csa_cute_launch_cache():
     """Stop the CSA CuTe launch cache from growing once per microbatch shape.
 
@@ -356,6 +280,5 @@ class _ShapeAgnosticLaunchCache(dict):
 _patch_distributed_optimizer_init()
 _patch_fp32_shard_leaf()
 _patch_fused_adam_fp32_master_remainder()
-_patch_dsa_cudnn_default_stream()
 _patch_csa_cute_launch_cache()
 

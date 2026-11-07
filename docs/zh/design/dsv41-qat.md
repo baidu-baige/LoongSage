@@ -47,20 +47,21 @@ DeepSeek-V4.1-Flash 的发布 checkpoint 本身就是量化格式：dense 层是
 
 量化公式：`s = 2^ceil(log2(amax / qmax))`，FP8 的 qmax 取 448，FP4 取 6；之后用 RNE（round to nearest even）落到网格上。用这个量化器去量化 bf16 checkpoint，反量化值与原始 checkpoint 逐位相同。字节层面有少量差异：约 4% 的 fp8 块 scale 比官方 checkpoint 小一档（取了 s/2，code 相应翻倍；toy checkpoint 实测，各层在 0.3%–5.5% 之间，wq_a 最少）；官方 checkpoint 的 fp4 里有 -0 编码，我们输出 +0。反量化后的数值一样。
 
-`read_ckpt_quant(path)` 只读 safetensors header，从每一对 `X.weight` / `X.scale` 的 dtype 和 shape 推断格式，完整模型约 0.6 s：
+`scan_ckpt_quant(path)` 只读 safetensors header，从每一对 `X.weight` / `X.scale` 的 dtype 和 shape 推断格式，完整模型约 0.6 s：
 
 - weight 是 `F8_E4M3` → `fp8_block`，tile = `(O/sO, I/sI)`；
 - weight 是 `I8`/`U8` 且 `sO == O` → `mxfp4`，group = `2I/sI`；
-- scale 不是 `F8_E8M0` 时直接报错。只有 2 的幂 scale 才能保证 snap 后的值在 bf16 中精确表示。
+- scale 不是 `F8_E8M0`（或 scale 不能整除 weight）时记为不支持，不在这里报错。只有 2 的幂 scale 才能保证 snap 后的值在 bf16 中精确表示。是否报错由 `QuantPlan` 决定（见 3.2）。`read_ckpt_quant(path)` 是严格版本，遇到不支持的格式直接报错，供调试脚本使用。
 
 关键性质：使用 ue8m0 scale 时，`dequant(quant(w))` 在 bf16 中可以精确表示，而且是量化器的不动点。把它再量化一次，得到的数值完全相同。这一点是整个 QAT 成立的前提，后面几节都依赖它。
 
 ### 3.2 Megatron 参数与 checkpoint tensor 的对应
 
-`QuantPlan`（[coda/backends/megatron/qat.py](../../../coda/backends/megatron/qat.py)）不按层名匹配，而是遍历 `bridge.get_conversion_tasks(model)`。每个 task 给出 Megatron 参数对应的 HF 名字（mapping.hf_param），再拿这个名字去 `read_ckpt_quant` 的结果里查表：
+`QuantPlan`（[coda/backends/megatron/qat.py](../../../coda/backends/megatron/qat.py)）不按层名匹配，而是遍历 `bridge.get_conversion_tasks(model)`。每个 task 给出 Megatron 参数对应的 HF 名字（mapping.hf_param），再拿这个名字去 `scan_ckpt_quant` 的结果里查表：
 
 - 查得到：这个 tensor 在 checkpoint 中是量化存储的，标记 `quantized=True`，导出时由 `check_export` 校验 bridge 输出的格式。
 - 如果同时开了 `qat`，还会把这个参数加入 `snap_params`，并在需要时把对应模块加入 `act_modules`（见 3.4）。
+- 格式不支持：只要有 task 映射到它（包括其他 PP stage 的 task），就报 `NotImplementedError`。没有被映射的不支持 tensor 会跳过，rank 0 打一条 info 日志列出它们。例如 DeepSeek-V4-Flash-BF16 转换时保留了 FP8 的 `mtp.0.e_proj` / `mtp.0.h_proj`（fp32 scale，128x128 块），trainer 不加载 MTP，所以跳过。
 
 TP/EP 分片的正确性由 `_local_layout_ok` 保证：只有当本地分片是完整 HF tensor 的连续切片，并且切在 tile 边界上（按 dim-0 或 dim-1 切，GatedMLP 是 n 段 dim-0 拼接），对本地分片做 snap 才等价于对完整 tensor 做 snap。不满足时直接报错，比如 head 交错排布的 QKV，或者 Fused expert mapping。这类情况需要为该模型写 adapter。V4.1 在 TP4/8、EP 切分下全部满足条件。
 
