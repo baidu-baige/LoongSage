@@ -32,7 +32,7 @@ ci = [
     "numpy>=1.26",
     "omegaconf==2.3.1",
     "hydra-core==1.3.4",
-    "ray>=2.54.0",
+    "ray>=2.55.0",
     "mlflow==3.14.0",
     "wandb==0.28.0",
     "mini-swe-agent==2.4.5",

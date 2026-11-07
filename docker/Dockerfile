@@ -12,7 +12,7 @@ RUN MAX_JOBS=128 pip install --no-build-isolation causal-conv1d==1.6.1 mamba-ssm
 RUN MAX_JOBS=128 NVTE_FRAMEWORK=pytorch NVTE_BUILD_THREADS_PER_JOB=4 pip install -v --no-build-isolation git+https://github.com/NVIDIA/TransformerEngine.git@v2.16
 
 # pip only
-RUN pip install ray[default]==2.54.0 omegaconf==2.3.1 hydra-core==1.3.4
+RUN pip install ray[default]==2.55.1 omegaconf==2.3.1 hydra-core==1.3.4
 RUN pip install --ignore-installed mlflow==3.14.0
 RUN pip install wandb==0.28.0 weave==0.53.1
 RUN pip install nvidia-resiliency-ext==0.6.0
