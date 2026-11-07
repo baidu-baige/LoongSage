@@ -290,7 +290,7 @@ index 1a3daa418..a3e145ec1 100644
  
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/deepseek_v41.py b/megatron/core/transformer/experimental_attention_variant/dsv41/deepseek_v41.py
 new file mode 100644
-index 000000000..e8b87691e
+index 000000000..94e2eb647
 --- /dev/null
 +++ b/megatron/core/transformer/experimental_attention_variant/dsv41/deepseek_v41.py
 @@ -0,0 +1,727 @@
@@ -342,7 +342,7 @@ index 000000000..e8b87691e
 +from megatron.core.transformer.experimental_attention_variant.dsv41.ops.kernel.tilelang_sparse_mla import sparse_attn_tilelang
 +from megatron.core.transformer.experimental_attention_variant.dsv41.ops.kvnorm import compressed_kv_stored, kv_norm_rope_fp8
 +from megatron.core.transformer.experimental_attention_variant.dsv41.ops.quant import fake_quant_compressed_kv
-+from megatron.core.transformer.experimental_attention_variant.dsv41.ops.rope import apply_rotary_emb
++from megatron.core.transformer.experimental_attention_variant.dsv41.ops.rope import rotary_emb_
 +from megatron.core.transformer.experimental_attention_variant.dsv41.ops.rope_tables import wrapped_precompute_freqs_cis
 +
 +V41_CONFIG_FIELDS = (
@@ -845,7 +845,7 @@ index 000000000..e8b87691e
 +
 +        qr = self.q_layernorm(self.linear_q_down_proj(x)[0])
 +        q = self.linear_q_up_proj(qr)[0].unflatten(-1, (self.n_local_heads, self.head_dim)).clone()
-+        apply_rotary_emb(q[..., -rd:], freqs_cis)
++        q = rotary_emb_(q, freqs_cis, rd)
 +
 +        kv = kv_norm_rope_fp8(self.linear_kv_proj(x)[0], self.kv_layernorm.weight, self.eps, freqs_cis, rd)
 +
@@ -896,7 +896,7 @@ index 000000000..e8b87691e
 +                        index_k = all_gather_cp(index_k, dim=1, cp_group=self.cp_group)
 +                    rt.index_k[self.layer_id] = index_k
 +                latent = latent.clone(memory_format=torch.contiguous_format)
-+                apply_rotary_emb(latent[..., -rd:], freqs_compress)
++                latent = rotary_emb_(latent, freqs_compress, rd)
 +                latent = fake_quant_compressed_kv(latent)
 +                latent = compressed_kv_stored(latent, rd)
 +                if cp > 1:
@@ -932,7 +932,7 @@ index 000000000..e8b87691e
 +        topk_idxs = topk_idxs.int()
 +        kv = copy_to_tensor_model_parallel_region(kv, group=self.tp_group, all_reduce_grad_fp32=True)
 +        o = sparse_attn_tilelang(q, kv, self.core_attention.attn_sink, topk_idxs, self.softmax_scale)
-+        apply_rotary_emb(o[..., -rd:], freqs_cis, inverse=True)
++        o = rotary_emb_(o, freqs_cis, rd, inverse=True)
 +
 +        o = o.view(bsz, seqlen, self.n_local_groups, -1)
 +        wo_a = self.linear_o_group_proj.view(self.n_local_groups, self.o_lora_rank, -1)
@@ -3185,14 +3185,14 @@ index 000000000..e8a833a58
 +    return out, lse
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kvnorm.py b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kvnorm.py
 new file mode 100644
-index 000000000..b098eca83
+index 000000000..40906f431
 --- /dev/null
 +++ b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kvnorm.py
 @@ -0,0 +1,74 @@
 +import torch
 +
 +from megatron.core.transformer.experimental_attention_variant.dsv41.ops.qat import fp8_simulate_qat
-+from megatron.core.transformer.experimental_attention_variant.dsv41.ops.rope import apply_rotary_emb
++from megatron.core.transformer.experimental_attention_variant.dsv41.ops.rope import rotary_emb_
 +
 +_PAGE_SIZE = 64
 +_BYTES_PER_TOKEN = 584
@@ -3204,7 +3204,7 @@ index 000000000..b098eca83
 +) -> torch.Tensor:
 +    x = kv.float()
 +    data = (x * torch.rsqrt(x.square().mean(-1, keepdim=True) + eps) * weight.float()).contiguous()
-+    apply_rotary_emb(data[..., -rope_dim:], freqs_cis)
++    data = rotary_emb_(data, freqs_cis, rope_dim)
 +    return data.to(kv.dtype)
 +
 +
@@ -3483,10 +3483,10 @@ index 000000000..353561604
 +    return _StraightThrough.apply(x, fake_quant_compressed_kv_forward)
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/ops/rope.py b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/rope.py
 new file mode 100644
-index 000000000..b20bf5c3c
+index 000000000..b2fd7164f
 --- /dev/null
 +++ b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/rope.py
-@@ -0,0 +1,62 @@
+@@ -0,0 +1,86 @@
 +import torch
 +import triton
 +import triton.language as tl
@@ -3549,6 +3549,30 @@ index 000000000..b20bf5c3c
 +    grid = (triton.cdiv(n_rows, rows_per_prog),)
 +    _rope_kernel[grid](x, f, n_rows, seqlen, inner, row_stride, HALF=half, INVERSE=inverse, ROWS=rows_per_prog)
 +    return x
++
++
++class _RotaryEmbInplace(torch.autograd.Function):
++    @staticmethod
++    def forward(ctx, x, freqs_cis, rope_dim, inverse):
++        apply_rotary_emb(x[..., -rope_dim:], freqs_cis, inverse)
++        ctx.mark_dirty(x)
++        ctx.save_for_backward(freqs_cis)
++        ctx.rope_dim, ctx.inverse = rope_dim, inverse
++        return x
++
++    @staticmethod
++    def backward(ctx, grad):
++        (freqs_cis,) = ctx.saved_tensors
++        # a rotation's transpose is its inverse
++        grad = grad.clone(memory_format=torch.contiguous_format)
++        apply_rotary_emb(grad[..., -ctx.rope_dim :], freqs_cis, not ctx.inverse)
++        return grad, None, None, None
++
++
++def rotary_emb_(x: torch.Tensor, freqs_cis: torch.Tensor, rope_dim: int, inverse: bool = False) -> torch.Tensor:
++    """Differentiable in-place RoPE on the last ``rope_dim`` of x (``apply_rotary_emb`` writes
++    through the data pointer, so autograd would pass the gradient through unrotated)."""
++    return _RotaryEmbInplace.apply(x, freqs_cis, rope_dim, inverse)
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/ops/rope_tables.py b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/rope_tables.py
 new file mode 100644
 index 000000000..97f8f56ad
