@@ -2,7 +2,25 @@
 
 from __future__ import annotations
 
+from enum import Enum
+
 import torch
+
+
+class ModalityKind(str, Enum):
+    """Input modality of a multimodal sample."""
+
+    IMAGE = "image"
+    VIDEO = "video"  # Interface reserved; no processing logic yet.
+    AUDIO = "audio"  # Interface reserved; no processing logic yet.
+
+
+# Placeholder written in dataset prompt text where a modality item goes.
+MODALITY_PLACEHOLDER: dict[ModalityKind, str] = {
+    ModalityKind.IMAGE: "<image>",
+    ModalityKind.VIDEO: "<video>",
+    ModalityKind.AUDIO: "<audio>",
+}
 
 # A dict-based batch produced along the rollout -> training path.
 # In Megatron backend, several fields are converted to torch.Tensor lists on GPU
@@ -50,6 +68,13 @@ import torch
 #
 # Optional:
 #   rollout_log_probs       : list[torch.Tensor] | None
+#   multimodal_train_inputs : list[list[str] | None]
+#                             – one entry per Segment row; the hashes (in pad order) of the images
+#                               whose pad run lies in that Segment. None for rows without images.
+#   image_table             : dict[str, dict[str, torch.Tensor]]
+#                             – shard-level, NOT row-aligned: image hash -> {pixel_values,
+#                               image_grid_thw}, one copy per distinct image. Both multimodal keys
+#                               are absent for text-only shards.
 RolloutBatch = dict[
     str, list[torch.Tensor] | list[int] | list[float] | list[str] | dict[str, float] | None
 ]

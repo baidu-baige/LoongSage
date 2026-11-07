@@ -45,6 +45,7 @@ Switches that turn on the "rollout runs concurrently with training" pipeline. Se
 | `dataset.prompt_data_path` | `???` | Prompt dataset path. Supports `.jsonl` / `.parquet`, plus an optional row-slice suffix like `data.jsonl@[0:1000]`. | Required. |
 | `dataset.eval_prompt_data_path` | `null` | Eval split path, same format as above. | `null` disables eval; also requires `rollout.eval.interval > 0` for eval to actually run. |
 | `dataset.max_prompt_len` | `null` | Maximum characters allowed per prompt. Rows exceeding this are dropped at load time. | `null` disables the filter. This is a **character** length, not tokens. |
+| `dataset.max_image_tokens` | `null` | Maximum estimated image tokens summed over all images of one prompt. Rows exceeding this are dropped at load time. | `null` disables the filter. Estimated from image headers and `multimodal.image.{min_pixels,max_pixels}`, assuming Qwen3-VL's 32x32 pixels per token; independent of `max_prompt_len`. |
 | `dataset.input_key` | `???` | Column holding the prompt text or message list. | Required. |
 | `dataset.label_key` | `???` | Column holding the ground-truth label. | Required; set to `null` explicitly if unused. |
 | `dataset.metadata_key` | `metadata` | Column holding per-row metadata dicts. Passed to the agent unchanged as `trajectory["metadata"]`. Schema is free-form — put whatever per-sample info your agent/reward need (e.g. `{"difficulty": "hard"}`). | Column value must be a dict; absent means an empty dict. |
