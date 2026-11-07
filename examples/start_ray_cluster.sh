@@ -21,6 +21,10 @@ RUNTIME_ENV_AGENT_PORT=20002
 CLIENT_SERVER_PORT=10001
 # GPUs per node; override for nodes with a different GPU count, e.g. NUM_GPUS=4
 NUM_GPUS="${NUM_GPUS:-8}"
+# The dashboard reporter reads /proc/<pid>/smaps_rollup of every worker each interval
+# (default 5 s). On training workers with tens of GB of RSS this holds mmap_lock for
+# hundreds of ms and stalls mmap/munmap in the training thread, so poll rarely.
+export REPORTER_UPDATE_INTERVAL_MS="${REPORTER_UPDATE_INTERVAL_MS:-3600000}"
 
 echo "=================================="
 echo "Ray Cluster Setup for CODA Training"
