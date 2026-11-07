@@ -290,10 +290,10 @@ index 1a3daa418..a3e145ec1 100644
  
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/deepseek_v41.py b/megatron/core/transformer/experimental_attention_variant/dsv41/deepseek_v41.py
 new file mode 100644
-index 000000000..15643c188
+index 000000000..94e2eb647
 --- /dev/null
 +++ b/megatron/core/transformer/experimental_attention_variant/dsv41/deepseek_v41.py
-@@ -0,0 +1,686 @@
+@@ -0,0 +1,727 @@
 +import copy
 +
 +import einops
@@ -327,13 +327,22 @@ index 000000000..15643c188
 +    all_gather_cp,
 +    get_freqs_cis_for_cp,
 +    get_q_positions_for_cp,
++    packed_compress_layout,
++    packed_cu_seqlens,
++    packed_seq_starts,
 +    get_window_topk_idxs_cp,
 +)
-+from megatron.core.transformer.experimental_attention_variant.dsv41.ops.indexer import DeepSeekV41Indexer
++from megatron.core.transformer.experimental_attention_variant.dsv41.ops.indexer import (
++    DeepSeekV41Indexer,
++    candidate_blocks_phased,
++    packed_max_compress_len,
++    phased_block_expand,
++    phased_block_reduce,
++)
 +from megatron.core.transformer.experimental_attention_variant.dsv41.ops.kernel.tilelang_sparse_mla import sparse_attn_tilelang
 +from megatron.core.transformer.experimental_attention_variant.dsv41.ops.kvnorm import compressed_kv_stored, kv_norm_rope_fp8
 +from megatron.core.transformer.experimental_attention_variant.dsv41.ops.quant import fake_quant_compressed_kv
-+from megatron.core.transformer.experimental_attention_variant.dsv41.ops.rope import apply_rotary_emb
++from megatron.core.transformer.experimental_attention_variant.dsv41.ops.rope import rotary_emb_
 +from megatron.core.transformer.experimental_attention_variant.dsv41.ops.rope_tables import wrapped_precompute_freqs_cis
 +
 +V41_CONFIG_FIELDS = (
@@ -371,6 +380,8 @@ index 000000000..15643c188
 +        self.index_k = {}
 +        self.topk = None
 +        self.candidates = None
++        # per-query start % candidate_block_size of the candidate blocks (None = 0, one sequence)
++        self.candidate_phase = None
 +
 +
 +def get_runtime(config) -> V41Runtime:
@@ -405,30 +416,6 @@ index 000000000..15643c188
 +
 +def v41_unpack_pre(packed: torch.Tensor, n: int) -> torch.Tensor:
 +    return packed[..., :n].float() + packed[..., n:].float()
-+
-+
-+def _packed_seq_starts(packed_seq_params, q_positions: torch.Tensor):
-+    """Per-query global start position of the query's own packed trajectory.
-+
-+    coda packs several trajectories into one THD sequence (cu_seqlens in
-+    packed_seq_params); without this the sparse window/indexer would let a query
-+    attend across trajectory boundaries into a sibling (same-prompt) trajectory
-+    and "peek" its continuation -> over-confident train logprobs. Returns None
-+    when not packing (single sequence), reproducing the original behavior.
-+    """
-+    if packed_seq_params is None:
-+        return None
-+    cu = getattr(packed_seq_params, "cu_seqlens_q_padded", None)
-+    if cu is None:
-+        cu = getattr(packed_seq_params, "cu_seqlens_q", None)
-+    if cu is None:
-+        return None
-+    cu = cu.to(device=q_positions.device)
-+    # cu_seqlens are global positions (already * cp_size in prepare_packed_seq_params);
-+    # q_positions from get_q_positions_for_cp are global too.
-+    seg = torch.searchsorted(cu, q_positions, right=True) - 1
-+    seg = seg.clamp(min=0, max=cu.numel() - 1)
-+    return cu[seg]
 +
 +
 +def v41_kv_source_layer(config, layer_id: int):
@@ -535,8 +522,13 @@ index 000000000..15643c188
 +        add(_CARRY_TOPK, 0, rt.topk.shape, _bits_to_bf16(rt.topk))
 +    if plan.candidates:
 +        bs = plan.candidate_block_size
-+        blocks = rt.candidates[..., ::bs]
-+        add(_CARRY_CAND, bs, (*rt.candidates.shape[:-1], rt.candidates.shape[-1]), _bits_to_bf16(blocks))
++        shape = (*rt.candidates.shape[:-1], rt.candidates.shape[-1])
++        if rt.candidate_phase is None:
++            add(_CARRY_CAND, bs, shape, _bits_to_bf16(rt.candidates[..., ::bs]))
++        else:
++            # packed: blocks start at each row's phase; key -bs marks the trailing phases
++            blocks = phased_block_reduce(rt.candidates, rt.candidate_phase, bs)
++            add(_CARRY_CAND, -bs, shape, torch.cat([_bits_to_bf16(blocks), _bits_to_bf16(rt.candidate_phase)]))
 +    header = torch.zeros(_CARRY_HEADER_INTS, dtype=torch.int32, device=hidden.device)
 +    header[0] = len(meta)
 +    flat_meta = [v for m in meta for v in m]
@@ -576,12 +568,17 @@ index 000000000..15643c188
 +            n = 2 * d0 * d1 * d2
 +            rt.topk = carry[off : off + n].detach().view(torch.int32).view(d0, d1, d2).to(torch.int64)
 +        elif kind == _CARRY_CAND:
-+            bs = key
++            bs = abs(key)
 +            nb = -(-d2 // bs)
 +            n = (d0 * d1 * nb + 1) // 2
 +            raw = carry[off : off + n].detach().view(torch.uint8)
 +            blocks = raw[: d0 * d1 * nb].view(d0, d1, nb).bool()
-+            rt.candidates = blocks.repeat_interleave(bs, dim=-1)[..., :d2]
++            if key > 0:
++                rt.candidates = blocks.repeat_interleave(bs, dim=-1)[..., :d2]
++            else:
++                rt.candidate_phase = carry[off + n : off + n + 2 * d1].detach().view(torch.int32)
++                rt.candidates = phased_block_expand(blocks, rt.candidate_phase, bs, d2)
++                n += 2 * d1
 +        else:
 +            raise ValueError(f"unknown carry section {kind}")
 +        off += n
@@ -644,7 +641,7 @@ index 000000000..15643c188
 +        if self.v41_carry:
 +            hidden_states = v41_unpack_carry(hidden_states, rt, self.v41_base_cols)
 +        if self.v41_engram is not None:
-+            hidden_states = self.v41_engram(hidden_states, rt.input_ids)
++            hidden_states = self.v41_engram(hidden_states, rt.input_ids, kwargs.get("packed_seq_params"))
 +        output, context = super().forward(hidden_states, *args, **kwargs)
 +        if self.v41_is_last:
 +            output = v41_aggregate(output, rt.pre, self.config.num_residual_streams)
@@ -836,16 +833,22 @@ index 000000000..15643c188
 +        freqs_full = wrapped_precompute_freqs_cis(self.config, rd, rope_base, not ratio, seqlen_global, x.device)[
 +            :seqlen_global
 +        ]
-+        freqs_cis = get_freqs_cis_for_cp(freqs_full, seqlen, cp, self.cp_group)
++        q_positions = get_q_positions_for_cp(seqlen, cp_size=cp, cp_group=self.cp_group, device=x.device)
++        seq_starts = packed_seq_starts(packed_seq_params, q_positions)
++        if seq_starts is None:
++            freqs_cis = get_freqs_cis_for_cp(freqs_full, seqlen, cp, self.cp_group)
++        else:
++            # RoPE at the position inside the token's own trajectory, as inference does. The
++            # rotated compressed kv and indexer q / k are fp4 fake-quantized afterwards, so a
++            # shifted angle changes their quantization error, not just the rounding.
++            freqs_cis = freqs_full[q_positions - seq_starts]
 +
 +        qr = self.q_layernorm(self.linear_q_down_proj(x)[0])
 +        q = self.linear_q_up_proj(qr)[0].unflatten(-1, (self.n_local_heads, self.head_dim)).clone()
-+        apply_rotary_emb(q[..., -rd:], freqs_cis)
++        q = rotary_emb_(q, freqs_cis, rd)
 +
 +        kv = kv_norm_rope_fp8(self.linear_kv_proj(x)[0], self.kv_layernorm.weight, self.eps, freqs_cis, rd)
 +
-+        q_positions = get_q_positions_for_cp(seqlen, cp_size=cp, cp_group=self.cp_group, device=x.device)
-+        seq_starts = _packed_seq_starts(packed_seq_params, q_positions)
 +        topk_idxs = get_window_topk_idxs_cp(
 +            q_positions, window_size=self.window_size, cp_size=cp, bsz=bsz, seq_starts=seq_starts
 +        )
@@ -854,20 +857,46 @@ index 000000000..15643c188
 +
 +        if ratio:
 +            offset = seqlen_global
-+            compress_lens = (q_positions + 1) // ratio
-+            compress_starts = None if seq_starts is None else (seq_starts // ratio).to(torch.int32)
++            group_index = None
++            if seq_starts is None:
++                compress_lens, compress_starts = (q_positions + 1) // ratio, None
++            elif cp == 1 and ratio > 1:
++                # group each trajectory from its own first token, as inference does; the
++                # global grouping straddles a boundary whenever a trajectory starts odd
++                group_index, group_pos, compress_starts, compress_lens = packed_compress_layout(
++                    packed_cu_seqlens(packed_seq_params, x.device), seqlen, ratio
++                )
++            else:
++                if ratio > 1:
++                    # coda aligns CP>1 trajectories to tp * 2 * cp, so the global grouping
++                    # is already per trajectory; the CP-sharded compressor relies on it
++                    cu = packed_cu_seqlens(packed_seq_params, x.device)
++                    torch._assert_async((cu % ratio == 0).all())
++                compress_lens = (q_positions + 1) // ratio
++                compress_starts = seq_starts // ratio
++            if compress_starts is not None:
++                compress_starts = compress_starts.to(torch.int32)
 +            if self.is_kv_source:
-+                latent = self.core_attention.compressor(hidden_states)
++                latent = self.core_attention.compressor(hidden_states, group_index)
 +                latent = einops.rearrange(latent, "n b d -> b n d")
 +                n_groups = latent.size(1)
-+                freqs_compress = get_freqs_cis_for_cp(freqs_full, seqlen, cp, self.cp_group, stride=ratio)[:n_groups]
++                if seq_starts is None:
++                    freqs_compress = get_freqs_cis_for_cp(freqs_full, seqlen, cp, self.cp_group, stride=ratio)[
++                        :n_groups
++                    ]
++                elif group_index is not None:
++                    freqs_compress = freqs_full[group_pos]
++                else:
++                    # a group sits at its first token's in-trajectory position
++                    first = slice(0, n_groups * ratio, ratio)
++                    freqs_compress = freqs_full[q_positions[first] - seq_starts[first]]
 +                if self.is_index_source:
 +                    index_k = self.core_attention.indexer.index_keys(latent, freqs_compress)
 +                    if cp > 1:
 +                        index_k = all_gather_cp(index_k, dim=1, cp_group=self.cp_group)
 +                    rt.index_k[self.layer_id] = index_k
 +                latent = latent.clone(memory_format=torch.contiguous_format)
-+                apply_rotary_emb(latent[..., -rd:], freqs_compress)
++                latent = rotary_emb_(latent, freqs_compress, rd)
 +                latent = fake_quant_compressed_kv(latent)
 +                latent = compressed_kv_stored(latent, rd)
 +                if cp > 1:
@@ -875,13 +904,25 @@ index 000000000..15643c188
 +                rt.latent[self.layer_id] = latent
 +            latent = rt.latent[self.kv_source_layer]
 +            if self.is_index_source:
++                index_k = rt.index_k[self.kv_source_layer]
++                bs = self.config.v41_candidate_block_size
++                candidate_phased = (
++                    self.core_attention.indexer.is_candidate_source
++                    and compress_starts is not None
++                    and candidate_blocks_phased(
++                        packed_max_compress_len(packed_seq_params, ratio, index_k.size(1)),
++                        self.config.v41_candidate_topk_blocks,
++                        bs,
++                    )
++                )
 +                topk_rel, candidates = self.core_attention.indexer(
-+                    x, qr, rt.index_k[self.kv_source_layer], freqs_cis, compress_lens, rt.candidates,
-+                    compress_starts,
++                    x, qr, index_k, freqs_cis, compress_lens, rt.candidates, compress_starts, candidate_phased
 +                )
 +                rt.topk = topk_rel
 +                if candidates is not None:
 +                    rt.candidates = candidates
++                if candidate_phased:
++                    rt.candidate_phase = compress_starts % bs
 +            topk_rel = rt.topk
 +            assert topk_rel is not None, f"layer {self.layer_id}: no index_source layer ran before it"
 +            compress_idxs = torch.where(topk_rel < 0, -1, topk_rel + offset).int()
@@ -891,7 +932,7 @@ index 000000000..15643c188
 +        topk_idxs = topk_idxs.int()
 +        kv = copy_to_tensor_model_parallel_region(kv, group=self.tp_group, all_reduce_grad_fp32=True)
 +        o = sparse_attn_tilelang(q, kv, self.core_attention.attn_sink, topk_idxs, self.softmax_scale)
-+        apply_rotary_emb(o[..., -rd:], freqs_cis, inverse=True)
++        o = rotary_emb_(o, freqs_cis, rd, inverse=True)
 +
 +        o = o.view(bsz, seqlen, self.n_local_groups, -1)
 +        wo_a = self.linear_o_group_proj.view(self.n_local_groups, self.o_lora_rank, -1)
@@ -1047,10 +1088,10 @@ index 000000000..ed1b7c544
 +    return _FLASHINFER_TIE_BREAK_VALUES[mode]
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/engram.py b/megatron/core/transformer/experimental_attention_variant/dsv41/engram.py
 new file mode 100644
-index 000000000..768df7614
+index 000000000..8f8c762c1
 --- /dev/null
 +++ b/megatron/core/transformer/experimental_attention_variant/dsv41/engram.py
-@@ -0,0 +1,373 @@
+@@ -0,0 +1,382 @@
 +import json
 +import logging
 +import os
@@ -1068,6 +1109,8 @@ index 000000000..768df7614
 +)
 +from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 +from megatron.core.transformer.transformer_config import TransformerConfig
++
++from megatron.core.transformer.experimental_attention_variant.dsv41.ops.cp_utils import packed_seq_starts
 +
 +logger = logging.getLogger(__name__)
 +
@@ -1336,14 +1379,17 @@ index 000000000..768df7614
 +        )
 +        self._table_loaded = True
 +
-+    def hash_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
++    def hash_ids(self, input_ids: torch.Tensor, seq_starts: torch.Tensor | None = None) -> torch.Tensor:
++        """``seq_starts``: per-position start of its packed trajectory (None = one sequence).
++        Predecessors before the start are PAD, as at the start of an inference request."""
 +        batch, seqlen = input_ids.shape
 +        compressed = self.token_map[input_ids]
 +        positions = torch.arange(seqlen, device=input_ids.device).expand(batch, seqlen)
++        starts = 0 if seq_starts is None else seq_starts
 +        tokens, blocked = [], torch.zeros_like(positions, dtype=torch.bool)
 +        for shift in range(self.max_ngram_size):
 +            source = compressed.gather(1, (positions - shift).clamp_min(0))
-+            blocked = blocked | (positions < shift)
++            blocked = blocked | (positions - shift < starts)
 +            tokens.append(torch.where(blocked, self.pad_id, source))
 +        tokens = torch.stack(tokens, dim=-1)
 +        products = tokens * self.multipliers
@@ -1400,7 +1446,7 @@ index 000000000..768df7614
 +            torch.distributed.all_reduce(values, group=self.tp_group)
 +        return values
 +
-+    def forward(self, hidden_states: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
++    def forward(self, hidden_states: torch.Tensor, input_ids: torch.Tensor, packed_seq_params=None) -> torch.Tensor:
 +        if self.sequence_parallel:
 +            hidden_states = gather_from_sequence_parallel_region(
 +                hidden_states, tensor_parallel_output_grad=False, group=self.tp_group
@@ -1408,13 +1454,17 @@ index 000000000..768df7614
 +        seqlen, bsz, _ = hidden_states.shape
 +        assert input_ids is not None and input_ids.shape[0] == bsz and input_ids.shape[1] == seqlen
 +        with torch.no_grad():
++            # cu_seqlens and the hashed sequence are both global (the CP branch hashes the gathered ids)
++            seq_starts = packed_seq_starts(
++                packed_seq_params, torch.arange(seqlen * self.cp_size, device=input_ids.device)
++            )
 +            if self.cp_size > 1:
 +                chunks = [torch.empty_like(input_ids) for _ in range(self.cp_size)]
 +                torch.distributed.all_gather(chunks, input_ids.contiguous(), group=self.cp_group)
 +                start = self.cp_group.rank() * seqlen
-+                ids = self.hash_ids(torch.cat(chunks, dim=1))[:, start : start + seqlen].transpose(0, 1)
++                ids = self.hash_ids(torch.cat(chunks, dim=1), seq_starts)[:, start : start + seqlen].transpose(0, 1)
 +            else:
-+                ids = self.hash_ids(input_ids).transpose(0, 1)
++                ids = self.hash_ids(input_ids, seq_starts).transpose(0, 1)
 +            rows = self.lookup(ids)
 +        kv, _ = self.linear_wkv(rows.flatten(-2))
 +        x = hidden_states.view(seqlen, bsz, self.hc_mult, self.dim)
@@ -1429,10 +1479,10 @@ new file mode 100644
 index 000000000..e69de29bb
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/ops/compressor.py b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/compressor.py
 new file mode 100644
-index 000000000..d3f1a0fb0
+index 000000000..c38c43dae
 --- /dev/null
 +++ b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/compressor.py
-@@ -0,0 +1,35 @@
+@@ -0,0 +1,37 @@
 +import torch
 +import torch.nn as nn
 +import torch.nn.functional as F
@@ -1455,13 +1505,15 @@ index 000000000..d3f1a0fb0
 +        self.norm = RMSNorm(head_dim, config.layernorm_epsilon)
 +        mark_keep_in_fp32(self.norm.weight)
 +
-+    def forward(self, x: torch.Tensor) -> torch.Tensor:
++    def forward(self, x: torch.Tensor, group_index: torch.Tensor | None = None) -> torch.Tensor:
++        """``group_index``: the token ids of each group, ``ratio`` per group, for a packed
++        buffer (see ``packed_compress_layout``); None = consecutive groups from token 0."""
 +        seqlen, bsz, _ = x.shape
 +        ratio = self.compress_ratio
 +        if ratio == 1:
 +            return self.norm(F.linear(x, self.linear_wkv.weight))
 +        groups = seqlen // ratio
-+        x = x[: groups * ratio].float()
++        x = (x[: groups * ratio] if group_index is None else x.index_select(0, group_index)).float()
 +        kv = F.linear(x, self.linear_wkv.weight.float())
 +        score = F.linear(x, self.linear_wgate.weight.float())
 +        kv = kv.view(groups, ratio, bsz, self.head_dim)
@@ -1470,10 +1522,10 @@ index 000000000..d3f1a0fb0
 +        return self.norm(kv.to(torch.bfloat16))
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/ops/cp_utils.py b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/cp_utils.py
 new file mode 100644
-index 000000000..c718f303f
+index 000000000..5e612be4d
 --- /dev/null
 +++ b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/cp_utils.py
-@@ -0,0 +1,90 @@
+@@ -0,0 +1,156 @@
 +from functools import lru_cache
 +
 +import torch
@@ -1484,6 +1536,72 @@ index 000000000..c718f303f
 +def all_gather_cp(tensor: Tensor, dim: int, cp_group: torch.distributed.ProcessGroup) -> Tensor:
 +    """All-gather tensor across CP ranks on `dim`. Contiguous CP = result already in natural order."""
 +    return torch.cat(torch.distributed.nn.functional.all_gather(tensor, group=cp_group), dim=dim)
++
++
++def packed_seq_starts(packed_seq_params, q_positions: torch.Tensor):
++    """Per-query global start position of the query's own packed trajectory.
++
++    coda packs several trajectories into one THD sequence (cu_seqlens in
++    packed_seq_params); without this the sparse window/indexer would let a query
++    attend across trajectory boundaries into a sibling (same-prompt) trajectory
++    and "peek" its continuation -> over-confident train logprobs, and the engram
++    n-grams of a trajectory's first tokens would hash the previous trajectory's
++    tail. Returns None when not packing (single sequence), reproducing the
++    original behavior.
++    """
++    cu = packed_cu_seqlens(packed_seq_params, q_positions.device)
++    if cu is None:
++        return None
++    # cu_seqlens are global positions (already * cp_size in prepare_packed_seq_params);
++    # q_positions from get_q_positions_for_cp are global too.
++    seg = torch.searchsorted(cu, q_positions, right=True) - 1
++    seg = seg.clamp(min=0, max=cu.numel() - 1)
++    return cu[seg]
++
++
++def packed_cu_seqlens(packed_seq_params, device):
++    """Global trajectory boundaries of a THD pack (None = one sequence)."""
++    if packed_seq_params is None:
++        return None
++    cu = getattr(packed_seq_params, "cu_seqlens_q_padded", None)
++    if cu is None:
++        cu = getattr(packed_seq_params, "cu_seqlens_q", None)
++    if cu is None:
++        return None
++    return cu.to(device=device, dtype=torch.int64)
++
++
++def packed_compress_layout(cu: Tensor, seqlen: int, ratio: int):
++    """Per-trajectory compression groups of a THD pack (CP=1), as inference forms them.
++
++    Trajectory i owns compressed slots [cu_g[i], cu_g[i + 1]), cu_g being the cumsum
++    of its complete groups (seg_len // ratio); its group j covers tokens
++    cu[i] + j * ratio + [0, ratio). The buffer keeps seqlen // ratio slots, an upper
++    bound of cu_g[-1], so no shape depends on the data; the spare slots at the end
++    read token 0 and no query can see them.
++
++    Returns group_index ([n_groups * ratio] token ids the compressor groups),
++    group_pos ([n_groups] in-trajectory position of each group's first token) and
++    compress_starts / compress_lens ([seqlen], the query's visible slots [starts, lens)).
++    """
++    device = cu.device
++    cu = torch.cat([cu, cu.new_tensor([seqlen])])  # an empty trailing segment when cu[-1] == seqlen
++    n_seg = cu.numel() - 1
++    n_groups = seqlen // ratio
++    cu_g = torch.nn.functional.pad(torch.cumsum((cu[1:] - cu[:-1]) // ratio, 0), (1, 0))
++
++    slot = torch.arange(n_groups, device=device)
++    seg = (torch.searchsorted(cu_g, slot, right=True) - 1).clamp(0, n_seg - 1)
++    used = slot < cu_g[-1]
++    group_pos = torch.where(used, (slot - cu_g[seg]) * ratio, 0)
++    first = torch.where(used, cu[seg] + group_pos, 0)
++    group_index = (first.unsqueeze(1) + torch.arange(ratio, device=device)).flatten()
++
++    q = torch.arange(seqlen, device=device)
++    q_seg = (torch.searchsorted(cu, q, right=True) - 1).clamp(0, n_seg - 1)
++    compress_starts = cu_g[q_seg]
++    compress_lens = compress_starts + (q - cu[q_seg] + 1) // ratio
++    return group_index, group_pos, compress_starts, compress_lens
 +
 +
 +def get_q_positions_for_cp(
@@ -1769,10 +1887,10 @@ index 000000000..583e622db
 +    return _Aggregate.apply(x, pre, n)
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/ops/indexer.py b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/indexer.py
 new file mode 100644
-index 000000000..eadc78d29
+index 000000000..400241539
 --- /dev/null
 +++ b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/indexer.py
-@@ -0,0 +1,237 @@
+@@ -0,0 +1,342 @@
 +import functools
 +import os
 +
@@ -1784,6 +1902,10 @@ index 000000000..eadc78d29
 +from megatron.core.transformer.transformer_config import TransformerConfig
 +
 +from megatron.core.transformer.experimental_attention_variant.dsv41.ops.kernel.tilelang_indexer_fwd import batched_indexer_fwd
++from megatron.core.transformer.experimental_attention_variant.dsv41.ops.kernel.phased_blocks import (
++    phased_block_expand_triton,
++    phased_block_reduce_triton,
++)
 +from megatron.core.transformer.experimental_attention_variant.dsv41.ops.norm import RMSNorm
 +from megatron.core.transformer.experimental_attention_variant.dsv41.ops.quant import fake_quant_fp4
 +from megatron.core.transformer.experimental_attention_variant.dsv41.ops.rope import apply_rotary_emb
@@ -1791,18 +1913,109 @@ index 000000000..eadc78d29
 +from megatron.core.transformer.experimental_attention_variant.dsv41.replay import indexer_replay_manager
 +
 +
++def candidate_blocks_phased(max_len: int, topk_blocks: int, block_size: int) -> bool:
++    """Whether candidate blocks must be counted from each trajectory start.
++
++    ``max_len`` bounds the compressed length of every packed trajectory. A trajectory of
++    length L touches at most (L + block_size - 2) // block_size + 1 global blocks; when
++    that fits in ``topk_blocks``, the global blocks and the per-trajectory ones (as in
++    inference) both keep every column a query can reach, and the consumers mask the
++    columns outside [starts, lens) anyway, so the cheap global blocks are exact.
++    """
++    return max_len > 0 and (max_len + block_size - 2) // block_size + 1 > topk_blocks
++
++
++def packed_max_compress_len(packed_seq_params, ratio: int, width: int) -> int:
++    """Upper bound of a packed trajectory's compressed length, without a host sync:
++    ``max_seqlen_q`` when the packer recorded it as a Python int, else the buffer width."""
++    max_seqlen = getattr(packed_seq_params, "max_seqlen_q", None)
++    if not isinstance(max_seqlen, int) or max_seqlen <= 0:
++        return width
++    return min(width, -(-max_seqlen // max(ratio, 1)))
++
++
 +def select_candidate_blocks(
-+    logits: torch.Tensor, compress_lens: torch.Tensor, topk_blocks: int, block_size: int
++    logits: torch.Tensor,
++    compress_lens: torch.Tensor,
++    topk_blocks: int,
++    block_size: int,
++    compress_starts: torch.Tensor | None = None,
 +) -> torch.Tensor:
++    """``compress_starts`` ([rows, 1]): count each row's blocks from its trajectory start,
++    as inference counts them from the request's slot 0 (None = from global slot 0; the
++    caller passes None when ``candidate_blocks_phased`` says the two agree)."""
 +    width = logits.size(-1)
-+    scores = F.pad(logits, (0, -width % block_size), value=-torch.inf)
-+    scores = scores.unflatten(-1, (-1, block_size)).amax(dim=-1)
++    phase = None if compress_starts is None else (compress_starts % block_size).view(-1)
++    if phase is None and not _use_phased_triton(logits, block_size):
++        scores = F.pad(logits, (0, -width % block_size), value=-torch.inf)
++        scores = scores.unflatten(-1, (-1, block_size)).amax(dim=-1)
++    else:
++        # the one-pass kernel is also faster than pad + amax for the global blocks (phase 0)
++        if phase is None:
++            rows_phase = logits.new_zeros(logits.size(-2), dtype=torch.int32)
++        else:
++            rows_phase = phase
++        scores = phased_block_reduce(logits, rows_phase, block_size)
++    if phase is not None:
++        compress_lens = compress_lens - phase.view(-1, 1)
 +    num_blocks = scores.size(-1)
 +    last = (compress_lens - 1) // block_size
 +    scores = scores.masked_fill(torch.arange(num_blocks, device=logits.device) == last, torch.inf)
 +    top = scores.topk(min(topk_blocks, num_blocks), dim=-1)
 +    keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(-1, top.indices, top.values > -torch.inf)
-+    return keep.repeat_interleave(block_size, dim=-1)[..., :width]
++    if phase is None:
++        return keep.repeat_interleave(block_size, dim=-1)[..., :width]
++    return phased_block_expand(keep, phase, block_size, width)
++
++
++# Row r's block k covers columns phase[r] + k * block_size + [0, block_size), phase[r] in
++# [0, block_size) and broadcast over the leading dims. On GPU a Triton kernel does it in
++# one pass; the torch version (one strided view per phase, block_size passes) is the
++# reference and the CPU path.
++
++
++def _use_phased_triton(x: torch.Tensor, block_size: int) -> bool:
++    return x.is_cuda and block_size & (block_size - 1) == 0
++
++
++def phased_block_reduce(x: torch.Tensor, phase: torch.Tensor, block_size: int) -> torch.Tensor:
++    """[..., rows, width] -> [..., rows, ceil(width / block_size)] block max (any for bool)."""
++    if _use_phased_triton(x, block_size):
++        return phased_block_reduce_triton(x, phase, block_size)
++    return phased_block_reduce_torch(x, phase, block_size)
++
++
++def phased_block_expand(blocks: torch.Tensor, phase: torch.Tensor, block_size: int, width: int) -> torch.Tensor:
++    """[..., rows, nb] block mask -> [..., rows, width] column mask; columns before phase are False."""
++    if _use_phased_triton(blocks, block_size):
++        return phased_block_expand_triton(blocks, phase, block_size, width)
++    return phased_block_expand_torch(blocks, phase, block_size, width)
++
++
++def phased_block_reduce_torch(x: torch.Tensor, phase: torch.Tensor, block_size: int) -> torch.Tensor:
++    """[..., rows, width] -> [..., rows, ceil(width / block_size)] block max (any for bool)."""
++    width = x.size(-1)
++    nb = -(-width // block_size)
++    is_bool = x.dtype == torch.bool
++    x = F.pad(x, (0, (nb + 1) * block_size - width), value=False if is_bool else -torch.inf)
++    phase = phase.view(-1, 1)
++    out = None
++    for p in range(block_size):
++        v = x[..., p : p + nb * block_size].unflatten(-1, (nb, block_size))
++        v = v.any(dim=-1) if is_bool else v.amax(dim=-1)
++        out = v if out is None else torch.where(phase == p, v, out)
++    return out
++
++
++def phased_block_expand_torch(blocks: torch.Tensor, phase: torch.Tensor, block_size: int, width: int) -> torch.Tensor:
++    nb = blocks.size(-1)
++    rep = blocks.repeat_interleave(block_size, dim=-1)
++    out = blocks.new_zeros(*blocks.shape[:-1], (nb + 1) * block_size)
++    phase = phase.view(-1, 1)
++    for p in range(block_size):
++        win = out[..., p : p + nb * block_size]
++        win.copy_(torch.where(phase == p, rep, win))
++    return out[..., :width]
 +
 +
 +INDEXER_QUERY_CHUNK = int(os.environ.get("MEGATRON_DSV41_INDEXER_QUERY_CHUNK", "8192"))
@@ -1837,7 +2050,11 @@ index 000000000..eadc78d29
 +    allow_deep_select: bool,
 +    query_chunk: int | None,
 +    compress_starts: torch.Tensor | None = None,
++    candidate_phased: bool = False,
 +) -> tuple[torch.Tensor, torch.Tensor | None]:
++    """``candidate_phased``: count the candidate blocks from ``compress_starts`` (see
++    ``candidate_blocks_phased``); otherwise from global slot 0."""
++    assert not candidate_phased or compress_starts is not None
 +    bsz, seqlen = q.shape[:2]
 +    n_kv = index_k.size(1)
 +    k_t = index_k.transpose(0, 1).contiguous()
@@ -1872,7 +2089,11 @@ index 000000000..eadc78d29
 +        # batched_indexer_fwd already wrote -inf outside [starts, lens) for every query
 +        if is_candidate_source:
 +            cand = select_candidate_blocks(
-+                scores[..., :n_kv], lens.unsqueeze(-1), candidate_topk_blocks, candidate_block_size
++                scores[..., :n_kv],
++                lens.unsqueeze(-1),
++                candidate_topk_blocks,
++                candidate_block_size,
++                starts.unsqueeze(-1) if candidate_phased else None,
 +            )
 +            cand_parts.append(cand)
 +        elif uses_candidates:
@@ -1981,6 +2202,7 @@ index 000000000..eadc78d29
 +        compress_lens: torch.Tensor,
 +        candidates: torch.Tensor | None,
 +        compress_starts: torch.Tensor | None = None,
++        candidate_phased: bool = False,
 +    ):
 +        bsz, seqlen, _ = x.shape
 +        rd = self.rope_head_dim
@@ -2008,6 +2230,7 @@ index 000000000..eadc78d29
 +            allow_deep_select=topk_fn is base_topk_fn,
 +            query_chunk=INDEXER_QUERY_CHUNK,
 +            compress_starts=compress_starts,
++            candidate_phased=candidate_phased,
 +        )
 +        return idx, candidates
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/__init__.py b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/__init__.py
@@ -2156,6 +2379,91 @@ index 000000000..eb6526bf2
 +        x.copy_(y)
 +        return x
 +    return y, s
+diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/phased_blocks.py b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/phased_blocks.py
+new file mode 100644
+index 000000000..70ba9a65f
+--- /dev/null
++++ b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/phased_blocks.py
+@@ -0,0 +1,79 @@
++"""Candidate blocks counted from a per-row offset, one pass over the input.
++
++Row r's block k covers columns phase[r] + k * BS + [0, BS); phase has one entry per row of
++the second-to-last dim and is broadcast over the leading dims.
++"""
++import torch
++import triton
++import triton.language as tl
++
++# Triton specializes int arguments on ==1 and %16 == 0, so every new length class would
++# compile another variant; the loads start at a per-row phase and are unaligned anyway, so
++# one variant per (BS, IS_BOOL) serves every shape.
++_DYNAMIC_INTS = ["rows", "width", "n_blocks", "x_stride", "out_stride"]
++
++
++@triton.jit(do_not_specialize=_DYNAMIC_INTS)
++def _phased_block_max_kernel(
++    x_ptr, phase_ptr, out_ptr, rows, width, n_blocks, x_stride, out_stride,
++    BS: tl.constexpr, BLOCK_K: tl.constexpr, IS_BOOL: tl.constexpr,
++):
++    r = tl.program_id(0)
++    phase = tl.load(phase_ptr + r % rows).to(tl.int64)
++    k = tl.program_id(1) * BLOCK_K + tl.arange(0, BLOCK_K)
++    cols = phase + k[:, None] * BS + tl.arange(0, BS)[None, :]
++    mask = (k[:, None] < n_blocks) & (cols < width)
++    ptrs = x_ptr + r.to(tl.int64) * x_stride + cols
++    if IS_BOOL:
++        v = tl.load(ptrs, mask=mask, other=0)
++    else:
++        v = tl.load(ptrs, mask=mask, other=float("-inf"))
++    tl.store(out_ptr + r.to(tl.int64) * out_stride + k, tl.max(v, axis=1), mask=k < n_blocks)
++
++
++@triton.jit(do_not_specialize=["rows", "width", "n_blocks", "b_stride", "out_stride"])
++def _phased_block_expand_kernel(
++    b_ptr, phase_ptr, out_ptr, rows, width, n_blocks, b_stride, out_stride,
++    BS: tl.constexpr, BLOCK_C: tl.constexpr,
++):
++    r = tl.program_id(0)
++    phase = tl.load(phase_ptr + r % rows).to(tl.int64)
++    c = tl.program_id(1).to(tl.int64) * BLOCK_C + tl.arange(0, BLOCK_C)
++    k = tl.maximum(c - phase, 0) // BS
++    valid = (c >= phase) & (c < width) & (k < n_blocks)
++    v = tl.load(b_ptr + r.to(tl.int64) * b_stride + k, mask=valid, other=0)
++    tl.store(out_ptr + r.to(tl.int64) * out_stride + c, v, mask=c < width)
++
++
++def _rows_view(x: torch.Tensor) -> torch.Tensor:
++    x2 = x.reshape(-1, x.size(-1))
++    return x2 if x2.stride(-1) == 1 else x2.contiguous()
++
++
++def phased_block_reduce_triton(x: torch.Tensor, phase: torch.Tensor, block_size: int) -> torch.Tensor:
++    width = x.size(-1)
++    nb = -(-width // block_size)
++    is_bool = x.dtype == torch.bool
++    x2 = _rows_view(x.view(torch.uint8) if is_bool else x)
++    out = torch.empty(x2.size(0), nb, dtype=x2.dtype, device=x.device)
++    block_k = 128
++    grid = (x2.size(0), triton.cdiv(nb, block_k))
++    _phased_block_max_kernel[grid](
++        x2, phase.contiguous(), out, phase.numel(), width, nb, x2.stride(0), out.stride(0),
++        BS=block_size, BLOCK_K=block_k, IS_BOOL=is_bool,
++    )
++    out = out.view(*x.shape[:-1], nb)
++    return out.view(torch.bool) if is_bool else out
++
++
++def phased_block_expand_triton(blocks: torch.Tensor, phase: torch.Tensor, block_size: int, width: int) -> torch.Tensor:
++    nb = blocks.size(-1)
++    b2 = _rows_view(blocks.view(torch.uint8))
++    out = torch.empty(b2.size(0), width, dtype=torch.uint8, device=blocks.device)
++    block_c = 1024
++    grid = (b2.size(0), triton.cdiv(width, block_c))
++    _phased_block_expand_kernel[grid](
++        b2, phase.contiguous(), out, phase.numel(), width, nb, b2.stride(0), out.stride(0),
++        BS=block_size, BLOCK_C=block_c,
++    )
++    return out.view(*blocks.shape[:-1], width).view(torch.bool)
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/tilelang_indexer_fwd.py b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/tilelang_indexer_fwd.py
 new file mode 100644
 index 000000000..5e0efe5f8
@@ -2877,14 +3185,14 @@ index 000000000..e8a833a58
 +    return out, lse
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kvnorm.py b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kvnorm.py
 new file mode 100644
-index 000000000..b098eca83
+index 000000000..40906f431
 --- /dev/null
 +++ b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kvnorm.py
 @@ -0,0 +1,74 @@
 +import torch
 +
 +from megatron.core.transformer.experimental_attention_variant.dsv41.ops.qat import fp8_simulate_qat
-+from megatron.core.transformer.experimental_attention_variant.dsv41.ops.rope import apply_rotary_emb
++from megatron.core.transformer.experimental_attention_variant.dsv41.ops.rope import rotary_emb_
 +
 +_PAGE_SIZE = 64
 +_BYTES_PER_TOKEN = 584
@@ -2896,7 +3204,7 @@ index 000000000..b098eca83
 +) -> torch.Tensor:
 +    x = kv.float()
 +    data = (x * torch.rsqrt(x.square().mean(-1, keepdim=True) + eps) * weight.float()).contiguous()
-+    apply_rotary_emb(data[..., -rope_dim:], freqs_cis)
++    data = rotary_emb_(data, freqs_cis, rope_dim)
 +    return data.to(kv.dtype)
 +
 +
@@ -3175,10 +3483,10 @@ index 000000000..353561604
 +    return _StraightThrough.apply(x, fake_quant_compressed_kv_forward)
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/ops/rope.py b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/rope.py
 new file mode 100644
-index 000000000..b20bf5c3c
+index 000000000..b2fd7164f
 --- /dev/null
 +++ b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/rope.py
-@@ -0,0 +1,62 @@
+@@ -0,0 +1,86 @@
 +import torch
 +import triton
 +import triton.language as tl
@@ -3241,6 +3549,30 @@ index 000000000..b20bf5c3c
 +    grid = (triton.cdiv(n_rows, rows_per_prog),)
 +    _rope_kernel[grid](x, f, n_rows, seqlen, inner, row_stride, HALF=half, INVERSE=inverse, ROWS=rows_per_prog)
 +    return x
++
++
++class _RotaryEmbInplace(torch.autograd.Function):
++    @staticmethod
++    def forward(ctx, x, freqs_cis, rope_dim, inverse):
++        apply_rotary_emb(x[..., -rope_dim:], freqs_cis, inverse)
++        ctx.mark_dirty(x)
++        ctx.save_for_backward(freqs_cis)
++        ctx.rope_dim, ctx.inverse = rope_dim, inverse
++        return x
++
++    @staticmethod
++    def backward(ctx, grad):
++        (freqs_cis,) = ctx.saved_tensors
++        # a rotation's transpose is its inverse
++        grad = grad.clone(memory_format=torch.contiguous_format)
++        apply_rotary_emb(grad[..., -ctx.rope_dim :], freqs_cis, not ctx.inverse)
++        return grad, None, None, None
++
++
++def rotary_emb_(x: torch.Tensor, freqs_cis: torch.Tensor, rope_dim: int, inverse: bool = False) -> torch.Tensor:
++    """Differentiable in-place RoPE on the last ``rope_dim`` of x (``apply_rotary_emb`` writes
++    through the data pointer, so autograd would pass the gradient through unrotated)."""
++    return _RotaryEmbInplace.apply(x, freqs_cis, rope_dim, inverse)
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/ops/rope_tables.py b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/rope_tables.py
 new file mode 100644
 index 000000000..97f8f56ad
