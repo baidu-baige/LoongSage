@@ -164,16 +164,20 @@ class CkptQuant:
 _SCALE_SUFFIX = ".scale"
 
 
-def read_ckpt_quant(path: str) -> dict[str, CkptQuant]:
-    """Weight name -> :class:`CkptQuant` for every ``X.weight`` stored with an ``X.scale`` companion.
+def scan_ckpt_quant(path: str) -> tuple[dict[str, CkptQuant], dict[str, str]]:
+    """Every ``X.weight`` stored with an ``X.scale`` companion, split into
+    (name -> :class:`CkptQuant` for supported layouts, name -> reason for unsupported ones).
 
     The scheme is inferred from dtypes and the weight/scale geometry: e4m3 weight -> ``fp8_block``
     with tile ``(O/sO, I/sI)``; int8/uint8 (packed e2m1) weight with one scale row per weight row ->
-    ``mxfp4`` groups of ``2*Ip/sI``. Only e8m0 scales are supported (raises otherwise), since only
-    power-of-two scales make the snapped bf16 weights exact.
+    ``mxfp4`` groups of ``2*Ip/sI``. Only e8m0 scales are supported, since only power-of-two scales
+    make the snapped bf16 weights exact. Unsupported layouts are only an error for tensors the
+    trainer actually maps (e.g. the BF16 DeepSeek-V4 conversion keeps the unused MTP e_proj/h_proj
+    in FP8 with fp32 scales), so the caller decides.
     """
     layout = read_source_layout(path)
     out: dict[str, CkptQuant] = {}
+    unsupported: dict[str, str] = {}
     for scale_name, sh in layout.items():
         if not scale_name.endswith(_SCALE_SUFFIX):
             continue
@@ -182,16 +186,28 @@ def read_ckpt_quant(path: str) -> dict[str, CkptQuant]:
         if wh is None:
             continue
         if sh.dtype != "F8_E8M0" or len(sh.shape) != 2 or len(wh.shape) != 2:
-            raise NotImplementedError(f"{name}: unsupported quantized layout weight={wh} scale={sh}")
+            unsupported[name] = f"unsupported quantized layout weight={wh} scale={sh}"
+            continue
         (O, I), (sO, sI) = wh.shape, sh.shape
         if wh.dtype == "F8_E4M3":
             kind, logical_i = "fp8_block", I
         elif wh.dtype in ("I8", "U8") and sO == O:
             kind, logical_i = "mxfp4", 2 * I
         else:
-            raise NotImplementedError(f"{name}: unsupported quantized layout weight={wh} scale={sh}")
+            unsupported[name] = f"unsupported quantized layout weight={wh} scale={sh}"
+            continue
         if O % sO or logical_i % sI:
-            raise NotImplementedError(f"{name}: scale {list(sh.shape)} does not tile weight [{O}, {logical_i}]")
+            unsupported[name] = f"scale {list(sh.shape)} does not tile weight [{O}, {logical_i}]"
+            continue
         scheme = QuantScheme(kind, (O // sO, logical_i // sI))
         out[name] = CkptQuant(scheme, scale_name, (O, logical_i))
+    return out, unsupported
+
+
+def read_ckpt_quant(path: str) -> dict[str, CkptQuant]:
+    """Weight name -> :class:`CkptQuant` (see :func:`scan_ckpt_quant`); raises on any unsupported layout."""
+    out, unsupported = scan_ckpt_quant(path)
+    if unsupported:
+        name, reason = next(iter(unsupported.items()))
+        raise NotImplementedError(f"{name}: {reason}")
     return out

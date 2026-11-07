@@ -86,9 +86,10 @@ def _cfg(enable, rollout=GOOD_ROLLOUT):
     return OmegaConf.create({"run_mode": "default", "trainer": {"qat": enable}, "rollout": rollout})
 
 
-def _plan(monkeypatch, m, enable, ckpt=CKPT, rollout=GOOD_ROLLOUT):
-    monkeypatch.setattr(qat, "read_ckpt_quant", lambda path: ckpt)
+def _plan(monkeypatch, m, enable, ckpt=CKPT, rollout=GOOD_ROLLOUT, unsupported=None):
+    monkeypatch.setattr(qat, "scan_ckpt_quant", lambda path: (ckpt, unsupported or {}))
     monkeypatch.setattr(qat.os.path, "isdir", lambda path: True)
+    monkeypatch.setattr(qat.torch.distributed, "get_rank", lambda: 0)
     return qat.QuantPlan(_bridge(m), [m], "/ckpt", _cfg(enable, rollout))
 
 
@@ -120,6 +121,19 @@ def test_plan_bf16_ckpt(monkeypatch):
     assert not _plan(monkeypatch, _toy(), enable=False, ckpt=table).quantized
     with pytest.raises(ValueError, match="no trained tensor"):
         _plan(monkeypatch, _toy(), enable=True, ckpt=table)
+
+
+def test_plan_unsupported_layout(monkeypatch, caplog):
+    # e.g. MTP e_proj kept FP8 with fp32 scales in the BF16 DeepSeek-V4 checkpoint, never mapped
+    unused = {"mtp.0.e_proj.weight": "unsupported quantized layout"}
+    with caplog.at_level("INFO", logger=qat.__name__):
+        assert not _plan(monkeypatch, _toy(), enable=False, ckpt={}, unsupported=unused).quantized
+    assert "skipping 1 unmapped tensors" in caplog.text and "mtp.0.e_proj.weight" in caplog.text
+    assert _plan(monkeypatch, _toy(), enable=True, unsupported=unused).snap_params
+    # a mapped tensor with an unsupported layout still fails, also on another PP stage
+    for name in ("layers.0.attn.wq_b.weight", "layers.9.attn.wq_b.weight"):
+        with pytest.raises(NotImplementedError, match=name):
+            _plan(monkeypatch, _toy(), enable=False, ckpt={}, unsupported={name: "unsupported quantized layout"})
 
 
 def test_adapter_rejects_unmodeled_rollout(monkeypatch):

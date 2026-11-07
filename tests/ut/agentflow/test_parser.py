@@ -112,11 +112,6 @@ def test_deepseek_official_family_detection(
 
 
 def test_deepseek_v41_tokenizer_uses_official_encoder() -> None:
-    # The V4.1 encoder ships with the DeepSeek-V4.1 SGLang build only.
-    pytest.importorskip(
-        "sglang.srt.entrypoints.openai.encoding_dsv41",
-        reason="the DeepSeek-V4.1 SGLang build is not installed",
-    )
     tokenizer = _wrap_deepseek_v4_tokenizer(
         FakeDeepSeekV4Tokenizer(), DEEPSEEK_V41_MODEL_FAMILY
     )
@@ -131,6 +126,85 @@ def test_deepseek_v41_tokenizer_uses_official_encoder() -> None:
     assert prompt.startswith("<｜begin▁of▁sentence｜>")
     assert "<｜User｜>inspect" in prompt
     assert prompt.endswith("<｜Assistant｜><think>")
+
+
+_DS_BOS = "<｜begin▁of▁sentence｜>"
+_DS_EOS = "<｜end▁of▁sentence｜>"
+_V41_EFFORT = "Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n"
+# deepseek-recipe's default (`high`) V4 thinking-mode effort, which SGLang v0.5.23 renders too.
+_V4_EFFORT = (
+    "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n"
+    "You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve "
+    "the root cause, rigorously stress-testing your logic against all potential paths, edge cases, "
+    "and adversarial scenarios.\n"
+    "Explicitly write out your entire deliberation process, documenting every intermediate step, "
+    "considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n"
+)
+
+
+# Fragments the tokenizer manager renders: SGLang v0.5.21's encode_messages layout, with
+# the reasoning effort of SGLang v0.5.23 (recipe's default).
+@pytest.mark.parametrize(
+    ("family", "messages", "thinking", "expected"),
+    [
+        # The empty-system probe has no generation header.
+        (DEEPSEEK_V4_MODEL_FAMILY, [{"role": "system", "content": ""}], False, _DS_BOS),
+        (DEEPSEEK_V4_MODEL_FAMILY, [{"role": "system", "content": ""}], True, _DS_BOS + _V4_EFFORT),
+        (DEEPSEEK_V41_MODEL_FAMILY, [{"role": "system", "content": ""}], False, _DS_BOS + "<｜System｜>"),
+        (DEEPSEEK_V41_MODEL_FAMILY, [{"role": "system", "content": ""}], True, _DS_BOS + "<｜System｜>" + _V41_EFFORT),
+        # A trailing assistant message keeps its reasoning and ends with EOS, no header after it.
+        (
+            DEEPSEEK_V4_MODEL_FAMILY,
+            [{"role": "user", "content": ""}, {"role": "assistant", "content": "hi", "reasoning_content": "r"}],
+            True,
+            _DS_BOS + _V4_EFFORT + "<｜User｜><｜Assistant｜><think>r</think>hi" + _DS_EOS,
+        ),
+        (
+            DEEPSEEK_V41_MODEL_FAMILY,
+            [{"role": "user", "content": ""}, {"role": "assistant", "content": "hi", "reasoning_content": "r"}],
+            True,
+            _DS_BOS + "<｜System｜>" + _V41_EFFORT + "<｜User｜><｜Assistant｜><think>r</think>hi" + _DS_EOS,
+        ),
+        # Chat mode renders no reasoning, even for the trailing assistant message.
+        (
+            DEEPSEEK_V4_MODEL_FAMILY,
+            [{"role": "user", "content": ""}, {"role": "assistant", "content": "hi", "reasoning_content": "r"}],
+            False,
+            _DS_BOS + "<｜User｜><｜Assistant｜></think>hi" + _DS_EOS,
+        ),
+        # V4 thinking mode renders recipe's default effort, before the first system content.
+        (
+            DEEPSEEK_V4_MODEL_FAMILY,
+            [{"role": "system", "content": "sys"}, {"role": "user", "content": "q"}],
+            True,
+            _DS_BOS + _V4_EFFORT + "sys<｜User｜>q<｜Assistant｜><think>",
+        ),
+        # Text parts are joined by a blank line.
+        (
+            DEEPSEEK_V41_MODEL_FAMILY,
+            [{"role": "user", "content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]}],
+            False,
+            _DS_BOS + "<｜User｜>a\n\nb<｜Assistant｜></think>",
+        ),
+    ],
+)
+def test_deepseek_recipe_wrapper_matches_official_encoder(
+    family: str, messages: list[dict], thinking: bool, expected: str
+) -> None:
+    tokenizer = _wrap_deepseek_v4_tokenizer(FakeDeepSeekV4Tokenizer(), family)
+
+    prompt = tokenizer.apply_chat_template(messages, tokenize=False, enable_thinking=thinking)
+
+    assert prompt == expected
+
+
+def test_deepseek_recipe_wrapper_rejects_non_text_content() -> None:
+    tokenizer = _wrap_deepseek_v4_tokenizer(FakeDeepSeekV4Tokenizer(), DEEPSEEK_V41_MODEL_FAMILY)
+
+    with pytest.raises(ValueError, match="text content only"):
+        tokenizer.apply_chat_template(
+            [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}], tokenize=False
+        )
 
 
 def test_deepseek_v4_empty_system_is_only_bos() -> None:
@@ -222,7 +296,9 @@ def test_deepseek_v4_continuation_strips_only_bos() -> None:
     continuation_ids = asyncio.run(parser._tokenize_delta_messages(messages[1:]))
 
     assert continuation_ids == full_ids[len(manager.non_assistant_prefix):]
-    assert bytes(continuation_ids).decode().startswith("\n\n<｜DSML｜tool_calls>")
+    # deepseek-recipe opens an assistant turn with its header even right after the system
+    # message (SGLang v0.5.21's encoder rendered the calls block right after BOS).
+    assert bytes(continuation_ids).decode().startswith("<｜Assistant｜></think>\n\n<｜DSML｜tool_calls>")
     assert "<tool_result>/repo</tool_result>" in bytes(continuation_ids).decode()
 
 
@@ -676,6 +752,37 @@ def test_deepseek_v4_parsers_disabled_when_model_config_unavailable(tmp_path) ->
     parser = make_deepseek_v4_parser(str(tmp_path / "missing"))
     assert parser._reasoning_parser_name is None
     assert parser._tool_call_parser_name is None
+
+
+@pytest.fixture
+def deepseek_v41_model_dir(tmp_path) -> str:
+    (tmp_path / "config.json").write_text(json.dumps({
+        "model_type": "deepseek_v41",
+        "architectures": ["DeepseekV41ForCausalLM"],
+    }))
+    return str(tmp_path)
+
+
+def test_build_assistant_message_keeps_deepseek_v41_string_params_verbatim(
+    deepseek_v41_model_dir: str,
+) -> None:
+    """SGLang v0.5.23 strips V4.1 string parameters; the tool must get them as generated."""
+    parser = make_deepseek_v4_parser(deepseek_v41_model_dir)
+    assert parser._tool_call_parser_name == "deepseekv41"
+    generated_text = (
+        "\n\n<｜DSML｜ calls>\n"
+        '<｜DSML｜ invoke name="write">\n'
+        '<｜DSML｜ parameter name="text" string="true">\n  indented\n</｜DSML｜ parameter>\n'
+        "</｜DSML｜ invoke>\n"
+        "</｜DSML｜ calls>"
+    )
+
+    _, message, _ = parser.build_assistant_message({
+        "text": generated_text,
+        "meta_info": {"weight_version": "1", "output_token_logprobs": [[-0.1, 101]]},
+    })
+
+    assert json.loads(message["tool_calls"][0]["function"]["arguments"]) == {"text": "\n  indented\n"}
 
 
 def make_sglang_parser(**kwargs) -> TrajectoryParser:

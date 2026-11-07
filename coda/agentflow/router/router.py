@@ -23,8 +23,8 @@ from coda.agentflow.utils import build_request_id
 class WorkerPayload(PydanticModel):
     """Worker management payload."""
     worker_url: str
-    # Number of attention-DP groups inside the worker (SGLang ``--dp-size`` when
-    # ``--enable-dp-attention`` is on). The router uses it to assign each request to
+    # Number of attention-DP groups inside the worker (SGLang ``--attn-dp-size``).
+    # The router uses it to assign each request to
     # a specific DP group via ``routed_dp_rank`` instead of SGLang load-balancing
     # internally. 1 means "no DP attention" (nothing to route).
     dp_size: int = 1

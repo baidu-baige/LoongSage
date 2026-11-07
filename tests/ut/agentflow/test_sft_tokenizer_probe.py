@@ -2,8 +2,9 @@
 
 Each fake (in ``fake_tokenizers.py``) reproduces one model family's chat-template layout
 with a char-level tokenizer, so no weights or HF files are needed.  The Qwen3 layout is
-pinned against the real Qwen3-4B template and the DeepSeek-V4.1 one against sglang's
-``encoding_dsv41``, so a template-layout change shows up here as a readable diff.
+pinned against the real Qwen3-4B template and the DeepSeek-V4.1 one against the
+deepseek-recipe wrapper (``_wrap_deepseek_v4_tokenizer``), so a template-layout change shows up
+here as a readable diff.
 
 Run: python -m pytest tests/ut/agentflow/test_sft_tokenizer_probe.py -v
 """

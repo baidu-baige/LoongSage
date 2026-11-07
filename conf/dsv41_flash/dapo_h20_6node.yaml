@@ -52,6 +52,12 @@ rollout:
     SGLANG_SHARED_EXPERT_TP1: "1"       # shared experts unsharded: 2304/16 is not 32-block aligned
     SGLANG_OPT_FP8_WO_A_GEMM: "0"       # no-op for 32x32 blocks (wo_a -> bf16); guard checked by the QAT adapter
     SGLANG_OPT_FUSE_WQA_WKV: "0"
+    SGLANG_OPT_DEEPGEMM_HC_PRENORM: "0" # else mHC split-weight caches make sglang reject online weight updates
+    # With HC_PRENORM=0 the load-time mhc_pre prewarm (run on the first weight sync under
+    # load_format=dummy) hits a TileLang kernel without hc_hidden_size 20480. V4.1 forward never
+    # calls mhc_pre (hc_pre_from_prev_sublayer path), so this only skips that prewarm.
+    SGLANG_OPT_USE_TILELANG_MHC_PRE: "0"
+    SGLANG_OPT_HOPPER_BLOCK_FP8_BF16: "0" # same for the bf16 copy of 32x32 FP8 linears DeepGEMM cannot run
     NCCL_CUMEM_ENABLE: "1"
   retry_limit: 3
   num_gpus_per_node: 8
@@ -68,9 +74,11 @@ rollout:
     max_total_tokens: 10000000 #10M tokens
     disable_cuda_graph: false
     ep_size: 8
-    #dp_size: 1
-    #enable_dp_attention: true
+    #attn_dp_size: 1
     attention_backend: dsv4
+    # 0.5.23 auto-enables this on TP-only V4.1; it is not numerically identical to full prefill and
+    # computes only the last SWA window rows in the tail layers, which misaligns R3 routed experts.
+    enable_decoder_swa_bounded_replay: false
     max_running_requests: 128
   sglang_replicas:
     regular:
