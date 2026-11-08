@@ -9,7 +9,7 @@ against the real templates:
   * Qwen3.5 / Qwen3: a turn's ``reasoning_content`` is kept only after the last
     user turn; earlier reasoning is dropped.  Qwen3.5 rejects messages without a
     user message.
-  * DeepSeek-V4 / V4.1 (sglang ``encoding_dsv4`` / ``encoding_dsv41``): see
+  * DeepSeek-V4 / V4.1 (deepseek-recipe through ``_wrap_deepseek_v4_tokenizer``): see
     ``_FakeDeepSeekEncoder``.
 
 The ``FakeQwen3`` / ``FakeLlama3`` classes at the end back
@@ -175,7 +175,9 @@ def _merge_user_turns(messages) -> list[dict]:
 
 
 class _FakeDeepSeekEncoder(FakeCharTokenizer):
-    """What sglang's ``encoding_dsv4`` / ``encoding_dsv41`` render for plain-text messages.
+    """What the DeepSeek encoder renders for plain-text messages: SGLang v0.5.21's
+    ``encoding_dsv4`` / ``encoding_dsv41``, which ``_wrap_deepseek_v4_tokenizer`` reproduces
+    on deepseek-recipe.
 
     Pinned against ``encode_messages(..., thinking_mode=...)``:
 

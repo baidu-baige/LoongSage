@@ -2,7 +2,7 @@
 
 The quantization format of every tensor is read from the training checkpoint itself
 (``trainer.hf_model_path``; the rollout boots from the same directory), see
-:func:`coda.utils.quant_formats.read_ckpt_quant`. Megatron params are matched to checkpoint tensors
+:func:`coda.utils.quant_formats.scan_ckpt_quant`. Megatron params are matched to checkpoint tensors
 through the bridge's conversion tasks, so nothing here is model specific; per-model rollout
 numerics that cannot be read from the checkpoint live in a small :class:`QATAdapter`.
 
@@ -44,7 +44,8 @@ from megatron.bridge.models.conversion.param_mapping import (
     RowParallelMapping,
 )
 
-from coda.utils.quant_formats import CkptQuant, QuantScheme, read_ckpt_quant
+from coda.utils.hf_ckpt import SAFETENSORS_DTYPE
+from coda.utils.quant_formats import CkptQuant, QuantScheme, UnsupportedQuant, scan_ckpt_quant
 
 logger = logging.getLogger(__name__)
 
@@ -165,38 +166,68 @@ def _local_layout_ok(mapping, n_parts: int, local: torch.Size, full: tuple[int, 
 class QuantPlan:
     """Quantized-tensor bookkeeping for one Megatron model (see module docstring).
 
+    ``ckpt`` / ``unsupported`` -- every checkpoint tensor stored quantized (trained or not), in a
+    layout :class:`QuantScheme` can / cannot express.
     ``quantized`` -- the checkpoint stores some trained tensors quantized, i.e. the rollout serves
     that format; the bridge exports it and :meth:`check_export` checks every weight sync.
+    ``snap_params`` / ``act_modules`` -- QAT only: params to snap, linears whose input is fake-quantized.
     """
 
     def __init__(self, bridge, model_chunks: Sequence[torch.nn.Module], hf_model_path: str, config):
         self.qat = bool(config.trainer.qat)
-        self.ckpt: dict[str, CkptQuant] = read_ckpt_quant(hf_model_path) if os.path.isdir(hf_model_path) else {}
+        self.ckpt: dict[str, CkptQuant]
+        self.unsupported: dict[str, UnsupportedQuant]
+        self.ckpt, self.unsupported = scan_ckpt_quant(hf_model_path) if os.path.isdir(hf_model_path) else ({}, {})
         self.snap_params: list[tuple[str, torch.nn.Parameter, QuantScheme]] = []
         self.act_modules: list[tuple[str, torch.nn.Module, int]] = []
-        self.quantized = False
-        if not self.ckpt:
-            if self.qat:
-                raise ValueError(f"trainer.qat needs a quantized checkpoint, {hf_model_path} has none")
-            return
-        adapter = get_adapter(getattr(bridge.hf_pretrained.config, "architectures", None))
+        tasks = self._quantized_tasks(bridge, model_chunks)
+        self.quantized = bool(tasks)
         if self.qat:
-            adapter.validate(config)
+            self._plan_qat(tasks, bridge, model_chunks, config, hf_model_path)
+        # Unsupported layouts (QAT has raised above if any is trained): a trained one is only checked
+        # against its stored dtype/shape on export (see check_export); an untrained one is left as is.
+        if self.unsupported and torch.distributed.get_rank() == 0:
+            mapped = {n for t in tasks for n in hf_names(t.mapping) if n in self.unsupported}
+            if mapped:
+                logger.warning(
+                    f"[QAT] {len(mapped)} trained tensors are stored in a quantized layout QuantScheme cannot "
+                    f"express; their export is only checked against the stored dtype/shape: {_preview(mapped)}"
+                )
+            if unmapped := self.unsupported.keys() - mapped:
+                logger.info(
+                    f"[QAT] skipping {len(unmapped)} unmapped tensors with an unsupported quantized layout "
+                    f"(left as is in the checkpoint): {_preview(unmapped)}"
+                )
+
+    def _quantized_tasks(self, bridge, model_chunks: Sequence[torch.nn.Module]) -> list:
+        """Conversion tasks that map at least one tensor the checkpoint stores quantized."""
+        tasks = []
+        # bf16 checkpoints never touch the bridge
+        if not self.ckpt and not self.unsupported:
+            return tasks
+        for task in bridge.get_conversion_tasks(list(model_chunks)):
+            if task is None:  # param without a mapping
+                continue
+            if any(n in self.ckpt or n in self.unsupported for n in hf_names(task.mapping)):
+                tasks.append(task)
+        return tasks
+
+    def _plan_qat(self, tasks: list, bridge, model_chunks: Sequence[torch.nn.Module], config, hf_model_path: str):
+        """Fill ``snap_params`` / ``act_modules``; raise on anything this QAT does not model."""
+        if not tasks:
+            raise ValueError(f"trainer.qat: no trained tensor of {hf_model_path} is stored quantized")
+        adapter = get_adapter(getattr(bridge.hf_pretrained.config, "architectures", None))
+        adapter.validate(config)
         own = {id(p) for chunk in model_chunks for p in chunk.parameters()}
         hooked: set[int] = set()
-        for task in bridge.get_conversion_tasks(list(model_chunks)):
-            if task is None:
-                continue
+        for task in tasks:
             names = hf_names(task.mapping)
+            if bad := [n for n in names if n in self.unsupported]:
+                raise NotImplementedError(f"[QAT] {task.param_name} <- {bad[0]}: {self.unsupported[bad[0]].reason}")
+            if task.param_weight is None:  # another PP stage
+                continue
             entries = [self.ckpt.get(n) for n in names]
-            if not any(entries):
-                continue
-            self.quantized = True
-            if task.param_weight is None or not self.qat:  # other PP stage / no QAT: nothing to snap
-                continue
-            schemes = {e.scheme if e else None for e in entries}
-            shapes = {e.shape if e else None for e in entries}
-            if len(schemes) != 1 or len(shapes) != 1:
+            if len({(e.scheme, e.shape) if e else None for e in entries}) != 1:
                 raise NotImplementedError(f"[QAT] {task.param_name}: mixed formats {dict(zip(names, entries))}")
             scheme, full = entries[0].scheme, entries[0].shape
             param = task.param_weight
@@ -215,8 +246,6 @@ class QuantPlan:
                     raise NotImplementedError(f"[QAT] {task.param_name}: input of a fused norm+linear is pre-norm")
                 hooked.add(id(module))
                 self.act_modules.append((task.param_name[: -len(".weight")], module, scheme.block[1]))
-        if self.qat and not self.quantized:
-            raise ValueError(f"trainer.qat: no trained tensor of {hf_model_path} is stored quantized")
 
     # -- weight QAT
     @torch.no_grad()
@@ -245,18 +274,30 @@ class QuantPlan:
         into weight + ``.scale`` (scale shape taken from the checkpoint, geometry validated by its
         quantizers), but returns bf16 unchanged when it cannot locate the checkpoint or when a
         model's bridge has no such override. A bf16 FP8 weight has the same shape as the e4m3 one,
-        so the rollout may not notice; this makes the first sync fail instead.
+        so the rollout may not notice; this makes the first sync fail instead. Tensors in a layout
+        :class:`QuantScheme` cannot express are checked against their stored dtype and shape.
         """
         for name, t in named_tensors:
-            entry = self.ckpt.get(name)
-            if entry is not None:
+            if (entry := self.ckpt.get(name)) is not None:
                 dtypes, shape = _stored_weight(entry)
-                if t.dtype not in dtypes or tuple(t.shape) != shape:
-                    raise RuntimeError(
-                        f"[QAT] export {name}: got {t.dtype} {tuple(t.shape)}, the checkpoint stores {entry.scheme} "
-                        f"{shape}; the bridge's maybe_modify_converted_hf_weight must re-quantize it"
-                    )
+                stored = f"{entry.scheme} {shape}"
+                ok = t.dtype in dtypes and tuple(t.shape) == shape
+            elif (u := self.unsupported.get(name)) is not None:
+                stored = f"{u.dtype} {u.shape}"
+                ok = SAFETENSORS_DTYPE.get(t.dtype) == u.dtype and tuple(t.shape) == u.shape
+            else:
+                ok = True
+            if not ok:
+                raise RuntimeError(
+                    f"[QAT] export {name}: got {t.dtype} {tuple(t.shape)}, the checkpoint stores {stored}; "
+                    f"the bridge's maybe_modify_converted_hf_weight must re-quantize it"
+                )
             yield name, t
+
+
+def _preview(names: Iterable[str], n: int = 5) -> str:
+    names = sorted(names)
+    return ", ".join(names[:n]) + (", ..." if len(names) > n else "")
 
 
 def _stored_weight(entry: CkptQuant) -> tuple[tuple[torch.dtype, ...], tuple[int, int]]:

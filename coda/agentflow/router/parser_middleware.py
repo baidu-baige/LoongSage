@@ -18,7 +18,7 @@ from starlette.responses import Response
 from starlette.types import ASGIApp
 
 from coda.agentflow.multimodal import MultimodalRequestError
-from coda.agentflow.tokenizer_manager import DEEPSEEK_OFFICIAL_ENCODER_MODULES
+from coda.agentflow.tokenizer_manager import DEEPSEEK_MODEL_FAMILIES
 from coda.agentflow.trajectory_store import TrajectoryStore
 from coda.agentflow.utils import CONTEXT_LENGTH_EXCEEDED, build_request_id
 from .parser import TrajectoryParser, TurnInputContext, decode_generate_body, is_passthrough_response
@@ -312,7 +312,7 @@ class ParserMiddleware(BaseHTTPMiddleware):
             if is_eval and self.eval_temperature is not None
             else self.train_temperature
         )
-        if self.parser.model_family in DEEPSEEK_OFFICIAL_ENCODER_MODULES:
+        if self.parser.model_family in DEEPSEEK_MODEL_FAMILIES:
             # DeepSeek-V4/V4.1 mark their think and DSML tool-call tags as special tokens,
             # so the detokenizer must keep them for the reasoning / tool-call parsers to
             # see them. no_stop_trim stays off so SGLang still strips the trailing EOS.

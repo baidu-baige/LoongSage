@@ -11,7 +11,7 @@ re-quantizing a snapped tensor with any quantizer on the same grid (same tiles, 
 round-to-nearest) reproduces the same values, so what the bridge re-quantizes at export time
 dequantizes to exactly the snapped training weights (QAT).
 
-:func:`read_ckpt_quant` recovers the per-tensor scheme of a safetensors checkpoint from its headers
+:func:`scan_ckpt_quant` recovers the per-tensor scheme of a safetensors checkpoint from its headers
 alone (dtype + shape of every ``X.weight`` / ``X.scale`` pair), without reading tensor data.
 """
 
@@ -161,19 +161,34 @@ class CkptQuant:
     shape: tuple[int, int]
 
 
+@dataclass(frozen=True)
+class UnsupportedQuant:
+    """A ``*.weight`` stored with a ``scale_name`` companion in a layout :class:`QuantScheme` cannot
+    express; ``dtype`` / ``shape`` are the stored (safetensors) dtype and shape of the weight."""
+
+    reason: str
+    scale_name: str
+    dtype: str
+    shape: tuple[int, ...]
+
+
 _SCALE_SUFFIX = ".scale"
 
 
-def read_ckpt_quant(path: str) -> dict[str, CkptQuant]:
-    """Weight name -> :class:`CkptQuant` for every ``X.weight`` stored with an ``X.scale`` companion.
+def scan_ckpt_quant(path: str) -> tuple[dict[str, CkptQuant], dict[str, UnsupportedQuant]]:
+    """Every ``X.weight`` stored with an ``X.scale`` companion, split into
+    (name -> :class:`CkptQuant` for supported layouts, name -> :class:`UnsupportedQuant`).
 
     The scheme is inferred from dtypes and the weight/scale geometry: e4m3 weight -> ``fp8_block``
     with tile ``(O/sO, I/sI)``; int8/uint8 (packed e2m1) weight with one scale row per weight row ->
-    ``mxfp4`` groups of ``2*Ip/sI``. Only e8m0 scales are supported (raises otherwise), since only
-    power-of-two scales make the snapped bf16 weights exact.
+    ``mxfp4`` groups of ``2*Ip/sI``. Only e8m0 scales are supported, since only power-of-two scales
+    make the snapped bf16 weights exact. Whether an unsupported layout is an error depends on
+    whether the trainer maps the tensor and on QAT (e.g. the BF16 DeepSeek-V4 conversion keeps the
+    unused MTP e_proj/h_proj in FP8 with fp32 scales), so the caller decides.
     """
     layout = read_source_layout(path)
     out: dict[str, CkptQuant] = {}
+    unsupported: dict[str, UnsupportedQuant] = {}
     for scale_name, sh in layout.items():
         if not scale_name.endswith(_SCALE_SUFFIX):
             continue
@@ -181,17 +196,21 @@ def read_ckpt_quant(path: str) -> dict[str, CkptQuant]:
         wh = layout.get(name)
         if wh is None:
             continue
+        stored = scale_name, wh.dtype, tuple(wh.shape)
         if sh.dtype != "F8_E8M0" or len(sh.shape) != 2 or len(wh.shape) != 2:
-            raise NotImplementedError(f"{name}: unsupported quantized layout weight={wh} scale={sh}")
+            unsupported[name] = UnsupportedQuant(f"unsupported quantized layout weight={wh} scale={sh}", *stored)
+            continue
         (O, I), (sO, sI) = wh.shape, sh.shape
         if wh.dtype == "F8_E4M3":
             kind, logical_i = "fp8_block", I
         elif wh.dtype in ("I8", "U8") and sO == O:
             kind, logical_i = "mxfp4", 2 * I
         else:
-            raise NotImplementedError(f"{name}: unsupported quantized layout weight={wh} scale={sh}")
+            unsupported[name] = UnsupportedQuant(f"unsupported quantized layout weight={wh} scale={sh}", *stored)
+            continue
         if O % sO or logical_i % sI:
-            raise NotImplementedError(f"{name}: scale {list(sh.shape)} does not tile weight [{O}, {logical_i}]")
+            unsupported[name] = UnsupportedQuant(f"scale {list(sh.shape)} does not tile weight [{O}, {logical_i}]", *stored)
+            continue
         scheme = QuantScheme(kind, (O // sO, logical_i // sI))
         out[name] = CkptQuant(scheme, scale_name, (O, logical_i))
-    return out
+    return out, unsupported

@@ -47,20 +47,21 @@ DeepSeek-V4.1-Flash 的发布 checkpoint 本身就是量化格式：dense 层是
 
 量化公式：`s = 2^ceil(log2(amax / qmax))`，FP8 的 qmax 取 448，FP4 取 6；之后用 RNE（round to nearest even）落到网格上。用这个量化器去量化 bf16 checkpoint，反量化值与原始 checkpoint 逐位相同。字节层面有少量差异：约 4% 的 fp8 块 scale 比官方 checkpoint 小一档（取了 s/2，code 相应翻倍；toy checkpoint 实测，各层在 0.3%–5.5% 之间，wq_a 最少）；官方 checkpoint 的 fp4 里有 -0 编码，我们输出 +0。反量化后的数值一样。
 
-`read_ckpt_quant(path)` 只读 safetensors header，从每一对 `X.weight` / `X.scale` 的 dtype 和 shape 推断格式，完整模型约 0.6 s：
+`scan_ckpt_quant(path)` 只读 safetensors header，从每一对 `X.weight` / `X.scale` 的 dtype 和 shape 推断格式，完整模型约 0.6 s：
 
 - weight 是 `F8_E4M3` → `fp8_block`，tile = `(O/sO, I/sI)`；
 - weight 是 `I8`/`U8` 且 `sO == O` → `mxfp4`，group = `2I/sI`；
-- scale 不是 `F8_E8M0` 时直接报错。只有 2 的幂 scale 才能保证 snap 后的值在 bf16 中精确表示。
+- scale 不是 `F8_E8M0`（或 scale 不能整除 weight）时记为不支持，不在这里报错。只有 2 的幂 scale 才能保证 snap 后的值在 bf16 中精确表示。是否报错由 `QuantPlan` 决定（见 3.2）。
 
 关键性质：使用 ue8m0 scale 时，`dequant(quant(w))` 在 bf16 中可以精确表示，而且是量化器的不动点。把它再量化一次，得到的数值完全相同。这一点是整个 QAT 成立的前提，后面几节都依赖它。
 
 ### 3.2 Megatron 参数与 checkpoint tensor 的对应
 
-`QuantPlan`（[coda/backends/megatron/qat.py](../../../coda/backends/megatron/qat.py)）不按层名匹配，而是遍历 `bridge.get_conversion_tasks(model)`。每个 task 给出 Megatron 参数对应的 HF 名字（mapping.hf_param），再拿这个名字去 `read_ckpt_quant` 的结果里查表：
+`QuantPlan`（[coda/backends/megatron/qat.py](../../../coda/backends/megatron/qat.py)）不按层名匹配，而是遍历 `bridge.get_conversion_tasks(model)`。每个 task 给出 Megatron 参数对应的 HF 名字（mapping.hf_param），再拿这个名字去 `scan_ckpt_quant` 的结果里查表：
 
 - 查得到：这个 tensor 在 checkpoint 中是量化存储的，标记 `quantized=True`，导出时由 `check_export` 校验 bridge 输出的格式。
 - 如果同时开了 `qat`，还会把这个参数加入 `snap_params`，并在需要时把对应模块加入 `act_modules`（见 3.4）。
+- 格式不支持且有 task 映射到它（包括其他 PP stage 的 task）：开 `qat` 时报 `NotImplementedError`，因为无法 snap；不开 `qat` 时同样标记 `quantized=True`，`check_export` 只按 checkpoint 中存储的 dtype 和 shape 校验导出，rank 0 打一条 warning 列出它们。没有被映射的不支持 tensor 会跳过，rank 0 打一条 info 日志列出它们。例如 DeepSeek-V4-Flash-BF16 转换时保留了 FP8 的 `mtp.0.e_proj` / `mtp.0.h_proj`（fp32 scale，128x128 块），trainer 不加载 MTP，所以跳过。
 
 TP/EP 分片的正确性由 `_local_layout_ok` 保证：只有当本地分片是完整 HF tensor 的连续切片，并且切在 tile 边界上（按 dim-0 或 dim-1 切，GatedMLP 是 n 段 dim-0 拼接），对本地分片做 snap 才等价于对完整 tensor 做 snap。不满足时直接报错，比如 head 交错排布的 QKV，或者 Fused expert mapping。这类情况需要为该模型写 adapter。V4.1 在 TP4/8、EP 切分下全部满足条件。
 
@@ -129,9 +130,9 @@ TransferMesh 以原始字节传输 fp8/e8m0/int8，不需要额外处理。SGLan
 
 ### 3.7 save_hf：与原始量化格式保持一致
 
-当 checkpoint 为量化格式时，`save_model(hf=...)` 调用 `_save_hf_like_source`，最终执行 [coda/utils/hf_ckpt.py](../../../coda/utils/hf_ckpt.py) 中的 `save_like_source`：
+checkpoint 中有任何量化存储的 tensor（无论是否被训练，例如 bf16 版 V4.1 的 FP8 engram 表）时，`save_model(hf=...)` 调用 `_save_hf_like_source`，最终执行 [coda/utils/hf_ckpt.py](../../../coda/utils/hf_ckpt.py) 中的 `save_like_source`。`save_hf_pretrained` 只写导出流中的 tensor（MTP 除外），会漏掉这些未训练的量化 tensor。
 
-- 计算 expected 集合：对所有 rank 上 conversion task 的 HF 名字做 `all_gather_object` 后取并集（EP 下各 rank 持有不同的 experts），再加上对应的 `.scale`。
+- 计算 expected 集合：取实际导出的名字（包括 bridge 生成的 `.scale`）。`update_weights` 每次权重同步时顺带记录导出的名字，save 直接复用；还没做过权重同步时（SFT、train-only），先空跑一遍 `bridge.export_hf_weights` 收集名字。不用 conversion task 的 HF 名字，因为 bridge 导出时可能改名（DSV4 把 `indexer.scorer.weights_proj` 改回 `indexer.weights_proj`）。如果某个量化 weight 导出了但对应的 `.scale` 没导出，直接报错。
 - rank 0 直接消费 `bridge.export_hf_weights(model)`，其他 rank 只负责参与导出所需的集合通信。这里不套 `check_export`：下面逐 shard 重写时已经按源 checkpoint 校验了名字、dtype、shape，也会检查 scale 是否齐全。
 - 按源 checkpoint 逐个 shard 重写：header 字节原样复制；训练过的 tensor 写入新数据，dtype 和 shape 必须与源一致，float 会 cast 为源 dtype，量化 tensor 的 dtype 不一致时报错；其余 tensor（vision、aligner、MTP、`gate.bias_vl`、engram 表等）按 256 MB 分块从源文件复制。每个 shard 先写 `.tmp`，再 `os.replace`。
 - 非权重文件（config、tokenizer、index、encoding 代码等）原样复制。
@@ -269,7 +270,7 @@ B200 toy 上用原始 checkpoint 启动，开和关的输出逐位相同（token
 
 | 文件 | 内容 |
 |---|---|
-| [coda/utils/quant_formats.py](../../../coda/utils/quant_formats.py) | 量化器、`QuantScheme`、`read_ckpt_quant` |
+| [coda/utils/quant_formats.py](../../../coda/utils/quant_formats.py) | 量化器、`QuantScheme`、`scan_ckpt_quant` |
 | [coda/backends/megatron/qat.py](../../../coda/backends/megatron/qat.py) | `QuantPlan`（snap、激活 hook、check_export）、adapter |
 | [coda/utils/hf_ckpt.py](../../../coda/utils/hf_ckpt.py) | `save_like_source` |
 | [coda/backends/megatron/megatron_train_worker.py](../../../coda/backends/megatron/megatron_train_worker.py) | 构建 plan、ref 模型 snap、`update_weights` 导出校验、`_save_hf_like_source` |

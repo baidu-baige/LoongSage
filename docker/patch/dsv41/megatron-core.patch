@@ -288,6 +288,87 @@ index 1a3daa418..a3e145ec1 100644
      return _CopyToModelParallelRegion.apply(input_, group)
  
  
+diff --git a/megatron/core/transformer/experimental_attention_variant/csa_utils/fused_sparse_attention.py b/megatron/core/transformer/experimental_attention_variant/csa_utils/fused_sparse_attention.py
+index 04b4c5466..1f77da108 100644
+--- a/megatron/core/transformer/experimental_attention_variant/csa_utils/fused_sparse_attention.py
++++ b/megatron/core/transformer/experimental_attention_variant/csa_utils/fused_sparse_attention.py
+@@ -101,7 +101,7 @@ def _ensure_flash_mla():
+     except ImportError as e:
+         raise ImportError(
+             "FlashMLA is required for DSA sparse attention forward. "
+-            "Install from https://github.com/deepseek-ai/FlashMLA/tree/nv_dev "
++            "Install sgl-flash-mla (bundled with sglang) "
+             "so that `from flash_mla import flash_mla_sparse_fwd` succeeds."
+         ) from e
+     _flash_mla_sparse_fwd = _fwd
+@@ -137,9 +137,9 @@ def _csa_fwd_flash_mla(
+     Accepts flat (unbatched) tensors with global indices; pads ``TopK`` to
+     the GPU-specific alignment; returns ``(out, lse, lse_indexer)``.
+     """
+-    assert not (
+-        indexer_topk > 0 and topk_length is not None
+-    ), "indexer_topk > 0 requires non-compact mode (topk_length must be None)"
++    assert indexer_topk == 0, (
++        "indexer_topk > 0 (lse_indexer) needs FlashMLA nv_dev; sgl-flash-mla does not provide it"
++    )
+     _ensure_flash_mla()
+ 
+     _total_S_q, _H, _D = q.shape
+@@ -154,7 +154,9 @@ def _csa_fwd_flash_mla(
+     indices = topk_idxs.unsqueeze(1)  # (total_S_q, 1, TopK_padded) h_kv=1
+ 
+     with torch.cuda.nvtx.range("flash_mla_sparse_fwd"):
+-        res = _flash_mla_sparse_fwd(
++        # sgl-flash-mla: the legacy kernels run on SM90 and SM100 and match
++        # FlashMLA nv_dev bitwise; the current ones are SM100-only.
++        out, _max_logits, lse = _flash_mla_sparse_fwd(
+             q,
+             kv_3d,
+             indices,
+@@ -162,20 +164,8 @@ def _csa_fwd_flash_mla(
+             d_v=d_v,
+             attn_sink=attn_sink,
+             topk_length=topk_length,
+-            indexer_topk=indexer_topk,
++            use_legacy=True,
+         )
+-        if indexer_topk > 0:
+-            out, _max_logits, lse, lse_indexer = res
+-        else:
+-            out, _max_logits, lse = res
+-            lse_indexer = None
+-
+-    if indexer_topk > 0:
+-        # When indexer_topk == total TopK, lse_indexer should equal lse but
+-        # the kernel may not snapshot correctly; fall back to lse.
+-        if indexer_topk >= TopK:
+-            return out, lse, lse.clone()
+-        return out, lse, lse_indexer
+     return out, lse, None
+ 
+ 
+diff --git a/megatron/core/transformer/experimental_attention_variant/dsa_cudnn_kernels.py b/megatron/core/transformer/experimental_attention_variant/dsa_cudnn_kernels.py
+index e6013f4d7..802b5338a 100644
+--- a/megatron/core/transformer/experimental_attention_variant/dsa_cudnn_kernels.py
++++ b/megatron/core/transformer/experimental_attention_variant/dsa_cudnn_kernels.py
+@@ -320,7 +320,7 @@ def _ensure_flash_mla() -> None:
+     except ImportError as e:
+         raise ImportError(
+             "FlashMLA is required for DSA sparse attention forward. "
+-            "Install from https://github.com/deepseek-ai/FlashMLA/tree/nv_dev "
++            "Install sgl-flash-mla (bundled with sglang) "
+             "so that `from flash_mla import flash_mla_sparse_fwd` succeeds."
+         ) from e
+     _flash_mla_sparse_fwd = _fwd
+@@ -914,7 +914,7 @@ def _dsa_fwd_flash_mla(
+             d_v=d_v,
+             attn_sink=attn_sink,
+             topk_length=topk_length,
+-            indexer_topk=0,
++            use_legacy=True,
+         )
+ 
+     if padded_num_heads != actual_num_heads:
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/deepseek_v41.py b/megatron/core/transformer/experimental_attention_variant/dsv41/deepseek_v41.py
 new file mode 100644
 index 000000000..94e2eb647
@@ -3185,7 +3266,7 @@ index 000000000..e8a833a58
 +    return out, lse
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kvnorm.py b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kvnorm.py
 new file mode 100644
-index 000000000..40906f431
+index 000000000..27816bff1
 --- /dev/null
 +++ b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kvnorm.py
 @@ -0,0 +1,74 @@
@@ -3210,8 +3291,8 @@ index 000000000..40906f431
 +
 +@torch.no_grad()
 +def kv_cache_roundtrip(kv: torch.Tensor, weight: torch.Tensor, eps: float, freqs_cis: torch.Tensor) -> torch.Tensor:
-+    from sglang.kernels.ops.attention.dsv4.dequant_k_cache import dequantize_k_cache_paged
-+    from sglang.kernels.ops.attention.dsv4.elementwise import fused_k_norm_rope_flashmla
++    from sglang.kernels.ops.attention.dsv4.dequant_k_cache import dequantize_k_cache_paged_dsv4
++    from sglang.kernels.ops.attention.dsv4.norm_rope import fused_k_norm_rope_flashmla
 +
 +    bsz, seqlen, dim = kv.shape
 +    flat = kv.reshape(bsz * seqlen, dim).contiguous()
@@ -3230,7 +3311,7 @@ index 000000000..40906f431
 +        kvcache=cache,
 +        page_size=_PAGE_SIZE,
 +    )
-+    return dequantize_k_cache_paged(cache, loc, _PAGE_SIZE).reshape(bsz, seqlen, dim).to(kv.dtype)
++    return dequantize_k_cache_paged_dsv4(cache, loc, _PAGE_SIZE).reshape(bsz, seqlen, dim).to(kv.dtype)
 +
 +
 +def kv_norm_rope_fp8(
@@ -3245,7 +3326,7 @@ index 000000000..40906f431
 +@torch.no_grad()
 +def compressed_kv_cache_roundtrip(latent: torch.Tensor) -> torch.Tensor:
 +    from sglang.kernels.ops.attention.dsv4.attn import fused_store_cache
-+    from sglang.kernels.ops.attention.dsv4.dequant_k_cache import dequantize_k_cache_paged
++    from sglang.kernels.ops.attention.dsv4.dequant_k_cache import dequantize_k_cache_paged_dsv4
 +
 +    bsz, seqlen, dim = latent.shape
 +    flat = latent.reshape(bsz * seqlen, dim).contiguous()
@@ -3254,7 +3335,7 @@ index 000000000..40906f431
 +    page_bytes = -(-(_BYTES_PER_TOKEN * _PAGE_SIZE) // _ROW_BYTES) * _ROW_BYTES
 +    cache = torch.zeros(pages, page_bytes, dtype=torch.uint8, device=latent.device)
 +    fused_store_cache(input=flat, cache=cache, indices=loc, page_size=_PAGE_SIZE, type="flashmla")
-+    return dequantize_k_cache_paged(cache, loc, _PAGE_SIZE).reshape(bsz, seqlen, dim).to(latent.dtype)
++    return dequantize_k_cache_paged_dsv4(cache, loc, _PAGE_SIZE).reshape(bsz, seqlen, dim).to(latent.dtype)
 +
 +
 +def compressed_kv_stored(latent: torch.Tensor, rope_dim: int) -> torch.Tensor:

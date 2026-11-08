@@ -14,7 +14,7 @@ from megatron.bridge.models.conversion.param_mapping import (  # noqa: E402
 )
 
 from coda.backends.megatron import qat  # noqa: E402
-from coda.utils.quant_formats import CkptQuant, QuantScheme  # noqa: E402
+from coda.utils.quant_formats import CkptQuant, QuantScheme, UnsupportedQuant  # noqa: E402
 
 FP8 = QuantScheme("fp8_block", (32, 32))
 FP4 = QuantScheme("mxfp4", (1, 32))
@@ -86,9 +86,10 @@ def _cfg(enable, rollout=GOOD_ROLLOUT):
     return OmegaConf.create({"run_mode": "default", "trainer": {"qat": enable}, "rollout": rollout})
 
 
-def _plan(monkeypatch, m, enable, ckpt=CKPT, rollout=GOOD_ROLLOUT):
-    monkeypatch.setattr(qat, "read_ckpt_quant", lambda path: ckpt)
+def _plan(monkeypatch, m, enable, ckpt=CKPT, rollout=GOOD_ROLLOUT, unsupported=None):
+    monkeypatch.setattr(qat, "scan_ckpt_quant", lambda path: (ckpt, unsupported or {}))
     monkeypatch.setattr(qat.os.path, "isdir", lambda path: True)
+    monkeypatch.setattr(qat.torch.distributed, "get_rank", lambda: 0)
     return qat.QuantPlan(_bridge(m), [m], "/ckpt", _cfg(enable, rollout))
 
 
@@ -113,13 +114,35 @@ def test_plan_without_qat_only_encodes(monkeypatch):
 def test_plan_bf16_ckpt(monkeypatch):
     plan = _plan(monkeypatch, _toy(), enable=False, ckpt={})
     assert not plan.quantized
-    with pytest.raises(ValueError, match="needs a quantized checkpoint"):
+    with pytest.raises(ValueError, match="no trained tensor"):
         _plan(monkeypatch, _toy(), enable=True, ckpt={})
     # only untrained tensors (e.g. the engram table) quantized
     table = {"layers.1.engram.embed.weight": CkptQuant(FP8, "layers.1.engram.embed.scale", (64, 64))}
     assert not _plan(monkeypatch, _toy(), enable=False, ckpt=table).quantized
     with pytest.raises(ValueError, match="no trained tensor"):
         _plan(monkeypatch, _toy(), enable=True, ckpt=table)
+
+
+def _unsupported(name, dtype="F8_E4M3", shape=(96, 64)):
+    return {name: UnsupportedQuant("unsupported quantized layout", name[: -len(".weight")] + ".scale", dtype, shape)}
+
+
+def test_plan_unsupported_layout(monkeypatch, caplog):
+    # e.g. MTP e_proj kept FP8 with fp32 scales in the BF16 DeepSeek-V4 checkpoint, never mapped
+    unused = _unsupported("mtp.0.e_proj.weight")
+    with caplog.at_level("INFO", logger=qat.__name__):
+        assert not _plan(monkeypatch, _toy(), enable=False, ckpt={}, unsupported=unused).quantized
+    assert "skipping 1 unmapped tensors" in caplog.text and "mtp.0.e_proj.weight" in caplog.text
+    assert _plan(monkeypatch, _toy(), enable=True, unsupported=unused).snap_params
+    # a mapped tensor with an unsupported layout: export-checked without QAT, an error with QAT
+    for name in ("layers.0.attn.wq_b.weight", "layers.9.attn.wq_b.weight"):  # also on another PP stage
+        caplog.clear()
+        with caplog.at_level("INFO", logger=qat.__name__):
+            assert _plan(monkeypatch, _toy(), enable=False, ckpt={}, unsupported=_unsupported(name)).quantized
+        assert "1 trained tensors" in caplog.text and name in caplog.text and "skipping" not in caplog.text
+        ckpt = {n: q for n, q in CKPT.items() if n != name}
+        with pytest.raises(NotImplementedError, match=name):
+            _plan(monkeypatch, _toy(), enable=True, ckpt=ckpt, unsupported=_unsupported(name))
 
 
 def test_adapter_rejects_unmodeled_rollout(monkeypatch):
@@ -148,6 +171,18 @@ def test_check_export(monkeypatch):
         list(plan.check_export([("layers.0.attn.wq_b.weight", m.wq_b.weight.data)]))
     with pytest.raises(RuntimeError, match="must re-quantize"):
         list(plan.check_export([("layers.0.ffn.experts.0.w1.weight", m.experts.weight0.data[:64])]))
+
+
+def test_check_export_unsupported_layout(monkeypatch):
+    name = "layers.0.attn.wq_b.weight"
+    ckpt = {n: q for n, q in CKPT.items() if n != name}
+    plan = _plan(monkeypatch, _toy(), enable=False, ckpt=ckpt, unsupported=_unsupported(name))
+    w = torch.randn(96, 64)
+    stored = [(name, w.to(torch.float8_e4m3fn)), ("layers.0.attn.wq_b.scale", torch.ones(1, 1))]
+    assert [n for n, _ in plan.check_export(stored)] == [n for n, _ in stored]
+    for bad in (w.bfloat16(), w[:32].to(torch.float8_e4m3fn)):
+        with pytest.raises(RuntimeError, match=r"stores F8_E4M3 \(96, 64\).*must re-quantize"):
+            list(plan.check_export([(name, bad)]))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

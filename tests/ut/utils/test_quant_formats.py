@@ -10,7 +10,7 @@ from coda.utils.quant_formats import (
     dequant_mxfp4,
     quant_fp8_block,
     quant_mxfp4,
-    read_ckpt_quant,
+    scan_ckpt_quant,
 )
 
 FP8 = QuantScheme("fp8_block", (32, 32))
@@ -86,7 +86,7 @@ def test_matches_original_checkpoint(name):
     w_orig, s_orig = get(ORIG_CKPT, name + ".weight"), get(ORIG_CKPT, name + ".scale")
     w_bf16 = get(BF16_CKPT, name + ".weight")
     fp4 = w_orig.dtype == torch.int8
-    scheme = read_ckpt_quant(ORIG_CKPT)[name + ".weight"].scheme
+    scheme = scan_ckpt_quant(ORIG_CKPT)[0][name + ".weight"].scheme
     assert scheme == (FP4 if fp4 else FP8)
     ref = scheme.dequant(w_orig, s_orig, torch.float32)
     torch.testing.assert_close(scheme.dequant(*scheme.quant(w_bf16), dtype=torch.float32), ref, rtol=0, atol=0)
@@ -121,7 +121,7 @@ def test_bridge_requant_of_snapped_is_exact(scheme):
     torch.testing.assert_close(scheme.dequant(bq, bs, torch.float32), snapped.float(), rtol=0, atol=0)
 
 
-def test_read_ckpt_quant(tmp_path):
+def test_scan_ckpt_quant(tmp_path):
     from safetensors.torch import save_file
 
     w8, s8 = quant_fp8_block(_rand(64, 96))
@@ -129,8 +129,22 @@ def test_read_ckpt_quant(tmp_path):
     we, se = quant_fp8_block(_rand(8, 64), (1, 32))
     save_file({"a.weight": w8, "a.scale": s8, "e.weight": w4, "e.scale": s4, "t.weight": we, "t.scale": se,
                "n.weight": torch.zeros(4, 4).bfloat16()}, str(tmp_path / "model.safetensors"))
-    got = read_ckpt_quant(str(tmp_path))
-    assert set(got) == {"a.weight", "e.weight", "t.weight"}
+    got, unsupported = scan_ckpt_quant(str(tmp_path))
+    assert set(got) == {"a.weight", "e.weight", "t.weight"} and not unsupported
     assert got["a.weight"].scheme == FP8 and got["a.weight"].shape == (64, 96) and got["a.weight"].scale_name == "a.scale"
     assert got["e.weight"].scheme == FP4 and got["e.weight"].shape == (32, 64)
     assert got["t.weight"].scheme == QuantScheme("fp8_block", (1, 32))
+
+
+def test_scan_ckpt_quant_unsupported(tmp_path):
+    from safetensors.torch import save_file
+
+    w8, s8 = quant_fp8_block(_rand(64, 96))
+    save_file({"a.weight": w8, "a.scale": s8,
+               "m.weight": w8.clone(), "m.scale": torch.ones(1, 1)},  # fp32 scale (128x128-block FP8)
+              str(tmp_path / "model.safetensors"))
+    got, unsupported = scan_ckpt_quant(str(tmp_path))
+    assert set(got) == {"a.weight"} and set(unsupported) == {"m.weight"}
+    u = unsupported["m.weight"]
+    assert (u.scale_name, u.dtype, u.shape) == ("m.scale", "F8_E4M3", (64, 96))
+    assert u.reason.startswith("unsupported quantized layout")

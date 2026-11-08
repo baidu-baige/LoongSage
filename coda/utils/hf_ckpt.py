@@ -25,13 +25,13 @@ import torch
 INDEX = "model.safetensors.index.json"
 _COPY_CHUNK = 256 << 20
 
-_DTYPE = {
+SAFETENSORS_DTYPE = {
     torch.float64: "F64", torch.float32: "F32", torch.float16: "F16", torch.bfloat16: "BF16",
     torch.int64: "I64", torch.int32: "I32", torch.int16: "I16", torch.int8: "I8", torch.uint8: "U8",
     torch.bool: "BOOL", torch.float8_e4m3fn: "F8_E4M3", torch.float8_e5m2: "F8_E5M2",
     torch.float8_e8m0fnu: "F8_E8M0",
 }
-_TORCH = {v: k for k, v in _DTYPE.items()}
+_TORCH = {v: k for k, v in SAFETENSORS_DTYPE.items()}
 
 
 @dataclass(frozen=True)
@@ -96,12 +96,21 @@ def _write_shard(src_dir: str, out_dir: str, fname: str, keys: list[str], layout
     os.replace(out_path + ".tmp", out_path)
 
 
+def _is_int(dtype: torch.dtype) -> bool:
+    return not dtype.is_floating_point and not dtype.is_complex and dtype != torch.bool
+
+
 def _check_and_cast(name: str, t: torch.Tensor, info: _SrcTensor) -> torch.Tensor:
     if tuple(t.shape) != info.shape:
         raise ValueError(f"{name}: shape {tuple(t.shape)} != source {list(info.shape)}")
     want = _TORCH[info.dtype]
     if t.dtype != want:
-        if not (t.is_floating_point() and want.is_floating_point and info.dtype in ("F32", "F16", "BF16", "F64")):
+        float_cast = t.is_floating_point() and want.is_floating_point and info.dtype in ("F32", "F16", "BF16", "F64")
+        # lossless integer widening, e.g. DSV4's int32 hash-routing table tid2eid stored as I64
+        int_widen = _is_int(t.dtype) and _is_int(want) and (
+            torch.iinfo(want).min <= torch.iinfo(t.dtype).min and torch.iinfo(t.dtype).max <= torch.iinfo(want).max
+        )
+        if not (float_cast or int_widen):
             raise ValueError(f"{name}: dtype {t.dtype} cannot be stored as source dtype {info.dtype}")
         t = t.to(want)
     return t

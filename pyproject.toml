@@ -38,6 +38,7 @@ ci = [
     "mini-swe-agent==2.4.5",
     "litellm==1.80.0",
     "transformers>=4.44",
+    "deepseek-recipe==0.2.0",
     "safetensors>=0.4",
     "fastapi>=0.115",
     "uvicorn>=0.30",

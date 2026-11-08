@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import importlib
 import json
 import logging
 import os
@@ -28,12 +27,10 @@ _PROCESS_TOKENIZER: Any = None
 DEFAULT_THINK_TAGS = ("<think>", "</think>")
 DEEPSEEK_V4_MODEL_FAMILY = "deepseek_v4"
 DEEPSEEK_V41_MODEL_FAMILY = "deepseek_v41"
-# DeepSeek checkpoints ship no Jinja chat template; SGLang carries an official
-# encoder per family instead. Keyed by the family the checkpoint declares.
-DEEPSEEK_OFFICIAL_ENCODER_MODULES = {
-    DEEPSEEK_V41_MODEL_FAMILY: "sglang.srt.entrypoints.openai.encoding_dsv41",
-    DEEPSEEK_V4_MODEL_FAMILY: "sglang.srt.entrypoints.openai.encoding_dsv4",
-}
+# DeepSeek checkpoints ship no Jinja chat template; deepseek-recipe renders them instead.
+DEEPSEEK_MODEL_FAMILIES = frozenset({DEEPSEEK_V4_MODEL_FAMILY, DEEPSEEK_V41_MODEL_FAMILY})
+_DEEPSEEK_ASSISTANT = "<｜Assistant｜>"
+_DEEPSEEK_EOS = "<｜end▁of▁sentence｜>"
 # Probe messages: the prefixes are read off their renders.
 _EMPTY_SYSTEM = {"role": "system", "content": ""}
 _EMPTY_USER = {"role": "user", "content": ""}
@@ -48,7 +45,7 @@ def _deepseek_v4_thinking_mode(generation_prompt_kwargs: Mapping[str, Any]) -> s
 
 
 def _deepseek_official_family(model_path: str) -> str | None:
-    """DeepSeek family whose official SGLang encoder renders this checkpoint.
+    """DeepSeek family whose official encoder renders this checkpoint.
 
     V4.1 is matched before V4 because it reuses the ``DeepseekV4`` architecture
     substring (mirrors SGLang's ``is_deepseek_v41_config``).
@@ -67,14 +64,65 @@ def _deepseek_official_family(model_path: str) -> str | None:
     return None
 
 
+def _deepseek_text(content: Any) -> str:
+    """Message content as one string; OpenAI text parts are joined by a blank line."""
+    if not isinstance(content, list):
+        return content or ""
+    texts = []
+    for part in content:
+        if part.get("type") != "text":
+            raise ValueError(f"DeepSeek prompts support text content only, got a {part.get('type')!r} part")
+        texts.append(part.get("text", ""))
+    return "\n\n".join(texts)
+
+
+def _deepseek_recipe_message(recipe: Any, message: Mapping[str, Any], *, thinking: bool, prefix: bool) -> Any:
+    """Convert an OpenAI-style message to a deepseek-recipe message."""
+    role = message.get("role")
+    content = _deepseek_text(message.get("content"))
+    if role in ("system", "developer"):
+        return recipe.SystemMessage(content)
+    if role == "user":
+        return recipe.UserMessage(content)
+    if role == "tool":
+        return recipe.ToolMessage(content, tool_call_id=message.get("tool_call_id"))
+    if role != "assistant":
+        raise ValueError(f"unsupported message role for DeepSeek prompts: {role!r}")
+    tool_calls = []
+    for index, call in enumerate(message.get("tool_calls") or []):
+        arguments = call["function"].get("arguments") or {}
+        if not isinstance(arguments, str):
+            arguments = json.dumps(arguments, ensure_ascii=False)
+        tool_calls.append(recipe.ToolCall(call.get("id") or f"call_{index}", call["function"]["name"], arguments))
+    return recipe.AssistantMessage(
+        content,
+        # Chat mode never renders reasoning; thinking mode renders a missing one as empty.
+        reasoning_content=(message.get("reasoning_content") or "") if thinking else None,
+        tool_calls=tool_calls or None,
+        prefix=prefix,
+    )
+
+
 def _wrap_deepseek_v4_tokenizer(tokenizer: Any, family: str) -> Any:
-    """Expose the official DeepSeek encoder through the HF tokenizer API."""
-    # Only V4.1 renders an empty system message as a system token; V4 renders it
-    # to nothing, so only tools justify inserting one there.
+    """Expose deepseek-recipe's DeepSeek prompt rendering through the HF tokenizer API.
+
+    The tokenizer manager renders fragments, not just whole requests, so recipe's
+    renderer is driven through its low-level ``Conversation`` with these adjustments:
+
+    * a trailing assistant message is the one being tokenized: it is rendered as a
+      continuation (``prefix``), which keeps its reasoning instead of dropping it as
+      history, and closed with EOS, instead of being followed by a generation header;
+    * a render of system messages only (the empty-system probe) has no generation header;
+    * otherwise the generation header always follows, as with the official encoder:
+      ``add_generation_prompt`` is ignored;
+    * the reasoning effort is recipe's default, as SGLang v0.5.23 renders it when
+      ``SGLANG_DSV4_REASONING_EFFORT`` / ``SGLANG_DSV41_REASONING_EFFORT`` are unset
+      (V4 thinking mode: the ``high`` preamble; V4.1: 75).
+    """
+    import deepseek_recipe as recipe  # noqa: PLC0415
+
     v41 = family == DEEPSEEK_V41_MODEL_FAMILY
-    encode_messages = importlib.import_module(
-        DEEPSEEK_OFFICIAL_ENCODER_MODULES[family]
-    ).encode_messages
+    encoding = recipe.DeepseekV41Encoding() if v41 else recipe.DeepseekV4Encoding()
 
     def apply_chat_template(
         self: Any,
@@ -82,19 +130,31 @@ def _wrap_deepseek_v4_tokenizer(tokenizer: Any, family: str) -> Any:
         tools: list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> str | list[int]:
-        conversation = copy.deepcopy(messages)
-        if v41:
-            # V4.1 consumes OpenAI content parts and requires a string content.
-            for message in conversation:
-                if message.get("content") is None:
-                    message["content"] = ""
-        if tools:
-            if not conversation or conversation[0].get("role") != "system":
-                conversation.insert(0, {"role": "system", "content": ""})
-            conversation[0]["tools"] = tools
-
-        thinking_mode = _deepseek_v4_thinking_mode(kwargs)
-        prompt = encode_messages(conversation, thinking_mode=thinking_mode)
+        thinking = _deepseek_v4_thinking_mode(kwargs) == "thinking"
+        trailing_assistant = bool(messages) and messages[-1].get("role") == "assistant"
+        conversation = recipe.Conversation(
+            [
+                _deepseek_recipe_message(
+                    recipe, message, thinking=thinking, prefix=trailing_assistant and index == len(messages) - 1
+                )
+                for index, message in enumerate(messages)
+            ],
+            thinking_mode=thinking,
+            tools=[
+                recipe.ToolDefinition(
+                    tool["function"]["name"],
+                    tool["function"].get("description"),
+                    tool["function"].get("parameters"),
+                )
+                for tool in tools or []
+            ] or None,
+        )
+        prompt = encoding.render_conversation(conversation).prompt
+        if trailing_assistant:
+            prompt += _DEEPSEEK_EOS
+        elif all(message.get("role") == "system" for message in messages):
+            header = _DEEPSEEK_ASSISTANT + ("<think>" if thinking else "</think>")
+            prompt = prompt.removesuffix(header)
         if not kwargs.get("tokenize", True):
             return prompt
         return self.encode(prompt, add_special_tokens=False)
@@ -312,7 +372,7 @@ class BaseTokenizerManager(ABC):
         # Optional MultimodalProcessor (set by create_tokenizer_manager when multimodal.enable).
         self.multimodal_processor: Any = None
         self.generation_prompt_kwargs: dict[str, Any] = generation_prompt_kwargs or {}
-        if self.model_family in DEEPSEEK_OFFICIAL_ENCODER_MODULES:
+        if self.model_family in DEEPSEEK_MODEL_FAMILIES:
             self.thinking_mode = _deepseek_v4_thinking_mode(
                 self.generation_prompt_kwargs
             )
