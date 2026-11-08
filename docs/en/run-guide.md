@@ -272,7 +272,7 @@ bash examples/start.sh qwen3_vl_30b_a3b/mmrb_h20_1node \
   data_source.dataset.eval_prompt_data_path=/root/MMRB/validation.parquet
 ```
 
-Both presets use TP4 x PP2, EP4 and freeze the vision tower while training the language model (`megatron.model.freeze_vision_model: true`, `freeze_language_model: false`). Megatron-Bridge defaults both flags to `True` for Qwen3-VL-MoE, so keep them explicit in your own configs. Field details are in [Config Reference §1.1](config-reference.md#11-multimodal-image-modality). How images flow through the Router and the trainer is described in [AgentFlow Framework](agentflow-framework.md) and [Controller](controller.md).
+Both presets use TP4 x PP2, EP4 and freeze the vision tower while training the language model (`megatron.model.freeze_vision_model: true`, `freeze_language_model: false`). Megatron-Bridge defaults both flags to `True` for Qwen3-VL-MoE, so keep them explicit in your own configs. Field details are in [Config Reference §1.1](config-reference.md#11-multimodal-image-modality). For how images flow through the Router and the trainer, see `coda/agentflow/multimodal.py` and `put_dp_shards_to_ray` in `coda/data_factory/data_processor.py` (the AgentFlow and Controller docs are not published yet).
 
 Tip: Each preset inherits from [`conf/default.yaml`](../../conf/default.yaml), and subdirectories such as [`conf/qwen3_30b_a3b/`](../../conf/qwen3_30b_a3b/) hold presets for a specific model and machine type. For more available configurations, see [`conf/`](../../conf/).
 

@@ -266,7 +266,7 @@ bash examples/start.sh qwen3_vl_30b_a3b/mmrb_h20_1node \
   data_source.dataset.eval_prompt_data_path=/root/MMRB/validation.parquet
 ```
 
-两个预设都使用 TP4 x PP2、EP4，冻结视觉塔、训练语言模型（`megatron.model.freeze_vision_model: true`，`freeze_language_model: false`）。Megatron-Bridge 对 Qwen3-VL-MoE 默认把两者都置为 `True`，自己的配置里请显式写出。字段详情见 [默认配置参数手册 §1.1](config-reference.md#11-multimodal图像模态)；图像在 Router 与训练侧的流转见 [AgentFlow 框架](agentflow-framework.md) 与 [控制器](controller.md)。
+两个预设都使用 TP4 x PP2、EP4，冻结视觉塔、训练语言模型（`megatron.model.freeze_vision_model: true`，`freeze_language_model: false`）。Megatron-Bridge 对 Qwen3-VL-MoE 默认把两者都置为 `True`，自己的配置里请显式写出。字段详情见 [默认配置参数手册 §1.1](config-reference.md#11-multimodal图像模态)；图像在 Router 与训练侧的流转见 `coda/agentflow/multimodal.py` 与 `coda/data_factory/data_processor.py` 中的 `put_dp_shards_to_ray`（AgentFlow 与 Controller 文档暂未发布）。
 
 提示：各预设继承 [`default.yaml`](../../conf/default.yaml)，[`conf/qwen3_30b_a3b/`](../../conf/qwen3_30b_a3b/) 这类子目录是特定模型与机型的预设。更多可用配置见 [`conf/`](../../conf/)。
 
