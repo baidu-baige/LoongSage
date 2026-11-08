@@ -112,6 +112,7 @@ class MegatronActorWorker(MegatronTrainWorker):
         # Megatron params are snapped onto the grid (before any TensorBackuper snapshot) and the
         # activation fake-quant hooks are registered.
         self._quant = qat.QuantPlan(self.bridge, self.model, config.hf_model_path, config)
+        self._hf_export_names: set[str] | None = None  # HF names of the last export, see _save_hf_like_source
         if self._quant.qat:
             n = self._quant.snap_()
             n_act = self._quant.register_activation_hooks()
@@ -154,7 +155,9 @@ class MegatronActorWorker(MegatronTrainWorker):
 
         if hf:
             hf_dir = get_hf_dir(self.config.checkpoint_path, step)
-            if self._quant.quantized:
+            # save_hf_pretrained only writes what the export produces (MTP aside), so it would drop
+            # untrained quantized tensors such as the FP8 engram table of a bf16 V4.1 checkpoint.
+            if self._quant.ckpt or self._quant.unsupported:
                 self._save_hf_like_source(hf_dir)
             else:
                 self.bridge.save_hf_pretrained(self.model, hf_dir)
@@ -163,17 +166,24 @@ class MegatronActorWorker(MegatronTrainWorker):
     @torch.no_grad()
     def _save_hf_like_source(self, hf_dir: str) -> None:
         """Save the HF model in the source checkpoint's own (quantized) format: same files, names,
-        dtypes and config as ``hf_model_path``; untrained tensors (vision, MTP, ...) are copied."""
-        names = {
-            n for t in self.bridge.get_conversion_tasks(self.model) if t is not None for n in qat.hf_names(t.mapping)
-        }
-        gathered = [None] * torch.distributed.get_world_size()
-        torch.distributed.all_gather_object(gathered, sorted(names))  # EP ranks own different experts
-        expected = set().union(*map(set, gathered))
-        expected |= {q.scale_name for n, q in self._quant.ckpt.items() if n in expected}
+        dtypes and config as ``hf_model_path``; untrained tensors (vision, MTP, ...) are copied.
+
+        ``save_like_source`` needs the exported names up front (to flush each shard once complete).
+        They come from an actual export rather than from the mappings, since a bridge may rename on
+        export (DSV4: ``indexer.scorer.weights_proj`` -> ``indexer.weights_proj``). They do not change
+        during training, so the names recorded by :meth:`update_weights` are reused; a dry export
+        runs only when no weight sync happened yet (SFT / train-only). Every rank sees the full
+        stream; all of them must iterate it for the collectives.
+        """
+        names = self._hf_export_names
+        if names is None:
+            names = self._hf_export_names = {name for name, _ in self.bridge.export_hf_weights(self.model)}
+        quant = (*self._quant.ckpt.items(), *self._quant.unsupported.items())
+        if missing := sorted(q.scale_name for n, q in quant if n in names and q.scale_name not in names):
+            raise RuntimeError(f"the bridge exports quantized weights without their scales, e.g. {missing[:5]}")
         hf_weights = self.bridge.export_hf_weights(self.model)
         if torch.distributed.get_rank() == 0:  # save_like_source checks names/dtypes/shapes against the source
-            save_like_source(hf_weights, self.config.hf_model_path, hf_dir, expected)
+            save_like_source(hf_weights, self.config.hf_model_path, hf_dir, names)
         else:
             for _ in hf_weights:  # collectives
                 pass
@@ -413,9 +423,12 @@ class MegatronActorWorker(MegatronTrainWorker):
         hf_weights = self.bridge.export_hf_weights(self.model)
         if self._quant.quantized:  # the bridge re-quantizes to the checkpoint format; verify it
             hf_weights = self._quant.check_export(hf_weights)
+        names = set()
         for name, tensor in hf_weights:
+            names.add(name)
             send_channel.send((name, tensor))
         send_channel.send(None, flush=True)
+        self._hf_export_names = names  # reused by _save_hf_like_source
         if self.offloaded:
             self._offload_model(move_params=True, move_grads=False)
             self.params_offloaded = True
