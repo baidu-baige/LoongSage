@@ -364,6 +364,13 @@ TrajectoryGroup 列表
 
 在完整训练模式中，Ray ObjectRef 被传给训练 Worker；在 rollout-only 模式中，DP shard 被保存到磁盘并返回空列表；在 train-only 模式中，磁盘 batch 直接恢复为 Ray 引用。
 
+开启图像模态时，对含图片的 DP shard，`put_dp_shards_to_ray`（[data_processor.py](../../coda/data_factory/data_processor.py)）会额外写入两个键：
+
+- `multimodal_train_inputs`：与 `tokens` 逐行对齐。每一行是该 Segment 内 pad 段所对应的图片 hash 列表（按 pad 顺序），没有图片则为 `None`。
+- `image_table`：`{image_hash: {pixel_values, image_grid_thw}}`，每个 shard 构建一次。在多行中出现的同一张图只存一份。该表是 shard 级的，不与行对齐，因此切 mini-batch 和 micro-batch 时不拆分，每个子 batch 都引用完整的表。
+
+纯文本 shard 不包含这两个键，布局与原来一致。同一 hash 对应不同的 `pixel_values` 形状或 `image_grid_thw` 时会报错，Segment 的 pad token 与其图片不匹配时同样报错。训练 Worker 在加载 shard 时（`get_rollout_data`）每步把该表一次性搬到 GPU；OPD 的 Teacher Worker 也做同样处理。
+
 启用 OPD 时，`TeacherManager.compute_teacher()` 在这一步之后被调用，它不重建 batch，而是把 Teacher 前向结果的 ObjectRef 追加到每个 DP shard 的 `teacher_worker_ref` 字段上。
 
 ### 权重更新流程

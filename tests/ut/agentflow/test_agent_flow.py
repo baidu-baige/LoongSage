@@ -87,26 +87,23 @@ def _make_agent_flow(rollout_mode: str = "single_turn", retry_limit: int = 1,
 
     # Control-plane requests (abort / session / wait) go through the shared
     # `_control_client`; replace it with an AsyncMock so those assertions are
-    # transparent. The generation hot path builds a fresh per-request client
-    # inline (see `_patch_generation_client`), so it is patched per-test.
+    # transparent. The generation hot path uses the shared `_generate_client`
+    # (see `_patch_generation_client`), which is patched per-test.
     af._control_client = AsyncMock()
     return af
 
 
 @contextmanager
-def _patch_generation_client(post=None):
-    """Patch the per-request ``httpx.AsyncClient`` created inline by
-    ``_execute_single_turn`` for the generation call.
+def _patch_generation_client(af, post=None):
+    """Install a mock shared generation client on ``af`` for ``_execute_single_turn``.
 
-    Yields the mock client so tests can set/assert on ``.post``. ``.aclose`` is
-    an AsyncMock so the ``finally: await client.aclose()`` path works.
+    Yields the mock client so tests can set/assert on ``.post``.
     """
     client = AsyncMock()
-    client.aclose = AsyncMock()
     if post is not None:
         client.post = post
-    with patch("coda.agentflow.agent_flow.httpx.AsyncClient", return_value=client):
-        yield client
+    af._generate_client = client
+    yield client
 
 
 # ---------------------------------------------------------------------------
@@ -785,6 +782,44 @@ class TestEmitTerminalTrajectory:
         af.traj_queue.add.assert_called_once()
         assert "t1" not in af.trajectory_store.trajectory_data
 
+    @pytest.mark.asyncio
+    async def test_queued_copy_shares_multimodal_tensors(self):
+        import torch
+
+        af = _make_agent_flow()
+        traj = _make_trajectory("t1")
+        tensors = {"pixel_values": torch.zeros(4, 4), "image_grid_thw": torch.tensor([[1, 2, 2]])}
+        traj.multimodal_train_inputs = [{"token_start": 0, "token_end": 4, "tensors": tensors}]
+        af.trajectory_store.add(traj.trajectory_id, traj)
+        af.traj_queue.add = MagicMock()
+
+        await af._emit_terminal_trajectory(traj)
+
+        queued = af.traj_queue.add.call_args.args[0]
+        assert queued.multimodal_train_inputs[0]["tensors"]["pixel_values"] is tensors["pixel_values"]
+
+
+class TestCopyForQueue:
+    def test_text_only_trajectory_is_deep_copied(self):
+        traj = _make_trajectory("t1")
+        copy = AgentFlow._copy_for_queue(traj)
+        assert copy is not traj and copy.trajectory_id == "t1"
+        assert copy.multimodal_train_inputs is None
+
+    def test_multimodal_tensors_shared_and_other_fields_deep_copied(self):
+        import torch
+
+        traj = _make_trajectory("t1")
+        pixel = torch.zeros(4, 4)
+        items = [{"token_start": 0, "token_end": 4, "tensors": {"pixel_values": pixel}}]
+        traj.multimodal_train_inputs = items
+
+        copy = AgentFlow._copy_for_queue(traj)
+
+        assert copy.multimodal_train_inputs[0]["tensors"]["pixel_values"] is pixel
+        assert traj.multimodal_train_inputs is items  # original restored
+        assert copy is not traj and copy.tokens is not traj.tokens
+
 
 # ---------------------------------------------------------------------------
 # _reemit_existing()
@@ -1319,7 +1354,7 @@ class TestExecuteSingleTurn:
         af, traj = self._setup(completion_params={})
         mock_resp = MagicMock()
         mock_resp.raise_for_status = MagicMock()
-        with _patch_generation_client() as client:
+        with _patch_generation_client(af) as client:
             client.post = AsyncMock(return_value=mock_resp)
             await af._execute_single_turn(traj, 0)
             body = client.post.call_args.kwargs["json"]
@@ -1332,7 +1367,7 @@ class TestExecuteSingleTurn:
         af, traj = self._setup(completion_params={"top_p": 0.9, "top_k": 50})
         mock_resp = MagicMock()
         mock_resp.raise_for_status = MagicMock()
-        with _patch_generation_client() as client:
+        with _patch_generation_client(af) as client:
             client.post = AsyncMock(return_value=mock_resp)
             await af._execute_single_turn(traj, 0)
             body = client.post.call_args.kwargs["json"]
@@ -1367,7 +1402,7 @@ class TestExecuteSingleTurn:
             json={"error": {"type": CONTEXT_LENGTH_EXCEEDED, "message": "exhausted"}},
             request=httpx.Request("POST", "http://router/t-overlong/0/v1/chat/completions"),
         )
-        with _patch_generation_client() as client:
+        with _patch_generation_client(af) as client:
             client.post = AsyncMock(return_value=response)
             reward = await af._execute_single_turn(traj, 0)
 
@@ -1390,7 +1425,7 @@ class TestExecuteSingleTurn:
         }
         mock_resp = MagicMock()
         mock_resp.raise_for_status = MagicMock()
-        with _patch_generation_client() as client:
+        with _patch_generation_client(af) as client:
             client.post = AsyncMock(return_value=mock_resp)
             await af._execute_single_turn(traj, 0)
             body = client.post.call_args.kwargs["json"]

@@ -227,6 +227,47 @@ bash examples/start.sh qwen3_coder_30b_a3b/claude_code_h20_2node \
   data_source.sandbox.kubeconfig=/path/to/kubeconfig.yaml
 ```
 
+### 任务八：使用图像训练视觉语言模型（Qwen3-VL）
+
+图像模态训练默认关闭。[`conf/qwen3_vl_30b_a3b/`](../../conf/qwen3_vl_30b_a3b/) 下的预设设置了 `multimodal.enable: true`，在单机 8 卡 H20 上用 `boxed_math` 奖励跑 GRPO；Router 依赖 `qwen-vl-utils` 包（镜像未自带时 `pip install qwen-vl-utils==0.0.14`）。
+
+**数据格式。** 带图数据集由 `data_source.dataset.multimodal_keys`（这里是 `{image: images}`）指定，包含两部分：
+
+- prompt 文本（`input_key` 对应的列）中，每张图对应一个 `<image>` 占位符。
+- `images` 列是 base64 data URI（`data:image/...;base64,...`）的列表，与占位符一一对应、顺序一致。数量不符或元素不是 data URI 时，加载阶段直接报错。
+
+其他格式的数据集可以用 `data_pre_processor` 转换。内置的 `geo3k` 会把 [hiyouga/geometry3k](https://huggingface.co/datasets/hiyouga/geometry3k) 中的 HF 图像结构转成 data URI，并补上占位符和 `\boxed{}` 格式指令。若要限制单个 prompt 的显存占用，设置 `data_source.dataset.max_image_tokens`：图片估算 token 数之和超过该值的 prompt 会在加载时丢弃。
+
+**单图（geo3k）。** 下载模型和数据：
+
+```bash
+hf download Qwen/Qwen3-VL-30B-A3B-Instruct --local-dir /root/Qwen3-VL-30B-A3B-Instruct
+hf download hiyouga/geometry3k --repo-type=dataset --local-dir /root/geometry3k
+```
+
+启动 [`qwen3_vl_30b_a3b/geo3k_h20_1node`](../../conf/qwen3_vl_30b_a3b/geo3k_h20_1node.yaml)：
+
+```bash
+bash examples/start.sh qwen3_vl_30b_a3b/geo3k_h20_1node \
+  checkpoint_path=/root/ckpt/geo3k \
+  hf_model_path=/root/Qwen3-VL-30B-A3B-Instruct \
+  data_source.dataset.prompt_data_path=/root/geometry3k/data/train-00000-of-00001.parquet \
+  data_source.dataset.eval_prompt_data_path=/root/geometry3k/data/validation-00000-of-00001.parquet
+```
+
+**多图（MMRB）。** [`qwen3_vl_30b_a3b/mmrb_h20_1node`](../../conf/qwen3_vl_30b_a3b/mmrb_h20_1node.yaml) 训练每条 prompt 含多张图的数据，并丢弃图片超过 15000 token 的样本（`max_image_tokens`）。数据集的 `images` 列已是上述格式，因此不设置 `data_pre_processor`：
+
+```bash
+hf download loongsage/MMRB --include "*.parquet" --repo-type=dataset --local-dir /root/MMRB
+bash examples/start.sh qwen3_vl_30b_a3b/mmrb_h20_1node \
+  checkpoint_path=/root/ckpt/mmrb \
+  hf_model_path=/root/Qwen3-VL-30B-A3B-Instruct \
+  data_source.dataset.prompt_data_path=/root/MMRB/train.parquet \
+  data_source.dataset.eval_prompt_data_path=/root/MMRB/validation.parquet
+```
+
+两个预设都使用 TP4 x PP2、EP4，冻结视觉塔、训练语言模型（`megatron.model.freeze_vision_model: true`，`freeze_language_model: false`）。Megatron-Bridge 对 Qwen3-VL-MoE 默认把两者都置为 `True`，自己的配置里请显式写出。字段详情见 [默认配置参数手册 §1.1](config-reference.md#11-multimodal图像模态)；图像在 Router 与训练侧的流转见 [AgentFlow 框架](agentflow-framework.md) 与 [控制器](controller.md)。
+
 提示：各预设继承 [`default.yaml`](../../conf/default.yaml)，[`conf/qwen3_30b_a3b/`](../../conf/qwen3_30b_a3b/) 这类子目录是特定模型与机型的预设。更多可用配置见 [`conf/`](../../conf/)。
 
 ## 运行监控
@@ -440,6 +481,8 @@ checkpoint_path/
 | | `bcp_h20_1node` | Qwen3-30B-A3B | BCP 检索（任务二）| 单机 8xH20 |
 | | `mopd_h20_1node` | Qwen3-30B-A3B | MOPD 多教师蒸馏（任务三）| 单机 8xH20 |
 | `conf/qwen3.8_27b/` | `dapo_h20_1node` | Qwen3.8-27B | DAPO 数学 | 单机 8xH20 |
+| `conf/qwen3_vl_30b_a3b/` | `geo3k_h20_1node` | Qwen3-VL-30B-A3B-Instruct | GRPO geo3k 单图（任务八） | 单机 8xH20 |
+| | `mmrb_h20_1node` | Qwen3-VL-30B-A3B-Instruct | GRPO MMRB 多图（任务八） | 单机 8xH20 |
 | `conf/qwen3_coder_30b_a3b/` | `mini_swe_h20_4node` | Qwen3-Coder-30B-A3B | mini-SWE（R2E-Gym）| 4 节点 xH20 |
 | | `opencode_h20_4node` | Qwen3-Coder-30B-A3B | OpenCode（R2E-Gym）（任务五）| 4 节点 xH20 |
 | | `codex_h20_4node` | Qwen3-Coder-30B-A3B | Codex（R2E-Gym）（任务六）| 4 节点 xH20 |

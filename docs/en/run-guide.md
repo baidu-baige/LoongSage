@@ -233,6 +233,47 @@ bash examples/start.sh qwen3_coder_30b_a3b/claude_code_h20_2node \
   data_source.sandbox.kubeconfig=/path/to/kubeconfig.yaml
 ```
 
+### Task 8: Train a Vision-Language Model (Qwen3-VL) with Images
+
+Image-modality training is off by default. The presets under [`conf/qwen3_vl_30b_a3b/`](../../conf/qwen3_vl_30b_a3b/) set `multimodal.enable: true` and run GRPO with `boxed_math` reward on one H20 node (8 GPUs); the Router needs the `qwen-vl-utils` package (`pip install qwen-vl-utils==0.0.14` if your image does not ship it).
+
+**Data format.** A dataset with images has two parts, selected by `data_source.dataset.multimodal_keys` (here `{image: images}`):
+
+- The prompt text (column `input_key`) contains one `<image>` placeholder per image.
+- The `images` column is a list of base64 data URIs (`data:image/...;base64,...`), one per placeholder and in the same order. A mismatch in count, or an item that is not a data URI, fails at load time.
+
+Datasets in another layout can convert their rows with a `data_pre_processor`. The built-in `geo3k` one turns the HF image structs of [hiyouga/geometry3k](https://huggingface.co/datasets/hiyouga/geometry3k) into data URIs and adds the placeholders and the `\boxed{}` instruction. To cap memory per prompt, set `data_source.dataset.max_image_tokens`: prompts whose images add up to more estimated tokens are dropped at load time.
+
+**Single image (geo3k).** Download the model and dataset:
+
+```bash
+hf download Qwen/Qwen3-VL-30B-A3B-Instruct --local-dir /root/Qwen3-VL-30B-A3B-Instruct
+hf download hiyouga/geometry3k --repo-type=dataset --local-dir /root/geometry3k
+```
+
+Launch [`qwen3_vl_30b_a3b/geo3k_h20_1node`](../../conf/qwen3_vl_30b_a3b/geo3k_h20_1node.yaml):
+
+```bash
+bash examples/start.sh qwen3_vl_30b_a3b/geo3k_h20_1node \
+  checkpoint_path=/root/ckpt/geo3k \
+  hf_model_path=/root/Qwen3-VL-30B-A3B-Instruct \
+  data_source.dataset.prompt_data_path=/root/geometry3k/data/train-00000-of-00001.parquet \
+  data_source.dataset.eval_prompt_data_path=/root/geometry3k/data/validation-00000-of-00001.parquet
+```
+
+**Multiple images (MMRB).** [`qwen3_vl_30b_a3b/mmrb_h20_1node`](../../conf/qwen3_vl_30b_a3b/mmrb_h20_1node.yaml) trains on prompts with several images each and drops prompts above 15000 image tokens (`max_image_tokens`). The dataset already has the `images` column in the format above, so no `data_pre_processor` is set:
+
+```bash
+hf download loongsage/MMRB --include "*.parquet" --repo-type=dataset --local-dir /root/MMRB
+bash examples/start.sh qwen3_vl_30b_a3b/mmrb_h20_1node \
+  checkpoint_path=/root/ckpt/mmrb \
+  hf_model_path=/root/Qwen3-VL-30B-A3B-Instruct \
+  data_source.dataset.prompt_data_path=/root/MMRB/train.parquet \
+  data_source.dataset.eval_prompt_data_path=/root/MMRB/validation.parquet
+```
+
+Both presets use TP4 x PP2, EP4 and freeze the vision tower while training the language model (`megatron.model.freeze_vision_model: true`, `freeze_language_model: false`). Megatron-Bridge defaults both flags to `True` for Qwen3-VL-MoE, so keep them explicit in your own configs. Field details are in [Config Reference §1.1](config-reference.md#11-multimodal-image-modality). How images flow through the Router and the trainer is described in [AgentFlow Framework](agentflow-framework.md) and [Controller](controller.md).
+
 Tip: Each preset inherits from [`conf/default.yaml`](../../conf/default.yaml), and subdirectories such as [`conf/qwen3_30b_a3b/`](../../conf/qwen3_30b_a3b/) hold presets for a specific model and machine type. For more available configurations, see [`conf/`](../../conf/).
 
 ## Monitoring
@@ -468,6 +509,8 @@ Besides the presets used in the tasks above, `conf/` ships the following ready-t
 | | `bcp_h20_1node` | Qwen3-30B-A3B | BCP retrieval (Task 2) | 1 node x 8 H20 |
 | | `mopd_h20_1node` | Qwen3-30B-A3B | MOPD distillation (Task 3) | 1 node x 8 H20 |
 | `conf/qwen3.8_27b/` | `dapo_h20_1node` | Qwen3.8-27B | DAPO math | 1 node x 8 H20 |
+| `conf/qwen3_vl_30b_a3b/` | `geo3k_h20_1node` | Qwen3-VL-30B-A3B-Instruct | GRPO geo3k, single image (Task 8) | 1 node x 8 H20 |
+| | `mmrb_h20_1node` | Qwen3-VL-30B-A3B-Instruct | GRPO MMRB, multi-image (Task 8) | 1 node x 8 H20 |
 | `conf/qwen3_coder_30b_a3b/` | `mini_swe_h20_4node` | Qwen3-Coder-30B-A3B | mini-SWE (R2E-Gym) | 4 nodes × H20 |
 | | `opencode_h20_4node` | Qwen3-Coder-30B-A3B | OpenCode (R2E-Gym) (Task 5) | 4 nodes × H20 |
 | | `codex_h20_4node` | Qwen3-Coder-30B-A3B | Codex (R2E-Gym) (Task 6) | 4 nodes × H20 |
