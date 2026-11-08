@@ -101,6 +101,7 @@ ______________________________________________________________________
 | DeepSeek-V4-Flash（BF16） | [`dsv4_flash_bf16/`](conf/dsv4_flash_bf16/)：DAPO、SWE | H20 × 6–8，GB200 × 8 |
 | Qwen3-30B-A3B | [`qwen3_30b_a3b/`](conf/qwen3_30b_a3b/)：DAPO、GSM8K、BCP、MOPD | H20 × 1 |
 | Qwen3-Coder-30B-A3B-Instruct | [`qwen3_coder_30b_a3b/`](conf/qwen3_coder_30b_a3b/)：Claude Code、Codex、OpenCode、mini-SWE | H20 × 2–4 |
+| Qwen3-VL-30B-A3B-Instruct | [`qwen3_vl_30b_a3b/`](conf/qwen3_vl_30b_a3b/)：GRPO（geo3k 单图、MMRB 多图） | H20 × 1 |
 | Qwen3.8-27B | [`qwen3.8_27b/`](conf/qwen3.8_27b/)：DAPO | H20 × 1 |
 | Qwen3-4B | [`qwen3_4b/`](conf/qwen3_4b/)：DAPO、SFT | H800 × 1，H20 × 1 |
 | StartLux-Decision-v1.1-4B-AutoThink | [`rlcd2/`](conf/rlcd2/)：RLCD2 | H20 × 1 |

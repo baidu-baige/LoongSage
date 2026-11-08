@@ -28,7 +28,7 @@ from coda.backends.megatron.data import (
     get_data_iterator,
 )
 from coda.backends.megatron.model import (
-    forward_only, train_minibatch, is_main_rank, reduce_dict, prune_router_replay_instances,
+    forward_only, train_minibatch, is_main_rank, reduce_dict,
 )
 from coda.utils.tracking import time_tracker, track
 from coda.algorithms.kl_policy import build_kl_policies
@@ -99,12 +99,6 @@ class MegatronActorWorker(MegatronTrainWorker):
           10. Set up frozen reference model for ref-KL (weight hot-swap)
         """
         super().init(config, master_addr, master_port)
-
-        if config.trainer.use_rollout_routing_replay:
-            dropped, kept = prune_router_replay_instances(self.model)
-            logger.info(
-                f"[Rank {self.rank}] R3: pruned {dropped} orphan RouterReplay instances, kept {kept}"
-            )
 
         # Step 8.5: quantized checkpoint (FP8/FP4 rollout). The plan records, from the checkpoint
         # headers, which HF tensors are stored quantized and in which format; the bridge re-quantizes

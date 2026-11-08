@@ -17,8 +17,12 @@ pytest.importorskip("megatron", reason="Megatron-Core is not installed")
 from coda.backends.megatron.data import (
     DataIterator,
     _get_min_num_microbatches,
+    concat_rollout_batch,
     get_data_iterator,
     get_rollout_data,
+    group_rollout_batch,
+    merge_rollout_batch,
+    slice_rollout_batch,
 )
 
 # ---------------------------------------------------------------------------
@@ -390,6 +394,166 @@ class TestGetRolloutData:
 
         assert torch.equal(result["critic_advantages"][0], torch.tensor([0.5, -0.5]))
         assert torch.equal(result["critic_advantages"][1], torch.tensor([1.0]))
+
+    def test_image_table_moved_and_rows_keep_hashes(self):
+        _set_parallel(dp_rank=0)
+        pixel = torch.ones(4, 8)
+        raw = {
+            "tokens": [torch.tensor([1, 2]), torch.tensor([3])],
+            "loss_masks": [torch.tensor([1.0, 1.0]), torch.tensor([1.0])],
+            "multimodal_train_inputs": [["h0"], None],
+            "image_table": {"h0": {"pixel_values": pixel, "image_grid_thw": torch.tensor([[1, 2, 2]])}},
+        }
+
+        with (
+            patch.object(_data_mod, "ray") as ray_mock,
+            patch("torch.cuda.current_device", return_value="cpu"),
+        ):
+            ray_mock.get.return_value = raw
+            result = get_rollout_data([MagicMock(ref="ref", teacher_worker_ref=[], critic_ref=None)])
+
+        assert result["multimodal_train_inputs"] == [["h0"], None]
+        assert torch.equal(result["image_table"]["h0"]["pixel_values"], pixel)
+
+    def test_text_only_shard_has_no_multimodal_keys(self):
+        _set_parallel(dp_rank=0)
+        raw = {"tokens": [torch.tensor([1])], "loss_masks": [torch.tensor([1.0])]}
+
+        with (
+            patch.object(_data_mod, "ray") as ray_mock,
+            patch("torch.cuda.current_device", return_value="cpu"),
+        ):
+            ray_mock.get.return_value = raw
+            result = get_rollout_data([MagicMock(ref="ref", teacher_worker_ref=[], critic_ref=None)])
+
+        assert "multimodal_train_inputs" not in result
+        assert "image_table" not in result
+
+
+class TestDataIteratorMultimodal:
+    """The row-aligned ``multimodal_train_inputs`` key follows the micro-batch row order."""
+
+    @staticmethod
+    def _rows(n):
+        return [None if i % 2 else [f"h{i}"] for i in range(n)]
+
+    def test_rows_follow_micro_batch_slices(self):
+        rows = self._rows(4)
+        data = _make_rollout(4, extra_fields={"multimodal_train_inputs": rows})
+        it = DataIterator(data, micro_batch_size=2)
+
+        b0 = it.get_next(["tokens", "multimodal_train_inputs"])
+        b1 = it.get_next(["tokens", "multimodal_train_inputs"])
+
+        assert b0["multimodal_train_inputs"][0] is rows[0]
+        assert b0["multimodal_train_inputs"][1] is None
+        assert b1["multimodal_train_inputs"][0] is rows[2]
+
+    def test_absent_key_returns_none(self):
+        it = DataIterator(_make_rollout(4), micro_batch_size=2)
+        batch = it.get_next(["tokens", "multimodal_train_inputs"])
+        assert batch["multimodal_train_inputs"] is None
+
+    def test_image_table_accessor(self):
+        table = {"h0": {"pixel_values": torch.zeros(2, 4)}}
+        data = _make_rollout(2, extra_fields={"multimodal_train_inputs": [["h0"], None], "image_table": table})
+        assert DataIterator(data, micro_batch_size=2).image_table is table
+        assert DataIterator(_make_rollout(2), micro_batch_size=2).image_table is None
+
+    def test_padding_row_resolves_through_table(self):
+        # index -1 reuses row 0's value, which is a hash list resolved via the same table
+        data = _make_rollout(2, extra_fields={"multimodal_train_inputs": [["h0"], None]})
+        it = DataIterator(data, micro_batch_indices=[[0, -1]])
+        assert it.get_next(["multimodal_train_inputs"])["multimodal_train_inputs"] == [["h0"], ["h0"]]
+
+
+class TestConcatRolloutBatchMultimodal:
+    """Text-only shards omit the multimodal keys; concatenation must keep row alignment and union the tables."""
+
+    @staticmethod
+    def _image_shard(n, prefix="h"):
+        rows = [[f"{prefix}{i}"] for i in range(n)]
+        table = {f"{prefix}{i}": {"pixel_values": torch.full((2, 4), float(i))} for i in range(n)}
+        return _make_rollout(n, extra_fields={"multimodal_train_inputs": rows, "image_table": table})
+
+    def test_first_shard_text_only_keeps_later_images(self):
+        text, image = _make_rollout(2), self._image_shard(3)
+        merged = concat_rollout_batch([text, image])
+        rows = merged["multimodal_train_inputs"]
+        assert len(rows) == len(merged["tokens"]) == 5
+        assert rows[:2] == [None, None]
+        assert rows[2:] == image["multimodal_train_inputs"]
+        assert merged["image_table"] == image["image_table"]
+
+    def test_later_shard_text_only_does_not_raise(self):
+        image, text = self._image_shard(2), _make_rollout(3)
+        merged = concat_rollout_batch([image, text])
+        rows = merged["multimodal_train_inputs"]
+        assert len(rows) == len(merged["tokens"]) == 5
+        assert rows[:2] == image["multimodal_train_inputs"]
+        assert rows[2:] == [None, None, None]
+        assert merged["image_table"] == image["image_table"]
+
+    def test_tables_are_unioned_and_first_entry_wins(self):
+        a, b = self._image_shard(2, "a"), self._image_shard(2, "b")
+        b["image_table"]["a0"] = {"pixel_values": torch.full((2, 4), 99.0)}
+        merged = concat_rollout_batch([a, b])
+        assert set(merged["image_table"]) == {"a0", "a1", "b0", "b1"}
+        assert merged["image_table"]["a0"] is a["image_table"]["a0"]
+        assert len(merged["multimodal_train_inputs"]) == 4
+        assert set(b["image_table"]) == {"b0", "b1", "a0"}  # inputs are not mutated
+
+    def test_all_text_only_stays_without_keys_and_inputs_unmutated(self):
+        shards = [_make_rollout(2), _make_rollout(2)]
+        merged = concat_rollout_batch(shards)
+        assert "multimodal_train_inputs" not in merged and "image_table" not in merged
+        assert all("multimodal_train_inputs" not in s for s in shards)
+
+
+class TestGroupMergeRolloutBatchMultimodal:
+    """`image_table` is shard-level: grouping must not index it per row, and every group keeps it."""
+
+    @staticmethod
+    def _data():
+        table = {"h0": {"pixel_values": torch.zeros(2, 4)}, "h1": {"pixel_values": torch.ones(2, 4)}}
+        return _make_rollout(
+            3,
+            extra_fields={
+                "multimodal_train_inputs": [["h0"], None, ["h1"]],
+                "image_table": table,
+                "teacher_idx": [0, 1, 0],
+            },
+        )
+
+    def test_group_keeps_table_by_reference_in_every_group(self):
+        data = self._data()
+        groups = group_rollout_batch(data, "teacher_idx")
+        assert set(groups) == {0, 1}
+        assert groups[0]["multimodal_train_inputs"] == [["h0"], ["h1"]]
+        assert groups[1]["multimodal_train_inputs"] == [None]
+        assert all(g["image_table"] is data["image_table"] for g in groups.values())
+        assert len(groups[0]["tokens"]) == 2
+
+    def test_group_text_only_has_no_table(self):
+        data = _make_rollout(2, extra_fields={"teacher_idx": [0, 1]})
+        assert all("image_table" not in g for g in group_rollout_batch(data, "teacher_idx").values())
+
+    def test_merge_unions_tables_and_places_rows(self):
+        data = self._data()
+        data["seq_index"] = [0, 1, 2]
+        groups = group_rollout_batch(data, "teacher_idx")
+        merged = merge_rollout_batch(
+            [{**g, "seq_index": [i for i, t in enumerate(data["teacher_idx"]) if t == k]} for k, g in groups.items()],
+            "seq_index",
+        )
+        assert merged["multimodal_train_inputs"] == [["h0"], None, ["h1"]]
+        assert merged["image_table"] is data["image_table"] or merged["image_table"] == data["image_table"]
+
+    def test_slice_passes_table_through_by_reference(self):
+        data = self._data()
+        part = slice_rollout_batch(data, 3, 1)
+        assert part["multimodal_train_inputs"] == [None]
+        assert part["image_table"] is data["image_table"]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
