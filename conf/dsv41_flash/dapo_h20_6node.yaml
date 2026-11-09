@@ -99,8 +99,7 @@ trainer:
   num_nodes: 6
   mini_batch_size: 128
   max_tokens_per_gpu: 20480
-  micro_batch_size: 1
-  use_dynamic_batch_size: false
+  use_dynamic_batch_size: true
   use_rollout_routing_replay: true   # R3 (on by default for V4.1)
   use_fp32_lm_head: true
   save_freq: 5                       # save_hf=true writes a full checkpoint copy (~same size as hf_model_path)
