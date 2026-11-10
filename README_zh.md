@@ -63,6 +63,7 @@ ______________________________________________________________________
 
 ## 📰 最新动态 (News)
 
+- **[2026-11]** 发布首个正式版本 [v0.2.0](https://github.com/baidu-baige/LoongSage/releases/tag/v0.2.0)：DeepSeek-V4.1 训练、PPO 与 SFT、Qwen3-VL 图像模态 RL、SGLang 0.5.23！
 - **[2026-10]** 支持 DeepSeek-V4.1-Flash [QAT 训练](conf/dsv41_flash/)，并新增 [RLCD2 训练配方](conf/rlcd2/)！
 - **[2026-10]** 技术报告 [*LoongSage: A Production-Grade, High-Efficiency Agentic RL Framework for Frontier LLMs with Validated Recipes*](https://arxiv.org/abs/2610.16352) 已在 arXiv 发布！
 - **[2026-09]** 原生支持黑盒智能体 OpenCode、Codex 与 Claude Code，无需改动智能体代码即可直接用于 RL 训练（配方见 [`conf/qwen3_coder_30b_a3b/`](conf/qwen3_coder_30b_a3b/)）！
