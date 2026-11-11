@@ -156,6 +156,12 @@ agentflow:
     # R3 only. Processes that parse /generate bodies and decode routed experts off the
     # router event loop; 0 decodes inline.
     r3_decode_workers: 0
+    # Client for /generate forwards: "httpx" (new client per request) or "aiohttp" (one pooled
+    # session; avoids per-request client setup on the router loop).
+    upstream_http_client: httpx
+    # aiohttp only: idle pooled connections are closed after this many seconds. Keep it below
+    # the SGLang server keep-alive (env SGLANG_TIMEOUT_KEEP_ALIVE, default 5).
+    upstream_keepalive_seconds: 3
     middleware:
       parser:
 

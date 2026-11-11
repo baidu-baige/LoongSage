@@ -7,13 +7,16 @@ import logging
 import os
 import platform
 import shlex
+import threading
 import time
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
+import httpx
 import minisweagent
 import yaml
+from openai import OpenAI
 from minisweagent.agents.default import DefaultAgent
 from minisweagent.exceptions import FormatError, InterruptAgentFlow
 from minisweagent.models import GLOBAL_MODEL_STATS
@@ -60,8 +63,48 @@ def _disable_litellm_think_extraction() -> bool:
 _disable_litellm_think_extraction()
 
 
+_SHARED_HTTP_CLIENT: httpx.Client | None = None
+_SHARED_HTTP_CLIENT_LOCK = threading.Lock()
+
+
+def _shared_http_client() -> httpx.Client:
+    """Return the process-wide pooled HTTP client used for all agent -> router calls.
+
+    litellm caches OpenAI clients per ``api_base`` with a 200-entry limit. Every trajectory
+    has its own router URL, so with hundreds of concurrent trajectories the cache thrashes and
+    each call builds a new ``httpx.Client`` and SSL context. Concurrent SSL context creation
+    serializes inside OpenSSL 3 and caps rollout throughput. One shared client builds the SSL
+    context once. ``keepalive_expiry`` stays below uvicorn's 5 s keep-alive so a pooled
+    connection the router already closed is never reused (calls run with no retries).
+    """
+    global _SHARED_HTTP_CLIENT
+    with _SHARED_HTTP_CLIENT_LOCK:
+        if _SHARED_HTTP_CLIENT is None:
+            _SHARED_HTTP_CLIENT = httpx.Client(
+                limits=httpx.Limits(
+                    max_connections=None, max_keepalive_connections=None, keepalive_expiry=3.0
+                ),
+                timeout=None,
+            )
+        return _SHARED_HTTP_CLIENT
+
+
 class CodaLitellmModel(LitellmModel):
     """LitellmModel variant that preserves the assistant reply on FormatError."""
+
+    _openai_client: OpenAI | None = None
+
+    def _query(self, messages, **kwargs):
+        """Reuse one OpenAI client per model instance over the shared HTTP pool."""
+        if self._openai_client is None:
+            model_kwargs = self.config.model_kwargs
+            self._openai_client = OpenAI(
+                api_key=model_kwargs.get("api_key"),
+                base_url=model_kwargs["api_base"],
+                http_client=_shared_http_client(),
+                max_retries=0,
+            )
+        return super()._query(messages, client=self._openai_client, **kwargs)
 
     def query(self, messages, **kwargs):
         """Query LiteLLM and preserve the raw assistant message on FormatError."""
