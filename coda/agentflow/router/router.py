@@ -7,9 +7,11 @@ import logging
 import threading
 import time
 from collections import Counter
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, AsyncIterator, Callable
 
+import aiohttp
 import httpx
 import uvicorn
 from fastapi import APIRouter, FastAPI, Request, status
@@ -140,11 +142,15 @@ class Router:
             timeout=config.proxy_timeout_seconds,
             limits=httpx.Limits(max_connections=self._max_connections),
         )
+        # Shared aiohttp forward session: its C-accelerated HTTP stack holds the GIL
+        # far less per request than httpx, which matters while agent threads contend
+        # for it. Created lazily on the uvicorn loop (sessions are loop-bound).
+        self._generate_session: aiohttp.ClientSession | None = None
         self._server: uvicorn.Server | None = None
         self._thread: threading.Thread | None = None
         self._startup_error: BaseException | None = None
         self.trajectory_store = (middleware_kwargs or {}).get("trajectory_store")
-        self.app = FastAPI()
+        self.app = FastAPI(lifespan=self._lifespan)
         self._setup_routes()
         # Callbacks run on shutdown to release middleware-owned resources (e.g. R3 decode pool).
         self._shutdown_callbacks: list[Callable[[], None]] = []
@@ -159,6 +165,27 @@ class Router:
     # -------------------------------------------------------------------------
     # Setup
     # -------------------------------------------------------------------------
+
+    def _get_generate_session(self) -> aiohttp.ClientSession:
+        """Return the shared forward session, creating it on the current loop."""
+        if self._generate_session is None:
+            timeout = self.config.proxy_timeout_seconds
+            self._generate_session = aiohttp.ClientSession(
+                # keepalive_timeout < uvicorn's 5s keep-alive: close idle connections
+                # before the worker does, so a stale one is not reused.
+                connector=aiohttp.TCPConnector(limit=self._max_connections, keepalive_timeout=3),
+                # Per-phase like the httpx timeout it replaces, not a total deadline.
+                timeout=aiohttp.ClientTimeout(total=None, connect=timeout, sock_read=timeout),
+            )
+        return self._generate_session
+
+    @asynccontextmanager
+    async def _lifespan(self, app: FastAPI) -> AsyncIterator[None]:
+        """Close the forward session on the uvicorn loop that owns it."""
+        yield
+        if self._generate_session is not None:
+            await self._generate_session.close()
+            self._generate_session = None
 
     def _setup_routes(self) -> None:
         """Register management and session-scoped proxy routes."""
@@ -593,21 +620,20 @@ class Router:
                 body_bytes = self._set_routed_dp_rank(body_bytes, slot)
                 target_url = f"{slot.worker_url.rstrip('/')}/generate"
 
-                generate_client = httpx.AsyncClient(timeout=self.config.proxy_timeout_seconds)
+                worker_response = await self._get_generate_session().request(
+                    method=request.method,
+                    url=target_url,
+                    headers=headers,
+                    data=body_bytes,
+                )
                 try:
-                    worker_response = await generate_client.request(
-                        method=request.method,
-                        url=target_url,
-                        headers=headers,
-                        content=body_bytes,
-                    )
-                    content = await worker_response.aread()
+                    content = await worker_response.read()
                 finally:
-                    await generate_client.aclose()
+                    worker_response.release()
                 filtered_headers = filter_headers(dict(worker_response.headers))
                 return Response(
                     content=content,
-                    status_code=worker_response.status_code,
+                    status_code=worker_response.status,
                     headers=filtered_headers,
                     media_type=worker_response.headers.get("content-type") or None,
                 )
@@ -616,7 +642,7 @@ class Router:
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                     content={"error": str(exc)},
                 )
-            except httpx.RequestError as exc:
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 logger.error("[proxy] %s -> %s: %s", request_id, slot, exc)
                 return JSONResponse(
                     status_code=status.HTTP_502_BAD_GATEWAY,
@@ -686,7 +712,10 @@ class Router:
         raise RuntimeError(f"Router did not become ready within {timeout}s")
 
     async def shutdown(self) -> None:
-        """Stop uvicorn and close the upstream HTTP client."""
+        """Stop uvicorn and close the upstream HTTP clients.
+
+        The forward session is closed by ``_lifespan`` on the uvicorn loop.
+        """
         await self._control_client.aclose()
         if self._server is not None:
             self._server.should_exit = True
