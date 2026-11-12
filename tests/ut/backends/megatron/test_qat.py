@@ -82,28 +82,62 @@ GOOD_ROLLOUT = {"backend": "sglang", "env_vars": {"SGLANG_OPT_FP8_WO_A_GEMM": "0
                 "sglang_args": {"flashinfer_mxfp4_moe_precision": "bf16", "disable_shared_experts_fusion": True}}
 
 
-def _cfg(enable, rollout=GOOD_ROLLOUT):
-    return OmegaConf.create({"run_mode": "default", "trainer": {"qat": enable}, "rollout": rollout})
+def _cfg(enable, rollout=GOOD_ROLLOUT, rounding="threshold"):
+    return OmegaConf.create({"run_mode": "default", "trainer": {"qat": enable, "qat_weight_rounding": rounding},
+                             "rollout": rollout})
 
 
-def _plan(monkeypatch, m, enable, ckpt=CKPT, rollout=GOOD_ROLLOUT, unsupported=None):
+def _plan(monkeypatch, m, enable, ckpt=CKPT, rollout=GOOD_ROLLOUT, unsupported=None, rounding="threshold"):
     monkeypatch.setattr(qat, "scan_ckpt_quant", lambda path: (ckpt, unsupported or {}))
     monkeypatch.setattr(qat.os.path, "isdir", lambda path: True)
     monkeypatch.setattr(qat.torch.distributed, "get_rank", lambda: 0)
-    return qat.QuantPlan(_bridge(m), [m], "/ckpt", _cfg(enable, rollout))
+    return qat.QuantPlan(_bridge(m), [m], "/ckpt", _cfg(enable, rollout, rounding))
 
 
-def test_plan_snap_and_hooks(monkeypatch):
+@pytest.mark.parametrize("rounding", ["threshold", "nearest"])
+def test_plan_snap_and_hooks(monkeypatch, rounding):
     m = _toy()
     keep = m.norm.weight.clone()
-    plan = _plan(monkeypatch, m, enable=True)
+    plan = _plan(monkeypatch, m, enable=True, rounding=rounding)
     assert plan.quantized and [n for n, _, _ in plan.snap_params] == ["wq_b.weight", "wo_a.weight", "experts.weight0"]
     assert [n for n, _, _ in plan.act_modules] == ["wq_b"]  # wo_a: bf16 act; experts: W4A16
     before = [p.clone() for _, p, _ in plan.snap_params]
     assert plan.snap_() == 3
-    for (_, p, scheme), b in zip(plan.snap_params, before):
-        assert not torch.equal(p, b) and torch.equal(p, scheme.snap_(b))
+    for (_, p, scheme), thr, b in zip(plan.snap_params, plan._snap_thresholds, before):
+        assert (thr is None) == (rounding == "nearest")
+        assert not torch.equal(p, b) and torch.equal(p, scheme.snap_(b, thr))
+        assert torch.equal(scheme.snap_(p.clone()), p)  # on the grid
     assert torch.equal(m.norm.weight, keep)
+
+
+def test_plan_rejects_unknown_rounding(monkeypatch):
+    with pytest.raises(ValueError, match="qat_weight_rounding"):
+        _plan(monkeypatch, _toy(), enable=True, rounding="stochastic")
+
+
+@pytest.mark.parametrize(
+    "mapping,n,full,tp",
+    [
+        (ColumnParallelMapping("x", "a"), 1, (128, 64), 2),  # dim-0 shard
+        (RowParallelMapping("x", "a"), 1, (64, 128), 4),  # dim-1 shard
+        (GatedMLPMapping("x", gate="g", up="u"), 2, (128, 64), 2),  # [g_r; u_r]
+        (GatedMLPMapping("x", gate="g", up="u"), 2, (64, 64), 1),  # EP expert, unsharded
+    ],
+)
+def test_thresholds_follow_checkpoint_layout(monkeypatch, mapping, n, full, tp):
+    """Every TP rank's local thresholds are the matching slices of the full checkpoint tensors'."""
+    names = qat.hf_names(mapping)
+    O, I = full
+    whole = {nm: qat._thresholds_fn(mapping, [nm], torch.Size(full), full)(0, O, "cpu") for nm in names}
+    dim0 = isinstance(mapping, (ColumnParallelMapping, GatedMLPMapping))
+    o, i = (O // tp, I) if dim0 else (O, I // tp)
+    for rank in range(tp):
+        monkeypatch.setattr(type(mapping), "tp_rank", property(lambda self, r=rank: r))
+        fn = qat._thresholds_fn(mapping, names, torch.Size((o * n, i)), full)
+        got = torch.cat([fn(r0, min(r0 + 24, o * n), "cpu") for r0 in range(0, o * n, 24)])  # uneven chunks
+        rs = slice(rank * o, (rank + 1) * o) if dim0 else slice(None)
+        cs = slice(None) if dim0 else slice(rank * i, (rank + 1) * i)
+        torch.testing.assert_close(got, torch.cat([whole[nm][rs, cs] for nm in names]), rtol=0, atol=0)
 
 
 def test_plan_without_qat_only_encodes(monkeypatch):

@@ -16,7 +16,10 @@ numerics that cannot be read from the checkpoint live in a small :class:`QATAdap
   estimator with no forward-time cost and no interference with TE's fused wgrad accumulation
   (param objects are never swapped). Snapped weights are a fixed point of any quantizer on the
   same grid (same tiles, ue8m0 scale = ceil-pow2(amax / max), round-to-nearest), so the bridge's
-  export re-quantization hands the rollout exactly the training weights.
+  export re-quantization hands the rollout exactly the training weights. The snap itself rounds
+  with fixed per-element thresholds (``trainer.qat_weight_rounding``): with round-to-nearest,
+  weights that start on the grid only move after drifting half a grid step, which RL updates
+  never do on MXFP4.
 * Activation QAT: forward pre-hooks fake-quantize the inputs of the linears the rollout runs as
   W8A8 (dynamic per-token, group = scale tile width, ue8m0) with SGLang's own kernel;
   straight-through backward. Temporary escape hatch: ``CODA_QAT_DISABLE_ACT=1`` (trainer env)
@@ -45,12 +48,23 @@ from megatron.bridge.models.conversion.param_mapping import (
 )
 
 from coda.utils.hf_ckpt import SAFETENSORS_DTYPE
-from coda.utils.quant_formats import CkptQuant, QuantScheme, UnsupportedQuant, scan_ckpt_quant
+from coda.utils.quant_formats import (
+    CkptQuant,
+    QuantScheme,
+    UnsupportedQuant,
+    element_thresholds,
+    scan_ckpt_quant,
+    tensor_seed,
+)
 
 logger = logging.getLogger(__name__)
 
 # Temporary: set to "1" in trainer.env_vars to keep weight QAT but skip the activation fake-quant.
 DISABLE_ACT_ENV = "CODA_QAT_DISABLE_ACT"
+
+# trainer.qat_weight_rounding: "threshold" = fixed per-element thresholds (see quant_formats),
+# "nearest" = round-to-nearest (freezes on-grid weights under small updates; for A/B only).
+_WEIGHT_ROUNDINGS = ("threshold", "nearest")
 
 # Mappings that place a contiguous dim-0 / dim-1 slice (or the whole tensor, or a dim-0 concat of
 # such slices for GatedMLP) of each HF tensor into the local param.
@@ -163,6 +177,30 @@ def _local_layout_ok(mapping, n_parts: int, local: torch.Size, full: tuple[int, 
     return False
 
 
+def _thresholds_fn(mapping, names: list[str], local: torch.Size, full: tuple[int, int]):
+    """``thresholds(r0, r1)`` for rows ``r0:r1`` of a local param laid out as checked by
+    :func:`_local_layout_ok`: part ``j`` of ``len(names)`` dim-0-stacked parts is a dim-0 or dim-1
+    TP slice of checkpoint tensor ``names[j]``. Thresholds are keyed by (tensor name, element index
+    in the full checkpoint tensor), so they do not depend on DP rank or the TP/EP layout."""
+    (o, i), (O, I) = local, full
+    o //= len(names)
+    row0 = mapping.tp_rank * o if o != O else 0
+    col0 = mapping.tp_rank * i if i != I else 0
+    seeds = [tensor_seed(n) for n in names]
+
+    def thresholds(r0: int, r1: int, device: torch.device) -> torch.Tensor:
+        out = torch.empty(r1 - r0, i, device=device)
+        cols = torch.arange(col0, col0 + i, device=device)
+        for j, seed in enumerate(seeds):
+            a, b = max(r0, j * o), min(r1, (j + 1) * o)
+            if a < b:
+                rows = torch.arange(a - j * o + row0, b - j * o + row0, device=device)
+                out[a - r0 : b - r0] = element_thresholds(seed, rows, cols, I)
+        return out
+
+    return thresholds
+
+
 class QuantPlan:
     """Quantized-tensor bookkeeping for one Megatron model (see module docstring).
 
@@ -175,10 +213,16 @@ class QuantPlan:
 
     def __init__(self, bridge, model_chunks: Sequence[torch.nn.Module], hf_model_path: str, config):
         self.qat = bool(config.trainer.qat)
+        self.weight_rounding = config.trainer.get("qat_weight_rounding", "threshold")
+        if self.weight_rounding not in _WEIGHT_ROUNDINGS:
+            raise ValueError(
+                f"trainer.qat_weight_rounding must be one of {_WEIGHT_ROUNDINGS}, got {self.weight_rounding!r}"
+            )
         self.ckpt: dict[str, CkptQuant]
         self.unsupported: dict[str, UnsupportedQuant]
         self.ckpt, self.unsupported = scan_ckpt_quant(hf_model_path) if os.path.isdir(hf_model_path) else ({}, {})
         self.snap_params: list[tuple[str, torch.nn.Parameter, QuantScheme]] = []
+        self._snap_thresholds: list = []  # per snap param: thresholds(r0, r1), or None = round-to-nearest
         self.act_modules: list[tuple[str, torch.nn.Module, int]] = []
         tasks = self._quantized_tasks(bridge, model_chunks)
         self.quantized = bool(tasks)
@@ -239,6 +283,9 @@ class QuantPlan:
                     f"tile-aligned slice of {names} {full} with {scheme}; add a QATAdapter for this model"
                 )
             self.snap_params.append((task.param_name, param, scheme))
+            self._snap_thresholds.append(
+                _thresholds_fn(task.mapping, names, param.shape, full) if self.weight_rounding == "threshold" else None
+            )
             module = task.megatron_module
             is_module_weight = task.param_name.rsplit(".", 1)[-1] == "weight"
             if is_module_weight and adapter.act_quant(names[0], scheme) and id(module) not in hooked:
@@ -251,8 +298,8 @@ class QuantPlan:
     @torch.no_grad()
     def snap_(self) -> int:
         """Snap every quantized param in place onto its checkpoint grid. Returns #params."""
-        for _, p, scheme in self.snap_params:
-            scheme.snap_(p.data)
+        for (_, p, scheme), thresholds in zip(self.snap_params, self._snap_thresholds):
+            scheme.snap_(p.data, thresholds)
         return len(self.snap_params)
 
     # -- activation QAT

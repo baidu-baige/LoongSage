@@ -365,6 +365,10 @@ trainer:
   # checkpoint is quantized, independent of this switch. true: snap the quantized weights onto the
   # grid after every optimizer step and fake-quant the inputs of the linears the rollout runs as W8A8.
   qat: false
+  # Rounding of the QAT weight snap. threshold: fixed per-element thresholds, so on-grid weights
+  # (every quantized checkpoint) move with small RL updates; nearest: round-to-nearest, which
+  # freezes MXFP4 experts at lr ~1e-6 (kept for A/B).
+  qat_weight_rounding: threshold
   env_vars:
     # Inject per-rank env vars into the train worker Ray actors (runtime_env).
     PYTORCH_ALLOC_CONF: expandable_segments:True

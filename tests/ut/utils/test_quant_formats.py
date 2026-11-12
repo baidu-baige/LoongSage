@@ -5,12 +5,16 @@ import pytest
 import torch
 
 from coda.utils.quant_formats import (
+    FP4_MAX,
+    FP8_MAX,
     QuantScheme,
     dequant_fp8_block,
     dequant_mxfp4,
+    element_thresholds,
     quant_fp8_block,
     quant_mxfp4,
     scan_ckpt_quant,
+    tensor_seed,
 )
 
 FP8 = QuantScheme("fp8_block", (32, 32))
@@ -119,6 +123,99 @@ def test_bridge_requant_of_snapped_is_exact(scheme):
     else:
         bq, bs = qu.quantize_fp8_e4m3fn_like_scale(snapped, like, block_size=scheme.block[0])
     torch.testing.assert_close(scheme.dequant(bq, bs, torch.float32), snapped.float(), rtol=0, atol=0)
+
+
+# ---------------------------------------------------------------- threshold rounding
+
+def _whole(w, seed=7):
+    """thresholds(r0, r1, device) of a whole [O, I] tensor."""
+    I = w.shape[1]
+    return lambda r0, r1, device: element_thresholds(seed, torch.arange(r0, r1, device=device),
+                                                     torch.arange(I, device=device), I)
+
+
+SCHEMES = [FP8, FP4, QuantScheme("fp8_block", (1, 32)), QuantScheme("mxfp4", (1, 16))]
+
+
+@pytest.mark.parametrize("scheme", SCHEMES)
+def test_threshold_snap_keeps_grid_and_is_exportable(scheme):
+    qu = pytest.importorskip("megatron.bridge.models.conversion.quantization_utils")
+    w = _rand(128, 256)
+    on_grid = scheme.snap_(w.clone())
+    # initial (on-grid) weights are reproduced exactly
+    torch.testing.assert_close(scheme.snap_(on_grid.clone(), _whole(w)), on_grid, rtol=0, atol=0)
+    # off-grid input: output is on the grid (fixed point of round-to-nearest) and the bridge's
+    # export quantizer reproduces it exactly
+    snapped = scheme.snap_(w.clone(), _whole(w))
+    torch.testing.assert_close(scheme.snap_(snapped.clone()), snapped, rtol=0, atol=0)
+    _, s = scheme.quant(snapped)
+    like = torch.empty(s.shape, dtype=s.dtype, device="meta")
+    if scheme.kind == "mxfp4":
+        bq, bs = qu.quantize_mxfp4_e2m1_like_scale(snapped, like, block_size=scheme.block[1])
+    else:
+        bq, bs = qu.quantize_fp8_e4m3fn_like_scale(snapped, like, block_size=scheme.block[0])
+    torch.testing.assert_close(scheme.dequant(bq, bs, torch.float32), snapped.float(), rtol=0, atol=0)
+
+
+def _on_grid_scale1(scheme, o=256, i=512, seed=1):
+    """Random on-grid weights whose blocks all have scale 1 (one element per block at the format max)."""
+    g = torch.Generator().manual_seed(seed)
+    if scheme.kind == "mxfp4":
+        grid = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+        w = grid[torch.randint(0, 8, (o, i), generator=g)]
+    else:
+        w = (torch.randn(o, i, generator=g) * 64).clamp(-440, 440).to(torch.float8_e4m3fn).float()
+    w = w * torch.where(torch.rand(o, i, generator=g) < 0.5, -1.0, 1.0)
+    br, bc = scheme.block
+    w.view(o // br, br, i // bc, bc)[:, 0, :, 0] = FP4_MAX if scheme.kind == "mxfp4" else FP8_MAX
+    return w
+
+
+@pytest.mark.parametrize("scheme", [FP8, FP4])
+def test_threshold_snap_follows_small_drift_on_average(scheme):
+    """On-grid weights plus a drift far below half a grid step: round-to-nearest keeps every
+    weight, threshold rounding moves them by the drift on average."""
+    w0 = _on_grid_scale1(scheme)
+    assert torch.equal(scheme.snap_(w0.clone()), w0)
+    sign = torch.where(torch.arange(w0.shape[1]) % 2 == 0, 1.0, -1.0)
+    # drift vs. half a grid step: e2m1 >= 0.25 near 0 and >= 1/8 of |w| above; e4m3 >= 1/32 of |w|
+    rel, floor = (0.1, 0.5) if scheme.kind == "mxfp4" else (0.01, 0.0)
+    delta = torch.where(w0.abs() == w0.abs().max(), 0.0, rel * w0.abs().clamp_min(floor) * sign)
+    w = w0 + delta
+    assert torch.equal(scheme.snap_(w.clone()), w0)
+    moved = scheme.snap_(w.clone(), _whole(w)) - w0
+    assert 0.01 < (moved != 0).float().mean() < 0.5
+    ratio = (moved * delta.sign()).sum() / delta.abs().sum()
+    assert abs(ratio - 1) < 0.05, ratio
+
+
+def test_threshold_rounding_matches_nearest_at_one_half():
+    from coda.utils.quant_formats import _round_e2m1, _round_e4m3_threshold
+
+    y = torch.randn(1 << 16) * torch.exp2(torch.randint(-12, 9, (1 << 16,)).float())
+    y = y.clamp(-448, 448)
+    half = torch.full_like(y, 0.5)  # differs from round-to-nearest-even only on exact ties
+    torch.testing.assert_close(_round_e4m3_threshold(y, half), y.to(torch.float8_e4m3fn).float(), rtol=0, atol=0)
+    x = torch.rand(1 << 16) * 12 - 6
+    torch.testing.assert_close(_round_e2m1(x, half), _round_e2m1(x), rtol=0, atol=0)
+    # extremes: t -> 0 rounds every off-grid magnitude up, t -> 1 truncates toward zero
+    assert torch.equal(_round_e2m1(torch.tensor([0.1, -2.2, 4.1]), torch.full((3,), 1e-6)), torch.tensor([0.5, -3.0, 6.0]))
+    assert torch.equal(_round_e2m1(torch.tensor([0.4, -3.9, 5.9]), torch.full((3,), 1 - 1e-6)), torch.tensor([0.0, -3.0, 4.0]))
+
+
+def test_element_thresholds():
+    rows, cols = torch.arange(1000), torch.arange(300)
+    t = element_thresholds(123, rows, cols, 300)
+    assert t.dtype == torch.float32 and t.shape == (1000, 300)
+    assert t.min() > 0 and t.max() < 1 and abs(t.mean() - 0.5) < 0.01
+    assert abs((t < 0.1).float().mean() - 0.1) < 0.01
+    # keyed by (seed, row * ncols + col): sub-blocks agree, other seeds differ
+    torch.testing.assert_close(element_thresholds(123, rows[10:20], cols[100:], 300), t[10:20, 100:], rtol=0, atol=0)
+    assert (element_thresholds(124, rows, cols, 300) != t).float().mean() > 0.99
+    assert tensor_seed("layers.0.ffn.experts.0.w1.weight") == tensor_seed("layers.0.ffn.experts.0.w1.weight")
+    if torch.cuda.is_available():
+        got = element_thresholds(123, rows.cuda(), cols.cuda(), 300).cpu()
+        torch.testing.assert_close(got, t, rtol=0, atol=0)
 
 
 def test_scan_ckpt_quant(tmp_path):
