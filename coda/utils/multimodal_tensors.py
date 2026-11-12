@@ -5,7 +5,7 @@
 
 A *row* is one trainable Segment. Its payload is `None` (no images) or the hashes of the images whose pad
 runs lie in the Segment, in pad order. Each DP shard keeps one copy of every image's tensors in an
-*image table* `{image_hash: {"pixel_values": ..., "image_grid_thw": ...}}`, shared by all rows.
+*image table* `{image_hash: {"pixel_values": ..., "image_grid_thw" | "image_grid_hw": ...}}`, shared by all rows.
 """
 
 from __future__ import annotations
@@ -17,6 +17,29 @@ import torch
 
 MultimodalRow = list[str] | None
 ImageTable = dict[str, dict[str, torch.Tensor]]
+
+# Grid tensor key per model family: Qwen-VL stores `[t, h, w]` patches, DeepSeek-V4.1 stores `[h, w]`.
+GRID_KEYS = ("image_grid_thw", "image_grid_hw")
+# DeepSeek-V4.1 `vision_downsample_ratio`: ViT patches per LLM token along each axis.
+DSV41_DOWNSAMPLE_RATIO = 3
+
+
+def grid_key(tensors: dict[str, torch.Tensor]) -> str:
+    """Return the name of the grid tensor in one image's `tensors`."""
+    for key in GRID_KEYS:
+        if key in tensors:
+            return key
+    raise ValueError(f"image tensors have none of {GRID_KEYS}: keys={sorted(tensors)}")
+
+
+def dsv41_span_tokens(grid_hw: torch.Tensor, downsample_ratio: int) -> int:
+    """Token count of the images in a DeepSeek-V4.1 `[n_img, 2]` grid: `h*(w+1)+2` per image on the LLM grid."""
+    total = 0
+    for n_vit_h, n_vit_w in grid_hw.tolist():
+        n_llm_h = -(-n_vit_h // downsample_ratio)
+        n_llm_w = -(-n_vit_w // downsample_ratio)
+        total += n_llm_h * (n_llm_w + 1) + 2
+    return total
 
 
 def cat_by_key(dicts: Sequence[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
@@ -35,12 +58,15 @@ def check_segment_pads(
     token_start: int,
     token_end: int,
     pad_id: int,
+    downsample_ratio: int = DSV41_DOWNSAMPLE_RATIO,
 ) -> None:
     """Check that the pad tokens of a Segment line up one-to-one with the selected images.
 
     Raises `ValueError` when a pad token has no image tensor (e.g. an image straddling the Segment
     boundary), an image's token range is not all pad tokens, or `pixel_values` does not hold
-    `sum(t*h*w)` patches. Otherwise a bad row would silently train as text-only.
+    `sum(t*h*w)` patches (`sum(h*w)` for `image_grid_hw`). For `image_grid_hw` the token range must also
+    be `h_llm*(w_llm+1)+2` long, with `downsample_ratio` ViT patches per LLM token. Otherwise a bad row
+    would silently train as text-only.
     """
     covered = 0
     for it in selected:
@@ -52,12 +78,20 @@ def check_segment_pads(
                 f"is not entirely image pad tokens (pad_id={pad_id})"
             )
         tensors = it["tensors"]
-        patches = int(tensors["image_grid_thw"].prod(dim=-1).sum())
+        key = grid_key(tensors)
+        patches = int(tensors[key].prod(dim=-1).sum())
         if tensors["pixel_values"].shape[0] != patches:
             raise ValueError(
                 f"image {it['image_hash'][:12]}: pixel_values has {tensors['pixel_values'].shape[0]} patches "
-                f"but image_grid_thw implies {patches}"
+                f"but {key} implies {patches}"
             )
+        if key == "image_grid_hw":
+            expected = dsv41_span_tokens(tensors[key], downsample_ratio)
+            if run != expected:
+                raise ValueError(
+                    f"image {it['image_hash'][:12]}: token range has {run} tokens but "
+                    f"image_grid_hw {tensors[key].tolist()} needs {expected}"
+                )
         covered += run
     n_pad = segment_tokens.count(pad_id)
     if n_pad != covered:
@@ -70,19 +104,23 @@ def add_to_image_table(table: ImageTable, image_hash: str, tensors: dict[str, to
     """Register `tensors` under `image_hash`, keeping the first copy.
 
     Raises `ValueError` if the hash is already present with a different `pixel_values` shape or
-    `image_grid_thw`, since one hash must map to one preprocessed image within a run.
+    grid (`image_grid_thw` or `image_grid_hw`), since one hash must map to one preprocessed image within a run.
     """
     known = table.get(image_hash)
     if known is None:
         table[image_hash] = tensors
         return
-    if known["pixel_values"].shape != tensors["pixel_values"].shape or not torch.equal(
-        known["image_grid_thw"], tensors["image_grid_thw"]
+    key = grid_key(tensors)
+    if (
+        key not in known
+        or known["pixel_values"].shape != tensors["pixel_values"].shape
+        or not torch.equal(known[key], tensors[key])
     ):
+        known_grid = known[key].tolist() if key in known else "missing"
         raise ValueError(
             f"image {image_hash[:12]} appears with two different preprocessed tensors "
             f"(pixel_values {tuple(known['pixel_values'].shape)} vs {tuple(tensors['pixel_values'].shape)}, "
-            f"image_grid_thw {known['image_grid_thw'].tolist()} vs {tensors['image_grid_thw'].tolist()})"
+            f"{key} {known_grid} vs {tensors[key].tolist()})"
         )
 
 
@@ -92,6 +130,7 @@ def slice_segment_inputs(
     token_end: int,
     table: ImageTable,
     segment_tokens: list[int] | None = None,
+    downsample_ratio: int = DSV41_DOWNSAMPLE_RATIO,
 ) -> MultimodalRow:
     """Return the hashes of the images whose pad run lies inside `[token_start, token_end)`, or `None` if none.
 
@@ -103,7 +142,7 @@ def slice_segment_inputs(
         return None
     selected = [it for it in items if it["token_start"] >= token_start and it["token_end"] <= token_end]
     if segment_tokens is not None:
-        check_segment_pads(selected, segment_tokens, token_start, token_end, items[0]["pad_id"])
+        check_segment_pads(selected, segment_tokens, token_start, token_end, items[0]["pad_id"], downsample_ratio)
     if not selected:
         return None
     for it in selected:

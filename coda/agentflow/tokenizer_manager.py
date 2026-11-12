@@ -31,6 +31,8 @@ DEEPSEEK_V41_MODEL_FAMILY = "deepseek_v41"
 DEEPSEEK_MODEL_FAMILIES = frozenset({DEEPSEEK_V4_MODEL_FAMILY, DEEPSEEK_V41_MODEL_FAMILY})
 _DEEPSEEK_ASSISTANT = "<｜Assistant｜>"
 _DEEPSEEK_EOS = "<｜end▁of▁sentence｜>"
+# Text form of V4.1's image token (id 129264); the Router expands each into the image's token span.
+DEEPSEEK_IMAGE_PLACEHOLDER = "<｜deepseek_image｜>"
 # Probe messages: the prefixes are read off their renders.
 _EMPTY_SYSTEM = {"role": "system", "content": ""}
 _EMPTY_USER = {"role": "user", "content": ""}
@@ -64,22 +66,38 @@ def _deepseek_official_family(model_path: str) -> str | None:
     return None
 
 
-def _deepseek_text(content: Any) -> str:
-    """Message content as one string; OpenAI text parts are joined by a blank line."""
+def _deepseek_text(content: Any, *, allow_images: bool = False) -> str:
+    """Message content as one string.
+
+    OpenAI text parts are joined by a blank line. With ``allow_images`` (V4.1), an ``image_url`` part
+    becomes the image placeholder, which abuts its neighbouring parts with no separator: the
+    placeholder is what the model sees, so ``[image, text]`` renders as ``<｜deepseek_image｜>text``.
+    """
     if not isinstance(content, list):
         return content or ""
-    texts = []
+    pieces: list[str] = []
+    prev_is_text = False
     for part in content:
-        if part.get("type") != "text":
-            raise ValueError(f"DeepSeek prompts support text content only, got a {part.get('type')!r} part")
-        texts.append(part.get("text", ""))
-    return "\n\n".join(texts)
+        part_type = part.get("type")
+        if part_type == "image_url" and allow_images:
+            pieces.append(DEEPSEEK_IMAGE_PLACEHOLDER)
+            prev_is_text = False
+        elif part_type == "text":
+            if prev_is_text:
+                pieces.append("\n\n")
+            pieces.append(part.get("text", ""))
+            prev_is_text = True
+        else:
+            raise ValueError(f"DeepSeek prompts support text content only, got a {part_type!r} part")
+    return "".join(pieces)
 
 
-def _deepseek_recipe_message(recipe: Any, message: Mapping[str, Any], *, thinking: bool, prefix: bool) -> Any:
+def _deepseek_recipe_message(
+    recipe: Any, message: Mapping[str, Any], *, thinking: bool, prefix: bool, allow_images: bool = False
+) -> Any:
     """Convert an OpenAI-style message to a deepseek-recipe message."""
     role = message.get("role")
-    content = _deepseek_text(message.get("content"))
+    content = _deepseek_text(message.get("content"), allow_images=allow_images)
     if role in ("system", "developer"):
         return recipe.SystemMessage(content)
     if role == "user":
@@ -135,7 +153,11 @@ def _wrap_deepseek_v4_tokenizer(tokenizer: Any, family: str) -> Any:
         conversation = recipe.Conversation(
             [
                 _deepseek_recipe_message(
-                    recipe, message, thinking=thinking, prefix=trailing_assistant and index == len(messages) - 1
+                    recipe,
+                    message,
+                    thinking=thinking,
+                    prefix=trailing_assistant and index == len(messages) - 1,
+                    allow_images=v41,
                 )
                 for index, message in enumerate(messages)
             ],
@@ -211,10 +233,40 @@ def load_processor(model_path: str) -> Any:
     return AutoProcessor.from_pretrained(str(Path(model_path)), trust_remote_code=True)
 
 
-def build_multimodal_processor(multimodal_config: Any, model_path: str, tokenizer: Any, num_workers: int) -> Any:
-    """Build a MultimodalProcessor from the `multimodal` config block, or None if disabled."""
+def build_multimodal_processor(
+    multimodal_config: Any,
+    model_path: str,
+    tokenizer: Any,
+    num_workers: int,
+    model_overrides: Mapping[str, Any] | None = None,
+) -> Any:
+    """Build the image processor from the `multimodal` config block, or None if disabled.
+
+    V4.1 checkpoints get a `Dsv41ImageProcessor` (planned from `config.json`'s `vision_*` values, with
+    `model_overrides` = the rollout's `json_model_override_args` applied on top). Other models get a
+    Qwen-style `MultimodalProcessor`.
+    """
     if multimodal_config is None or not getattr(multimodal_config, "enable", False):
         return None
+
+    if _deepseek_official_family(model_path) == DEEPSEEK_V41_MODEL_FAMILY:
+        from coda.agentflow.multimodal import Dsv41ImageProcessor, load_dsv41_vision_args
+
+        vision_args = load_dsv41_vision_args(model_path, model_overrides)
+        pad_id = tokenizer.convert_tokens_to_ids(DEEPSEEK_IMAGE_PLACEHOLDER)
+        if pad_id is None or pad_id == getattr(tokenizer, "unk_token_id", None):
+            raise ValueError(f"tokenizer has no {DEEPSEEK_IMAGE_PLACEHOLDER!r} token")
+        dsv41_processor = Dsv41ImageProcessor(vision_args, pad_id, num_workers=num_workers)
+        logger.info(
+            "Multimodal processor ready (deepseek_v41): pad_id=%d patch=%d downsample=%d min_pixels=%d max_n_token=%d",
+            dsv41_processor.image_pad_id,
+            dsv41_processor.patch_size,
+            dsv41_processor.merge_size,
+            dsv41_processor.min_pixels,
+            dsv41_processor.max_n_token,
+        )
+        return dsv41_processor
+
     from coda.agentflow.multimodal import MultimodalProcessor
 
     # Fail at startup rather than on the first image request.
@@ -728,12 +780,16 @@ class ProcessTokenizerManager(BaseTokenizerManager):
 # ---------------------------------------------------------------------------
 
 def create_tokenizer_manager(
-    tokenizer_config: Any, model_path: str, multimodal_config: Any = None
+    tokenizer_config: Any,
+    model_path: str,
+    multimodal_config: Any = None,
+    model_overrides: Mapping[str, Any] | None = None,
 ) -> BaseTokenizerManager:
     """Build tokenizer manager from YAML config.
 
     When `multimodal_config.enable` is true the returned manager carries a
     `multimodal_processor`; otherwise `manager.multimodal_processor` is None.
+    `model_overrides` is the rollout's parsed `json_model_override_args` (used by the V4.1 image processor).
     """
     if not model_path:
         raise ValueError("hf_model_path is required in config")
@@ -778,7 +834,9 @@ def create_tokenizer_manager(
         )
 
     try:
-        manager.multimodal_processor = build_multimodal_processor(multimodal_config, model_path, tokenizer, num_workers)
+        manager.multimodal_processor = build_multimodal_processor(
+            multimodal_config, model_path, tokenizer, num_workers, model_overrides
+        )
     except BaseException:
         manager.shutdown()
         raise

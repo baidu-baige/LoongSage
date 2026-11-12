@@ -31,7 +31,7 @@ from coda.data_factory import (
 )
 from coda.data_factory.dataset import Dataset
 from coda.utils.checkpoint_utils import get_data_source_dir
-from coda.utils.multimodal_config import multimodal_enabled
+from coda.utils.multimodal_config import multimodal_enabled, read_hf_model_type, rollout_model_override_args
 
 logger = logging.getLogger(__name__)
 
@@ -154,10 +154,24 @@ class RolloutDataSource(DataSource):
             multimodal_keys=self._multimodal_keys(),
             max_image_tokens=max_image_tokens,
             image_pixel_bounds=self._image_pixel_bounds() if max_image_tokens is not None else None,
+            image_token_estimator=self._image_token_estimator() if max_image_tokens is not None else None,
         )
 
         if self.dataset_config.shuffle:
             self.dataset.shuffle(self.epoch_id)
+
+    def _image_token_estimator(self):
+        """`data_uri -> tokens` for models whose image token count is not set by the pixel bounds, else None.
+
+        DeepSeek-V4.1 plans each image from the checkpoint's `vision_*` config, so the Qwen-style estimate
+        from `multimodal.image` bounds does not apply.
+        """
+        if read_hf_model_type(getattr(self.config, "hf_model_path", None)) != "deepseek_v41":
+            return None
+        from coda.agentflow.multimodal import dsv41_image_token_estimator, load_dsv41_vision_args
+
+        vision_args = load_dsv41_vision_args(self.config.hf_model_path, rollout_model_override_args(self.config))
+        return dsv41_image_token_estimator(vision_args)
 
     def _image_pixel_bounds(self) -> tuple[int, int]:
         """Return `(min_pixels, max_pixels)` from `multimodal.image`, the bounds the router resizes images into."""

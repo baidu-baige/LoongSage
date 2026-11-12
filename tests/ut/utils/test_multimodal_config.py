@@ -4,11 +4,13 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from omegaconf import OmegaConf
 
 from coda.utils.multimodal_config import (
     multimodal_enabled,
+    select_dsv41_vision,
     validate_multimodal_config,
     validate_pixel_bounds,
     validate_vlm_parallel_config,
@@ -169,3 +171,87 @@ class TestVlmParallelConfig(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestValidateDsv41(unittest.TestCase):
+    def _cfg(self, tmp, *, sglang_args=None, model=None, image=None):
+        (Path(tmp) / "config.json").write_text(json.dumps({"model_type": "deepseek_v41"}))
+        cfg = _config(
+            keys={"image": "images"},
+            image=image or {"min_pixels": 65536, "max_pixels": 16777216},
+            sglang_args={"image_processor_backend": "pil", **(sglang_args or {})},
+        )
+        cfg.hf_model_path = tmp
+        cfg.megatron = {"model": dict(model or {})}
+        return cfg
+
+    def _raises(self, pattern, **kwargs):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(ValueError, pattern):
+                validate_multimodal_config(self._cfg(tmp, **kwargs))
+
+    def test_valid_config_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            validate_multimodal_config(self._cfg(tmp, sglang_args={"moe_a2a_backend": "none"}))
+
+    def test_vision_disabled_override_raises(self):
+        self._raises("vision_n_layers", sglang_args={"json_model_override_args": '{"vision_n_layers": 0}'})
+
+    def test_other_vision_override_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            validate_multimodal_config(
+                self._cfg(tmp, sglang_args={"json_model_override_args": '{"vision_max_n_token": 512}'})
+            )
+
+    def test_rollout_parallelism_raises(self):
+        self._raises("pp_size", sglang_args={"pp_size": 2})
+        self._raises("attn_cp_size", sglang_args={"attn_cp_size": 2})
+        self._raises("moe_a2a_backend", sglang_args={"moe_a2a_backend": "deepep"})
+
+    def test_image_processor_backend_must_be_pil(self):
+        self._raises("image_processor_backend", sglang_args={"image_processor_backend": "auto"})
+
+    def test_router_fusion_raises(self):
+        self._raises("moe_router_fusion", model={"moe_router_fusion": True})
+
+    def test_frozen_vision_false_raises(self):
+        self._raises("freeze_vision_model", model={"freeze_vision_model": False})
+
+    def test_frozen_vision_true_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            validate_multimodal_config(self._cfg(tmp, model={"freeze_vision_model": True}))
+
+    def test_pixel_bounds_must_stay_default(self):
+        self._raises("no effect", image={"min_pixels": 65536, "max_pixels": 1048576})
+
+    def test_non_dsv41_model_is_not_checked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "config.json").write_text(json.dumps({"model_type": "qwen3_vl"}))
+            cfg = _config(keys={"image": "images"}, sglang_args={"pp_size": 2})
+            cfg.hf_model_path = tmp
+            validate_multimodal_config(cfg)
+
+
+class TestSelectDsv41Vision(unittest.TestCase):
+    @staticmethod
+    def _hf(model_type="deepseek_v41", vision=None):
+        return SimpleNamespace(model_type=model_type, vision_config=vision)
+
+    def test_disabled_clears_vision_config(self):
+        hf = self._hf(vision={"hidden_size": 8})
+        select_dsv41_vision(hf, False)
+        self.assertIsNone(hf.vision_config)
+
+    def test_enabled_keeps_vision_config(self):
+        hf = self._hf(vision={"hidden_size": 8})
+        select_dsv41_vision(hf, True)
+        self.assertEqual(hf.vision_config, {"hidden_size": 8})
+
+    def test_enabled_without_vision_config_raises(self):
+        with self.assertRaisesRegex(ValueError, "no vision_config"):
+            select_dsv41_vision(self._hf(vision=None), True)
+
+    def test_other_model_types_are_left_alone(self):
+        hf = self._hf(model_type="qwen3_vl", vision={"hidden_size": 8})
+        select_dsv41_vision(hf, False)
+        self.assertEqual(hf.vision_config, {"hidden_size": 8})

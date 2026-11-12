@@ -29,7 +29,7 @@ from coda.backends.memory_pool import build_memory_pool
 from coda.backends.teacher_worker import TeacherWorker as BaseTeacherWorker
 from coda.utils.memory_utils import clear_memory
 from coda.utils.multimodal_tensors import move_image_table_to_device
-from coda.utils.multimodal_config import validate_vlm_parallel_config
+from coda.utils.multimodal_config import multimodal_enabled, select_dsv41_vision, validate_vlm_parallel_config
 from coda.backends.megatron.checkpoint import load_model_weights
 from coda.backends.megatron.mixed_precision import KeepFP32Module
 from coda.utils.checkpoint_utils import resolve_dist_ckpt_dir
@@ -176,6 +176,7 @@ class MegatronTeacherWorker(BaseTeacherWorker):
         )
 
         self.bridge = AutoBridge.from_hf_pretrained(hf_path)
+        select_dsv41_vision(self.bridge.hf_pretrained.config, multimodal_enabled(self.config))
         provider = self.bridge.to_megatron_provider(load_weights=ckpt_dir is None)
         # Apply overrides and finalize via the bridge helper so provider paths
         # that need post-override setup (e.g. DeepSeek-V4 hash MoE auto-setting
