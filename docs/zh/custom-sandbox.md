@@ -11,7 +11,7 @@ LoongSage 默认提供 `k8s` 和 `docker` 两种 sandbox，可直接通过配置
 sandbox 基类和内置实现位于 [sandbox 目录](../../coda/agentflow/sandbox/)。新增后端时，按以下步骤操作：
 
 1. 继承 [SandboxClient](../../coda/agentflow/sandbox/base.py)，实现 `create()`、`execute(sandbox_id, command, **kwargs)` 和 `delete(sandbox_id, **kwargs)`。
-2. `create()` 返回后端 ID；`execute()` 返回 `stdout`、`stderr`、`exit_code` 和 `success`；`delete()` 销毁显式指定的实例，并应把后端资源已经不存在视为成功。不要在 client 中保存当前 sandbox ID；一个 client 可以寻址多个实例。只有配置字段需要额外转换时才覆写 `from_config()`。
+2. `create()` 返回后端 ID；`execute()` 返回 `stdout`、`stderr`、`exit_code` 和 `success`，还可以返回可选的 `timed_out` 和 `error`，用于把"命令耗尽超时预算"告知模型，避免模型只看到一个空观测；`delete()` 销毁显式指定的实例，并应把后端资源已经不存在视为成功。不要在 client 中保存当前 sandbox ID；一个 client 可以寻址多个实例。只有配置字段需要额外转换时才覆写 `from_config()`。
 3. 使用 `@register_sandbox("your-type")` 注册，并把实现放到 [coda/custom/](../../coda/custom/) 下，LoongSage 会自动发现，详见[自定义扩展](./custom-extensions.md)。
 
 ## 2. 最小示例
