@@ -4,6 +4,7 @@ import asyncio
 import tempfile
 import os
 from contextlib import contextmanager
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch, call
 
 import httpx
@@ -317,6 +318,47 @@ class TestRunTrajectory:
                         reward = await af._run_trajectory(traj)
 
         assert reward.final_reward == 0.5
+
+    @pytest.mark.asyncio
+    async def test_attempts_metric_counts_one_on_first_success(self):
+        af = _make_agent_flow()
+        af.ds_configs[0] = {"agent": {}}
+        traj = _make_trajectory("t1")
+
+        expected = Reward(final_reward=0.7, is_valid=True)
+        with patch.object(af, "_execute_single_turn", new_callable=AsyncMock, return_value=expected):
+            with patch.object(af, "_post_process_reward", return_value=traj):
+                with patch.object(af, "_emit_terminal_trajectory", new_callable=AsyncMock):
+                    with patch.object(af, "_router_session_request", new_callable=AsyncMock):
+                        af.trajectory_store.add(traj.trajectory_id, traj)
+                        reward = await af._run_trajectory(traj)
+
+        assert reward.extra_info["metric/mean,max/attempts"] == 1.0
+
+    @pytest.mark.asyncio
+    async def test_attempts_metric_counts_retries(self):
+        """A failed attempt followed by a success reports 2."""
+        af = _make_agent_flow()
+        af.retry_limit = 3
+        af.ds_configs[0] = {"agent": {}}
+        traj = _make_trajectory("t1")
+
+        outcomes = [RuntimeError("transient"), Reward(final_reward=1.0, is_valid=True)]
+
+        async def flaky(_traj, _attempt_id):
+            outcome = outcomes.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        with patch.object(af, "_execute_single_turn", side_effect=flaky):
+            with patch.object(af, "_post_process_reward", return_value=traj):
+                with patch.object(af, "_emit_terminal_trajectory", new_callable=AsyncMock):
+                    with patch.object(af, "_router_session_request", new_callable=AsyncMock):
+                        af.trajectory_store.add(traj.trajectory_id, traj)
+                        reward = await af._run_trajectory(traj)
+
+        assert reward.extra_info["metric/mean,max/attempts"] == 2.0
 
     @pytest.mark.asyncio
     async def test_terminal_traj_none_skips_emit(self):
@@ -957,6 +999,46 @@ class TestExecuteMultiTurn:
 
         af.ds_agent_classes[0] = MagicMock(side_effect=build_agent)
         return agent_instance
+
+    @pytest.mark.asyncio
+    async def test_driver_reports_sandbox_setup_time(self):
+        """The driver owns setup when the reward provides prepare_sandbox."""
+        af, traj = self._setup()
+        af.ds_reward_fns[0] = SimpleNamespace(prepare_sandbox=lambda *a, **k: {})
+        self._agent_completing(af, traj, Reward(final_reward=1.0, is_valid=True))
+
+        reward = await af._execute_multi_turn(traj, 0)
+
+        assert "metric/mean,max/time_sandbox_setup" in reward.extra_info
+        assert reward.extra_info["metric/mean,max/time_sandbox_setup"] >= 0.0
+
+    @pytest.mark.asyncio
+    async def test_sandbox_setup_time_is_zero_on_resume(self):
+        """A reused sandbox means this attempt spent no time preparing one."""
+        af, traj = self._setup()
+        af.ds_reward_fns[0] = SimpleNamespace(prepare_sandbox=lambda *a, **k: {})
+        af._sandbox_ids[traj.trajectory_id] = "sandbox-existing"
+        self._agent_completing(af, traj, Reward(final_reward=1.0, is_valid=True))
+
+        reward = await af._execute_multi_turn(traj, 0)
+
+        assert reward.extra_info["metric/mean,max/time_sandbox_setup"] == 0.0
+
+    @pytest.mark.asyncio
+    async def test_agent_reported_setup_time_is_kept(self):
+        """Without prepare_sandbox the agent creates the sandbox and owns the metric."""
+        af, traj = self._setup()
+        af.ds_reward_fns[0] = None
+        agent_reward = Reward(
+            final_reward=1.0,
+            is_valid=True,
+            extra_info={"metric/mean,max/time_sandbox_setup": 12.5},
+        )
+        self._agent_completing(af, traj, agent_reward)
+
+        reward = await af._execute_multi_turn(traj, 0)
+
+        assert reward.extra_info["metric/mean,max/time_sandbox_setup"] == 12.5
 
     async def _run_two_blocking_attempts(self, af: AgentFlow, traj: Trajectory) -> int:
         """Start two concurrent attempts whose agents block; return how many got in before release."""

@@ -63,6 +63,19 @@ _disable_litellm_think_extraction()
 class CodaLitellmModel(LitellmModel):
     """LitellmModel variant that preserves the assistant reply on FormatError."""
 
+    # Wall time spent inside LLM calls, summed over the trajectory this model serves.
+    # Reported as rollout/time_generate so the share of a turn that is not generation
+    # (tool execution, router work, prefill wait) can be attributed.
+    generate_seconds: float = 0.0
+
+    def _query(self, messages, **kwargs):
+        """Time the LLM call. Timed here so a FormatError retry counts every call."""
+        started = time.perf_counter()
+        try:
+            return super()._query(messages, **kwargs)
+        finally:
+            self.generate_seconds += time.perf_counter() - started
+
     def query(self, messages, **kwargs):
         """Query LiteLLM and preserve the raw assistant message on FormatError."""
         for attempt in retry(logger=logger, abort_exceptions=self.abort_exceptions):
@@ -113,6 +126,10 @@ class CodaSandboxEnvironment:
         self._execute = execute
         self._cwd = cwd
         self._shell_prefix = shell_prefix
+        # Wall time and call count for sandbox commands, summed over the trajectory.
+        # Reported as rollout/time_tool_calls and rollout/tool_calls.
+        self.tool_seconds: float = 0.0
+        self.tool_calls: int = 0
         # mini-swe-agent accesses env.config.cwd
         self.config = type("_Cfg", (), {"cwd": cwd, "to_dict": lambda s: {"cwd": cwd}})()
 
@@ -124,6 +141,7 @@ class CodaSandboxEnvironment:
         if self._shell_prefix:
             command = f"bash -c {shlex.quote(self._shell_prefix + command)}"
         workdir = cwd or self._cwd
+        started = time.perf_counter()
         try:
             result = self._execute(command, workdir=workdir)
             output: dict[str, Any] = {
@@ -133,6 +151,11 @@ class CodaSandboxEnvironment:
             }
         except Exception as e:
             output = {"output": "", "returncode": -1, "exception_info": str(e)}
+        finally:
+            # In finally so timed-out and failed commands count too; those dominate
+            # a straggler's wall time.
+            self.tool_seconds += time.perf_counter() - started
+            self.tool_calls += 1
 
         # Detect submission sentinel: the agent runs
         #   echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && cat patch.txt
@@ -303,10 +326,15 @@ class SWEAgent(BaseAgent):
             problem_statement = str(prompt)
 
         cwd = str(metadata.get("repo_path", "/testbed"))
+        # Only data sources whose reward has no prepare_sandbox reach this path; for the
+        # others the driver creates the sandbox and reports the same metric itself.
+        sandbox_setup_seconds = 0.0
         if self.sandbox_id is None:
+            started = time.perf_counter()
             self.sandbox_id = await asyncio.to_thread(
                 self.sandbox_client.create, image=require_docker_image(metadata)
             )
+            sandbox_setup_seconds = time.perf_counter() - started
         execute = lambda command, **kwargs: self.sandbox_client.execute(self.sandbox_id, command, **kwargs)
 
         # Build agent config from swebench.yaml — only override step_limit.
@@ -344,6 +372,7 @@ class SWEAgent(BaseAgent):
             max_consecutive_format_errors=self.max_consecutive_format_errors,
             **agent_cfg,
         )
+        started = time.perf_counter()
         try:
             result = await asyncio.to_thread(
                 agent.run,
@@ -361,15 +390,35 @@ class SWEAgent(BaseAgent):
                 logger.warning("SWEAgent: agent.run raised %s: %s", type(e).__name__, e)
                 raise
         messages: list[dict] = agent.messages
+        wall_seconds = time.perf_counter() - started
         exit_status = result.get("exit_status", "unknown") if isinstance(result, dict) else str(result)
         n_steps = sum(1 for m in messages if m.get("role") == "assistant")
         logger.info(
             "mini-swe-agent done: instance=%s exit=%s steps=%d",
             metadata.get("instance_id", "?"), exit_status, n_steps,
         )
-        return await asyncio.to_thread(
+        grade_started = time.perf_counter()
+        reward = await asyncio.to_thread(
             self.reward_fn,
             messages,
             trajectory.get("label", ""),
             {**metadata, "sandbox_client": self.sandbox_client, "sandbox_id": self.sandbox_id},
         )
+        grade_seconds = time.perf_counter() - grade_started
+        # "metric/<reductions>/<name>" metadata is summarized into rollout/<name>_<reduction>.
+        # Together these cover the whole trajectory: sandbox setup, then the agent loop
+        # (generate + tool + the time_agent_other residual for router handling, prefill
+        # wait, template rendering and serialization), then grading.
+        reward.extra_info.update({
+            "metric/mean,max/time_generate": model.generate_seconds,
+            "metric/mean,max/time_tool_calls": env.tool_seconds,
+            "metric/mean,max/time_agent_other": max(
+                wall_seconds - model.generate_seconds - env.tool_seconds, 0.0
+            ),
+            "metric/mean/tool_calls": float(env.tool_calls),
+            "metric/mean,max/time_grade": grade_seconds,
+            # 0 unless this agent created the sandbox itself; when the reward owns
+            # prepare_sandbox the driver created it and overwrites this.
+            "metric/mean,max/time_sandbox_setup": sandbox_setup_seconds,
+        })
+        return reward

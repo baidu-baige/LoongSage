@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import socket
+import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -435,6 +436,9 @@ class AgentFlow:
                     attempt_id,
                 )
                 logger.info("[%s] Attempt %d complete, reward=%s", traj.trajectory_id, attempt_id, reward.final_reward)
+                reward.extra_info.setdefault(
+                    "metric/mean,max/attempts", float(local_retry_idx + 1)
+                )
                 return reward
 
     def _prepare_attempt_template(self, traj: Trajectory) -> Trajectory:
@@ -500,11 +504,16 @@ class AgentFlow:
         resume = sandbox_id is not None
         agent = None
         keep_sandbox = False
+        # Stays 0 on partial resume: an existing sandbox is reused, so this attempt
+        # really did spend no time preparing one.
+        sandbox_setup_seconds = 0.0
         try:
             prepare_sandbox = getattr(reward_fn, "prepare_sandbox", None)
             if prepare_sandbox is not None and sandbox_id is None:
+                started = time.perf_counter()
                 sandbox_id, sandbox_context = await setup_sandbox(
                     sandbox_client, traj.metadata, prepare_sandbox)
+                sandbox_setup_seconds = time.perf_counter() - started
 
             agent = agent_class(
                 router_url=f"{self.router_url}/{traj.trajectory_id}/{attempt_id}",
@@ -537,6 +546,15 @@ class AgentFlow:
             if not any(segment.trainable for segment in completed_attempt.segments):
                 raise RuntimeError(f"[{traj.trajectory_id}] attempt {attempt_id} completed without trainable Segment")
 
+            # The driver owns sandbox setup whenever the reward provides
+            # prepare_sandbox, so its measurement replaces the agent's placeholder.
+            # Agents that create their own sandbox keep the value they reported.
+            if prepare_sandbox is not None:
+                reward.extra_info["metric/mean,max/time_sandbox_setup"] = sandbox_setup_seconds
+            else:
+                reward.extra_info.setdefault(
+                    "metric/mean,max/time_sandbox_setup", sandbox_setup_seconds
+                )
             return reward
         except asyncio.CancelledError:
             keep_sandbox = self.partial_rollout_enabled
