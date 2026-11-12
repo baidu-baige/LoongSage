@@ -47,6 +47,17 @@ def _ds_bucket() -> dict:
     }
 
 
+def llm_token_count(traj) -> int:
+    """Count the tokens the LLM actually generated in one trajectory.
+
+    Non-LLM positions (tool outputs, re-appearing context) carry
+    ``rollout_weight_version == -1``. That marker is independent of loss-mask
+    off-policy filtering, so this is a faithful "pure model output" length and the
+    right denominator for per-token timing.
+    """
+    return sum(1 for v in traj.rollout_weight_versions if v >= 0)
+
+
 def _accumulate_ds_metrics(bucket: dict, traj_group: TrajectoryGroup, data_sources: list) -> None:
     """Fold one prompt group's raw values and clip counters into ``bucket``.
 
@@ -66,11 +77,8 @@ def _accumulate_ds_metrics(bucket: dict, traj_group: TrajectoryGroup, data_sourc
         response_len = len(t.rollout_log_probs)
         prompt_len = len(t.tokens) - response_len
         # response_len counts the whole response space (LLM output + tool outputs +
-        # re-appearing context). llm_response_len counts only tokens the LLM actually
-        # generated: non-LLM positions carry rollout_weight_version == -1 (and this marker
-        # is independent of loss-mask off-policy filtering, so it is a faithful "pure model
-        # output" length).
-        llm_response_len = sum(1 for v in t.rollout_weight_versions if v >= 0)
+        # re-appearing context); llm_token_count() counts only what the LLM generated.
+        llm_response_len = llm_token_count(t)
 
         bucket["rewards"].append(t.reward)
         bucket["prompt_length"].append(prompt_len)

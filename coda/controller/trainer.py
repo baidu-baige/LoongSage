@@ -10,7 +10,7 @@ from enum import Enum
 from omegaconf import DictConfig, OmegaConf
 from typing import Optional
 
-from coda.controller.rollout_sampler import RolloutSampler
+from coda.controller.rollout_sampler import RolloutSampler, llm_token_count
 from coda.resource_scheduler import ResourceScheduler
 from coda.data_factory.data_source import RolloutDataSourceWithBuffer
 from coda.agentflow.agent_flow import AgentFlow
@@ -370,7 +370,7 @@ class Trainer:
         """Synchronous loop: rollout the whole step, then train on it."""
         for step in range(start_step, self.config.total_steps + 1):
             with time_marker("step", step=step):
-                with time_marker("rollout", step=step):
+                with time_marker("rollout", step=step) as rollout_marker:
                     accepted_traj_group_list = await self.rollout_sampler(step)
 
                 with time_marker("process_traj", step=step):
@@ -390,8 +390,12 @@ class Trainer:
                     with time_marker("onload_train", step=step):
                         self.train_manager.onload()
 
-                with time_marker("train", step=step):
+                with time_marker("train", step=step) as train_marker:
                     ray.get(self.train_manager.async_train(step, splited_batch_refs))
+
+                self._track_throughput(
+                    step, accepted_traj_group_list, rollout_marker.elapsed, train_marker.elapsed
+                )
 
                 with time_marker("save_ckpt", step=step):
                     self.save_ckpt(step)
@@ -538,6 +542,33 @@ class Trainer:
                     self.save_ckpt(step)
 
         self._finalize_training()
+
+    @staticmethod
+    def _track_throughput(
+        step: int,
+        traj_groups: list[TrajectoryGroup],
+        rollout_seconds: float,
+        train_seconds: float,
+    ) -> None:
+        """Report token totals and per-token timings for the step.
+
+        Both per-token metrics use the generated-token total as the denominator.
+        Training actually processes fewer tokens (loss masking and off-policy
+        filtering drop some), but a shared denominator is what makes the gen and
+        train figures addable and comparable across batch sizes.
+        """
+        trajectories = [t for group in traj_groups for t in group.trajectories]
+        llm_tokens = sum(llm_token_count(t) for t in trajectories)
+        if not llm_tokens:
+            return
+        response_tokens = sum(len(t.rollout_log_probs) for t in trajectories)
+        track({
+            "rollout/total_llm_tokens": llm_tokens,
+            "rollout/total_response_tokens": response_tokens,
+            "perf/gen_throughput_tokens_per_s": llm_tokens / max(rollout_seconds, 1e-9),
+            "timing_per_token_ms/gen": rollout_seconds * 1000 / llm_tokens,
+            "timing_per_token_ms/train": train_seconds * 1000 / llm_tokens,
+        }, step=step)
 
     def _process_traj_for_train(
         self,

@@ -442,3 +442,47 @@ class TestBatchDiskRoundTrip:
 
         with pytest.raises(FileNotFoundError, match="Ensure ROLLOUT_ONLY mode was executed"):
             trainer._load_batch_from_disk(step=7)
+
+
+class TestTrackThroughput:
+    """_track_throughput(): token totals and per-token timings for one step."""
+
+    @staticmethod
+    def _group(token_counts):
+        """A trajectory group whose trajectories carry the given generated-token counts."""
+        group = create_test_trajectory_group("prompt_0", num_trajectories=len(token_counts))
+        for traj, count in zip(group.trajectories, token_counts):
+            traj.rollout_weight_versions = [0] * count + [-1, -1]
+            traj.rollout_log_probs = [-0.1] * (count + 2)
+        return group
+
+    def _tracked(self, groups, rollout_seconds, train_seconds):
+        import coda.controller.trainer as trainer_module
+
+        with patch.object(trainer_module, "track") as track:
+            with patch.object(trainer_module, "llm_token_count",
+                              lambda t: sum(1 for v in t.rollout_weight_versions if v >= 0)):
+                Trainer._track_throughput(3, groups, rollout_seconds, train_seconds)
+        return track
+
+    def test_reports_totals_and_per_token_timings(self):
+        track = self._tracked([self._group([100, 300])], rollout_seconds=4.0, train_seconds=2.0)
+
+        metrics, kwargs = track.call_args[0][0], track.call_args[1]
+        assert kwargs == {"step": 3}
+        assert metrics["rollout/total_llm_tokens"] == 400
+        assert metrics["rollout/total_response_tokens"] == 404
+        assert metrics["perf/gen_throughput_tokens_per_s"] == 100.0
+        assert metrics["timing_per_token_ms/gen"] == 10.0
+        assert metrics["timing_per_token_ms/train"] == 5.0
+
+    def test_skips_the_batch_when_no_tokens_were_generated(self):
+        """An empty or fully failed step must not divide by zero."""
+        track = self._tracked([self._group([0, 0])], rollout_seconds=4.0, train_seconds=2.0)
+
+        track.assert_not_called()
+
+    def test_zero_duration_does_not_divide_by_zero(self):
+        track = self._tracked([self._group([10])], rollout_seconds=0.0, train_seconds=0.0)
+
+        assert track.call_args[0][0]["perf/gen_throughput_tokens_per_s"] > 0

@@ -1374,3 +1374,25 @@ class TestFullyAsyncInit:
             assert sampler.pipeline_buf.async_get.await_count == 5
 
         asyncio.run(_run())
+
+
+class TestLlmTokenCount:
+    """llm_token_count(): the denominator for the per-token timing metrics."""
+
+    def _count(self, versions):
+        from coda.controller.rollout_sampler import llm_token_count
+
+        traj = create_test_trajectory("t1")
+        traj.rollout_weight_versions = versions
+        return llm_token_count(traj)
+
+    def test_skips_non_llm_positions(self):
+        """-1 marks tool output and re-appearing context, which the LLM did not generate."""
+        assert self._count([0, 0, -1, -1, 0]) == 3
+
+    def test_counts_every_weight_version(self):
+        """Any version >= 0 is a generated token, including later versions."""
+        assert self._count([0, 1, 2, 3]) == 4
+
+    def test_empty_trajectory_counts_zero(self):
+        assert self._count([]) == 0

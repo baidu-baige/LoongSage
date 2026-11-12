@@ -18,6 +18,7 @@ from contextlib import contextmanager
 from enum import Enum
 from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Optional
 
 import mlflow
@@ -157,12 +158,21 @@ def time_marker(name: str, step: int):
         name: A short label for the timed block (e.g. "rollout", "train").
             Used in both the metric key (``timing/<name>``) and the log message.
         step: The training step, forwarded to ``track()`` and included in logs.
+
+    Yields:
+        A holder whose ``elapsed`` field carries the duration in seconds once the
+        block exits; it is 0.0 while the block runs. Bind it with ``as`` to derive
+        a rate, e.g. tokens per second.
     """
+    marker = SimpleNamespace(elapsed=0.0)
     t0 = time.time()
-    yield
-    elapsed = time.time() - t0
-    track({f"timing/{name}": f"{elapsed:.4f}"}, step=step)
-    logger.info("[step %d] %s done, elapsed=%.4fs", step, name, elapsed)
+    try:
+        yield marker
+    finally:
+        # In finally so a block that raises still reports how long it ran for.
+        marker.elapsed = time.time() - t0
+        track({f"timing/{name}": f"{marker.elapsed:.4f}"}, step=step)
+        logger.info("[step %d] %s done, elapsed=%.4fs", step, name, marker.elapsed)
 
 
 class Tracking:
