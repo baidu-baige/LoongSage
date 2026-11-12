@@ -148,6 +148,9 @@ def put_dp_shards_to_ray(dp_traj_groups_list: list[list[TrajectoryGroup]], dp_si
         response_lengths: list[int] = []
         total_lengths: list[int] = []
         rollout_routed_experts: list[torch.Tensor | None] = []
+        # TRACE record objects of each row: (key, rows) of every call of the Segment that returned one
+        # (``Triplet.metadata["qat_trace"]``, coda/utils/qat_trace.py).
+        qat_trace_objs: list[list[tuple[str, int]]] = []
         multimodal_train_inputs: list[list[str] | None] = []
         image_table: dict[str, dict[str, torch.Tensor]] = {}
         metadata: list[dict] = []
@@ -194,6 +197,10 @@ def put_dp_shards_to_ray(dp_traj_groups_list: list[list[TrajectoryGroup]], dp_si
                     rewards.append(traj.reward)
                     metadata.append(traj.metadata)
                     ds_indices.append(traj.ds_index)
+                    qat_trace_objs.append([
+                        (t.metadata["qat_trace"]["key"], int(t.metadata["qat_trace"]["n_rows"]))
+                        for t in seg.triplets if t.metadata.get("qat_trace")
+                    ])
                 local_tid += 1
 
         rollout_data = {
@@ -209,6 +216,7 @@ def put_dp_shards_to_ray(dp_traj_groups_list: list[list[TrajectoryGroup]], dp_si
             "total_lengths": total_lengths,
             "metadata": metadata,
             "ds_indices": ds_indices,
+            "qat_trace_objs": qat_trace_objs,
         }
         # `multimodal_train_inputs` is row-aligned with `tokens` (image hashes per row); `image_table` holds
         # each image's tensors once per shard. Both are omitted for text-only shards so they keep the old layout.

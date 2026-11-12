@@ -86,6 +86,7 @@ _EXPECTED_ROLLOUT_KEYS = {
     "total_lengths",
     "metadata",
     "ds_indices",
+    "qat_trace_objs",
 }
 
 
@@ -172,6 +173,17 @@ class TestPutDpShardsToRay(unittest.TestCase):
         d = captured[0]
         for rl, lm in zip(d["response_lengths"], d["loss_masks"]):
             self.assertEqual(rl, len(lm))
+
+    def test_qat_trace_objs_collect_the_segment_calls(self):
+        traj = _make_trajectory(6)
+        first = _make_triplet(0, 3, 0, 3)
+        first.metadata["qat_trace"] = {"key": "coda_trace/x/a.0", "n_rows": 3}
+        traj.segments[0].triplets = [first, _make_triplet(0, 6, 3, 6)]  # the second call returned none
+        mock_ray, captured = _fake_ray_put()
+        with patch("coda.data_factory.data_processor.torch", _torch_mod):
+            with patch("coda.data_factory.data_processor.ray", mock_ray):
+                put_dp_shards_to_ray([[TrajectoryGroup(prompt_id="p0", trajectories=[traj])]], dp_size=1)
+        self.assertEqual(captured[0]["qat_trace_objs"], [[("coda_trace/x/a.0", 3)]])
 
     def test_total_lengths_equals_tokens_len(self):
         group = _make_group("p0", [7, 4])

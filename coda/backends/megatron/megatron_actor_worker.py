@@ -34,6 +34,7 @@ from coda.utils.tracking import time_tracker, track
 from coda.algorithms.kl_policy import build_kl_policies
 from coda.backends.megatron.teacher_lm_head import TeacherLMHeads
 from coda.backends.megatron import qat
+from coda.utils import qat_trace as qat_trace_utils
 from coda.utils.hf_ckpt import save_like_source
 
 logger = logging.getLogger(__name__)
@@ -57,6 +58,7 @@ class MegatronActorWorker(MegatronTrainWorker):
             # the bf16 param plus an int16 remainder, so the snap would overwrite it too and drop
             # every sub-grid update. Keep a separate fp32 master (+2 B/param).
             config.megatron.optimizer.store_param_remainders = False
+        qat_trace_utils.validate(config)
 
         if config.algorithm.is_correction.enable and config.trainer.use_rollout_log_probs:
             raise ValueError(
@@ -267,6 +269,8 @@ class MegatronActorWorker(MegatronTrainWorker):
         # run finalize_fn for pre checkpoint save
         async_calls.maybe_finalize_async_calls()
         rollout_data = get_rollout_data(rollout_data_ref)
+        # Rollout-guided activation QAT: fetch this rollout's records (collective).
+        self._quant.trace_new_step(rollout_data)
 
         # Determine OPD mode
         opd_enabled = self.config.opd.enable
@@ -282,7 +286,8 @@ class MegatronActorWorker(MegatronTrainWorker):
                 rollout_data.update(self._compute_log_probs(step, rollout_data))
 
             if self.config.algorithm.ref_kl.enable:
-                rollout_data.update(self._compute_ref_log_probs(step, rollout_data))
+                with self._quant.trace_paused():  # reference weights: the rollout records do not apply
+                    rollout_data.update(self._compute_ref_log_probs(step, rollout_data))
 
             if self.config.algorithm.m2po.enable:
                 rollout_data.update(self._compute_m2po(step, rollout_data))
@@ -307,12 +312,14 @@ class MegatronActorWorker(MegatronTrainWorker):
         if self._forward_only:
             # No optimizer: report the forward-side metrics (IS/k3, adv, ...) only.
             self._track_metrics(step, rollout_data, {})
+            self._quant.trace_end_step()
             return
 
         # Train
         for m in self.model:
             m.train()
         self._train_actor(step, rollout_data)
+        self._quant.trace_end_step()  # before the next rollout records anything
 
         # Refresh the CPU "actor" snapshot after the optimizer step for ref-KL
         # weight switching; optionally move the reference toward the current
