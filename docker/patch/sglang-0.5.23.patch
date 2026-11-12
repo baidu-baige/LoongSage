@@ -678,6 +678,43 @@ index 5058c3f..4e9684e 100644
      def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
          parameter = self.model_runner.weight_exporter.get_weights_by_name(
              recv_req.name, recv_req.truncate_size
+diff --git a/python/sglang/srt/model_executor/model_runner_components/cuda_graph_setup.py b/python/sglang/srt/model_executor/model_runner_components/cuda_graph_setup.py
+index 6e4ad28..2cbfd5b 100644
+--- a/python/sglang/srt/model_executor/model_runner_components/cuda_graph_setup.py
++++ b/python/sglang/srt/model_executor/model_runner_components/cuda_graph_setup.py
+@@ -402,6 +402,17 @@ def capture_cuda_graphs(
+ 
+     """
+ 
++    # Forward hook specs with "capture": true are attached BEFORE capture: their tensor ops are
++    # recorded into the graphs and replayed with them, so such a hook must be graph-safe (fixed
++    # shapes and addresses while capturing). The other specs are attached after the final capture
++    # (finalize_cuda_graph_capture).
++    hook_specs = get_observability().forward_hooks
++    if hook_specs and not getattr(model_runner, "_capture_hooks_registered", False):
++        register_forward_hooks(
++            model_runner.model, [s for s in hook_specs if s.get("capture")]
++        )
++        model_runner._capture_hooks_registered = True
++
+     model_runner.graph_shared_output = GraphSharedOutput.create_for_model_runner(
+         model_runner
+     )
+@@ -454,9 +465,12 @@ def finalize_cuda_graph_capture(model_runner: ModelRunner) -> None:
+     # Register forward hooks AFTER cuda-graph capture so their tensor ops are
+     # not traced into any captured graph — capture stays hook-free and hooks
+     # fire only on the eager forward path (capture replay never runs Python
+-    # hooks anyway).
++    # hooks anyway). Specs with "capture": true were attached before capture.
+     if get_observability().forward_hooks:
+-        register_forward_hooks(model_runner.model, get_observability().forward_hooks)
++        register_forward_hooks(
++            model_runner.model,
++            [s for s in get_observability().forward_hooks if not s.get("capture")],
++        )
+ 
+     prealloc_symmetric_memory_pool(
+         is_draft_worker=model_runner.is_draft_worker,
 diff --git a/python/sglang/srt/model_executor/model_runner_components/weight_updater.py b/python/sglang/srt/model_executor/model_runner_components/weight_updater.py
 index 80965e5..7395618 100644
 --- a/python/sglang/srt/model_executor/model_runner_components/weight_updater.py

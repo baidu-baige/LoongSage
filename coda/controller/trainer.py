@@ -27,6 +27,7 @@ from coda.transfer_mesh import ChannelMeta
 from coda.utils.checkpoint_utils import get_tracker_file, resolve_dist_ckpt_dir, should_save
 from coda.utils.tracking import configure_tracking, time_marker, TimeMarkerAcc, track
 from coda.utils import logging_utils
+from coda.utils import qat_trace
 from coda.utils.multimodal_config import validate_multimodal_config
 
 logger = logging.getLogger(__name__)
@@ -84,6 +85,13 @@ class Trainer:
         self.is_sft = Mode(self.config.run_mode) == Mode.SFT
         self._validate_config()
         self.is_colocated = self.config.colocate
+        if qat_trace.trace_config(self.config) is not None and Mode(self.config.run_mode) != Mode.SFT:
+            # Rollout-guided activation QAT moves its records through a Mooncake Store of this run; its
+            # address goes into the config before any worker or rollout engine is created.
+            qat_trace.validate(self.config)
+            self._trace_master, master_log = qat_trace.start_master(self.config)
+            logger.info("[init] TRACE: mooncake_master at %s (log %s)",
+                        self.config.trainer.qat_trace.mooncake.master_server, master_log)
         self.is_fully_async = self.config.fully_async.enable
         self._init_tracking()
 

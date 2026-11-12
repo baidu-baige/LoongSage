@@ -15,6 +15,7 @@ from omegaconf import OmegaConf
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
 from coda.backends.rollout_worker import RolloutWorker
+from coda.utils import qat_trace
 from coda.utils.logging_utils import redact_secrets
 logger = logging.getLogger(__name__)
 
@@ -360,6 +361,10 @@ def _compute_server_args(
 
     for key, value in engine_args.items():
         kwargs[key] = value
+
+    if qat_trace.trace_config(config) is not None:
+        # Rollout-guided activation QAT: record the FP8 linear input codes for the trainer.
+        kwargs["forward_hooks"] = list(kwargs.get("forward_hooks") or []) + [qat_trace.sglang_hook_spec(config)]
 
     # sglang_args is a verbatim ServerArgs passthrough and may carry api_key.
     logger.info("sglang kwargs: %s", redact_secrets(kwargs))

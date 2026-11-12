@@ -24,6 +24,8 @@ numerics that cannot be read from the checkpoint live in a small :class:`QATAdap
   W8A8 (dynamic per-token, group = scale tile width, ue8m0) with SGLang's own kernel;
   straight-through backward. Temporary escape hatch: ``CODA_QAT_DISABLE_ACT=1`` (trainer env)
   keeps weight QAT only, since activation QAT currently raises k3 on DeepSeek-V4.1.
+  ``trainer.qat_trace`` replaces round-to-nearest on the traced layers by rounding guided by the
+  rollout's own codes (coda/backends/megatron/qat_trace.py).
 
 Snapping a local (TP/EP) shard equals snapping the full checkpoint tensor only when the shard is a
 contiguous, tile-aligned slice of it; :func:`_local_layout_ok` checks this per param and raises
@@ -32,8 +34,10 @@ otherwise (e.g. head-interleaved QKV), which then needs an adapter.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
+import re
 from typing import Iterable, Iterator, Sequence
 
 import torch
@@ -47,6 +51,7 @@ from megatron.bridge.models.conversion.param_mapping import (
     RowParallelMapping,
 )
 
+from coda.utils import qat_trace as qat_trace_utils
 from coda.utils.hf_ckpt import SAFETENSORS_DTYPE
 from coda.utils.quant_formats import (
     CkptQuant,
@@ -85,6 +90,11 @@ class QATAdapter:
     def validate(self, config) -> None:
         """Reject rollout settings whose numerics this QAT does not model."""
 
+    def rollout_linear_name(self, hf_name: str) -> str | None:
+        """SGLang module that runs the GEMM of checkpoint weight ``hf_name`` (``trainer.qat_trace``
+        matches rollout records by it); None if unknown for this model."""
+        return None
+
 
 class DeepseekV41Adapter(QATAdapter):
     """SGLang DeepSeek-V4.1: wo_a is dequantized to bf16 at load (bf16 activations); routed MXFP4
@@ -109,6 +119,17 @@ class DeepseekV41Adapter(QATAdapter):
             problems.append("sglang_args.disable_shared_experts_fusion must be true (shared experts as dense FP8 linears)")
         if problems:
             raise ValueError("DeepSeek-V4.1 QAT: " + "; ".join(problems))
+
+
+    def rollout_linear_name(self, hf_name: str) -> str | None:
+        m = re.fullmatch(r"layers\.(\d+)\.(.+)\.weight", hf_name)
+        if m is None:
+            return None
+        rest = m.group(2)
+        rest = re.sub(r"^attn\.", "self_attn.", rest)
+        rest = re.sub(r"^ffn\.shared_experts\.w[13]$", "mlp.shared_experts.gate_up_proj", rest)
+        rest = re.sub(r"^ffn\.shared_experts\.w2$", "mlp.shared_experts.down_proj", rest)
+        return f"model.layers.{m.group(1)}.{rest}"
 
 
 _ADAPTERS: dict[str, QATAdapter] = {"DeepseekV41ForCausalLM": DeepseekV41Adapter()}
@@ -224,6 +245,9 @@ class QuantPlan:
         self.snap_params: list[tuple[str, torch.nn.Parameter, QuantScheme]] = []
         self._snap_thresholds: list = []  # per snap param: thresholds(r0, r1), or None = round-to-nearest
         self.act_modules: list[tuple[str, torch.nn.Module, int]] = []
+        self.act_hf: dict[int, str] = {}  # id(module) -> its checkpoint weight name
+        self.trace = None  # rollout-guided activation QAT (trainer.qat_trace), see register_activation_hooks
+        self._config, self._model_chunks, self._adapter = config, list(model_chunks), None
         tasks = self._quantized_tasks(bridge, model_chunks)
         self.quantized = bool(tasks)
         if self.qat:
@@ -260,7 +284,7 @@ class QuantPlan:
         """Fill ``snap_params`` / ``act_modules``; raise on anything this QAT does not model."""
         if not tasks:
             raise ValueError(f"trainer.qat: no trained tensor of {hf_model_path} is stored quantized")
-        adapter = get_adapter(getattr(bridge.hf_pretrained.config, "architectures", None))
+        adapter = self._adapter = get_adapter(getattr(bridge.hf_pretrained.config, "architectures", None))
         adapter.validate(config)
         own = {id(p) for chunk in model_chunks for p in chunk.parameters()}
         hooked: set[int] = set()
@@ -293,6 +317,7 @@ class QuantPlan:
                     raise NotImplementedError(f"[QAT] {task.param_name}: input of a fused norm+linear is pre-norm")
                 hooked.add(id(module))
                 self.act_modules.append((task.param_name[: -len(".weight")], module, scheme.block[1]))
+                self.act_hf[id(module)] = names[0]
 
     # -- weight QAT
     @torch.no_grad()
@@ -308,9 +333,44 @@ class QuantPlan:
         if os.environ.get(DISABLE_ACT_ENV) == "1":
             logger.info(f"[QAT] activation QAT disabled by {DISABLE_ACT_ENV}=1, weight QAT only")
             return 0
+        cfg = qat_trace_utils.trace_config(self._config)
+        traced = []
+        if cfg is not None:
+            layers = set(qat_trace_utils.trace_layers(cfg["layers"], qat_trace_utils.num_hidden_layers(self._config.hf_model_path)))
+            for name, module, group in self.act_modules:
+                hf = self.act_hf[id(module)]
+                hit = re.match(r"layers\.(\d+)\.", hf)
+                if hit is None or int(hit.group(1)) not in layers:
+                    continue
+                sname = self._adapter.rollout_linear_name(hf)
+                if sname is None:
+                    raise NotImplementedError(f"[QAT trace] no rollout module name for {hf}; add it to the QATAdapter")
+                traced.append((name, module, group, sname, int(hit.group(1))))
+        traced_ids = {id(t[1]) for t in traced}
         for _, module, group in self.act_modules:
-            module.register_forward_pre_hook(_make_act_pre_hook(group))
+            if id(module) not in traced_ids:
+                module.register_forward_pre_hook(_make_act_pre_hook(group))
+        if cfg is not None:
+            from coda.backends.megatron.qat_trace import TraceHooks
+
+            self.trace = TraceHooks(cfg, self._model_chunks, traced)
+            logger.info(f"[QAT] rollout-guided activation fake-quant on {len(traced)}/{len(self.act_modules)} linears "
+                        f"(bits={cfg['bits']}, layers={cfg['layers']})")
         return len(self.act_modules)
+
+    def trace_new_step(self, rollout_data) -> None:
+        """Start of a train step: fetch the rollout records of ``rollout_data`` (collective)."""
+        if self.trace is not None:
+            self.trace.new_step(rollout_data)
+
+    def trace_end_step(self) -> None:
+        """End of a train step: report the guidance and delete the step's records."""
+        if self.trace is not None:
+            self.trace.end_step()
+
+    def trace_paused(self):
+        """Round-to-nearest activation fake-quant inside (e.g. reference-model log-probs)."""
+        return self.trace.paused() if self.trace is not None else contextlib.nullcontext()
 
     # -- export
     def check_export(self, named_tensors: Iterable[tuple[str, torch.Tensor]]) -> Iterator[tuple[str, torch.Tensor]]:

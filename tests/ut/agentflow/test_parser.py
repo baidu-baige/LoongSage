@@ -1043,6 +1043,28 @@ def test_update_trajectory_records_weight_versions() -> None:
     assert stored.rollout_weight_versions == [7, 7]
 
 
+def test_update_trajectory_records_qat_trace_objects() -> None:
+    """The TRACE record object SGLang returns per call lands on that call's triplet."""
+    parser = make_parser(r3_enabled=False)
+    trajectory = Trajectory(trajectory_id="traj-trace", prompt_id="prompt-0", status=TrajectoryStatus.GENERATING)
+    parser.trajectory_store.add(trajectory.trajectory_id, trajectory)
+    obj = {"key": "coda_trace/traj-trace_0/ab.0", "n_rows": 3}
+    for turn, trace in enumerate(([obj], [])):
+        payload, assistant_message, _ = parser.build_assistant_message({
+            "text": "ok",
+            "meta_info": {"weight_version": "1", "output_token_logprobs": [[-0.3, 3]], "qat_trace": trace},
+        })
+        turn_ctx = TurnInputContext(
+            delta_prompt_ids=[1, 2], input_ids=[1, 2], start_new_segment=turn == 0, raw_new_messages=[],
+            target_segment_id=0, new_segment_origin="root",
+        )
+        parser.update_trajectory(trajectory, turn_ctx, payload, assistant_message)
+
+    stored = parser.trajectory_store.get(["traj-trace"])["traj-trace"][-1]
+    triplets = stored.segments[0].triplets
+    assert triplets[0].metadata["qat_trace"] == obj and "qat_trace" not in triplets[1].metadata
+
+
 def test_build_assistant_message_rejects_negative_weight_version() -> None:
     """-1 is the prompt-token / unset sentinel, so it must not come back as a real version."""
     parser = make_parser(r3_enabled=False)

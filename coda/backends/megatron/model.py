@@ -40,6 +40,8 @@ from coda.backends.megatron.cp_utils import (
     gather_and_slice_response,
 )
 from coda.backends.megatron.data import DataIterator
+from coda.backends.megatron.qat_trace import attach_keys as attach_trace_keys
+from coda.utils.qat_trace import trace_config
 from coda.backends.megatron.loss import loss_function
 from coda.backends.megatron.logits_utils import compute_log_probs
 from coda.utils.multimodal_tensors import merge_multimodal_batch
@@ -352,6 +354,7 @@ def forward_only(
     """
     # Detect teacher fields from rollout_data (populated by collect_teacher).
     teacher_keys = [k for k in data_iterator[0].rollout_data if k.startswith("teacher_")]
+    trace_enabled = trace_config(config) is not None  # rollout-guided activation QAT row keys
 
     def forward_step_func(data_iter, model_chunk):
         # 1. Fetch micro-batch
@@ -359,6 +362,8 @@ def forward_only(
             "tokens", "total_lengths", "response_lengths", "rollout_routed_experts", "multimodal_train_inputs",
         ]
         fetch_keys += teacher_keys
+        if trace_enabled:
+            fetch_keys.append("qat_trace_objs")
         batch = data_iter.get_next(fetch_keys)
         tokens_list: list[torch.Tensor] = batch["tokens"]
 
@@ -367,6 +372,8 @@ def forward_only(
         packed_tokens, packed_seq_params = prepare_packed_seq_params(
             tokens_list, cp_partition_mode=cp_partition_mode,
         )
+        if trace_enabled:
+            attach_trace_keys(packed_seq_params, tokens_list, batch["qat_trace_objs"], cp_partition_mode)
         target_list = [
             torch.cat([t[1:], t.new_full((1,), 0)])
             for t in tokens_list
@@ -456,6 +463,7 @@ def train_minibatch(
     """
     # Detect teacher fields from rollout_data (populated by collect_teacher).
     teacher_keys = [k for k in data_iterator[0].rollout_data if k.startswith("teacher_")]
+    trace_enabled = trace_config(config) is not None  # rollout-guided activation QAT row keys
 
     # ── forward_step callback ──────────────────────────────────────────
 
@@ -484,6 +492,8 @@ def train_minibatch(
             "multimodal_train_inputs",
         ]
         keys += teacher_keys
+        if trace_enabled:
+            keys.append("qat_trace_objs")
 
         batch = data_iter.get_next(keys)
         tokens_list: list[torch.Tensor] = batch["tokens"]
@@ -494,6 +504,8 @@ def train_minibatch(
             tokens_list,
             cp_partition_mode=cp_partition_mode,
         )
+        if trace_enabled:
+            attach_trace_keys(packed_seq_params, tokens_list, batch["qat_trace_objs"], cp_partition_mode)
         position_ids = _get_position_ids(
             model_chunk, tokens_list, packed_tokens, cp_partition_mode,
             multimodal_rows=batch.get("multimodal_train_inputs"),

@@ -240,7 +240,9 @@ class LLMGenerateResponse:
     logprobs: list[float]
     weight_version: int
     routed_experts: torch.Tensor | None = None
-
+    # TRACE record object of this call (``meta_info["qat_trace"]``, coda/utils/qat_trace.py):
+    # {"key": object key, "n_rows": rows}; None when nothing was recorded.
+    qat_trace: dict | None = None
 
 # Wire dtypes SGLang may report in meta_info["routed_experts_dtype"]; absent means int32.
 _R3_WIRE_DTYPES = {"int32": torch.int32, "int16": torch.int16, "uint8": torch.uint8}
@@ -799,6 +801,7 @@ class TrajectoryParser:
 
         weight_version = _parse_weight_version(meta.get("weight_version"))
         generated_text: str = response_json.get("text") or ""
+        trace = meta.get("qat_trace") or []
 
         payload = LLMGenerateResponse(
             generated_text=generated_text,
@@ -806,6 +809,7 @@ class TrajectoryParser:
             logprobs=logprobs,
             weight_version=weight_version,
             routed_experts=routed_experts,
+            qat_trace={"key": str(trace[0]["key"]), "n_rows": int(trace[0]["n_rows"])} if trace else None,
         )
 
         reasoning_content, visible_text = self._parse_reasoning(generated_text)
@@ -910,6 +914,7 @@ class TrajectoryParser:
             logprobs=payload.logprobs,
             weight_version=payload.weight_version,
             turn_ctx=turn_ctx,
+            qat_trace=payload.qat_trace,
         )
         if turn_ctx.new_images and not turn_ctx.is_subagent_placeholder:
             self._record_multimodal_inputs(trajectory, turn_ctx, base)
@@ -1326,9 +1331,11 @@ class TrajectoryParser:
         logprobs: list[float],
         weight_version: int,
         turn_ctx: TurnInputContext,
+        qat_trace: dict | None = None,
     ) -> None:
         """Append a (prompt, response, logprobs) triplet and update segment bookkeeping.
 
+        ``qat_trace`` (the TRACE record object of this call) goes to ``triplet.metadata``.
         Case 3 (subagent placeholder): appends an empty placeholder Segment carrying only
         tree metadata, and returns without touching tokens/loss_masks/rollout_log_probs/
         rollout_weight_versions or trajectory.active_segment_id.
@@ -1389,7 +1396,8 @@ class TrajectoryParser:
             logprob_start=response_logprob_start,
             logprob_end=len(trajectory.rollout_log_probs),
         )
-
+        if qat_trace:
+            triplet.metadata["qat_trace"] = dict(qat_trace)
         if start_new_segment or not trajectory.segments:
             trajectory.segments.append(
                 Segment(

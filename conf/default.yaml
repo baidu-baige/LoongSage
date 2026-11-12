@@ -369,6 +369,25 @@ trainer:
   # (every quantized checkpoint) move with small RL updates; nearest: round-to-nearest, which
   # freezes MXFP4 experts at lr ~1e-6 (kept for A/B).
   qat_weight_rounding: threshold
+  # Rollout-guided activation QAT (TRACE, arXiv 2610.07767; coda/utils/qat_trace.py). Instead of
+  # rounding its own FP8 linear inputs to the nearest e4m3 code, the trainer rounds each element
+  # toward the code the rollout actually used: the SGLang rollout records the lowest `bits` code bits
+  # of every recorded element, the trainer picks the bracketing code they agree with. The records
+  # move through a Mooncake Store whose master the driver starts (docs/zh/design/dsv41-trace-mooncake.md).
+  # Needs trainer.qat, colocate, rollout.sglang_args.disable_radix_cache and disable_prefill_cuda_graph
+  # (the decode CUDA graph is supported).
+  qat_trace:
+    enable: false
+    bits: 1                 # 1 | 2 low code bits per element (DSV4.1: ~2.7 / 5.5 KB per token and traced layer)
+    layers: back_half       # back_half | all decoder layers guided; the others keep round-to-nearest
+    mooncake:
+      protocol: rdma        # rdma | tcp
+      rdma_devices: ""      # "" -> the active RDMA NIC nearest each process's GPU
+      segment_gb: 64        # host memory attention-TP rank 0 of every SGLang engine lends the store
+      max_host_gb: 32       # per SGLang engine (rank 0): records of unfinished requests; rows beyond are dropped
+      shm_dir: /dev/shm     # trainer nodes: shared buffer of the step's records
+      master_server: null   # filled in by the driver
+      metadata_server: null # filled in by the driver
   env_vars:
     # Inject per-rank env vars into the train worker Ray actors (runtime_env).
     PYTORCH_ALLOC_CONF: expandable_segments:True
