@@ -19,6 +19,7 @@ from pathlib import Path
 from collections.abc import Mapping
 from typing import Any
 
+from coda.utils.hf_config import DEEPSEEK_V41_MODEL_TYPE
 from coda.utils.path_utils import resolve_conf_path
 
 logger = logging.getLogger(__name__)
@@ -26,11 +27,13 @@ logger = logging.getLogger(__name__)
 _PROCESS_TOKENIZER: Any = None
 DEFAULT_THINK_TAGS = ("<think>", "</think>")
 DEEPSEEK_V4_MODEL_FAMILY = "deepseek_v4"
-DEEPSEEK_V41_MODEL_FAMILY = "deepseek_v41"
+DEEPSEEK_V41_MODEL_FAMILY = DEEPSEEK_V41_MODEL_TYPE
 # DeepSeek checkpoints ship no Jinja chat template; deepseek-recipe renders them instead.
 DEEPSEEK_MODEL_FAMILIES = frozenset({DEEPSEEK_V4_MODEL_FAMILY, DEEPSEEK_V41_MODEL_FAMILY})
 _DEEPSEEK_ASSISTANT = "<｜Assistant｜>"
 _DEEPSEEK_EOS = "<｜end▁of▁sentence｜>"
+# Text form of V4.1's image token (id 129264); the Router expands each into the image's token span.
+DEEPSEEK_IMAGE_PLACEHOLDER = "<｜deepseek_image｜>"
 # Probe messages: the prefixes are read off their renders.
 _EMPTY_SYSTEM = {"role": "system", "content": ""}
 _EMPTY_USER = {"role": "user", "content": ""}
@@ -64,22 +67,38 @@ def _deepseek_official_family(model_path: str) -> str | None:
     return None
 
 
-def _deepseek_text(content: Any) -> str:
-    """Message content as one string; OpenAI text parts are joined by a blank line."""
+def _deepseek_text(content: Any, *, allow_images: bool = False) -> str:
+    """Message content as one string.
+
+    OpenAI text parts are joined by a blank line. With ``allow_images`` (V4.1), an ``image_url`` part
+    becomes the image placeholder, which abuts its neighbouring parts with no separator: the
+    placeholder is what the model sees, so ``[image, text]`` renders as ``<｜deepseek_image｜>text``.
+    """
     if not isinstance(content, list):
         return content or ""
-    texts = []
+    pieces: list[str] = []
+    prev_is_text = False
     for part in content:
-        if part.get("type") != "text":
-            raise ValueError(f"DeepSeek prompts support text content only, got a {part.get('type')!r} part")
-        texts.append(part.get("text", ""))
-    return "\n\n".join(texts)
+        part_type = part.get("type")
+        if part_type == "image_url" and allow_images:
+            pieces.append(DEEPSEEK_IMAGE_PLACEHOLDER)
+            prev_is_text = False
+        elif part_type == "text":
+            if prev_is_text:
+                pieces.append("\n\n")
+            pieces.append(part.get("text", ""))
+            prev_is_text = True
+        else:
+            raise ValueError(f"DeepSeek prompts support text content only, got a {part_type!r} part")
+    return "".join(pieces)
 
 
-def _deepseek_recipe_message(recipe: Any, message: Mapping[str, Any], *, thinking: bool, prefix: bool) -> Any:
+def _deepseek_recipe_message(
+    recipe: Any, message: Mapping[str, Any], *, thinking: bool, prefix: bool, allow_images: bool = False
+) -> Any:
     """Convert an OpenAI-style message to a deepseek-recipe message."""
     role = message.get("role")
-    content = _deepseek_text(message.get("content"))
+    content = _deepseek_text(message.get("content"), allow_images=allow_images)
     if role in ("system", "developer"):
         return recipe.SystemMessage(content)
     if role == "user":
@@ -135,7 +154,11 @@ def _wrap_deepseek_v4_tokenizer(tokenizer: Any, family: str) -> Any:
         conversation = recipe.Conversation(
             [
                 _deepseek_recipe_message(
-                    recipe, message, thinking=thinking, prefix=trailing_assistant and index == len(messages) - 1
+                    recipe,
+                    message,
+                    thinking=thinking,
+                    prefix=trailing_assistant and index == len(messages) - 1,
+                    allow_images=v41,
                 )
                 for index, message in enumerate(messages)
             ],
@@ -212,9 +235,33 @@ def load_processor(model_path: str) -> Any:
 
 
 def build_multimodal_processor(multimodal_config: Any, model_path: str, tokenizer: Any, num_workers: int) -> Any:
-    """Build a MultimodalProcessor from the `multimodal` config block, or None if disabled."""
+    """Build the image processor from the `multimodal` config block, or None if disabled.
+
+    V4.1 checkpoints get a `Dsv41ImageProcessor` (planned from `config.json`'s `vision_*` values). Other
+    models get a Qwen-style `MultimodalProcessor`.
+    """
     if multimodal_config is None or not getattr(multimodal_config, "enable", False):
         return None
+
+    if _deepseek_official_family(model_path) == DEEPSEEK_V41_MODEL_FAMILY:
+        from coda.agentflow.multimodal import Dsv41ImageProcessor, load_dsv41_vision_args
+
+        vision_args = load_dsv41_vision_args(model_path)
+        # SGLang and the Megatron bridge both take the pad id from config.json's `image_token_id`.
+        pad_id = getattr(vision_args, "image_token_id", None)
+        if pad_id is None:
+            raise ValueError(f"{model_path}/config.json has no image_token_id")
+        dsv41_processor = Dsv41ImageProcessor(vision_args, pad_id, num_workers=num_workers)
+        logger.info(
+            "Multimodal processor ready (deepseek_v41): pad_id=%d patch=%d downsample=%d min_pixels=%d max_n_token=%d",
+            dsv41_processor.image_pad_id,
+            vision_args.vision_patch_size,
+            vision_args.vision_downsample_ratio,
+            vision_args.vision_min_pixels,
+            vision_args.vision_max_n_token,
+        )
+        return dsv41_processor
+
     from coda.agentflow.multimodal import MultimodalProcessor
 
     # Fail at startup rather than on the first image request.
@@ -225,12 +272,14 @@ def build_multimodal_processor(multimodal_config: Any, model_path: str, tokenize
             "multimodal.enable=true requires the `qwen-vl-utils` package (pip install qwen-vl-utils==0.0.14)"
         ) from exc
 
-    image_cfg = multimodal_config.image
+    from coda.utils.multimodal_config import read_image_pixel_bounds
+
+    min_pixels, max_pixels = read_image_pixel_bounds(model_path)
     processor = MultimodalProcessor(
         load_processor(model_path),
         tokenizer,
-        min_pixels=int(image_cfg.min_pixels),
-        max_pixels=int(image_cfg.max_pixels),
+        min_pixels=min_pixels,
+        max_pixels=max_pixels,
         num_workers=num_workers,
     )
     # Fail at startup if the HF processor's pad expansion differs from the num_tokens-based one used per request.

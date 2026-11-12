@@ -242,6 +242,29 @@ class TestDatasetMaxImageTokens(unittest.TestCase):
         with self.assertRaises(ValueError):
             Dataset(path, None, prompt_key="q", multimodal_keys=KEYS, max_image_tokens=100)
 
+    def test_estimator_replaces_pixel_bounds(self):
+        path = self._write(self._records())
+        # 1 token per 512x512 image and 100 for a 2048x2048 one; no pixel bounds needed.
+        big = _png_uri(2048, 2048)
+        ds = Dataset(
+            path,
+            None,
+            prompt_key="q",
+            multimodal_keys=KEYS,
+            max_image_tokens=101,
+            image_token_estimator=lambda url: 100 if url == big else 1,
+        )
+        self.assertEqual(len(ds), 3)
+        ds = Dataset(
+            path,
+            None,
+            prompt_key="q",
+            multimodal_keys=KEYS,
+            max_image_tokens=100,
+            image_token_estimator=lambda url: 100 if url == big else 1,
+        )
+        self.assertEqual([len(p.prompt[0]["content"]) for p in ds.prompts], [3, 2])
+
 
 if __name__ == "__main__":
     unittest.main()
