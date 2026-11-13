@@ -4,6 +4,7 @@ import asyncio
 import tempfile
 import os
 from contextlib import contextmanager
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch, call
 
 import httpx
@@ -33,6 +34,9 @@ def _make_config(rollout_mode: str = "single_turn", retry_limit: int = 1) -> Mag
     cfg.agentflow.router.proxy_timeout_seconds = 30
     cfg.agentflow.router.max_connections = 100
     cfg.agentflow.router.abort_timeout_seconds = 600
+    # Mirror the real default: agents run in the driver process. A MagicMock answers
+    # .get() with a truthy mock, which would read as a worker count and start Ray actors.
+    cfg.agentflow.get = lambda key, default=None: {"agent_workers": 0}.get(key, default)
     cfg.agentflow.agent.name = "dummy_agent" if rollout_mode == "multi_turn" else ""
     cfg.agentflow.tokenizer = MagicMock()
     cfg.agentflow.dump_trajectory_path = ""
@@ -990,6 +994,51 @@ class TestExecuteMultiTurn:
         af, traj = self._setup()
         af._ds_sandbox_sems[0] = asyncio.Semaphore(1)
         assert await self._run_two_blocking_attempts(af, traj) == 1
+
+    def _stub_pool(self, af, result):
+        """Replace the worker pool with a stub recording the request it received."""
+        from coda.agentflow.agent_worker import AttemptRequest
+
+        requests = []
+
+        async def run_attempt(request: AttemptRequest):
+            requests.append(request)
+            return result
+
+        af.agent_worker_pool = SimpleNamespace(run_attempt=run_attempt)
+        af.ds_agent_classes[0] = MagicMock(side_effect=AssertionError("agent built in driver"))
+        return requests
+
+    @pytest.mark.asyncio
+    async def test_worker_pool_result_is_used_without_building_agent(self):
+        from coda.agentflow.agent_worker import AttemptResult
+
+        af, traj = self._setup()
+        completed = traj.model_copy(deep=True)
+        completed.rollout_log_probs = [-0.1]
+        completed.segments = [Segment(trainable=True)]
+        af.trajectory_store.add(traj.trajectory_id, completed)
+        reward = Reward(final_reward=1.0, is_valid=True)
+        requests = self._stub_pool(af, AttemptResult(reward=reward, sandbox_id="sandbox-9"))
+
+        assert await af._execute_multi_turn(traj, 0) is reward
+        assert len(requests) == 1
+        assert requests[0].router_url.endswith(f"/{traj.trajectory_id}/0")
+        assert requests[0].payload["prompt"] == traj.prompt
+        # The worker's sandbox id is what gets released by the driver.
+        af.ds_sandbox_clients[0].delete.assert_called_once_with("sandbox-9")
+
+    @pytest.mark.asyncio
+    async def test_worker_pool_error_is_raised_for_retry(self):
+        from coda.agentflow.agent_worker import AttemptResult
+
+        af, traj = self._setup()
+        af.trajectory_store.add(traj.trajectory_id, traj)
+        self._stub_pool(af, AttemptResult(sandbox_id="sandbox-9", error="ValueError: boom"))
+
+        with pytest.raises(RuntimeError, match="boom"):
+            await af._execute_multi_turn(traj, 0)
+        af.ds_sandbox_clients[0].delete.assert_called_once_with("sandbox-9")
 
     @pytest.mark.asyncio
     async def test_no_max_concurrency_is_unbounded(self):

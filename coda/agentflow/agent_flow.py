@@ -30,6 +30,7 @@ from coda.agentflow.tokenizer_manager import (
     create_tokenizer_manager,
 )
 from coda.agentflow.agent import get_agent_class
+from coda.agentflow.agent_worker import AgentWorkerPool, AttemptRequest
 from coda.agentflow.sandbox import SandboxClient, create_sandbox_client
 from coda.agentflow.utils import CONTEXT_LENGTH_EXCEEDED, setup_sandbox
 from coda.reward import create_reward_fn
@@ -123,7 +124,38 @@ class AgentFlow:
         self._run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self._init_tokenizer()
         self._init_router()
+        self._init_agent_worker_pool()
         logger.info("[init] AgentFlow ready")
+
+    def _init_agent_worker_pool(self) -> None:
+        """Create the out-of-process agent pool when agentflow.agent_workers > 0."""
+        num_workers = int(self.config.agentflow.get("agent_workers", 0))
+        self.agent_worker_pool: AgentWorkerPool | None = None
+        if num_workers <= 0:
+            return
+        # A sandbox the agent creates itself is only known to the worker, so a cancelled
+        # attempt cannot hand its id back for partial resume. Sources whose reward owns
+        # sandbox setup (prepare_sandbox) are created by the driver and unaffected.
+        if self.partial_rollout_enabled:
+            for ds_index, ds_cfg in self.ds_configs.items():
+                if get_rollout_mode(ds_cfg) == _ROLLOUT_SINGLE_TURN:
+                    continue
+                if self.ds_sandbox_clients.get(ds_index) is None:
+                    continue
+                if getattr(self.ds_reward_fns.get(ds_index), "prepare_sandbox", None) is None:
+                    raise ValueError(
+                        f"agentflow.agent_workers>0 with rollout.partial requires "
+                        f"data_sources[{ds_index}].reward to provide prepare_sandbox, so the "
+                        "driver owns the sandbox and can reuse it after an abort"
+                    )
+        self.agent_worker_pool = AgentWorkerPool(
+            ds_configs=self.ds_configs,
+            num_workers=num_workers,
+            num_cpus=float(self.config.agentflow.get("agent_worker_num_cpus", 4)),
+            max_concurrency=int(self.config.agentflow.get("agent_worker_max_concurrency", 256)),
+            cancel_timeout_seconds=float(self.config.agentflow.router.abort_timeout_seconds),
+        )
+        self._resources.callback(self.agent_worker_pool.shutdown)
 
     def _init_tokenizer(self) -> None:
         """Initialize tokenizer from config."""
@@ -499,28 +531,46 @@ class AgentFlow:
         sandbox_context = self._sandbox_contexts.get(traj.trajectory_id, {})
         resume = sandbox_id is not None
         agent = None
+        result_sandbox_id = sandbox_id
         keep_sandbox = False
         try:
             prepare_sandbox = getattr(reward_fn, "prepare_sandbox", None)
             if prepare_sandbox is not None and sandbox_id is None:
                 sandbox_id, sandbox_context = await setup_sandbox(
                     sandbox_client, traj.metadata, prepare_sandbox)
+                result_sandbox_id = sandbox_id
 
-            agent = agent_class(
-                router_url=f"{self.router_url}/{traj.trajectory_id}/{attempt_id}",
-                max_response_len_per_trajectory=max_response_len_per_trajectory,
-                **agent_cfg,
-                reward_fn=reward_fn,
-                sandbox_client=sandbox_client,
-                sandbox_id=sandbox_id,
-            )
-            reward = await agent.run_trajectory({
+            payload = {
                 "prompt": copy.deepcopy(_active_chat(traj)),
                 "initial_prompt": copy.deepcopy(traj.prompt),
                 "label": copy.deepcopy(traj.label),
                 "metadata": {**copy.deepcopy(traj.metadata), **sandbox_context},
                 "resume": resume,
-            })
+            }
+            if self.agent_worker_pool is None:
+                agent = agent_class(
+                    router_url=f"{self.router_url}/{traj.trajectory_id}/{attempt_id}",
+                    max_response_len_per_trajectory=max_response_len_per_trajectory,
+                    **agent_cfg,
+                    reward_fn=reward_fn,
+                    sandbox_client=sandbox_client,
+                    sandbox_id=sandbox_id,
+                )
+                reward = await agent.run_trajectory(payload)
+            else:
+                result = await self.agent_worker_pool.run_attempt(AttemptRequest(
+                    ds_index=ds_index,
+                    trajectory_id=traj.trajectory_id,
+                    attempt_id=attempt_id,
+                    router_url=f"{self.router_url}/{traj.trajectory_id}/{attempt_id}",
+                    payload=payload,
+                    max_response_len_per_trajectory=max_response_len_per_trajectory,
+                    sandbox_id=sandbox_id,
+                ))
+                result_sandbox_id = result.sandbox_id or sandbox_id
+                if result.error:
+                    raise RuntimeError(result.error)
+                reward = result.reward
 
             attempts = self.trajectory_store.get(
                 [traj.trajectory_id], attempt_id=attempt_id).get(traj.trajectory_id) or []
@@ -547,9 +597,9 @@ class AgentFlow:
                     await agent.close()
             finally:
                 if agent is not None:
-                    sandbox_id = agent.sandbox_id
-                if sandbox_id is not None:
-                    self._sandbox_ids[traj.trajectory_id] = sandbox_id
+                    result_sandbox_id = agent.sandbox_id
+                if result_sandbox_id is not None:
+                    self._sandbox_ids[traj.trajectory_id] = result_sandbox_id
                     self._sandbox_contexts[traj.trajectory_id] = sandbox_context
                 if not keep_sandbox:
                     await self._release_sandbox(traj.trajectory_id)
