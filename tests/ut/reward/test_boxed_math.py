@@ -95,6 +95,26 @@ class TestBoxedMathReward(unittest.TestCase):
                 self.assertEqual(_score(f"\\boxed{{{pred}}}", "7").final_reward, 0.0)
         self.assertFalse(os.path.exists("/tmp/boxed_math_should_not_exist"))
 
+    def test_variable_a_is_not_stripped_as_article(self):
+        """`a ` must not be removed when it is a variable: `3a + 2` used to normalize to `3+2`."""
+        for pred, label in [
+            ("3a + 2", "5"),
+            ("a + b", "b"),
+            ("2a + 1", "3"),
+            ("a \\sin x", "\\sin x"),
+            ("\\tan x", "\\t x"),
+        ]:
+            with self.subTest(pred=pred, label=label):
+                self.assertEqual(_score(f"\\boxed{{{pred}}}", label).final_reward, 0.0)
+
+    def test_variable_a_still_matches_equivalent_forms(self):
+        self.assertEqual(_score("\\boxed{3a + 2}", "2 + 3a").final_reward, 1.0)
+        self.assertEqual(_score("\\boxed{a + b}", "b + a").final_reward, 1.0)
+
+    def test_english_article_is_still_ignored(self):
+        self.assertEqual(_score("\\boxed{\\text{a triangle}}", "triangle").final_reward, 1.0)
+        self.assertEqual(_score("\\boxed{\\text{an octagon}}", "octagon").final_reward, 1.0)
+
     def test_dict_label(self):
         self.assertEqual(_score("\\boxed{5}", {"answer": "5"}).final_reward, 1.0)
 
