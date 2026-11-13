@@ -22,7 +22,10 @@ def collect(loss_agg_mode, losses):
     return model_mod._collect_loss_metrics(config, losses, grad_norm=1.5)
 
 
-@pytest.mark.parametrize("loss_key", ["train/loss", "train/value_loss"])
+@pytest.mark.parametrize(
+    "loss_key",
+    ["train/loss", "train/pg_loss", "train/ref_loss", "train/opd_loss", "train/value_loss"],
+)
 def test_aggregated_losses_follow_seq_mean(loss_key):
     losses = [
         {"num_tokens": 6, "num_sequences": 2, loss_key: 4.0, "train/value_clipfrac": 3.0},
@@ -34,7 +37,10 @@ def test_aggregated_losses_follow_seq_mean(loss_key):
     assert out["train/grad_norm"] == 1.5
 
 
-@pytest.mark.parametrize("loss_key", ["train/loss", "train/value_loss"])
+@pytest.mark.parametrize(
+    "loss_key",
+    ["train/loss", "train/pg_loss", "train/ref_loss", "train/opd_loss", "train/value_loss"],
+)
 def test_token_mean_divides_everything_by_tokens(loss_key):
     out = collect("token-mean", [{"num_tokens": 4, "num_sequences": 2, loss_key: 2.0}])
     assert out[loss_key] == pytest.approx(0.5)
