@@ -64,8 +64,6 @@ def remove_boxed(s: str) -> str:
 
 # Constants for normalization
 SUBSTITUTIONS = [
-    ("an ", ""),
-    ("a ", ""),
     (".$", "$"),
     ("\\$", ""),
     (r"\ ", ""),
@@ -75,6 +73,12 @@ SUBSTITUTIONS = [
     ("\\text{and}", ","),
     ("\\text{m}", "\\text{}"),
 ]
+
+# English articles ("a triangle", "an octagon") are dropped only when they are whole words
+# followed by another word. A plain ``replace("a ", "")`` also deletes the variable ``a``
+# ("3a + 2" -> "3+2", "a + b" -> "+b", "a sin x" -> "sinx") and corrupts commands like
+# ``\\tan x``.
+_ARTICLE_RE = re.compile(r"\b(?:an?)\s+(?=(?!(?:sin|cos|tan|cot|sec|csc|log|ln|exp)\b)[A-Za-z]{2,})")
 
 REMOVED_EXPRESSIONS = [
     "square",
@@ -133,6 +137,7 @@ def normalize_final_answer(final_answer: str) -> str:
     final_answer = final_answer.split("=")[-1]
 
     # Apply substitutions and removals
+    final_answer = _ARTICLE_RE.sub("", final_answer)
     for before, after in SUBSTITUTIONS:
         final_answer = final_answer.replace(before, after)
     for expr in REMOVED_EXPRESSIONS:
