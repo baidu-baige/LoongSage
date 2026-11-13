@@ -17,8 +17,10 @@ RUN pip install mlflow-skinny==3.16.0 wandb==0.28.0
 RUN pip install nvidia-resiliency-ext==0.6.0
 
 # git
-RUN git clone https://github.com/NVIDIA-NeMo/Megatron-Bridge.git && cd Megatron-Bridge && git checkout v0.6.0 && pip install --no-deps --no-build-isolation -e .
-RUN git clone https://github.com/NVIDIA/Megatron-LM.git && cd Megatron-LM && git checkout cd0e795f0 && pip install --no-deps --no-build-isolation -e .
+RUN git clone https://github.com/NVIDIA-NeMo/Megatron-Bridge.git && cd Megatron-Bridge && git checkout 8f580c643 && pip install --no-deps --no-build-isolation -e .
+RUN git clone https://github.com/NVIDIA/Megatron-LM.git && cd Megatron-LM && git checkout f78809f6d && pip install --no-deps --no-build-isolation -e .
+# sglang 0.5.23 -> 6d1ce5b894 (ERNIE 5.5 support); --no-deps keeps the base image's kernel packages
+RUN rm -rf sglang && git clone https://github.com/sgl-project/sglang.git && cd sglang/python && git checkout 6d1ce5b894 && pip install --no-deps --no-build-isolation -e .
 
 RUN pip install mini-swe-agent==2.4.5 litellm==1.80.0
 RUN ARCH="$(uname -m)" && case "$ARCH" in \
@@ -43,6 +45,7 @@ RUN pip install qwen-vl-utils==0.0.14
 RUN git clone https://github.com/baidu-baige/LoongSage.git && cd LoongSage && pip install --no-deps --no-build-isolation -e .
 
 # patch
-RUN cd /sgl-workspace/sglang && git apply ../LoongSage/docker/patch/sglang-0.5.23.patch
+RUN cd /sgl-workspace/sglang && git apply ../LoongSage/docker/patch/sglang-6d1ce5b894.patch
 RUN cd /sgl-workspace/Megatron-LM && git apply ../LoongSage/docker/patch/dsv41/megatron-core.patch
 RUN cd /sgl-workspace/Megatron-Bridge && git apply ../LoongSage/docker/patch/dsv41/megatron-bridge.patch
+RUN cd /sgl-workspace/Megatron-Bridge && git apply ../LoongSage/docker/patch/ernie55/megatron-bridge.patch

@@ -1,0 +1,35 @@
+diff --git a/src/megatron/bridge/models/ernie/configuration_ernie55.py b/src/megatron/bridge/models/ernie/configuration_ernie55.py
+index b8fd443d0..de44d12ee 100644
+--- a/src/megatron/bridge/models/ernie/configuration_ernie55.py
++++ b/src/megatron/bridge/models/ernie/configuration_ernie55.py
+@@ -266,6 +266,12 @@ class Ernie55Config(PretrainedConfig):
+                 **kwargs,
+             }
+         )
++        # LoongSage does not train MTP: build the decoder only (as DeepseekV41Config does for V4.1). The
++        # checkpoint's MTP tensors are skipped by check_ernie55_checkpoint_keys.
++        if num_nextn_predict_layers and compress_ratios is not None:
++            compress_ratios = list(compress_ratios)[:num_hidden_layers]
++        num_nextn_predict_layers = 0
++        mtp_shared_last_layer = False
+         self.vocab_size = vocab_size
+         self.hidden_size = hidden_size
+         self.num_hidden_layers = num_hidden_layers
+diff --git a/src/megatron/bridge/models/ernie/ernie55_mappings.py b/src/megatron/bridge/models/ernie/ernie55_mappings.py
+index beafe79bb..b6bd4e9c9 100644
+--- a/src/megatron/bridge/models/ernie/ernie55_mappings.py
++++ b/src/megatron/bridge/models/ernie/ernie55_mappings.py
+@@ -1002,6 +1002,13 @@ def check_ernie55_checkpoint_keys(hf_config: Any, hf_keys: Iterable[str]) -> Non
+     """
+     expected = set(ernie55_hf_param_dtypes(hf_config))
+     keys = set(hf_keys)
++    if not int(_hf_get(hf_config, "num_nextn_predict_layers", 0) or 0):
++        # LoongSage: Ernie55Config drops MTP, so skip the MTP layers a released checkpoint still stores.
++        num_hidden_layers = int(_hf_get(hf_config, "num_hidden_layers", 0))
++        keys = {
++            k for k in keys
++            if not (k.startswith("model.layers.") and int(k.split(".")[2]) >= num_hidden_layers)
++        }
+     missing = sorted(expected - keys)
+     unexpected = sorted(keys - expected - ernie55_mtp_body_copy_keys(hf_config, expected))
+     if missing or unexpected:

@@ -1,8 +1,8 @@
 diff --git a/megatron/core/models/gpt/experimental_attention_variant_module_specs.py b/megatron/core/models/gpt/experimental_attention_variant_module_specs.py
-index 289c11286..35dc4c0d9 100644
+index 37ce2666b..4edd0516d 100644
 --- a/megatron/core/models/gpt/experimental_attention_variant_module_specs.py
 +++ b/megatron/core/models/gpt/experimental_attention_variant_module_specs.py
-@@ -244,6 +244,14 @@ def get_experimental_attention_variant_module_spec(
+@@ -170,6 +170,14 @@ def get_experimental_attention_variant_module_spec(
          return get_dsa_module_spec_for_backend(config=config, backend=backend)
      elif config.experimental_attention_variant == "dsv4_hybrid":
          return get_dsv4_hybrid_module_spec_for_backend(config=config, backend=backend)
@@ -17,226 +17,11 @@ index 289c11286..35dc4c0d9 100644
      else:
          raise ValueError(
              f"Invalid experimental attention variant: {config.experimental_attention_variant}"
-diff --git a/megatron/core/optimizer/cpu_offloading/chunked_optimizer_state_offload.py b/megatron/core/optimizer/cpu_offloading/chunked_optimizer_state_offload.py
-index 930bf7f84..f259a144f 100644
---- a/megatron/core/optimizer/cpu_offloading/chunked_optimizer_state_offload.py
-+++ b/megatron/core/optimizer/cpu_offloading/chunked_optimizer_state_offload.py
-@@ -68,6 +68,12 @@ class ChunkedOptimizerStateOffloader:
-     optimizer and FP8 parameter-gather paths unchanged while still removing masters from the
-     forward/backward residency set.
- 
-+    With ``chunk_master_weights`` the optimizer-owned ``state['master_param']`` entries are
-+    instead staged with the tensor states of their chunk, so the step never holds more than
-+    two chunks of masters on GPU. This requires every master reader to be the optimizer step
-+    itself (precision-aware FusedAdam without FP8/MXFP8 parameter staging); readers that need
-+    the full master window (``ensure_master_for_param_sync``) are rejected.
-+
-     Args:
-         optimizer: The external torch-compatible optimizer to execute.
-         master_params: MCore-owned FP32 master parameters. These objects also appear in
-@@ -84,8 +90,12 @@ class ChunkedOptimizerStateOffloader:
-             accounts for compact int16 parameter remainders.
-         d2h_stream: Optional transfer stream shared by related optimizer wrappers.
-         h2d_stream: Optional transfer stream shared by related optimizer wrappers.
-+        chunk_master_weights: Stage optimizer-owned masters per chunk instead of as one
-+            full window. Chunk sizes then also count master bytes.
-     """
- 
-+    _chunk_masters: bool = False
-+
-     def __init__(
-         self,
-         optimizer: torch.optim.Optimizer,
-@@ -96,6 +106,7 @@ class ChunkedOptimizerStateOffloader:
-         optimizer_owned_master_dtypes: Mapping[torch.Tensor, torch.dtype] | None = None,
-         d2h_stream: torch.cuda.Stream | None = None,
-         h2d_stream: torch.cuda.Stream | None = None,
-+        chunk_master_weights: bool = False,
-     ) -> None:
-         if chunk_size_bytes < 0:
-             raise ValueError(f"chunk_size_bytes must be non-negative, got {chunk_size_bytes}")
-@@ -150,6 +161,14 @@ class ChunkedOptimizerStateOffloader:
-                 raise ValueError(
-                     "optimizer_owned_master_dtypes requires an optimizer with master_weights"
-                 )
-+        if chunk_master_weights and (
-+            self._explicit_master_param_ids or not self._master_in_optimizer_state
-+        ):
-+            raise ValueError(
-+                "chunk_master_weights requires optimizer-owned state['master_param'] masters "
-+                "(precision-aware optimizer with master_weights) and no MCore-owned masters"
-+            )
-+        self._chunk_masters = chunk_master_weights
- 
-         self._selected_params = self._select_params_for_offload()
-         self._selected_param_ids = {id(param) for param in self._selected_params}
-@@ -240,7 +259,11 @@ class ChunkedOptimizerStateOffloader:
-         oversized_param_count = 0
-         largest_oversized_param_bytes = 0
-         for param in params:
--            param_bytes = self._estimated_state_bytes(param)
-+            param_bytes = (
-+                self._estimated_bundle_bytes(param)
-+                if self._chunk_masters
-+                else self._estimated_state_bytes(param)
-+            )
-             if param_bytes > self.chunk_size_bytes:
-                 oversized_param_count += 1
-                 largest_oversized_param_bytes = max(largest_oversized_param_bytes, param_bytes)
-@@ -344,9 +367,16 @@ class ChunkedOptimizerStateOffloader:
-             and value.shape == param.shape
-         )
- 
-+    def _tracks_state(self, param: torch.Tensor, key: str, value: object) -> bool:
-+        """Return whether this manager stages ``state[param][key]`` through its chunks."""
-+
-+        if self._chunk_masters and key == _MASTER_PARAM_KEY:
-+            return isinstance(value, torch.Tensor) and value.shape == param.shape
-+        return self._is_offloadable_state(param, key, value)
-+
-     def _state_items_to_offload(self, param: torch.Tensor) -> Iterable[tuple[str, torch.Tensor]]:
-         for key, value in self.optimizer.state.get(param, {}).items():
--            if self._is_offloadable_state(param, key, value) and value.is_cuda:
-+            if self._tracks_state(param, key, value) and value.is_cuda:
-                 yield key, value
- 
-     def _has_unregistered_cuda_state(self, params: Sequence[torch.Tensor]) -> bool:
-@@ -391,7 +421,7 @@ class ChunkedOptimizerStateOffloader:
-                 continue
-             adopted_keys = set()
-             for key, value in tuple(self.optimizer.state.get(param, {}).items()):
--                if self._is_offloadable_state(param, key, value) and value.device.type == "cpu":
-+                if self._tracks_state(param, key, value) and value.device.type == "cpu":
-                     if not value.is_pinned():
-                         pinned_value = self._new_cpu_buffer(value)
-                         pinned_value.copy_(value)
-@@ -570,7 +600,7 @@ class ChunkedOptimizerStateOffloader:
-                     if not self.is_param_offloaded(param):
-                         for state_name, state_value in tuple(value.items()):
-                             if (
--                                self._is_offloadable_state(param, state_name, state_value)
-+                                self._tracks_state(param, state_name, state_value)
-                                 and state_value.device.type == "cpu"
-                             ):
-                                 value[state_name] = state_value.to(
-@@ -615,7 +645,7 @@ class ChunkedOptimizerStateOffloader:
-         )
- 
-     def _schedule_master_d2h(self) -> None:
--        if not self._selected_params:
-+        if not self._selected_params or self._chunk_masters:
-             return
-         self._validate_master_storage()
-         # A rerun or checkpoint can request offload after prefetch but before step().
-@@ -648,7 +678,11 @@ class ChunkedOptimizerStateOffloader:
-                     self.optimizer.state[param][state_key] = cpu_tensor
- 
-     def _schedule_master_h2d(self) -> None:
--        if not self._selected_params or self._master_h2d_event is not None:
-+        if (
-+            not self._selected_params
-+            or self._chunk_masters
-+            or self._master_h2d_event is not None
-+        ):
-             return
-         self._validate_master_storage()
- 
-@@ -800,6 +834,13 @@ class ChunkedOptimizerStateOffloader:
-     def ensure_master_for_param_sync(self) -> None:
-         """Ensure selected master weights are available for pre-forward FP8 staging."""
- 
-+        if self._chunk_masters:
-+            if self._master_bindings_are_cuda():
-+                return
-+            raise RuntimeError(
-+                "chunk_master_weights keeps masters CPU-resident outside the chunked optimizer "
-+                "step; a full master window for parameter staging is not supported"
-+            )
-         if self._master_weights_resident and self._master_h2d_event is None:
-             return
-         self._schedule_master_h2d()
-@@ -820,6 +861,11 @@ class ChunkedOptimizerStateOffloader:
- 
-         if not self._selected_params:
-             return
-+        if self._chunk_masters and not offload_master:
-+            raise RuntimeError(
-+                "chunk_master_weights stages masters with their state chunk; they cannot stay "
-+                "GPU-resident while the state is offloaded"
-+            )
-         if self._first_prefetch is not None:
-             self._wait_state_prefetch(self._first_prefetch)
-             self._first_prefetch = None
-diff --git a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py b/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
-index 45bf910f8..5c14957e4 100644
---- a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
-+++ b/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
-@@ -276,6 +276,8 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
-                     cpu_copy = True
-                 if self.param_update_in_fp32 and param.dtype != torch.float32:
-                     param = param.detach().clone().float()
-+                    if cpu_copy and self.pin_cpu_params:
-+                        param = param.pin_memory()
-                     param_to_fp32_param[orig_param] = param
- 
-                 if cpu_copy:
-diff --git a/megatron/core/optimizer/optimizer.py b/megatron/core/optimizer/optimizer.py
-index d22f6f9f4..f42bc979d 100644
---- a/megatron/core/optimizer/optimizer.py
-+++ b/megatron/core/optimizer/optimizer.py
-@@ -204,6 +204,7 @@ class MegatronOptimizer(ABC):
-             optimizer_owned_master_dtypes=optimizer_owned_master_dtypes,
-             d2h_stream=d2h_stream,
-             h2d_stream=h2d_stream,
-+            chunk_master_weights=self.config.optimizer_state_offload_chunk_masters,
-         )
- 
-     def set_optimizer_state_offload_deferred_lifecycle(
-diff --git a/megatron/core/optimizer/optimizer_config.py b/megatron/core/optimizer/optimizer_config.py
-index ecb471100..bc857b092 100644
---- a/megatron/core/optimizer/optimizer_config.py
-+++ b/megatron/core/optimizer/optimizer_config.py
-@@ -376,7 +376,15 @@ class OptimizerConfig:
-     """Target GPU staging-window size for optimizer tensor state, in MiB.
- 
-     Zero restores all selected tensor state together. Master weights are restored in one full
--    window and are not bounded by this value.
-+    window and are not bounded by this value, unless optimizer_state_offload_chunk_masters.
-+    """
-+
-+    optimizer_state_offload_chunk_masters: bool = False
-+    """Stage optimizer-owned fp32 master weights per state chunk instead of as one full window.
-+
-+    Bounds the optimizer-step GPU peak by the chunk window (chunk sizes then also count master
-+    bytes). Requires precision-aware Adam without FP8 parameters, where the optimizer step is
-+    the only master reader.
-     """
- 
-     optimizer_state_offload_fraction: float = 1.0
-@@ -501,6 +509,18 @@ class OptimizerConfig:
-             )
-         )
- 
-+        if self.optimizer_state_offload_chunk_masters:
-+            assert (
-+                self.chunked_optimizer_state_offload
-+                and self.optimizer == 'adam'
-+                and self.use_precision_aware_optimizer
-+                and self.fp8_recipe is None
-+                and not self.reuse_grad_buf_for_mxfp8_param_ag
-+            ), (
-+                "optimizer_state_offload_chunk_masters requires chunked_optimizer_state_offload "
-+                "with precision-aware Adam and no FP8 parameters"
-+            )
-+
-         if self.fp8_recipe == "mxfp8":
-             if not self.reuse_grad_buf_for_mxfp8_param_ag:
-                 warnings.warn(
 diff --git a/megatron/core/tensor_parallel/mappings.py b/megatron/core/tensor_parallel/mappings.py
-index 1a3daa418..a3e145ec1 100644
+index eaed82318..9b615b142 100644
 --- a/megatron/core/tensor_parallel/mappings.py
 +++ b/megatron/core/tensor_parallel/mappings.py
-@@ -218,6 +218,32 @@ class _CopyToModelParallelRegion(torch.autograd.Function):
+@@ -222,6 +222,32 @@ class _CopyToModelParallelRegion(torch.autograd.Function):
          return _reduce(grad_output, ctx.group), None
  
  
@@ -269,7 +54,7 @@ index 1a3daa418..a3e145ec1 100644
  class _ReduceFromModelParallelRegion(torch.autograd.Function):
      """All-reduce the input from the model parallel region."""
  
-@@ -534,9 +560,16 @@ class _AllToAll(torch.autograd.Function):
+@@ -538,9 +564,16 @@ class _AllToAll(torch.autograd.Function):
  # -----------------
  
  
@@ -289,10 +74,10 @@ index 1a3daa418..a3e145ec1 100644
  
  
 diff --git a/megatron/core/transformer/experimental_attention_variant/csa_utils/fused_sparse_attention.py b/megatron/core/transformer/experimental_attention_variant/csa_utils/fused_sparse_attention.py
-index 04b4c5466..1f77da108 100644
+index c28f28de3..47663ca2b 100644
 --- a/megatron/core/transformer/experimental_attention_variant/csa_utils/fused_sparse_attention.py
 +++ b/megatron/core/transformer/experimental_attention_variant/csa_utils/fused_sparse_attention.py
-@@ -101,7 +101,7 @@ def _ensure_flash_mla():
+@@ -680,7 +680,7 @@ def _ensure_flash_mla():
      except ImportError as e:
          raise ImportError(
              "FlashMLA is required for DSA sparse attention forward. "
@@ -301,7 +86,7 @@ index 04b4c5466..1f77da108 100644
              "so that `from flash_mla import flash_mla_sparse_fwd` succeeds."
          ) from e
      _flash_mla_sparse_fwd = _fwd
-@@ -137,9 +137,9 @@ def _csa_fwd_flash_mla(
+@@ -721,9 +721,9 @@ def _csa_fwd_flash_mla(
      Accepts flat (unbatched) tensors with global indices; pads ``TopK`` to
      the GPU-specific alignment; returns ``(out, lse, lse_indexer)``.
      """
@@ -313,9 +98,9 @@ index 04b4c5466..1f77da108 100644
 +    )
      _ensure_flash_mla()
  
-     _total_S_q, _H, _D = q.shape
-@@ -154,7 +154,9 @@ def _csa_fwd_flash_mla(
-     indices = topk_idxs.unsqueeze(1)  # (total_S_q, 1, TopK_padded) h_kv=1
+     _total_S_q, actual_num_heads, _D = q.shape
+@@ -748,7 +748,9 @@ def _csa_fwd_flash_mla(
+             attn_sink = attn_sink_padded
  
      with torch.cuda.nvtx.range("flash_mla_sparse_fwd"):
 -        res = _flash_mla_sparse_fwd(
@@ -325,7 +110,7 @@ index 04b4c5466..1f77da108 100644
              q,
              kv_3d,
              indices,
-@@ -162,20 +164,8 @@ def _csa_fwd_flash_mla(
+@@ -756,27 +758,14 @@ def _csa_fwd_flash_mla(
              d_v=d_v,
              attn_sink=attn_sink,
              topk_length=topk_length,
@@ -337,6 +122,13 @@ index 04b4c5466..1f77da108 100644
 -        else:
 -            out, _max_logits, lse = res
 -            lse_indexer = None
+ 
+     if padded_num_heads != actual_num_heads:
+         # Reconstruction uses the same strides for saved output and its private destination.
+         out = out[:, :actual_num_heads, :].contiguous()
+         lse = lse[:, :actual_num_heads]
+-        if lse_indexer is not None:
+-            lse_indexer = lse_indexer[:, :actual_num_heads]
 -
 -    if indexer_topk > 0:
 -        # When indexer_topk == total TopK, lse_indexer should equal lse but
@@ -344,14 +136,15 @@ index 04b4c5466..1f77da108 100644
 -        if indexer_topk >= TopK:
 -            return out, lse, lse.clone()
 -        return out, lse, lse_indexer
++
      return out, lse, None
  
  
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsa_cudnn_kernels.py b/megatron/core/transformer/experimental_attention_variant/dsa_cudnn_kernels.py
-index e6013f4d7..802b5338a 100644
+index 3a9186a86..803de09eb 100644
 --- a/megatron/core/transformer/experimental_attention_variant/dsa_cudnn_kernels.py
 +++ b/megatron/core/transformer/experimental_attention_variant/dsa_cudnn_kernels.py
-@@ -320,7 +320,7 @@ def _ensure_flash_mla() -> None:
+@@ -388,7 +388,7 @@ def _ensure_flash_mla() -> None:
      except ImportError as e:
          raise ImportError(
              "FlashMLA is required for DSA sparse attention forward. "
@@ -360,7 +153,7 @@ index e6013f4d7..802b5338a 100644
              "so that `from flash_mla import flash_mla_sparse_fwd` succeeds."
          ) from e
      _flash_mla_sparse_fwd = _fwd
-@@ -914,7 +914,7 @@ def _dsa_fwd_flash_mla(
+@@ -1149,7 +1149,7 @@ def _dsa_fwd_flash_mla(
              d_v=d_v,
              attn_sink=attn_sink,
              topk_length=topk_length,
@@ -371,10 +164,10 @@ index e6013f4d7..802b5338a 100644
      if padded_num_heads != actual_num_heads:
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/deepseek_v41.py b/megatron/core/transformer/experimental_attention_variant/dsv41/deepseek_v41.py
 new file mode 100644
-index 000000000..94e2eb647
+index 000000000..ca525155a
 --- /dev/null
 +++ b/megatron/core/transformer/experimental_attention_variant/dsv41/deepseek_v41.py
-@@ -0,0 +1,727 @@
+@@ -0,0 +1,729 @@
 +import copy
 +
 +import einops
@@ -671,10 +464,11 @@ index 000000000..94e2eb647
 +        super().__init__(config, layer_number)
 +        self.norm_eps = config.layernorm_epsilon
 +
-+    def forward(self, hidden_states, mhc_recompute_manager=None, output_slot=None):
++    def forward(self, hidden_states, mhc_recompute_manager=None, output_slot=None, return_residual=False):
 +        if mhc_recompute_manager is not None or output_slot is not None:
 +            raise NotImplementedError("mHC recompute is not supported for the DeepSeek-V4.1 plugin")
-+        return self._forward_normal(hidden_states)
++        result = self._forward_normal(hidden_states)
++        return result if return_residual else result[:3]
 +
 +    def _forward_normal(self, hidden_states):
 +        rt = get_runtime(self.config)
@@ -741,6 +535,7 @@ index 000000000..94e2eb647
 +        attention_type: str = None,
 +        cp_comm_type: str = None,
 +        pg_collection=None,
++        is_mtp_layer: bool = False,
 +        name: str | None = None,
 +    ):
 +        torch.backends.cuda.matmul.allow_tf32 = True
@@ -3786,19 +3581,19 @@ index 000000000..bcda5dfa2
 +
 +indexer_replay_manager = _NoopIndexerReplayManager()
 diff --git a/megatron/core/transformer/transformer_config.py b/megatron/core/transformer/transformer_config.py
-index 80b3ecf4f..b4b351d7b 100644
+index 6f16f8064..aaead6dd8 100644
 --- a/megatron/core/transformer/transformer_config.py
 +++ b/megatron/core/transformer/transformer_config.py
-@@ -313,7 +313,7 @@ class TransformerConfig(ModelParallelConfig):
+@@ -384,7 +384,7 @@ class TransformerConfig(ModelParallelConfig):
      # attention variant
      ####################
      experimental_attention_variant: Optional[
--        Literal['gdn', 'kda', 'gated_delta_net', 'dsa', 'dsv4_hybrid']
-+        Literal['gdn', 'kda', 'gated_delta_net', 'dsa', 'dsv4_hybrid', 'dsv41_hybrid']
+-        Literal['gdn', 'gdn2', 'kda', 'gated_delta_net', 'dsa', 'dsv4_hybrid']
++        Literal['gdn', 'gdn2', 'kda', 'gated_delta_net', 'dsa', 'dsv4_hybrid', 'dsv41_hybrid']
      ] = None
      """Type of experimental attention variant to use.
  
-@@ -1663,13 +1663,13 @@ class TransformerConfig(ModelParallelConfig):
+@@ -2471,13 +2471,13 @@ class TransformerConfig(ModelParallelConfig):
              if self.cp_partition_mode == "contiguous":
                  if (
                      self.multi_latent_attention
@@ -3814,8 +3609,8 @@ index 80b3ecf4f..b4b351d7b 100644
                      is_gated_delta_net_variant(self.experimental_attention_variant)
                  ):
                      raise ValueError(
-@@ -1686,7 +1686,7 @@ class TransformerConfig(ModelParallelConfig):
-                         "GDN-family linear_cp_mode='headwise'."
+@@ -2500,7 +2500,7 @@ class TransformerConfig(ModelParallelConfig):
+                         "experimental_attention_variant='gdn2', which supports only headwise CP."
                      )
              elif self.cp_partition_mode == "zigzag":
 -                if self.experimental_attention_variant == "dsv4_hybrid":
@@ -3823,7 +3618,7 @@ index 80b3ecf4f..b4b351d7b 100644
                      raise ValueError(
                          "DSv4 Hybrid with context parallelism requires "
                          "cp_partition_mode='contiguous'."
-@@ -1934,6 +1934,27 @@ class TransformerConfig(ModelParallelConfig):
+@@ -2898,6 +2898,27 @@ class TransformerConfig(ModelParallelConfig):
                              "build or set dsa_kernel_backend='none'."
                          )
  
@@ -3851,20 +3646,21 @@ index 80b3ecf4f..b4b351d7b 100644
          if self.gdn_pre_gated_delta_rule_fusion and self.experimental_attention_variant == "kda":
              raise NotImplementedError(
                  "gdn_pre_gated_delta_rule_fusion is not implemented for KDA yet."
-@@ -3964,7 +3985,7 @@ class MLATransformerConfig(TransformerConfig):
+@@ -6339,7 +6360,7 @@ class MLATransformerConfig(TransformerConfig):
              )
  
-         # DSv4 hybrid: derive qk_head_dim and kv_lora_rank from v_head_dim and qk_pos_emb_head_dim
+         # DSv4 hybrid: derive qk_head_dim and kv_lora_rank from v_head_dim and qk_pos_emb_head_dim.
 -        if self.experimental_attention_variant == "dsv4_hybrid":
 +        if self.experimental_attention_variant in ("dsv4_hybrid", "dsv41_hybrid"):
              assert (
                  not self.mla_down_proj_fusion
              ), "MLA down projection fusion must be disabled for DSv4 hybrid mode."
-@@ -3974,9 +3995,16 @@ class MLATransformerConfig(TransformerConfig):
-                 f"DSv4 hybrid mode is enabled, deriving qk_head_dim and kv_lora_rank from "
-                 f"v_head_dim and qk_pos_emb_head_dim",
+@@ -6361,10 +6382,17 @@ class MLATransformerConfig(TransformerConfig):
+                 "DSv4 hybrid mode is enabled, deriving qk_head_dim and kv_lora_rank from "
+                 "v_head_dim and qk_pos_emb_head_dim",
              )
 -            derived = self.v_head_dim - self.qk_pos_emb_head_dim
+-            assert derived > 0, "v_head_dim must be greater than qk_pos_emb_head_dim."
 -            self.qk_head_dim = derived
 -            self.kv_lora_rank = derived
 +            if self.experimental_attention_variant == "dsv41_hybrid":
@@ -3875,6 +3671,7 @@ index 80b3ecf4f..b4b351d7b 100644
 +                self.qk_head_dim = self.v_head_dim
 +            else:
 +                derived = self.v_head_dim - self.qk_pos_emb_head_dim
++                assert derived > 0, "v_head_dim must be greater than qk_pos_emb_head_dim."
 +                self.qk_head_dim = derived
 +                self.kv_lora_rank = derived
  

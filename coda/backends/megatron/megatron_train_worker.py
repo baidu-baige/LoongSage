@@ -21,7 +21,6 @@ import random
 import logging
 from abc import abstractmethod
 from typing import override, Optional, get_type_hints
-from enum import Enum
 from functools import partial
 
 import numpy as np
@@ -39,7 +38,6 @@ from megatron.core.utils import get_model_config
 from megatron.core.distributed import DistributedDataParallel as DDP
 from coda.backends.megatron.checkpoint import async_calls
 from megatron.bridge import AutoBridge
-from megatron.bridge.models import GPTModelProvider
 
 from coda.backends.train_worker import TrainWorker
 from coda.utils.memory_utils import print_memory, clear_memory
@@ -51,6 +49,7 @@ from coda.backends.megatron.checkpoint import load_checkpoint, load_model_weight
 from coda.utils.types import to_torch_dtype
 from coda.utils.tracking import configure_tracking
 from coda.backends.megatron.mixed_precision import KeepFP32Module
+from coda.backends.megatron.model_builder import build_bridge_model
 
 logger = logging.getLogger(__name__)
 
@@ -219,31 +218,14 @@ class MegatronTrainWorker(TrainWorker):
         # If checkpoint exists: structure only (weights restored from ckpt later)
         # Otherwise: load HF weights into model
         self.bridge = AutoBridge.from_hf_pretrained(config.hf_model_path)
-        provider = self.bridge.to_megatron_provider(load_weights=not has_checkpoint)
-
-        model_config_dict = OmegaConf.to_container(config.megatron.model)
-        hints = get_type_hints(GPTModelProvider)
-        overrides = {}
-        for k, v in model_config_dict.items():
-            # Convert string dtype like "torch.bfloat16" to actual torch.dtype
-            hint = hints.get(k)
-            if hint is torch.dtype or hint is Optional[torch.dtype]:
-                v = to_torch_dtype(v)
-            elif isinstance(hint, type) and issubclass(hint, Enum) and isinstance(v, str):
-                # e.g. attention_backend: flash -> AttnBackend.flash. Megatron's enums
-                # are plain Enum (no str mixin), so a raw string silently compares
-                # unequal to every member instead of failing loudly.
-                v = hint[v]
-            overrides[k] = v
-        # Apply overrides and finalize via the bridge helper so provider paths
-        # that need post-override setup (e.g. DeepSeek-V4 hash MoE auto-setting
-        # pipeline_model_parallel_layout when PP > 1) run before finalize().
-        provider.apply_overrides_and_finalize(overrides=overrides)
-        self._configure_provider(provider)
         megatron_ddp_config = DistributedDataParallelConfig(
             **OmegaConf.to_container(config.megatron.ddp_config)
         )
-        self.model = provider.provide_distributed_model(
+        self.model = build_bridge_model(
+            self.bridge,
+            OmegaConf.to_container(config.megatron.model),
+            load_weights=not has_checkpoint,
+            configure=self._configure_provider,
             ddp_config=megatron_ddp_config,
             wrap_with_ddp=not self._forward_only,
             mixed_precision_wrapper=partial(KeepFP32Module, config.megatron.keep_fp32_weights)
@@ -271,11 +253,13 @@ class MegatronTrainWorker(TrainWorker):
         self.params_offloaded = False
 
     def _configure_provider(self, provider) -> None:
-        """Hook to adjust the finalized model provider before DDP wrapping.
+        """Hook to adjust the model config before the model is built.
 
-        Called between ``apply_overrides_and_finalize`` and
-        ``provide_distributed_model``, i.e. before the DDP grad buffers and the
-        optimizer are built from the model's parameters. No-op by default.
+        Receives the finalized ``GPTModelProvider`` on the provider path, or the
+        overridden (not yet finalized) builder-backed ``ModelConfig`` otherwise
+        (see :func:`~coda.backends.megatron.model_builder.build_bridge_model`).
+        Runs before the DDP grad buffers and the optimizer are built from the
+        model's parameters. No-op by default.
         """
 
     def _build_optimizer(self):

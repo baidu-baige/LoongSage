@@ -1,16 +1,14 @@
 diff --git a/src/megatron/bridge/models/deepseek/__init__.py b/src/megatron/bridge/models/deepseek/__init__.py
-index 968868c28..5b6346d98 100644
 --- a/src/megatron/bridge/models/deepseek/__init__.py
 +++ b/src/megatron/bridge/models/deepseek/__init__.py
-@@ -15,10 +15,12 @@
- from megatron.bridge.models.deepseek.deepseek_v2_bridge import DeepSeekV2Bridge  # noqa: F401
+@@ -14,9 +14,11 @@
+ 
  from megatron.bridge.models.deepseek.deepseek_v3_bridge import DeepSeekV3Bridge  # noqa: F401
  from megatron.bridge.models.deepseek.deepseek_v4_bridge import DeepSeekV4Bridge  # noqa: F401
 +from megatron.bridge.models.deepseek.deepseek_v41_bridge import DeepSeekV41Bridge  # noqa: F401
  
  
  __all__ = [
-     "DeepSeekV2Bridge",
      "DeepSeekV3Bridge",
      "DeepSeekV4Bridge",
 +    "DeepSeekV41Bridge",

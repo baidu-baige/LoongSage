@@ -741,6 +741,8 @@ def create_tokenizer_manager(
     custom_chat_template = _load_chat_template(tokenizer_config.custom_chat_template_path)
     generation_prompt_kwargs = dict(tokenizer_config.generation_prompt_kwargs or {})
     think_tags = getattr(tokenizer_config, "think_tags", None) or getattr(tokenizer_config, "thought_words", None)
+    if think_tags is not None:
+        think_tags = tuple(think_tags)
     manager_config = tokenizer_config.manager
     mode = str(manager_config.mode).strip().lower() if manager_config else "thread"
     default_workers = min(4, os.cpu_count() or 1)

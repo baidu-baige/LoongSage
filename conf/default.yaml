@@ -201,6 +201,7 @@ megatron:
     virtual_pipeline_model_parallel_size: null
     context_parallel_size: 1
     cp_partition_mode: zigzag
+    max_seqlen_per_dp_cp_rank: ${trainer.max_tokens_per_gpu}  # only to pass MCore's sequence_packing_scheduler check
     expert_model_parallel_size: 1
     expert_tensor_parallel_size: null
     overlap_p2p_comm: false
@@ -223,7 +224,6 @@ megatron:
     chunked_optimizer_state_offload: false
     optimizer_state_offload_fraction: 1.0
     optimizer_state_offload_chunk_size_mb: 1024
-    optimizer_state_offload_chunk_masters: false
   scheduler:
     lr_warmup_steps: 0
     lr_decay_steps: 1
@@ -288,6 +288,7 @@ opd:
     virtual_pipeline_model_parallel_size: null
     context_parallel_size: 1
     cp_partition_mode: zigzag
+    max_seqlen_per_dp_cp_rank: ${trainer.max_tokens_per_gpu}  # only to pass MCore's sequence_packing_scheduler check
     expert_model_parallel_size: 1
     expert_tensor_parallel_size: null
     overlap_p2p_comm: false

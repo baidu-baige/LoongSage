@@ -1,5 +1,5 @@
 diff --git a/python/sglang/srt/debug_utils/dumper.py b/python/sglang/srt/debug_utils/dumper.py
-index 094a461..c8bcd3e 100644
+index b57a87886a..34d23c81dc 100644
 --- a/python/sglang/srt/debug_utils/dumper.py
 +++ b/python/sglang/srt/debug_utils/dumper.py
 @@ -1819,12 +1819,18 @@ class _SGLangPlugin(_FrameworkPlugin):
@@ -28,10 +28,10 @@ index 094a461..c8bcd3e 100644
      @property
      def name(self) -> str:
 diff --git a/python/sglang/srt/entrypoints/http_server.py b/python/sglang/srt/entrypoints/http_server.py
-index 899a40f..4d03954 100644
+index 134d20376b..45fac2e3ec 100644
 --- a/python/sglang/srt/entrypoints/http_server.py
 +++ b/python/sglang/srt/entrypoints/http_server.py
-@@ -161,6 +161,7 @@ from sglang.srt.managers.io_struct import (
+@@ -168,6 +168,7 @@ from sglang.srt.managers.io_struct import (
      UpdateWeightFromDiskReqInput,
      UpdateWeightsFromDistributedReqInput,
      UpdateWeightsFromIPCReqInput,
@@ -39,7 +39,7 @@ index 899a40f..4d03954 100644
      UpdateWeightsFromTensorReqInput,
      UpdateWeightVersionReqInput,
      VertexGenerateReqInput,
-@@ -1433,6 +1434,19 @@ async def destroy_weights_update_group(
+@@ -1432,6 +1433,19 @@ async def destroy_weights_update_group(
      )
  
  
@@ -60,10 +60,10 @@ index 899a40f..4d03954 100644
  @auth_level(AuthLevel.ADMIN_OPTIONAL)
  async def update_weights_from_tensor(
 diff --git a/python/sglang/srt/layers/engram.py b/python/sglang/srt/layers/engram.py
-index 78fe483..281195e 100644
+index a047cbb2f7..53ff421f93 100644
 --- a/python/sglang/srt/layers/engram.py
 +++ b/python/sglang/srt/layers/engram.py
-@@ -1392,3 +1392,63 @@ def _bcg_engram_embed(
+@@ -1609,3 +1609,63 @@ def _bcg_engram_embed(
      # A replay builds a fresh batch; the capture-time one stages no rows.
      forward_batch = get_tc_piecewise_forward_context().forward_batch
      out.copy_(engram.embed_rows(hash_ids, forward_batch, cp_all_tokens))
@@ -128,10 +128,10 @@ index 78fe483..281195e 100644
 +                param.weight_loader(param, f.get_slice(name))
 +        emb.finish_load(label=f"dummy engram layer {i}")
 diff --git a/python/sglang/srt/layers/quantization/fp8.py b/python/sglang/srt/layers/quantization/fp8.py
-index d779091..d20160c 100644
+index f371de5051..07b2cf6d54 100644
 --- a/python/sglang/srt/layers/quantization/fp8.py
 +++ b/python/sglang/srt/layers/quantization/fp8.py
-@@ -992,6 +992,33 @@ class Fp8LinearMethod(LinearMethodBase):
+@@ -1033,6 +1033,33 @@ class Fp8LinearMethod(LinearMethodBase):
          self._process_mxfp8_linear_weight_scale(layer, scale_u8=scale_u8)
          layer.block_fp8_mxfp8_ready = True
  
@@ -166,7 +166,7 @@ index d779091..d20160c 100644
          """Pack the weight scale a FlashInfer layer needs for a DeepGEMM-packed input pair."""
          from sglang.srt.layers import deep_gemm_wrapper
 diff --git a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py b/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py
-index 7a1c5a9..0c0be3c 100644
+index 7a1c5a9512..0c0be3cf22 100644
 --- a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py
 +++ b/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py
 @@ -6,8 +6,10 @@ TRT-LLM implementation.
@@ -305,7 +305,7 @@ index 7a1c5a9..0c0be3c 100644
          self,
          layer: Module,
 diff --git a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_trtllm_moe.py b/python/sglang/srt/layers/quantization/mxfp4_flashinfer_trtllm_moe.py
-index 8188c99..c2780c3 100644
+index 12008798a0..27563bc249 100644
 --- a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_trtllm_moe.py
 +++ b/python/sglang/srt/layers/quantization/mxfp4_flashinfer_trtllm_moe.py
 @@ -1,6 +1,8 @@
@@ -317,7 +317,7 @@ index 8188c99..c2780c3 100644
  from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple
  
  import torch
-@@ -164,6 +166,15 @@ class Mxfp4FlashinferTrtllmMoEMethod:
+@@ -162,6 +164,15 @@ class Mxfp4FlashinferTrtllmMoEMethod:
              if swiglu_limit is not None
              else None
          )
@@ -333,7 +333,7 @@ index 8188c99..c2780c3 100644
  
      def get_moe_runner_backend(self, layer):
          return MoeRunnerBackend.FLASHINFER_MXFP4
-@@ -244,6 +255,7 @@ class Mxfp4FlashinferTrtllmMoEMethod:
+@@ -242,6 +253,7 @@ class Mxfp4FlashinferTrtllmMoEMethod:
          if getattr(layer, "_mega_moe_weights_built", False):
              return
  
@@ -341,7 +341,7 @@ index 8188c99..c2780c3 100644
          _pad_intermediate_size(layer)
  
          w13_w, w13_s = reorder_w1w3_to_w3w1(
-@@ -268,61 +280,19 @@ class Mxfp4FlashinferTrtllmMoEMethod:
+@@ -266,61 +278,19 @@ class Mxfp4FlashinferTrtllmMoEMethod:
              w13_scale = w13_scale.to(torch.float8_e8m0fnu)
              w2_scale = w2_scale.to(torch.float8_e8m0fnu)
  
@@ -415,7 +415,7 @@ index 8188c99..c2780c3 100644
  
          layer.w13_weight = Parameter(torch.stack(g1_w), requires_grad=False)
          layer.w13_weight_scale_inv = Parameter(
-@@ -340,8 +310,114 @@ class Mxfp4FlashinferTrtllmMoEMethod:
+@@ -338,8 +308,114 @@ class Mxfp4FlashinferTrtllmMoEMethod:
          )
  
          self._register_static_scale_ones(layer)
@@ -531,10 +531,10 @@ index 8188c99..c2780c3 100644
          device = layer.w13_weight.device
          for name in (
 diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
-index dcec0aa..034cba6 100644
+index 7d81b55ec9..7b0a8d007c 100644
 --- a/python/sglang/srt/managers/io_struct.py
 +++ b/python/sglang/srt/managers/io_struct.py
-@@ -2152,6 +2152,25 @@ class DestroyWeightsUpdateGroupReqOutput(BaseReq, kw_only=True):
+@@ -2216,6 +2216,25 @@ class DestroyWeightsUpdateGroupReqOutput(BaseReq, kw_only=True):
      message: str
  
  
@@ -561,10 +561,10 @@ index dcec0aa..034cba6 100644
      # The new weight version
      new_version: str
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index a50c085..44fcc1f 100644
+index d3c33748f0..b5f7774ffc 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
-@@ -185,6 +185,7 @@ from sglang.srt.managers.io_struct import (
+@@ -210,6 +210,7 @@ from sglang.srt.managers.io_struct import (
      UnloadLoRAAdapterReqInput,
      UnloadLoRAAdapterReqOutput,
      UpdateWeightFromDiskReqInput,
@@ -572,7 +572,7 @@ index a50c085..44fcc1f 100644
      UpdateWeightsFromDistributedReqInput,
      UpdateWeightsFromIPCReqInput,
      UpdateWeightsFromTensorReqInput,
-@@ -1878,6 +1879,10 @@ class Scheduler(
+@@ -1960,6 +1961,10 @@ class Scheduler(
                      UpdateWeightsFromIPCReqInput,
                      self.weight_updater.update_weights_from_ipc,
                  ),
@@ -584,10 +584,10 @@ index a50c085..44fcc1f 100644
                      UpdateWeightVersionReqInput,
                      self.handle_update_weight_version,
 diff --git a/python/sglang/srt/managers/scheduler_components/weight_updater.py b/python/sglang/srt/managers/scheduler_components/weight_updater.py
-index 2381b3a..a506736 100644
+index 42d7e7a0e3..8281352f03 100644
 --- a/python/sglang/srt/managers/scheduler_components/weight_updater.py
 +++ b/python/sglang/srt/managers/scheduler_components/weight_updater.py
-@@ -41,6 +41,8 @@ from sglang.srt.managers.io_struct import (
+@@ -53,6 +53,8 @@ from sglang.srt.managers.io_struct import (
      UpdateWeightsFromDistributedReqOutput,
      UpdateWeightsFromIPCReqInput,
      UpdateWeightsFromIPCReqOutput,
@@ -596,7 +596,7 @@ index 2381b3a..a506736 100644
      UpdateWeightsFromTensorReqInput,
      UpdateWeightsFromTensorReqOutput,
  )
-@@ -290,6 +292,22 @@ class SchedulerWeightUpdaterManager:
+@@ -328,6 +330,22 @@ class SchedulerWeightUpdaterManager:
          parameter = self.tp_worker.get_weights_by_name(recv_req)
          return GetWeightsByNameReqOutput(parameter=parameter)
  
@@ -620,10 +620,10 @@ index 2381b3a..a506736 100644
          """Reject freeing/restoring model weights while the CUDA IPC weight
          cache is active: the weights are shared with the daemon via CUDA IPC, so
 diff --git a/python/sglang/srt/managers/tokenizer_control_mixin.py b/python/sglang/srt/managers/tokenizer_control_mixin.py
-index df58b81..25a58c5 100644
+index 330a2bf0e3..f5fdbf0d2d 100644
 --- a/python/sglang/srt/managers/tokenizer_control_mixin.py
 +++ b/python/sglang/srt/managers/tokenizer_control_mixin.py
-@@ -80,6 +80,8 @@ from sglang.srt.managers.io_struct import (
+@@ -84,6 +84,8 @@ from sglang.srt.managers.io_struct import (
      UpdateWeightsFromDistributedReqOutput,
      UpdateWeightsFromIPCReqInput,
      UpdateWeightsFromIPCReqOutput,
@@ -632,7 +632,7 @@ index df58b81..25a58c5 100644
      UpdateWeightsFromTensorReqInput,
      UpdateWeightsFromTensorReqOutput,
      UpdateWeightVersionReqInput,
-@@ -120,6 +122,7 @@ _COMMUNICATOR_SPECS = [
+@@ -124,6 +126,7 @@ _COMMUNICATOR_SPECS = [
      ("send_weights_to_remote_instance", SendWeightsToRemoteInstanceReqOutput),
      ("update_weights_from_tensor", UpdateWeightsFromTensorReqOutput),
      ("update_weights_from_ipc", UpdateWeightsFromIPCReqOutput),
@@ -640,7 +640,7 @@ index df58b81..25a58c5 100644
      ("update_weight_version", UpdateWeightVersionReqOutput),
      ("get_weights_by_name", GetWeightsByNameReqOutput),
      ("release_memory_occupation", ReleaseMemoryOccupationReqOutput),
-@@ -631,6 +634,23 @@ class TokenizerControlMixin:
+@@ -659,6 +662,23 @@ class TokenizerControlMixin:
  
          return success, message
  
@@ -665,10 +665,10 @@ index df58b81..25a58c5 100644
          self: TokenizerManager,
          obj: UnloadLoRAAdapterReqInput,
 diff --git a/python/sglang/srt/managers/tp_worker.py b/python/sglang/srt/managers/tp_worker.py
-index 5058c3f..4e9684e 100644
+index 0d9d925de9..9c39c5a671 100644
 --- a/python/sglang/srt/managers/tp_worker.py
 +++ b/python/sglang/srt/managers/tp_worker.py
-@@ -200,6 +200,9 @@ class BaseTpWorker(ABC):
+@@ -199,6 +199,9 @@ class BaseTpWorker(ABC):
              serialized_named_tensors[get_parallel().tp_rank]
          )
  
@@ -679,10 +679,10 @@ index 5058c3f..4e9684e 100644
          parameter = self.model_runner.weight_exporter.get_weights_by_name(
              recv_req.name, recv_req.truncate_size
 diff --git a/python/sglang/srt/model_executor/model_runner_components/weight_updater.py b/python/sglang/srt/model_executor/model_runner_components/weight_updater.py
-index 80965e5..7395618 100644
+index 47aa591706..20890814d1 100644
 --- a/python/sglang/srt/model_executor/model_runner_components/weight_updater.py
 +++ b/python/sglang/srt/model_executor/model_runner_components/weight_updater.py
-@@ -434,6 +434,40 @@ class WeightUpdater:
+@@ -446,6 +446,40 @@ class WeightUpdater:
              logger.error(f"IPC weight update failed: {e}")
              return False, str(e)
  
@@ -724,10 +724,10 @@ index 80965e5..7395618 100644
  def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):
      params_dict = dict(model.named_parameters())
 diff --git a/python/sglang/srt/model_loader/loader.py b/python/sglang/srt/model_loader/loader.py
-index edda2a7..c61dd78 100644
+index 972fceb802..a6408b0caa 100644
 --- a/python/sglang/srt/model_loader/loader.py
 +++ b/python/sglang/srt/model_loader/loader.py
-@@ -1518,6 +1518,13 @@ class DummyModelLoader(BaseModelLoader):
+@@ -1529,6 +1529,13 @@ class DummyModelLoader(BaseModelLoader):
  
              post_load_weights(model)
  
@@ -742,10 +742,10 @@ index edda2a7..c61dd78 100644
                  quant_method = getattr(module, "quant_method", None)
                  if quant_method is not None:
 diff --git a/python/sglang/srt/model_loader/weight_utils.py b/python/sglang/srt/model_loader/weight_utils.py
-index 64d781e..25ce8a1 100644
+index cc45ce7c4d..e78ae1d836 100644
 --- a/python/sglang/srt/model_loader/weight_utils.py
 +++ b/python/sglang/srt/model_loader/weight_utils.py
-@@ -1756,6 +1756,13 @@ def initialize_dummy_weights(
+@@ -1758,6 +1758,13 @@ def initialize_dummy_weights(
      the parameter's number of elements and its data type.
      """
      for name, param in model.state_dict().items():
@@ -756,14 +756,14 @@ index 64d781e..25ce8a1 100644
 +        # TP rank, which caused the colocate host OOM.
 +        if ".engram.embed." in name:
 +            continue
-         if torch.is_floating_point(param):
-             # Neutral FP4 global scales keep fused gate/up projections compatible.
-             if name.endswith(("weight_scale_inv", "weight_scale_2")):
+         # UE8M0 MXFP8 block scales (uint8): 127 is 2**0. Left at zero, every
+         # MXFP8 weight scales to 2**-127.
+         if name.endswith("weight_scale_inv") and param.dtype == torch.uint8:
 diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
-index 19fd546..35068b0 100644
+index 57cdbcc58f..e9bbc017ac 100644
 --- a/python/sglang/srt/models/deepseek_v4.py
 +++ b/python/sglang/srt/models/deepseek_v4.py
-@@ -5060,6 +5060,15 @@ class DeepseekV4ForCausalLM(nn.Module):
+@@ -5124,6 +5124,15 @@ class DeepseekV4ForCausalLM(nn.Module):
          if self.wo_a_fp8:
              self._setup_fp8_wo_a_scales(is_nextn)
  
@@ -779,7 +779,7 @@ index 19fd546..35068b0 100644
          for module in self.modules():
              if isinstance(module, MQALayer):
                  module.setup_mega_attention()
-@@ -5635,6 +5644,16 @@ class DeepseekV4ForCausalLM(nn.Module):
+@@ -5696,6 +5705,16 @@ class DeepseekV4ForCausalLM(nn.Module):
                  f"Some weights are not initialized from checkpoints: {unloaded_params}"
              )
  
