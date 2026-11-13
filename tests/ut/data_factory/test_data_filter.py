@@ -2,6 +2,8 @@
 
 import unittest
 
+from omegaconf import OmegaConf
+
 from coda.agentflow.trajectory_store import Trajectory, TrajectoryGroup
 from coda.data_factory import DATA_FILTER_REGISTRY
 from coda.data_factory.data_filter import (
@@ -228,6 +230,34 @@ class TestDataFilterInit(unittest.TestCase):
         df = DataFilter({"status": None, "reward": False})
         self.assertEqual(len(df.chain), 1)
         self.assertEqual(df.chain[0].name, "status")
+
+    def test_dictconfig_params_are_forwarded(self):
+        """Params from a Hydra DictConfig (as rollout_sampler passes) reach the filter."""
+        seen = {}
+
+        def _threshold(traj_group, threshold=0.0):
+            seen["threshold"] = threshold
+            return traj_group
+
+        DATA_FILTER_REGISTRY.register("_test_dictconfig")(_threshold)
+        try:
+            df = DataFilter(OmegaConf.create({"_test_dictconfig": {"threshold": 0.5}}))
+            df.apply(_group(0, 1))
+            self.assertEqual(seen["threshold"], 0.5)
+        finally:
+            del DATA_FILTER_REGISTRY._registry["_test_dictconfig"]
+
+    def test_dictconfig_invalid_param_raises_type_error(self):
+        """Signature validation also applies to DictConfig params."""
+        def _strict(traj_group, _required_param):
+            return traj_group
+
+        DATA_FILTER_REGISTRY.register("_test_strict_dc")(_strict)
+        try:
+            with self.assertRaises(TypeError):
+                DataFilter(OmegaConf.create({"_test_strict_dc": {"bad_param": 1}}))
+        finally:
+            del DATA_FILTER_REGISTRY._registry["_test_strict_dc"]
 
 
 # ===========================================================================

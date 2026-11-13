@@ -30,6 +30,7 @@ Configuration example (YAML):
 
 import inspect
 import logging
+from collections.abc import Mapping
 from typing import Any, Callable
 
 from coda.agentflow.trajectory_store import TrajectoryGroup, TrajectoryStatus
@@ -120,8 +121,8 @@ class DataFilter:
 
     On construction the caller passes a map of filter configs. Each key is a filter name
     registered in DATA_FILTER_REGISTRY, and the value controls behavior:
-      - None (or any non-dict/non-False): enabled with no params
-      - dict: enabled with params forwarded as kwargs
+      - None (or any non-mapping/non-False): enabled with no params
+      - mapping (dict or OmegaConf DictConfig): enabled with params forwarded as kwargs
       - False: explicitly disabled (skipped)
 
     Hydra merge semantics: default.yaml defines the baseline filters. User configs
@@ -157,7 +158,8 @@ class DataFilter:
                 # False value means the filter is explicitly disabled (e.g. user override)
                 logger.info(f"disabled filter {name}")
                 continue
-            params = params if isinstance(params, dict) else {}
+            # Hydra passes an OmegaConf DictConfig, which is a Mapping but not a dict.
+            params = dict(params) if isinstance(params, Mapping) else {}
             func = get_data_filter(name)
             # Validate params statically via signature inspection — avoids calling the function body and thus
             # sidesteps any side-effects custom filters might have (logging, counters, remote calls, etc.).
