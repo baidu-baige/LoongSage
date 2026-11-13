@@ -145,6 +145,19 @@ rollout:
 
 agentflow:
   dump_trajectory_path: ""
+  # Ray actors that run agent attempts out of process. Agent work (request building,
+  # template rendering, serialization) is pure Python, so running every agent in the
+  # driver process caps rollout throughput regardless of how many trajectories are in
+  # flight. 0 (default) keeps agents in the driver process.
+  agent_workers: 0
+  # CPUs reserved per agent worker actor.
+  agent_worker_num_cpus: 4
+  # Thread-pool size inside one worker; bounds the trajectories it runs at once.
+  agent_worker_max_concurrency: 256
+  # Environment variable prefixes forwarded from the driver to the workers, for sandbox
+  # backends that read credentials from the environment (e.g. ["MYSANDBOX_"]).
+  # PYTHONPATH is always forwarded.
+  agent_worker_env_prefixes: []
   router:
     ip: "" # When empty (default), the router auto-resolves to the local machine's routable IP at runtime.
     port: 0 # When zero, the router auto-assigns a free port at runtime.
