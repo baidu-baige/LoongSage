@@ -1,0 +1,132 @@
+# @package _global_
+#
+# Full DeepSeek-V4.1-Flash on ONE RTX 4090 (22 GB) + 32 GB RAM, LoongSage entry point.
+#
+# Rollout: SGLang serves the pruned checkpoint (40 layers x 64 experts + engram) with file-backed
+# expert paging and file-backed engram tables. Training: coda/custom/dsv41_4090/stream_worker.py
+# keeps all layers on disk and trains LoRA on the dense parts of the last four layers; after each
+# step it merges the adapters into the serving checkpoint, which the rollout engine reloads.
+#
+#   T=coda/custom/dsv41_4090/tools
+#   # pruned base checkpoint (STREAM_BASE_CKPT, SGLANG_FILE_EXPERTS_CKPT): 64 experts per layer
+#   python $T/build_pruned.py --src /root/DeepSeek-V4.1-Flash --dst /root/dsv41-k64 \
+#     --mask mask_top64.npy --drop-engram-tables --expert-fp8
+#   # serving checkpoint (hf_model_path): everything but the routed experts; the trainer writes it
+#   python $T/build_serve_ckpt.py --src /root/dsv41-k64 --dst /root/dsv41-k64-serve
+#   python $T/prepare_gsm8k_answer_only.py --src /root/gsm8k/main --dst /root/gsm8k_answer_only
+#   # this file is outside conf/, so add its directory to Hydra's search path
+#   bash examples/start.sh gsm8k_stream --config-dir coda/custom/dsv41_4090/conf \
+#     dsv41_4090.orig_ckpt=/root/DeepSeek-V4.1-Flash dsv41_4090.base_ckpt=/root/dsv41-k64 \
+#     hf_model_path=/root/dsv41-k64-serve \
+#     data_source.dataset.prompt_data_path=/root/gsm8k_answer_only/train.jsonl
+defaults:
+  - /default
+  - _self_
+
+# coda/custom/dsv41_4090/patch.py: streaming actor worker + rollout weight reload from disk
+dsv41_4090:
+  stream: true
+  # original release; only its engram tables are read (row by row, from the files)
+  orig_ckpt: ???
+  # pruned checkpoint from tools/build_pruned.py: routed experts for rollout, base weights for training
+  base_ckpt: ???
+
+checkpoint_path: ./checkpoints/dsv41_stream
+hf_model_path: ???
+colocate: true
+total_steps: 20
+
+data_source:
+  dataset:
+    prompt_data_path: ???
+    input_key: prompt
+    label_key: reward_model
+  reward:
+    name: gsm8k_answer_only
+    format_weight: 0.0
+  num_prompts_per_step: 16
+  num_trajectories_per_prompt: 4
+  max_response_len_per_trajectory: 6
+
+rollout:
+  env_vars:
+    SGLANG_FILE_EXPERTS: "1"
+    # dense tail tensors the trainer merges LoRA into; reloaded from disk without post-processing
+    SGLANG_STREAM_RELOAD_REGEX: 'layers\.(36|37|38|39)\.(attn\.(wq_b|wkv|wo_b)|ffn\.shared_experts\.w[123])\.(weight|scale)$'
+    # weights are backed up to disk (not RAM) while the trainer holds the GPU
+    # (~20 GB, next to the serving checkpoint; not inside it, or SGLang would load it as weights)
+    SGLANG_DISK_WEIGHT_BACKUP: "${hf_model_path}.weights_backup.bin"
+    SGLANG_FILE_EXPERTS_CKPT: "${dsv41_4090.base_ckpt}"
+    SGLANG_ENGRAM_FILE_CKPT: "${dsv41_4090.orig_ckpt}"
+    SGLANG_DSV4_FP4_EXPERTS: "0"
+    SGLANG_SM120_FLASHMLA_BACKEND: "triton"
+    SGLANG_OPT_FP8_WO_A_GEMM: "0"
+    SGLANG_OPT_FUSE_WQA_WKV: "0"
+    SGLANG_OPT_DEEPGEMM_HC_PRENORM: "0"
+    SGLANG_OPT_USE_TILELANG_MHC_PRE: "0"
+    TORCHINDUCTOR_COMPILE_THREADS: "1"
+  num_gpus_per_node: 1
+  sglang_args:
+    mem_fraction_static: 0.95
+    max_running_requests: 16
+    swa_prefix_tails: 1
+    disable_cuda_graph: true
+    load_format: auto
+    attention_backend: dsv4
+    dsv4_attn_backend: flashmla
+    enable_decoder_swa_bounded_replay: false
+    enable_paged_experts: true
+    paged_experts_num_resident: 6
+  sglang_replicas:
+    regular:
+      num_nodes: 1
+      num_gpus_per_replica: 1
+
+agentflow:
+  dump_trajectory_path: "log/trajectories"
+  tokenizer:
+    generation_prompt_kwargs:
+      thinking: false
+    manager:
+      num_workers: 2
+
+trainer:
+  num_gpus_per_node: 1
+  num_nodes: 1
+  mini_batch_size: 64
+  micro_batch_size: 1
+  max_tokens_per_gpu: 2048
+  use_dynamic_batch_size: true
+  use_rollout_routing_replay: false
+  use_fp32_lm_head: false
+  save_freq: -1
+  save_checkpoint: false
+  async_save: false
+  env_vars:
+    MEGATRON_SKIP_PARAM_INIT: "1"
+    STREAM_BASE_CKPT: "${dsv41_4090.base_ckpt}"
+    STREAM_ENGRAM_CKPT: "${dsv41_4090.orig_ckpt}"
+    PYTORCH_ALLOC_CONF: "expandable_segments:True,pinned_max_cached_size_mb:32"
+    TORCHINDUCTOR_COMPILE_THREADS: "1"
+
+megatron:
+  model:
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+    expert_model_parallel_size: 1
+    expert_tensor_parallel_size: 1
+  optimizer:
+    lr: 2.0e-4
+
+algorithm:
+  advantage_estimator: grpo
+  advantage_norm_mode: group_zscore
+  policy_loss: grpo
+  loss_agg_mode: token-mean
+  is_correction:
+    enable: true
+    action: mask
+    level: token
+    lower_bound: 0.5
+    upper_bound: 2

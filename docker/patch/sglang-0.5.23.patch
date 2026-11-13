@@ -1,0 +1,1396 @@
+diff --git a/python/sglang/srt/arg_groups/model_hook.py b/python/sglang/srt/arg_groups/model_hook.py
+index 5f79806..3f3674e 100644
+--- a/python/sglang/srt/arg_groups/model_hook.py
++++ b/python/sglang/srt/arg_groups/model_hook.py
+@@ -479,7 +479,7 @@ def handle_model_specific_adjustments(server_args: Any):
+         validate_deepseek_v41_features(server_args)
+         validate_deepseek_v4_cp(server_args)
+ 
+-        if get_platform().is_sm120:
++        if get_platform().is_sm120 or get_platform().is_sm8x:
+             # FP8 wo_a stays opt-in on SM120: only recent DeepGEMM builds ship
+             # the SM120 kernels, and deep_gemm_wrapper.configurer validates them.
+             if not envs.SGLANG_OPT_FP8_WO_A_GEMM.is_set():
+diff --git a/python/sglang/srt/debug_utils/dumper.py b/python/sglang/srt/debug_utils/dumper.py
+index 094a461..c8bcd3e 100644
+--- a/python/sglang/srt/debug_utils/dumper.py
++++ b/python/sglang/srt/debug_utils/dumper.py
+@@ -1819,12 +1819,18 @@ class _SGLangPlugin(_FrameworkPlugin):
+ 
+ 
+ class _MegatronPlugin(_FrameworkPlugin):
+-    _available = True
+-    try:
+-        from megatron.core import parallel_state as _mpu
+-        from megatron.core.packed_seq_params import PackedSeqParams
+-    except ImportError:
+-        _available = False
++    # NOTE(coda): eager `import megatron.core` disabled on purpose.
++    # In colocate mode the sglang engine process loads weights via Megatron-FSDP;
++    # importing megatron flips torch_memory_saver's global hook_mode to "torch",
++    # which breaks sglang's pauseable CUDA graph (needs hook_mode="preload") and
++    # crashes startup with "Only hook_mode=preload supports pauseable CUDA Graph".
++    # The dumper is unused in the engine process, so force _available=False.
++    _available = False
++    #try:
++    #    from megatron.core import parallel_state as _mpu
++    #    from megatron.core.packed_seq_params import PackedSeqParams
++    #except ImportError:
++    #    _available = False
+ 
+     @property
+     def name(self) -> str:
+diff --git a/python/sglang/srt/entrypoints/http_server.py b/python/sglang/srt/entrypoints/http_server.py
+index 899a40f..4d03954 100644
+--- a/python/sglang/srt/entrypoints/http_server.py
++++ b/python/sglang/srt/entrypoints/http_server.py
+@@ -161,6 +161,7 @@ from sglang.srt.managers.io_struct import (
+     UpdateWeightFromDiskReqInput,
+     UpdateWeightsFromDistributedReqInput,
+     UpdateWeightsFromIPCReqInput,
++    UpdateWeightsFromChannelReqInput,
+     UpdateWeightsFromTensorReqInput,
+     UpdateWeightVersionReqInput,
+     VertexGenerateReqInput,
+@@ -1433,6 +1434,19 @@ async def destroy_weights_update_group(
+     )
+ 
+ 
++@app.post("/update_weights_from_channel")
++@auth_level(AuthLevel.ADMIN_OPTIONAL)
++async def update_weights_from_channel(
++    obj: Annotated[UpdateWeightsFromChannelReqInput, Body()], request: Request
++):
++    """Update weights by receiving from the TransferMesh channel."""
++    success, message = await _global_state.tokenizer_manager.update_weights_from_channel(
++        obj, request
++    )
++    content = {"success": success, "message": message}
++    return ORJSONResponse(content, status_code=200 if success else HTTPStatus.BAD_REQUEST)
++
++
+ @app.post("/update_weights_from_tensor")
+ @auth_level(AuthLevel.ADMIN_OPTIONAL)
+ async def update_weights_from_tensor(
+diff --git a/python/sglang/srt/layers/attention/deepseek_v4_backend.py b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
+index 25ab480..4eb6290 100644
+--- a/python/sglang/srt/layers/attention/deepseek_v4_backend.py
++++ b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
+@@ -207,8 +207,12 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
+     return F.pad(x, pad=(0, target_size - curr_size), mode="constant", value=-1)
+ 
+ 
++def _use_portable_flashmla() -> bool:
++    return get_platform().is_sm120 or get_platform().is_sm8x
++
++
+ def _create_flashmla_metadata():
+-    if get_platform().is_sm120 or _is_xpu:
++    if _use_portable_flashmla() or _is_xpu:
+         return None
+     from sglang.kernels.ops.attention.flash_mla_interface import get_mla_metadata
+ 
+@@ -2924,7 +2928,7 @@ class DeepseekV4AttnBackend(
+             not self.trtllm_attn
+             and forward_batch.forward_mode.is_extend_without_speculative()
+             and not is_cp_active(forward_batch)
+-            and not get_platform().is_sm120
++            and not _use_portable_flashmla()
+             and self.forward_metadata.late_layer_tail is None
+             and (
+                 num_qo_tokens > _LARGE_INDEXER_QUERY_THRESHOLD
+@@ -4332,7 +4336,7 @@ class DeepseekV4AttnBackend(
+                     extra_topk_lengths,
+                 )
+ 
+-            if get_platform().is_sm120:
++            if _use_portable_flashmla():
+                 from sglang.kernels.ops.attention.flash_mla_sm120 import (
+                     SM120_DECODE_MAX_TOKENS,
+                     flash_mla_with_kvcache_sm120,
+diff --git a/python/sglang/srt/layers/engram.py b/python/sglang/srt/layers/engram.py
+index 78fe483..c86d020 100644
+--- a/python/sglang/srt/layers/engram.py
++++ b/python/sglang/srt/layers/engram.py
+@@ -1011,7 +1011,19 @@ class EngramEmbedding(nn.Module):
+         self._sort_host_reads = False
+         self.staged_by_scheduler = False
+         self.peer: Optional[_PeerShards] = None
+-        if (
++        self.file_table = None
++        _file_ckpt = os.environ.get("SGLANG_ENGRAM_FILE_CKPT")
++        if _file_ckpt:
++            from sglang.srt.layers.engram_file import FileEngramTable
++
++            self.file_table = FileEngramTable(_file_ckpt, layer_id, dim, self.row_start, self.rows)
++            self.file_table.tp_size = self.tp_size
++            self.weight = nn.Parameter(torch.empty(0, dim, dtype=torch.float8_e4m3fn),
++                                       requires_grad=False)
++            self.scale = nn.Parameter(
++                torch.empty(0, dim // FP8_BLOCK_SIZE, dtype=torch.float8_e8m0fnu),
++                requires_grad=False)
++        elif (
+             envs.SGLANG_OPT_DSV41_ENGRAM_PEER_SHARDS.get()
+             and self.tp_size > 1
+             and is_cuda()
+@@ -1079,6 +1091,8 @@ class EngramEmbedding(nn.Module):
+         return self._host_table_ptrs
+ 
+     def _load_rows(self, param: nn.Parameter, loaded_weight: torch.Tensor):
++        if self.file_table is not None:
++            return
+         rows = slice(self.row_start, self.row_start + self.rows)
+         if self._shared:
+             param.data[rows].copy_(loaded_weight[rows])
+@@ -1090,6 +1104,8 @@ class EngramEmbedding(nn.Module):
+     def finish_load(self, label: str):
+         """Collective in the shared layout and with peer shards: every rank calls
+         it after loading."""
++        if self.file_table is not None:
++            return
+         if self.peer is not None:
+             self.peer.connect(self.row_start, label)
+         if self.host_table is not None:
+@@ -1102,6 +1118,8 @@ class EngramEmbedding(nn.Module):
+         *,
+         cp_all_tokens: bool = False,
+     ) -> torch.Tensor:
++        if self.file_table is not None:
++            return self.file_table.lookup(indices)
+         if self.peer is not None:
+             assert self.peer.ready, "engram peer shards are mapped in finish_load"
+             # Every shard is mapped here: read this rank's own tokens only, which
+@@ -1392,3 +1410,63 @@ def _bcg_engram_embed(
+     # A replay builds a fresh batch; the capture-time one stages no rows.
+     forward_batch = get_tc_piecewise_forward_context().forward_batch
+     out.copy_(engram.embed_rows(hash_ids, forward_batch, cp_all_tokens))
++
++
++def load_engram_tables_from_disk(model: nn.Module, model_path: str) -> None:
++    """Load the frozen engram fp8 tables from ``model_path`` into the model's
++    ``EngramEmbedding`` modules.
++
++    Required for ``load_format=dummy`` (the RL rollout path): the dummy loader
++    skips ``model.load_weights()`` and fills every parameter — including the engram
++    ``weight``/``scale`` — with random values. The engram tables are constants that
++    the RL weight update does NOT carry, so without this they would stay garbage and
++    train/rollout parity blows up. This reuses each ``EngramEmbedding``'s own
++    ``weight_loader`` (row-sharded per TP rank) and ``finish_load``; it is a no-op for
++    models that have no engram layers.
++    """
++    import json
++
++    from safetensors import safe_open
++
++    inner = getattr(model, "model", None)
++    layers = getattr(inner, "layers", None)
++    if layers is None:
++        return
++    engram_layers = [
++        (i, layer.engram)
++        for i, layer in enumerate(layers)
++        if getattr(layer, "engram", None) is not None
++    ]
++    if not engram_layers:
++        return
++
++    index_path = os.path.join(model_path, "model.safetensors.index.json")
++    if not os.path.exists(index_path):
++        logger.warning(
++            "engram dummy-load: no safetensors index at %s; engram tables left uninitialized",
++            index_path,
++        )
++        return
++    with open(index_path) as f:
++        weight_map = json.load(f)["weight_map"]
++
++    logger.info(
++        "load_format=dummy: loading engram tables from %s for %d layer(s)",
++        model_path,
++        len(engram_layers),
++    )
++    for i, engram in engram_layers:
++        emb = engram.embed
++        for suffix, param in (("weight", emb.weight), ("scale", emb.scale)):
++            name = f"layers.{i}.engram.embed.{suffix}"
++            shard = weight_map.get(name)
++            if shard is None:
++                raise KeyError(f"engram dummy-load: {name} missing from {index_path}")
++            with safe_open(os.path.join(model_path, shard), framework="pt", device="cpu") as f:
++                # Pass the LAZY safetensors slice (not get_tensor) to the module's own
++                # weight_loader: _load_rows only indexes loaded_weight[row_start:row_end],
++                # so a PySafeSlice reads just this rank's rows from disk and we never
++                # materialize the full ~98GB fp8 table in host RAM per rank (that caused
++                # colocate host OOM). _load_rows also handles the shared/private layout.
++                param.weight_loader(param, f.get_slice(name))
++        emb.finish_load(label=f"dummy engram layer {i}")
+diff --git a/python/sglang/srt/layers/engram_file.py b/python/sglang/srt/layers/engram_file.py
+new file mode 100644
+index 0000000..7e1e624
+--- /dev/null
++++ b/python/sglang/srt/layers/engram_file.py
+@@ -0,0 +1,62 @@
++"""Engram tables read from the checkpoint files instead of pinned host memory.
++
++`_HostTable` pins the whole table (~99GB per layer) so the GPU can gather rows directly. This
++table keeps the bytes in the safetensors shards (page cache, reclaimable) and gathers the rows a
++forward needs with parallel preads, dequantizing them on the GPU.
++
++Enabled with SGLANG_ENGRAM_FILE_CKPT=<checkpoint dir>.
++"""
++from __future__ import annotations
++
++import os
++from concurrent.futures import ThreadPoolExecutor
++
++import numpy as np
++import torch
++
++FP8_BLOCK_SIZE = 32
++
++
++class FileEngramTable:
++    def __init__(self, ckpt_dir: str, layer_id: int, dim: int, row_start: int, rows: int,
++                 threads: int = 64):
++        from sglang.srt.layers.moe.paged_experts.file_store import read_headers
++
++        meta = read_headers(ckpt_dir)
++        wpath, ws, we, _, wshape = meta[f"layers.{layer_id}.engram.embed.weight"]
++        spath, ss, se, _, sshape = meta[f"layers.{layer_id}.engram.embed.scale"]
++        self.w = np.memmap(wpath, dtype=np.uint8, mode="r", offset=ws, shape=wshape)
++        self.s = np.memmap(spath, dtype=np.uint8, mode="r", offset=ss, shape=sshape)
++        for mm in (self.w, self.s):
++            mm._mmap.madvise(2)  # MADV_RANDOM: no readahead on scattered row reads
++        self.dim = dim
++        self.row_start = row_start
++        self.rows = rows
++        self.tp_size = None
++        self.pool = ThreadPoolExecutor(threads)
++        self.threads = threads
++
++    def lookup(self, indices: torch.Tensor) -> torch.Tensor:
++        flat = indices.flatten().cpu().numpy()
++        owned = (flat >= self.row_start) & (flat < self.row_start + self.rows)
++        local = np.where(owned, flat - self.row_start, 0)
++        uniq, inv = np.unique(local, return_inverse=True)
++        parts = np.array_split(uniq, self.threads)
++        bounds = np.cumsum([0] + [len(p) for p in parts])
++        w = np.empty((len(uniq), self.dim), np.uint8)
++        s = np.empty((len(uniq), self.dim // FP8_BLOCK_SIZE), np.uint8)
++
++        def run(i):
++            if len(parts[i]):
++                w[bounds[i]: bounds[i + 1]] = self.w[parts[i]]
++                s[bounds[i]: bounds[i + 1]] = self.s[parts[i]]
++
++        list(self.pool.map(run, range(len(parts))))
++        for mm in (self.w, self.s):
++            mm._mmap.madvise(4)  # MADV_DONTNEED: drop the touched pages from RSS
++        u = len(uniq)
++        wt = torch.from_numpy(w).cuda().view(torch.float8_e4m3fn).float()
++        st = torch.from_numpy(s).cuda().view(torch.float8_e8m0fnu).float()
++        vals = (wt.view(u, -1, FP8_BLOCK_SIZE) * st.unsqueeze(-1)).view(u, self.dim).bfloat16()
++        out = vals[torch.from_numpy(inv).cuda()]
++        return out.view(*indices.shape, self.dim)
+diff --git a/python/sglang/srt/layers/moe/paged_experts/file_store.py b/python/sglang/srt/layers/moe/paged_experts/file_store.py
+new file mode 100644
+index 0000000..9d76d08
+--- /dev/null
++++ b/python/sglang/srt/layers/moe/paged_experts/file_store.py
+@@ -0,0 +1,146 @@
++"""Paged experts whose host copy lives in the checkpoint files instead of RAM.
++
++`HostExpertStore` keeps every expert in pinned host memory, which needs the whole (dequantized)
++expert set resident. This store instead records where each expert's bytes sit in the safetensors
++shards and reads them on `page_in`, so only the K resident slots use device memory and nothing
++but page cache uses host memory.
++
++Enabled with SGLANG_FILE_EXPERTS=1; the checkpoint directory is SGLANG_FILE_EXPERTS_CKPT.
++"""
++from __future__ import annotations
++
++import json
++import os
++import struct
++from typing import Dict, List, Sequence, Tuple
++
++import torch
++
++_DT = {
++    "F8_E4M3": torch.float8_e4m3fn,
++    "F32": torch.float32,
++    "BF16": torch.bfloat16,
++    "F16": torch.float16,
++    "F8_E8M0": getattr(torch, "float8_e8m0fnu", torch.float32),
++    "I8": torch.int8,
++}
++
++# GPU tensor name -> checkpoint tensors that fill it, in destination order (w1 rows then w3).
++_SOURCES = {
++    "w13_weight": ("w1.weight", "w3.weight"),
++    "w2_weight": ("w2.weight",),
++    "w13_weight_scale_inv": ("w1.scale", "w3.scale"),
++    "w2_weight_scale_inv": ("w2.scale",),
++}
++
++
++def read_headers(ckpt_dir: str):
++    """name -> (path, start, end, dtype, shape) for every tensor in the sharded checkpoint."""
++    index = json.load(open(os.path.join(ckpt_dir, "model.safetensors.index.json")))["weight_map"]
++    meta = {}
++    for fn in sorted(set(index.values())):
++        path = os.path.join(ckpt_dir, fn)
++        with open(path, "rb") as f:
++            (n,) = struct.unpack("<Q", f.read(8))
++            hdr = json.loads(f.read(n))
++        base = 8 + n
++        for k, v in hdr.items():
++            if k == "__metadata__":
++                continue
++            meta[k] = (path, base + v["data_offsets"][0], base + v["data_offsets"][1],
++                       _DT[v["dtype"]], tuple(v["shape"]))
++    return meta
++
++
++class _LazyRows:
++    """Looks like an [E, ...] host tensor; rows are materialized from the checkpoint on access.
++
++    Writes are accepted and dropped: the loader's per-expert copies duplicate what is on disk.
++    """
++
++    is_lazy = True
++
++    def __init__(self, entries: List[List[tuple]], row_shape):
++        self.entries = entries  # per expert: list of (path, start, end, dtype, shape)
++        self.shape = (len(entries),) + tuple(row_shape)
++        self.dtype = entries[0][0][3]
++
++    def __len__(self):
++        return self.shape[0]
++
++    def _materialize(self, ids):
++        out = torch.empty((len(ids),) + tuple(self.shape[1:]), dtype=self.dtype)
++        for i, e in enumerate(ids):
++            offset = 0
++            for path, start, end, dtype, shape in self.entries[e]:
++                nbytes = end - start
++                with open(path, "rb") as f:
++                    f.seek(start)
++                    buf = f.read(nbytes)
++                part = out[i].reshape(-1).view(torch.uint8).narrow(0, offset, nbytes)
++                part.copy_(torch.frombuffer(bytearray(buf), dtype=torch.uint8))
++                offset += nbytes
++        return out
++
++    def __getitem__(self, key):
++        if isinstance(key, int):
++            return self._materialize([key if key >= 0 else len(self) + key])[0]
++        start, stop, step = key.indices(len(self))
++        assert step == 1
++        return self._materialize(range(start, stop))
++
++    def copy_(self, src):
++        return self
++
++    def expand_as(self, other):
++        return self
++
++    def to(self, *a, **k):
++        raise RuntimeError("LazyRows cannot move to a device; read rows instead")
++
++
++class FileExpertStore:
++    """Drop-in replacement for HostExpertStore backed by the checkpoint files."""
++
++    def __init__(self, layer, names: Sequence[str], num_experts: int, ckpt_dir: str):
++        if not ckpt_dir:
++            raise RuntimeError("SGLANG_FILE_EXPERTS needs SGLANG_FILE_EXPERTS_CKPT")
++        self.ckpt_dir = ckpt_dir
++        self.num_experts = num_experts
++        self.layer_id = int(layer.layer_id)
++        self.meta = read_headers(ckpt_dir)
++        self.host: Dict[str, _LazyRows] = {}
++        for name in names:
++            sources = [_SOURCES[name]] if name in _SOURCES else None
++            if sources is None:
++                raise RuntimeError(f"FileExpertStore: no source mapping for paged tensor {name}")
++            entries = [self._sources(name, e) for e in range(num_experts)]
++            self.host[name] = _LazyRows(entries, self._row_shape(name))
++
++    def _sources(self, name, expert):
++        return [self.meta[f"layers.{self.layer_id}.ffn.experts.{expert}.{s}"] for s in _SOURCES[name]]
++
++    def _row_shape(self, name):
++        shapes = [s[4] for s in self._sources(name, 0)]
++        if len(shapes) == 2:
++            return (shapes[0][0] + shapes[1][0],) + shapes[0][1:]
++        return shapes[0]
++
++    def page_in(self, layer, loads: Sequence[Tuple[int, int]]) -> None:
++        for name, rows in self.host.items():
++            gpu = getattr(layer, name).data
++            parts = len(_SOURCES[name])
++            for expert, slot in loads:
++                dst = gpu[slot]
++                if parts == 2:
++                    dst = dst.view(2, -1, *dst.shape[1:])
++                for part, (path, start, end, dtype, shape) in enumerate(self._sources(name, expert)):
++                    nbytes = end - start
++                    buf = torch.empty(nbytes, dtype=torch.uint8)
++                    with open(path, "rb") as f:
++                        f.seek(start)
++                        buf.copy_(torch.frombuffer(bytearray(f.read(nbytes)), dtype=torch.uint8))
++                    (dst[part] if parts == 2 else dst).copy_(buf.view(dtype).view(shape))
++
++    def bind_device_gather(self, layer):
++        raise RuntimeError("FileExpertStore does not support CUDA-graph gather; disable graphs")
+diff --git a/python/sglang/srt/layers/moe/paged_experts/method.py b/python/sglang/srt/layers/moe/paged_experts/method.py
+index dfe1e92..2dde700 100644
+--- a/python/sglang/srt/layers/moe/paged_experts/method.py
++++ b/python/sglang/srt/layers/moe/paged_experts/method.py
+@@ -100,10 +100,13 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
+         )
+         # The loader follows the base method's weight layout, as it would without paging.
+         layer.weight_load_method = self.base_method
+-        layer._derived_weight_cache_error = (
+-            "Online weight updates are not supported with --enable-paged-experts: "
+-            "experts already on the GPU would keep the old weights."
+-        )
++        import os as _os
++        if not _os.environ.get("SGLANG_FILE_EXPERTS"):
++            layer._derived_weight_cache_error = (
++                "Online weight updates are not supported with --enable-paged-experts: "
++                "experts already on the GPU would keep the old weights."
++            )
++        # File-backed experts are immutable: dense-weight updates from disk leave them valid.
+         for name in self.format.freed:
+             setattr(layer, name, None)
+         self.checkpoint_params = expert_params(layer, self.num_resident)
+@@ -116,6 +119,14 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
+                 param.weight_loader = loader
+ 
+     def _make_host_loader(self, layer, name):
++        import os as _os
++        if _os.environ.get("SGLANG_FILE_EXPERTS"):
++            # The rows are already in the checkpoint files; keep the loader a no-op.
++            def weight_loader(param, loaded_weight, weight_name, shard_id, *rest, **kwargs):
++                return
++
++            return weight_loader
++
+         def weight_loader(param, loaded_weight, weight_name, shard_id, *rest, **kwargs):
+             expert_id = kwargs.get("expert_id", rest[0] if rest else None)
+             if expert_id is None:
+@@ -153,15 +164,28 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
+         self.contract = contract_for(self.runner)
+         self.routed_scaling_factor = moe_runner_config.routed_scaling_factor or 1.0
+         # A store that only stages the checkpoint layout for a repack need not be pinned.
+-        self.store = HostExpertStore(
+-            layer=layer,
+-            names=self.checkpoint_params,
+-            num_experts=self.num_experts,
+-            pin=not self.contract.repacks,
+-        )
++        import os as _os
++        if _os.environ.get("SGLANG_FILE_EXPERTS"):
++            from sglang.srt.layers.moe.paged_experts.file_store import FileExpertStore
++
++            self.store = FileExpertStore(
++                layer=layer,
++                names=self.checkpoint_params,
++                num_experts=self.num_experts,
++                ckpt_dir=_os.environ.get("SGLANG_FILE_EXPERTS_CKPT", ""),
++            )
++        else:
++            self.store = HostExpertStore(
++                layer=layer,
++                names=self.checkpoint_params,
++                num_experts=self.num_experts,
++                pin=not self.contract.repacks,
++            )
+         # What a loader leaves unwritten (e.g. padding for a kernel) keeps the values the base
+         # method created, as on the GPU.
+         for name, host in self.store.host.items():
++            if getattr(host, "is_lazy", False):
++                continue
+             host.copy_(getattr(layer, name).data[:1].cpu().expand_as(host))
+ 
+     def process_weights_after_loading(self, layer):
+diff --git a/python/sglang/srt/layers/quantization/fp8.py b/python/sglang/srt/layers/quantization/fp8.py
+index d779091..bd59b90 100644
+--- a/python/sglang/srt/layers/quantization/fp8.py
++++ b/python/sglang/srt/layers/quantization/fp8.py
+@@ -992,6 +992,33 @@ class Fp8LinearMethod(LinearMethodBase):
+         self._process_mxfp8_linear_weight_scale(layer, scale_u8=scale_u8)
+         layer.block_fp8_mxfp8_ready = True
+ 
++    @torch.no_grad()
++    def refresh_block_fp8_mxfp8_scale(self, layer: Module) -> None:
++        """Re-derive the MXFP8 scale copies IN PLACE from `weight_scale_inv`.
++
++        The swizzled (and DeepGEMM-packed) copies are built once at load; an RL weight
++        update (or dummy boot + weight sync, or a memory-saver release of the weights
++        region) only refreshes `weight` / `weight_scale_inv`, so without this the MXFP8
++        GEMM keeps the stale scales. Idempotent (scale-only; the CUTLASS / CuTe-DSL
++        weight is untouched), so it is safe to run after every partial update.
++        copy_or_rebind_param copies in place, which keeps CUDA-graph pointers.
++        """
++        if not (self.block_fp8_as_mxfp8 and getattr(layer, "block_fp8_mxfp8_ready", False)):
++            return
++        backend = self.mxfp8_dense_backend
++        if not (backend.is_flashinfer_cutlass() or backend.is_flashinfer_cutedsl()):
++            raise RuntimeError(
++                f"MXFP8 dense backend {backend} reshuffles the weight at load and cannot be "
++                "hot-updated; use --fp8-gemm-backend flashinfer_cutedsl/flashinfer_cutlass."
++            )
++        n, k = layer.weight.shape
++        scale_u8 = block_fp8_scale_to_mxfp8_e8m0(
++            layer.weight_scale_inv.data, (n, k), self.weight_block_size
++        )
++        self._process_mxfp8_linear_weight_scale(layer, scale_u8=scale_u8)
++        if getattr(layer, "deepgemm_mxfp8_input", False):
++            self.prepare_deepgemm_mxfp8_input(layer)
++
+     def prepare_deepgemm_mxfp8_input(self, layer: Module) -> bool:
+         """Pack the weight scale a FlashInfer layer needs for a DeepGEMM-packed input pair."""
+         from sglang.srt.layers import deep_gemm_wrapper
+@@ -1871,6 +1898,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
+             weight_param.data = torch.stack(new_weights)
+             scale_param.data = torch.stack(new_scales).float()
+             scale_param.format_ue8m0 = False
++        # cast_e2m1fn_to_e4m3fn folds the per-32 FP4 scales into 128x128 blocks; the MoE
++        # runner must be told that block size or its scale-shape asserts fail (e.g. SM89
++        # triton, where the FP4 kernels do not exist and this dequant is the only path).
++        self.weight_block_size = [128, 128]
+         self.is_fp4_expert = False
+         logger.warning_once("Dequantized FP4 MoE expert weights to FP8.")
+ 
+@@ -3034,7 +3065,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
+             ),
+             a13_scale=layer.w13_input_scale,
+             a2_scale=layer.w2_input_scale,
+-            block_shape=self.weight_block_size,
++            # The FP4->FP8 dequant folds the per-32 scales into 128x128 blocks
++            # (cast_e2m1fn_to_e4m3fn), so the runner's block size must match even when the
++            # checkpoint config declares 32x32 (DeepSeek-V4.1 dense layout).
++            block_shape=([128, 128] if self.dequant_fp4_to_fp8 else self.weight_block_size),
+         )
+ 
+     def _process_npu_fp4_expert_weights(self, layer: torch.nn.Module) -> None:
+diff --git a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py b/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py
+index 7a1c5a9..0c0be3c 100644
+--- a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py
++++ b/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py
+@@ -6,8 +6,10 @@ TRT-LLM implementation.
+ 
+ from __future__ import annotations
+ 
++import functools
+ import logging
+ import os
++import threading
+ from typing import TYPE_CHECKING
+ 
+ import torch
+@@ -118,6 +120,13 @@ class Mxfp4FlashinferCutlassMoEMethod:
+             )
+         else:
+             self._swiglu_limit_tensor = None
++        # These constants are allocated inside the memory-saver "weights" region but are not
++        # weight-synced; as (non-persistent) buffers they are stashed/restored in place across
++        # release/resume_memory_occupation (colocate), otherwise they come back as garbage.
++        for name in ("_swiglu_limit_tensor", "_mxfp4_weight_global_scale_tensor"):
++            t = getattr(self, name)
++            if t is not None:
++                layer.register_buffer(f"_mxfp4_cutlass{name}", t, persistent=False)
+ 
+         # Register the fused func at runner construction so the FusedOpPool
+         # lookup at `MoeRunner.__init__` finds it.
+@@ -221,6 +230,20 @@ class Mxfp4FlashinferCutlassMoEMethod:
+             layer.w2_weight = Parameter(w2_il, requires_grad=False)
+             layer.w13_weight_scale_inv = Parameter(w13_s_il, requires_grad=False)
+             layer.w2_weight_scale_inv = Parameter(w2_s_il, requires_grad=False)
++            if not self._use_sm90_humming:
++                # RL hot weight update: the interleaved params have no checkpoint-layout
++                # loader, so route checkpoint-format tensors through an in-place
++                # per-expert re-interleave (pointers stay stable for CUDA graphs).
++                loader = functools.partial(self._hot_update_weight_loader, layer)
++                for p in (
++                    layer.w13_weight,
++                    layer.w2_weight,
++                    layer.w13_weight_scale_inv,
++                    layer.w2_weight_scale_inv,
++                ):
++                    p.weight_loader = loader
++                layer._mxfp4_hot_pending = {}
++                layer._mxfp4_hot_lock = threading.Lock()
+ 
+         layer._dsv4_mxfp4_backend = (
+             "flashinfer_cutlass_sm120"
+@@ -235,6 +258,88 @@ class Mxfp4FlashinferCutlassMoEMethod:
+         if not self._use_mxfp8_act_scaling:
+             torch.cuda.empty_cache()
+ 
++    @staticmethod
++    def _local_expert_ids(layer: Module, expert_id: int) -> list[int]:
++        """Checkpoint (logical) expert id -> local slots, mirroring FusedMoE.weight_loader."""
++        from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
++
++        meta = (
++            get_global_expert_location_metadata()
++            if getattr(layer, "uses_expert_location", True)
++            else None
++        )
++        ids = (
++            [expert_id]
++            if meta is None
++            else meta.logical_to_all_physical(layer.layer_id, expert_id, False)
++        )
++        out = []
++        for i in ids:
++            local = layer._map_global_expert_id_to_local_expert_id(i)
++            if 0 <= local < layer.num_local_experts:
++                out.append(local)
++        return out
++
++    @torch.no_grad()
++    def _hot_update_weight_loader(
++        self,
++        layer: Module,
++        param: Parameter,
++        loaded_weight: torch.Tensor,
++        weight_name: str,
++        shard_id: str,
++        expert_id: int,
++    ) -> None:
++        """In-place hot update of one expert from checkpoint-format MXFP4 tensors.
++
++        Buffers w1/w3 (or w2) weight + E8M0 scale of an expert until complete, then
++        interleaves that single expert (the SM90 interleave is per-expert separable)
++        and copies it into the live buffers.
++        """
++        if layer.moe_tp_size != 1:
++            raise NotImplementedError("MXFP4 hot weight update requires moe_tp_size == 1 (use EP).")
++        if shard_id not in ("w1", "w2", "w3"):
++            raise ValueError(f"unexpected shard_id {shard_id}")
++        locals_ = self._local_expert_ids(layer, expert_id)
++        if not locals_:
++            return
++        from flashinfer.fused_moe import (
++            interleave_moe_scales_for_sm90_mixed_gemm,
++            interleave_moe_weights_for_sm90_mixed_gemm,
++        )
++
++        kind = "w2" if shard_id == "w2" else "w13"
++        is_scale = weight_name.endswith("_scale_inv")
++        device = layer.w13_weight.device
++        for local in locals_:
++            with layer._mxfp4_hot_lock:  # loaders may run on the async-load threadpool
++                pend = layer._mxfp4_hot_pending.setdefault((kind, local), {})
++                pend[(shard_id, is_scale)] = loaded_weight
++                if len(pend) < (4 if kind == "w13" else 2):
++                    continue
++                del layer._mxfp4_hot_pending[(kind, local)]
++            if kind == "w13":
++                # FlashInfer CUTLASS expects W13 as [up; gate] (load_up_proj_weight_first).
++                w = torch.cat([pend[("w3", False)], pend[("w1", False)]], dim=0)
++                s = torch.cat([pend[("w3", True)], pend[("w1", True)]], dim=0)
++            else:
++                w, s = pend[("w2", False)], pend[("w2", True)]
++
++            w_u8 = w.to(device).view(torch.uint8).unsqueeze(0).contiguous()
++            s_u8 = s.to(device).view(torch.uint8).unsqueeze(0).contiguous()
++            live_w = getattr(layer, f"{kind}_weight")
++            live_s = getattr(layer, f"{kind}_weight_scale_inv")
++            w_il = interleave_moe_weights_for_sm90_mixed_gemm(w_u8, "fp4")[0]
++            s_il = interleave_moe_scales_for_sm90_mixed_gemm(s_u8, group_size=_GROUP_SIZE)[0]
++            if w_il.shape != live_w.shape[1:] or s_il.shape != live_s.shape[1:]:
++                raise ValueError(
++                    f"{self.prefix} {kind} expert {local}: shape {tuple(w_il.shape)}/"
++                    f"{tuple(s_il.shape)} != live {tuple(live_w.shape[1:])}/"
++                    f"{tuple(live_s.shape[1:])}"
++                )
++            live_w.data[local].copy_(w_il.view(live_w.dtype))
++            live_s.data[local].copy_(s_il.view(live_s.dtype))
++
+     def apply(
+         self,
+         layer: Module,
+diff --git a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_trtllm_moe.py b/python/sglang/srt/layers/quantization/mxfp4_flashinfer_trtllm_moe.py
+index 8188c99..c2780c3 100644
+--- a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_trtllm_moe.py
++++ b/python/sglang/srt/layers/quantization/mxfp4_flashinfer_trtllm_moe.py
+@@ -1,6 +1,8 @@
+ from __future__ import annotations
+ 
++import functools
+ import logging
++import threading
+ from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple
+ 
+ import torch
+@@ -164,6 +166,15 @@ class Mxfp4FlashinferTrtllmMoEMethod:
+             if swiglu_limit is not None
+             else None
+         )
++        # Allocated inside the memory-saver "weights" region but not weight-synced; as a
++        # (non-persistent) buffer it is stashed/restored in place across
++        # release/resume_memory_occupation (colocate), otherwise it comes back as garbage.
++        if self._gemm1_clamp_limit_tensor is not None:
++            layer.register_buffer(
++                "_mxfp4_trtllm_gemm1_clamp_limit",
++                self._gemm1_clamp_limit_tensor,
++                persistent=False,
++            )
+ 
+     def get_moe_runner_backend(self, layer):
+         return MoeRunnerBackend.FLASHINFER_MXFP4
+@@ -244,6 +255,7 @@ class Mxfp4FlashinferTrtllmMoEMethod:
+         if getattr(layer, "_mega_moe_weights_built", False):
+             return
+ 
++        w2_width = layer.w2_weight.shape[2]
+         _pad_intermediate_size(layer)
+ 
+         w13_w, w13_s = reorder_w1w3_to_w3w1(
+@@ -268,61 +280,19 @@ class Mxfp4FlashinferTrtllmMoEMethod:
+             w13_scale = w13_scale.to(torch.float8_e8m0fnu)
+             w2_scale = w2_scale.to(torch.float8_e8m0fnu)
+ 
+-        epilogue_tile_m = 128
+         g1_w, g1_s, g2_w, g2_s = [], [], [], []
+-        if _USE_OFFICIAL_SHUFFLE:
+-            cache: dict = {}
+-            for i in range(num_experts):
+-                w13_u8 = w13[i].view(torch.uint8)
+-                w13_s_u8 = w13_scale[i].view(torch.uint8)
+-                w2_u8 = w2[i].view(torch.uint8)
+-                w2_s_u8 = w2_scale[i].view(torch.uint8)
+-
+-                perm = _maybe_get_cached_w3_w1_permute_indices(
+-                    cache,
+-                    w13_u8,
+-                    epilogue_tile_m,
+-                )
+-                g1_w.append(w13_u8[perm.to(w13_u8.device)].contiguous())
+-                perm_sf = _maybe_get_cached_w3_w1_permute_indices(
+-                    cache,
+-                    w13_s_u8,
+-                    epilogue_tile_m,
+-                    num_elts_per_sf=16,
+-                )
+-                g1_s.append(
+-                    block_scale_interleave(
+-                        w13_s_u8[perm_sf.to(w13_s_u8.device)].contiguous()
+-                    )
+-                )
+-
+-                perm = get_w2_permute_indices_with_cache(
+-                    cache,
+-                    w2_u8,
+-                    epilogue_tile_m,
+-                )
+-                g2_w.append(w2_u8[perm.to(w2_u8.device)].contiguous())
+-                perm_sf = get_w2_permute_indices_with_cache(
+-                    cache,
+-                    w2_s_u8,
+-                    epilogue_tile_m,
+-                    num_elts_per_sf=16,
+-                )
+-                g2_s.append(
+-                    block_scale_interleave(
+-                        w2_s_u8[perm_sf.to(w2_s_u8.device)].contiguous()
+-                    )
+-                )
+-        else:
+-            for i in range(num_experts):
+-                g1_w.append(shuffle_matrix_a(w13[i].view(torch.uint8), epilogue_tile_m))
+-                g1_s.append(
+-                    shuffle_matrix_sf_a(w13_scale[i].view(torch.uint8), epilogue_tile_m)
+-                )
+-                g2_w.append(shuffle_matrix_a(w2[i].view(torch.uint8), epilogue_tile_m))
+-                g2_s.append(
+-                    shuffle_matrix_sf_a(w2_scale[i].view(torch.uint8), epilogue_tile_m)
+-                )
++        cache: dict = {}
++        for i in range(num_experts):
++            w, s = self._shuffle_expert(
++                "w13", w13[i].view(torch.uint8), w13_scale[i].view(torch.uint8), cache
++            )
++            g1_w.append(w)
++            g1_s.append(s)
++            w, s = self._shuffle_expert(
++                "w2", w2[i].view(torch.uint8), w2_scale[i].view(torch.uint8), cache
++            )
++            g2_w.append(w)
++            g2_s.append(s)
+ 
+         layer.w13_weight = Parameter(torch.stack(g1_w), requires_grad=False)
+         layer.w13_weight_scale_inv = Parameter(
+@@ -340,8 +310,114 @@ class Mxfp4FlashinferTrtllmMoEMethod:
+         )
+ 
+         self._register_static_scale_ones(layer)
++        self._install_hot_update_loaders(layer, padded=layer.w2_weight.shape[2] != w2_width)
+         torch.cuda.empty_cache()
+ 
++    @staticmethod
++    def _shuffle_expert(
++        kind: str, w_u8: torch.Tensor, s_u8: torch.Tensor, cache: dict
++    ) -> Tuple[torch.Tensor, torch.Tensor]:
++        """TRT-LLM layout of ONE expert: ``kind`` "w13" takes ``[w3; w1]`` rows, "w2" the
++        down proj; ``s_u8`` is its E8M0 scale bytes. Returns (weight u8, flat scale u8)."""
++        epilogue_tile_m = 128
++        if not _USE_OFFICIAL_SHUFFLE:
++            return (
++                shuffle_matrix_a(w_u8, epilogue_tile_m),
++                shuffle_matrix_sf_a(s_u8, epilogue_tile_m),
++            )
++        get_perm = (
++            _maybe_get_cached_w3_w1_permute_indices
++            if kind == "w13"
++            else get_w2_permute_indices_with_cache
++        )
++        perm = get_perm(cache, w_u8, epilogue_tile_m)
++        perm_sf = get_perm(cache, s_u8, epilogue_tile_m, num_elts_per_sf=16)
++        return (
++            w_u8[perm.to(w_u8.device)].contiguous(),
++            block_scale_interleave(s_u8[perm_sf.to(s_u8.device)].contiguous()),
++        )
++
++    def _install_hot_update_loaders(self, layer: Module, padded: bool) -> None:
++        """RL hot weight update: the shuffled params have no checkpoint-layout loader, so
++        route checkpoint-format tensors through an in-place per-expert re-shuffle (pointers
++        stay stable for CUDA graphs)."""
++        if padded:
++            return  # padded intermediate (moe TP) is not supported by the hot path
++        loader = functools.partial(self._hot_update_weight_loader, layer)
++        for p in (
++            layer.w13_weight,
++            layer.w2_weight,
++            layer.w13_weight_scale_inv,
++            layer.w2_weight_scale_inv,
++        ):
++            p.weight_loader = loader
++        layer._mxfp4_hot_pending = {}
++        layer._mxfp4_hot_lock = threading.Lock()
++        self._hot_perm_cache: dict = {}
++
++    @torch.no_grad()
++    def _hot_update_weight_loader(
++        self,
++        layer: Module,
++        param: Parameter,
++        loaded_weight: torch.Tensor,
++        weight_name: str,
++        shard_id: str,
++        expert_id: int,
++    ) -> None:
++        """In-place hot update of one expert from checkpoint-format MXFP4 tensors.
++
++        Buffers w1/w3 (or w2) weight + E8M0 scale of an expert until complete, then
++        shuffles that single expert exactly like process_weights_after_loading and copies
++        it into the live buffers.
++        """
++        from sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe import (
++            Mxfp4FlashinferCutlassMoEMethod,
++        )
++
++        if layer.moe_tp_size != 1:
++            raise NotImplementedError(
++                "MXFP4 hot weight update requires moe_tp_size == 1 (use EP)."
++            )
++        if shard_id not in ("w1", "w2", "w3"):
++            raise ValueError(f"unexpected shard_id {shard_id}")
++        locals_ = Mxfp4FlashinferCutlassMoEMethod._local_expert_ids(layer, expert_id)
++        if not locals_:
++            return
++        kind = "w2" if shard_id == "w2" else "w13"
++        is_scale = weight_name.endswith("_scale_inv")
++        device = layer.w13_weight.device
++        for local in locals_:
++            with layer._mxfp4_hot_lock:  # loaders may run on the async-load threadpool
++                pend = layer._mxfp4_hot_pending.setdefault((kind, local), {})
++                pend[(shard_id, is_scale)] = loaded_weight
++                if len(pend) < (4 if kind == "w13" else 2):
++                    continue
++                del layer._mxfp4_hot_pending[(kind, local)]
++            if kind == "w13":
++                # TRT-LLM expects W13 as [w3; w1] (reorder_w1w3_to_w3w1).
++                w = torch.cat([pend[("w3", False)], pend[("w1", False)]], dim=0)
++                s = torch.cat([pend[("w3", True)], pend[("w1", True)]], dim=0)
++            else:
++                w, s = pend[("w2", False)], pend[("w2", True)]
++            w_u8 = w.to(device).view(torch.uint8).contiguous()
++            s = s.to(device)
++            if s.dtype != torch.float8_e8m0fnu:  # fp32 power-of-two scales
++                s = s.to(torch.float8_e8m0fnu)
++            s_u8 = s.view(torch.uint8).contiguous()
++            with layer._mxfp4_hot_lock:  # shared permute-index cache
++                w_sh, s_sh = self._shuffle_expert(kind, w_u8, s_u8, self._hot_perm_cache)
++            live_w = getattr(layer, f"{kind}_weight")
++            live_s = getattr(layer, f"{kind}_weight_scale_inv")
++            if w_sh.shape != live_w.shape[1:] or s_sh.numel() != live_s[local].numel():
++                raise ValueError(
++                    f"{self.prefix} {kind} expert {local}: shape {tuple(w_sh.shape)}/"
++                    f"{s_sh.numel()} != live {tuple(live_w.shape[1:])}/"
++                    f"{live_s[local].numel()}"
++                )
++            live_w.data[local].copy_(w_sh.view(live_w.dtype))
++            live_s.data[local].copy_(s_sh.view(live_s.dtype).view_as(live_s[local]))
++
+     def _register_static_scale_ones(self, layer: Module) -> None:
+         device = layer.w13_weight.device
+         for name in (
+diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
+index dcec0aa..034cba6 100644
+--- a/python/sglang/srt/managers/io_struct.py
++++ b/python/sglang/srt/managers/io_struct.py
+@@ -2152,6 +2152,25 @@ class DestroyWeightsUpdateGroupReqOutput(BaseReq, kw_only=True):
+     message: str
+ 
+ 
++class UpdateWeightsFromChannelReqInput(BaseReq, kw_only=True):
++    master_addr: str
++    world_size: int
++    train_world_size: int
++    weight_version: str
++    engine_id: int = 0
++    recreate: bool = False
++    buffer_size_bytes: int = 256 * 1024 * 1024
++    timeout: float = 300.0
++    gloo_port: int = 29500
++    flush_cache: bool = True
++    torch_empty_cache: bool = False
++
++
++class UpdateWeightsFromChannelReqOutput(BaseReq, kw_only=True):
++    success: bool
++    message: str
++
++
+ class UpdateWeightVersionReqInput(BaseReq, kw_only=True):
+     # The new weight version
+     new_version: str
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index a50c085..44fcc1f 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -185,6 +185,7 @@ from sglang.srt.managers.io_struct import (
+     UnloadLoRAAdapterReqInput,
+     UnloadLoRAAdapterReqOutput,
+     UpdateWeightFromDiskReqInput,
++    UpdateWeightsFromChannelReqInput,
+     UpdateWeightsFromDistributedReqInput,
+     UpdateWeightsFromIPCReqInput,
+     UpdateWeightsFromTensorReqInput,
+@@ -1878,6 +1879,10 @@ class Scheduler(
+                     UpdateWeightsFromIPCReqInput,
+                     self.weight_updater.update_weights_from_ipc,
+                 ),
++                (
++                    UpdateWeightsFromChannelReqInput,
++                    self.weight_updater.update_weights_from_channel,
++                ),
+                 (
+                     UpdateWeightVersionReqInput,
+                     self.handle_update_weight_version,
+diff --git a/python/sglang/srt/managers/scheduler_components/weight_updater.py b/python/sglang/srt/managers/scheduler_components/weight_updater.py
+index 2381b3a..1893fee 100644
+--- a/python/sglang/srt/managers/scheduler_components/weight_updater.py
++++ b/python/sglang/srt/managers/scheduler_components/weight_updater.py
+@@ -41,6 +41,8 @@ from sglang.srt.managers.io_struct import (
+     UpdateWeightsFromDistributedReqOutput,
+     UpdateWeightsFromIPCReqInput,
+     UpdateWeightsFromIPCReqOutput,
++    UpdateWeightsFromChannelReqInput,
++    UpdateWeightsFromChannelReqOutput,
+     UpdateWeightsFromTensorReqInput,
+     UpdateWeightsFromTensorReqOutput,
+ )
+@@ -290,6 +292,22 @@ class SchedulerWeightUpdaterManager:
+         parameter = self.tp_worker.get_weights_by_name(recv_req)
+         return GetWeightsByNameReqOutput(parameter=parameter)
+ 
++    def update_weights_from_channel(
++        self, recv_req: UpdateWeightsFromChannelReqInput
++    ):
++        """Update model weights by receiving from the TransferMesh channel."""
++        with self._observe_weight_load("channel"):
++            success, message = self.tp_worker.update_weights_from_channel(recv_req)
++            if success:
++                self.record_weight_version_after_update(recv_req.weight_version)
++                success, message = self.flush_cache_after_weight_update(
++                    recv_req, success, message
++                )
++            if not success:
++                logger.error(message)
++            torch.distributed.barrier(group=self.tp_cpu_group)
++            return UpdateWeightsFromChannelReqOutput(success=success, message=message)
++
+     def _assert_weight_cache_inactive(self, op: str) -> None:
+         """Reject freeing/restoring model weights while the CUDA IPC weight
+         cache is active: the weights are shared with the daemon via CUDA IPC, so
+@@ -370,6 +388,7 @@ class SchedulerWeightUpdaterManager:
+             self.stashed_model_static_state = _export_static_state(
+                 self.tp_worker.model_runner.model
+             )
++            _disk_backup_weights(self.tp_worker.model_runner.model)
+             torch.distributed.barrier(self.tp_cpu_group)
+             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_WEIGHTS)
+ 
+@@ -377,6 +396,9 @@ class SchedulerWeightUpdaterManager:
+             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_CUDA_GRAPH)
+ 
+         torch.get_device_module().synchronize()
++        # Return cached activation blocks too, so a colocated trainer gets the whole GPU and the
++        # regions can be resumed without fragmentation.
++        torch.cuda.empty_cache()
+ 
+         return ReleaseMemoryOccupationReqOutput()
+ 
+@@ -396,6 +418,7 @@ class SchedulerWeightUpdaterManager:
+             self._assert_weight_cache_inactive("resume_memory_occupation")
+             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_WEIGHTS)
+             torch.distributed.barrier(self.tp_cpu_group)
++            _disk_restore_weights(self.tp_worker.model_runner.model)
+             _import_static_state(
+                 self.tp_worker.model_runner.model,
+                 self.stashed_model_static_state,
+@@ -475,7 +498,79 @@ class SchedulerWeightUpdaterManager:
+         )
+ 
+ 
++def _disk_weight_tensors(model):
++    """Raw uint8 views of the model's unique CUDA parameter/buffer storages (stable order).
++
++    Storages, not tensors: parameters can be non-contiguous views, and reshaping them would copy.
++    """
++    seen, out = set(), []
++    tensors = [p for _, p in model.named_parameters()] + [b for _, b in model.named_buffers()]
++    for t in tensors:
++        if t is None or not t.is_cuda:
++            continue
++        st = t.untyped_storage()
++        key = st.data_ptr()
++        if key in seen or st.nbytes() == 0:
++            continue
++        seen.add(key)
++        out.append(torch.empty(0, dtype=torch.uint8, device=t.device).set_(st))
++    return out
++
++
++def _disk_backup_weights(model):
++    """SGLANG_DISK_WEIGHT_BACKUP=<file>: save the (post-processed) GPU weights before they are
++    released, so resume can restore them without host RAM (single-GPU colocated streaming)."""
++    import os
++    import time
++
++    path = os.environ.get("SGLANG_DISK_WEIGHT_BACKUP")
++    if not path:
++        return
++    t0 = time.time()
++    views = _disk_weight_tensors(model)
++    total = sum(v.numel() for v in views)
++    chunk = torch.empty(256 << 20, dtype=torch.uint8, pin_memory=True)
++    with open(path, "wb") as f:
++        for v in views:
++            for off in range(0, v.numel(), chunk.numel()):
++                n = min(chunk.numel(), v.numel() - off)
++                chunk[:n].copy_(v[off: off + n])
++                f.write(memoryview(chunk[:n].numpy()))
++    del chunk
++    logger.info(f"Disk weight backup: {len(views)} storages, {total / 2**30:.2f} GiB, "
++                f"{time.time() - t0:.1f}s -> {path}")
++
++
++def _disk_restore_weights(model):
++    import os
++    import time
++
++    path = os.environ.get("SGLANG_DISK_WEIGHT_BACKUP")
++    if not path or not os.path.exists(path):
++        return
++    t0 = time.time()
++    views = _disk_weight_tensors(model)
++    chunk = torch.empty(256 << 20, dtype=torch.uint8, pin_memory=True)
++    buf = chunk.numpy()
++    with open(path, "rb") as f:
++        for v in views:
++            for off in range(0, v.numel(), chunk.numel()):
++                n = min(chunk.numel(), v.numel() - off)
++                f.readinto(memoryview(buf[:n]))
++                v[off: off + n].copy_(chunk[:n])
++                torch.cuda.current_stream().synchronize()
++    del chunk
++    torch.cuda.empty_cache()
++    logger.info(f"Disk weight restore: {len(views)} storages, {time.time() - t0:.1f}s")
++
++
+ def _export_static_state(model):
++    import os
++
++    if os.environ.get("SGLANG_DISK_WEIGHT_BACKUP"):
++        # The disk backup already holds every buffer storage; a GPU clone here would pin ~2 GB
++        # of device memory while the weights are released.
++        return dict(buffers=[])
+     return dict(
+         buffers=[
+             (name, buffer.detach().clone()) for name, buffer in model.named_buffers()
+diff --git a/python/sglang/srt/managers/tokenizer_control_mixin.py b/python/sglang/srt/managers/tokenizer_control_mixin.py
+index df58b81..25a58c5 100644
+--- a/python/sglang/srt/managers/tokenizer_control_mixin.py
++++ b/python/sglang/srt/managers/tokenizer_control_mixin.py
+@@ -80,6 +80,8 @@ from sglang.srt.managers.io_struct import (
+     UpdateWeightsFromDistributedReqOutput,
+     UpdateWeightsFromIPCReqInput,
+     UpdateWeightsFromIPCReqOutput,
++    UpdateWeightsFromChannelReqInput,
++    UpdateWeightsFromChannelReqOutput,
+     UpdateWeightsFromTensorReqInput,
+     UpdateWeightsFromTensorReqOutput,
+     UpdateWeightVersionReqInput,
+@@ -120,6 +122,7 @@ _COMMUNICATOR_SPECS = [
+     ("send_weights_to_remote_instance", SendWeightsToRemoteInstanceReqOutput),
+     ("update_weights_from_tensor", UpdateWeightsFromTensorReqOutput),
+     ("update_weights_from_ipc", UpdateWeightsFromIPCReqOutput),
++    ("update_weights_from_channel", UpdateWeightsFromChannelReqOutput),
+     ("update_weight_version", UpdateWeightVersionReqOutput),
+     ("get_weights_by_name", GetWeightsByNameReqOutput),
+     ("release_memory_occupation", ReleaseMemoryOccupationReqOutput),
+@@ -631,6 +634,23 @@ class TokenizerControlMixin:
+ 
+         return success, message
+ 
++    async def update_weights_from_channel(
++        self: TokenizerManager,
++        obj: UpdateWeightsFromChannelReqInput,
++        request: Optional[fastapi.Request] = None,
++    ) -> Tuple[bool, str]:
++        """Update weights by receiving from the TransferMesh channel."""
++        self.auto_create_handle_loop()
++        async with self.model_update_lock.writer_lock:
++            if obj.weight_version == "":
++                return False, "weight_version must not be empty"
++            results = await self.update_weights_from_channel_communicator(obj)
++            success, message = FanOutCommunicator.merge_results(results)
++            if success:
++                self._update_weight_version_if_provided(obj.weight_version)
++                message += f" Weight version updated to {obj.weight_version}."
++            return success, message
++
+     async def _unload_lora_adapter_locked(
+         self: TokenizerManager,
+         obj: UnloadLoRAAdapterReqInput,
+diff --git a/python/sglang/srt/managers/tp_worker.py b/python/sglang/srt/managers/tp_worker.py
+index 5058c3f..4e9684e 100644
+--- a/python/sglang/srt/managers/tp_worker.py
++++ b/python/sglang/srt/managers/tp_worker.py
+@@ -200,6 +200,9 @@ class BaseTpWorker(ABC):
+             serialized_named_tensors[get_parallel().tp_rank]
+         )
+ 
++    def update_weights_from_channel(self, recv_req):
++        return self.model_runner.weight_updater.update_weights_from_channel(recv_req)
++
+     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
+         parameter = self.model_runner.weight_exporter.get_weights_by_name(
+             recv_req.name, recv_req.truncate_size
+diff --git a/python/sglang/srt/model_executor/model_runner_components/weight_updater.py b/python/sglang/srt/model_executor/model_runner_components/weight_updater.py
+index 80965e5..d43ebe6 100644
+--- a/python/sglang/srt/model_executor/model_runner_components/weight_updater.py
++++ b/python/sglang/srt/model_executor/model_runner_components/weight_updater.py
+@@ -202,6 +202,17 @@ class WeightUpdater:
+             message = f"Failed to get model loader: {loader}."
+             return False, message
+ 
++        import os as _os
++        import re as _re
++
++        _dense_re = _os.environ.get("SGLANG_STREAM_RELOAD_REGEX")
++        if _dense_re:
++            # Streaming LoRA backend: only the merged dense tail tensors changed on disk. Reload
++            # just those, with no post-processing pass (it is not idempotent on processed
++            # params, and the paged experts / dequantized wo_a must stay as they are).
++            _pat = _re.compile(_dense_re)
++            weight_name_filter = lambda n, _p=_pat: bool(_p.search(n))  # noqa: E731
++
+         def get_weight_iter(config):
+             iter = loader._get_weights_iterator(
+                 DefaultModelLoader.Source.init_new(config, self.get_model())
+@@ -214,6 +225,13 @@ class WeightUpdater:
+             return iter
+ 
+         def model_load_weights(model, iter):
++            if _dense_re:
++                n = 0
++                for name, w in iter:
++                    model.load_weights([(name, w)])
++                    n += 1
++                logger.info(f"Streaming dense reload: {n} tensors (no post-processing)")
++                return model
+             # Expert loaders may copy in parallel; restore before any thread writes.
+             DefaultModelLoader.restore_weights_before_loading(model, target_device)
+             loader.load_weights_and_postprocess(model, iter, target_device)
+@@ -434,6 +452,40 @@ class WeightUpdater:
+             logger.error(f"IPC weight update failed: {e}")
+             return False, str(e)
+ 
++    def update_weights_from_channel(self: WeightUpdater, recv_req):
++        """Receive weights from TransferMesh channel and update model in-place.
++
++        Uses coda.transfer_mesh.create_receiver_channel() to lazily create or reuse a
++        process-local TransferMeshChannel based on the request parameters.
++        """
++        self._assert_weight_cache_inactive("update_weights_from_channel")
++        error = _unsupported_derived_weight_cache_error(self.get_model())
++        if error is not None:
++            return False, error
++
++        try:
++            from coda.transfer_mesh import ChannelMeta, create_receiver_channel
++            from sglang.srt.utils.network import get_local_ip_auto
++
++            meta = ChannelMeta(
++                master_addr=recv_req.master_addr,
++                world_size=recv_req.world_size,
++                train_world_size=recv_req.train_world_size,
++                engine_id=recv_req.engine_id,
++                recreate=recv_req.recreate,
++                buffer_size_bytes=recv_req.buffer_size_bytes,
++                timeout=recv_req.timeout,
++                gloo_port=recv_req.gloo_port,
++                local_ip=get_local_ip_auto(),
++            )
++            channel = create_receiver_channel(meta)
++            self.get_model().load_weights(channel.get_iterator())
++            return True, "Succeeded to update weights from channel."
++        except Exception as e:
++            error_msg = f"Failed to update weights from channel: {e}."
++            logger.error(error_msg)
++            return False, error_msg
++
+ 
+ def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):
+     params_dict = dict(model.named_parameters())
+diff --git a/python/sglang/srt/model_loader/loader.py b/python/sglang/srt/model_loader/loader.py
+index edda2a7..c61dd78 100644
+--- a/python/sglang/srt/model_loader/loader.py
++++ b/python/sglang/srt/model_loader/loader.py
+@@ -1518,6 +1518,13 @@ class DummyModelLoader(BaseModelLoader):
+ 
+             post_load_weights(model)
+ 
++            # dummy load fills every param with random values, but the engram fp8
++            # tables are frozen constants NOT carried by the RL weight update, so they
++            # must still be read from the checkpoint here (no-op for non-engram models).
++            from sglang.srt.layers.engram import load_engram_tables_from_disk
++
++            load_engram_tables_from_disk(model, model_config.model_path)
++
+             for _, module in model.named_modules():
+                 quant_method = getattr(module, "quant_method", None)
+                 if quant_method is not None:
+diff --git a/python/sglang/srt/model_loader/weight_utils.py b/python/sglang/srt/model_loader/weight_utils.py
+index 64d781e..fad1ff0 100644
+--- a/python/sglang/srt/model_loader/weight_utils.py
++++ b/python/sglang/srt/model_loader/weight_utils.py
+@@ -1143,6 +1143,11 @@ def _drop_file_cache_after_load(path: str) -> None:
+             os.close(fd)
+ 
+ 
++def _skip_file_engram(name: str) -> bool:
++    """The engram tables are gathered from the checkpoint by FileEngramTable when configured."""
++    return bool(os.environ.get("SGLANG_ENGRAM_FILE_CKPT")) and ".engram.embed." in name
++
++
+ def safetensors_weights_iterator(
+     hf_weights_files: List[str],
+     disable_mmap: bool = False,
+@@ -1172,10 +1177,14 @@ def safetensors_weights_iterator(
+             with open(st_file, "rb") as f:
+                 result = safetensors.torch.load(f.read())
+                 for name in sorted(result.keys()):
++                    if _skip_file_engram(name):
++                        continue
+                     yield name, result[name]
+         else:
+             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
+                 for name in f.keys():
++                    if _skip_file_engram(name):
++                        continue
+                     yield name, f.get_tensor(name)
+         if drop_cache_after_load:
+             _drop_file_cache_after_load(st_file)
+@@ -1384,6 +1393,8 @@ def buffered_multi_thread_safetensors_weights_iterator(
+                     pending.append((next_file, executor.submit(_load_file, next_file)))
+ 
+                 for name in sorted(state_dict.keys()):
++                    if _skip_file_engram(name):
++                        continue
+                     yield name, state_dict[name]
+                 del state_dict
+                 if drop_cache_after_load:
+@@ -1756,6 +1767,13 @@ def initialize_dummy_weights(
+     the parameter's number of elements and its data type.
+     """
+     for name, param in model.state_dict().items():
++        # The engram fp8 tables are huge (~98GB each). They are (re)loaded from the
++        # checkpoint by load_engram_tables_from_disk, so there is no need to fill them
++        # with random values here -- and doing so upcasts the full fp8 table to fp16
++        # (`param.data.to(torch.float16)`), allocating a ~2x (~196GB) PRIVATE temp per
++        # TP rank, which caused the colocate host OOM.
++        if ".engram.embed." in name:
++            continue
+         if torch.is_floating_point(param):
+             # Neutral FP4 global scales keep fused gate/up projections compatible.
+             if name.endswith(("weight_scale_inv", "weight_scale_2")):
+diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
+index 19fd546..35068b0 100644
+--- a/python/sglang/srt/models/deepseek_v4.py
++++ b/python/sglang/srt/models/deepseek_v4.py
+@@ -5060,6 +5060,15 @@ class DeepseekV4ForCausalLM(nn.Module):
+         if self.wo_a_fp8:
+             self._setup_fp8_wo_a_scales(is_nextn)
+ 
++        # Block-fp8 linears served as MXFP8 (SM100 default) keep a load-time swizzled
++        # copy of the scales; re-derive it so weight updates take effect.
++        for module in self.modules():
++            refresh = getattr(
++                getattr(module, "quant_method", None), "refresh_block_fp8_mxfp8_scale", None
++            )
++            if refresh is not None:
++                refresh(module)
++
+         for module in self.modules():
+             if isinstance(module, MQALayer):
+                 module.setup_mega_attention()
+@@ -5635,6 +5644,16 @@ class DeepseekV4ForCausalLM(nn.Module):
+                 f"Some weights are not initialized from checkpoints: {unloaded_params}"
+             )
+ 
++        # MXFP4 hot update buffers an expert until all its tensors arrived; anything left
++        # over means a partial update, which would leave the expert silently stale.
++        incomplete = [
++            f"{name}{sorted(m._mxfp4_hot_pending)[:4]}"
++            for name, m in self.named_modules()
++            if getattr(m, "_mxfp4_hot_pending", None)
++        ]
++        if incomplete:
++            raise RuntimeError(f"Incomplete MXFP4 expert hot update: {incomplete[:8]}")
++
+         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
+ 
+         if not is_nextn:
+diff --git a/python/sglang/srt/runtime_context.py b/python/sglang/srt/runtime_context.py
+index 054e46f..8c8cef0 100644
+--- a/python/sglang/srt/runtime_context.py
++++ b/python/sglang/srt/runtime_context.py
+@@ -1833,6 +1833,7 @@ _PLATFORM_PROBES: Dict[str, str] = {
+     "is_sm100_or_sm110": "is_sm100_or_sm110_supported",
+     "is_sm110": "is_sm110_supported",
+     "is_sm120": "is_sm120_supported",
++    "is_sm8x": "is_sm80_supported",
+     "is_blackwell": "is_blackwell_supported",
+     "is_hopper_with_cuda_12_3": "is_hopper_with_cuda_12_3",
+     "has_amx": "cpu_has_amx_support",
