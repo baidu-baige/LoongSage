@@ -6,6 +6,7 @@ import json
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import aiohttp
 import httpx
 import pytest
 from fastapi import status
@@ -134,24 +135,24 @@ def make_proxy_router(trajectory_store: TrajectoryStore | None = None) -> Router
 async def proxy_client(router: Router, *, upstream_body: dict, **request_kwargs):
     """Yield ``(asgi_client, generate_request_mock)`` for proxy forwarding tests.
 
-    ``Router.proxy`` builds a throwaway ``httpx.AsyncClient`` per forward, so the
-    seam for tests is the constructor rather than a router attribute. The ASGI
-    test client is created *before* the patch goes live, so it keeps the real
-    httpx implementation and only the proxy's client is mocked.
+    ``Router.proxy`` forwards through the shared ``router._generate_session``
+    (aiohttp), so only that session's ``request`` is mocked; the ASGI test client
+    stays real.
 
     Args:
         router: The router under test.
         upstream_body: Body injected as ``request.state.upstream_body``.
         request_kwargs: Forwarded to the ``AsyncMock`` standing in for
-            ``AsyncClient.request`` (e.g. ``return_value`` or ``side_effect``).
+            ``ClientSession.request`` (e.g. ``return_value`` or ``side_effect``).
     """
-    async with make_client(router, upstream_body=upstream_body) as client:
-        request_mock = AsyncMock(**request_kwargs)
-        generate_client = MagicMock()
-        generate_client.request = request_mock
-        generate_client.aclose = AsyncMock()
-        with patch.object(httpx, "AsyncClient", return_value=generate_client):
-            yield client, request_mock
+    session = router._get_generate_session()
+    try:
+        async with make_client(router, upstream_body=upstream_body) as client:
+            request_mock = AsyncMock(**request_kwargs)
+            with patch.object(session, "request", request_mock):
+                yield client, request_mock
+    finally:
+        await session.close()
 
 
 # ---------------------------------------------------------------------------
@@ -743,9 +744,9 @@ class TestProxyForwarding:
         router.slot_request_counts[slot("http://w1:8888")] = 0
 
         mock_response = MagicMock()
-        mock_response.status_code = status.HTTP_400_BAD_REQUEST
+        mock_response.status = status.HTTP_400_BAD_REQUEST
         mock_response.headers = {"content-type": "application/json"}
-        mock_response.aread = AsyncMock(return_value=b'{"error": "worker rejected it"}')
+        mock_response.read = AsyncMock(return_value=b'{"error": "worker rejected it"}')
 
         async with proxy_client(
             router,
@@ -768,9 +769,9 @@ class TestProxyForwarding:
         router.slot_request_counts[slot("http://w1:8888")] = 0
 
         mock_response = MagicMock()
-        mock_response.status_code = status.HTTP_200_OK
+        mock_response.status = status.HTTP_200_OK
         mock_response.headers = {"content-type": "application/json"}
-        mock_response.aread = AsyncMock(
+        mock_response.read = AsyncMock(
             return_value=json.dumps(
                 {
                     "text": "ok",
@@ -814,9 +815,9 @@ class TestProxyForwarding:
         router.slot_request_counts[slot("http://w1:8888")] = 0
 
         mock_response = MagicMock()
-        mock_response.status_code = status.HTTP_200_OK
+        mock_response.status = status.HTTP_200_OK
         mock_response.headers = {"content-type": "application/json"}
-        mock_response.aread = AsyncMock(return_value=json.dumps({
+        mock_response.read = AsyncMock(return_value=json.dumps({
             "text": "hi",
             "meta_info": {"prompt_tokens": 3, "completion_tokens": 1,
                           "weight_version": "0", "output_token_logprobs": [[-0.1, 201]]},
@@ -842,9 +843,9 @@ class TestProxyForwarding:
         router.slot_request_counts[slot("http://w2:8888")] = 0
 
         mock_response = MagicMock()
-        mock_response.status_code = status.HTTP_200_OK
+        mock_response.status = status.HTTP_200_OK
         mock_response.headers = {"content-type": "application/json"}
-        mock_response.aread = AsyncMock(return_value=json.dumps({
+        mock_response.read = AsyncMock(return_value=json.dumps({
             "text": "hi",
             "meta_info": {"prompt_tokens": 3, "completion_tokens": 1,
                           "weight_version": "0", "output_token_logprobs": [[-0.1, 201]]},
@@ -882,9 +883,9 @@ class TestProxyForwarding:
                           "weight_version": "0", "output_token_logprobs": [[-0.1, 201]]},
         }).encode()
         mock_response = MagicMock()
-        mock_response.status_code = status.HTTP_200_OK
+        mock_response.status = status.HTTP_200_OK
         mock_response.headers = {"content-type": "application/json"}
-        mock_response.aread = AsyncMock(return_value=valid_body)
+        mock_response.read = AsyncMock(return_value=valid_body)
 
         async def check_count(*args, **kwargs):
             assert router.slot_request_counts[slot("http://w1:8888")] == 1
@@ -925,9 +926,9 @@ class TestProxyForwarding:
                           "weight_version": "0", "output_token_logprobs": [[-0.1, 201]]},
         }).encode()
         mock_response = MagicMock()
-        mock_response.status_code = status.HTTP_200_OK
+        mock_response.status = status.HTTP_200_OK
         mock_response.headers = {"content-type": "application/json"}
-        mock_response.aread = AsyncMock(return_value=valid_body)
+        mock_response.read = AsyncMock(return_value=valid_body)
 
         async def blocking_request(*args, **kwargs):
             nonlocal concurrent, max_concurrent
@@ -968,9 +969,9 @@ class TestProxyForwarding:
         router.slot_request_counts[slot("http://w1:8888")] = 0
 
         mock_response = MagicMock()
-        mock_response.status_code = status.HTTP_200_OK
+        mock_response.status = status.HTTP_200_OK
         mock_response.headers = {"content-type": "text/plain"}
-        mock_response.aread = AsyncMock(return_value=b"plain text response")
+        mock_response.read = AsyncMock(return_value=b"plain text response")
 
         async with proxy_client(
             router,
@@ -997,9 +998,9 @@ class TestProxyForwarding:
         router.slot_request_counts[slot("http://w1:8888")] = 0
 
         mock_response = MagicMock()
-        mock_response.status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
+        mock_response.status = status.HTTP_500_INTERNAL_SERVER_ERROR
         mock_response.headers = {"content-type": "application/json"}
-        mock_response.aread = AsyncMock(return_value=b'{"error": "internal"}')
+        mock_response.read = AsyncMock(return_value=b'{"error": "internal"}')
 
         upstream_body = {
             "input_ids": [1, 2, 3],
@@ -1029,7 +1030,7 @@ class TestProxyForwarding:
         async with proxy_client(
             router,
             upstream_body={"messages": [{"role": "user", "content": "hi"}]},
-            side_effect=httpx.RequestError("Connection refused"),
+            side_effect=aiohttp.ClientConnectionError("Connection refused"),
         ) as (client, _):
             response = await client.post(
                 "/req-001/0/v1/chat/completions",
@@ -1046,9 +1047,9 @@ class TestProxyForwarding:
         router.slot_request_counts[slot("http://w1:8888")] = 0
 
         mock_response = MagicMock()
-        mock_response.status_code = status.HTTP_200_OK
+        mock_response.status = status.HTTP_200_OK
         mock_response.headers = {"content-type": "application/json"}
-        mock_response.aread = AsyncMock(return_value=json.dumps({
+        mock_response.read = AsyncMock(return_value=json.dumps({
             "text": "ok",
             "meta_info": {"prompt_tokens": 3, "completion_tokens": 1,
                           "weight_version": "0", "output_token_logprobs": [[-0.1, 201]]},
@@ -1101,9 +1102,9 @@ class TestChatCompletionIntegration:
         router.slot_request_counts[slot("http://w1:8888")] = 0
 
         mock_response = MagicMock()
-        mock_response.status_code = status.HTTP_200_OK
+        mock_response.status = status.HTTP_200_OK
         mock_response.headers = {"content-type": "application/json"}
-        mock_response.aread = AsyncMock(
+        mock_response.read = AsyncMock(
             return_value=json.dumps(
                 {
                     "text": "ok",
@@ -1141,7 +1142,7 @@ class TestChatCompletionIntegration:
         assert response_json["choices"][0]["message"]["content"] == "ok"
         # The chat-completions path must be rewritten to the worker's /generate.
         assert request_mock.await_args.kwargs["url"] == "http://w1:8888/generate"
-        forwarded = json.loads(request_mock.await_args.kwargs["content"])
+        forwarded = json.loads(request_mock.await_args.kwargs["data"])
         assert "messages" not in forwarded
 
 
@@ -1284,9 +1285,9 @@ class TestDpAttentionRouting:
         self._register(router, "http://w1:8888", dp_size=2)
 
         mock_response = MagicMock()
-        mock_response.status_code = status.HTTP_200_OK
+        mock_response.status = status.HTTP_200_OK
         mock_response.headers = {"content-type": "application/json"}
-        mock_response.aread = AsyncMock(return_value=b'{"text": "ok", "meta_info": {}}')
+        mock_response.read = AsyncMock(return_value=b'{"text": "ok", "meta_info": {}}')
 
         async with proxy_client(
             router,
@@ -1295,6 +1296,6 @@ class TestDpAttentionRouting:
         ) as (client, request_mock):
             await client.post("/req-001/0/v1/chat/completions", json={"messages": []})
 
-        forwarded = json.loads(request_mock.await_args.kwargs["content"])
+        forwarded = json.loads(request_mock.await_args.kwargs["data"])
         assert forwarded["routed_dp_rank"] == 0
         assert request_mock.await_args.kwargs["url"] == "http://w1:8888/generate"
