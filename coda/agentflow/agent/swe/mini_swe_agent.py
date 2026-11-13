@@ -126,10 +126,14 @@ class CodaSandboxEnvironment:
         workdir = cwd or self._cwd
         try:
             result = self._execute(command, workdir=workdir)
+            # A timed-out command returns -1 with no output. Without surfacing the
+            # reason the model cannot tell it apart from a command that printed
+            # nothing, so it retries the same hung command and each retry burns the
+            # full timeout budget.
             output: dict[str, Any] = {
                 "output": result.get("stdout", "") + result.get("stderr", ""),
                 "returncode": result.get("exit_code", -1),
-                "exception_info": "",
+                "exception_info": result.get("error", "") if result.get("timed_out") else "",
             }
         except Exception as e:
             output = {"output": "", "returncode": -1, "exception_info": str(e)}

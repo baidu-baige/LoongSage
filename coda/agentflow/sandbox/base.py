@@ -7,6 +7,13 @@ from collections.abc import Mapping
 from typing import Any
 
 
+def decode_output(data: bytes | str | None) -> str:
+    """Return ``data`` as text; ``TimeoutExpired`` carries bytes (or None) even with ``text=True``."""
+    if isinstance(data, bytes):
+        return data.decode(errors="replace")
+    return data or ""
+
+
 class SandboxClient(ABC):
     """Backend connector that can manage multiple sandbox instances."""
 

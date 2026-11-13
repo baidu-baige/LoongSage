@@ -11,7 +11,7 @@ LoongSage provides `k8s` and `docker` sandboxes by default. Use them directly th
 The sandbox base class and built-in implementations live in the [sandbox directory](../../coda/agentflow/sandbox/). Follow these steps to add a backend:
 
 1. Inherit from [SandboxClient](../../coda/agentflow/sandbox/base.py) and implement `create()`, `execute(sandbox_id, command, **kwargs)`, and `delete(sandbox_id, **kwargs)`.
-2. `create()` returns the backend ID. `execute()` returns `stdout`, `stderr`, `exit_code`, and `success`. `delete()` destroys the explicitly identified instance and should treat an already-missing backend resource as success. Do not store the current sandbox ID on the client; one client may address multiple instances. Override `from_config()` only when configuration fields require extra adaptation.
+2. `create()` returns the backend ID. `execute()` returns `stdout`, `stderr`, `exit_code`, and `success`, plus the optional `timed_out` and `error` keys that tell the model a command exhausted its timeout budget instead of leaving it with an empty observation. `delete()` destroys the explicitly identified instance and should treat an already-missing backend resource as success. Do not store the current sandbox ID on the client; one client may address multiple instances. Override `from_config()` only when configuration fields require extra adaptation.
 3. Register the implementation with `@register_sandbox("your-type")` and place it in [coda/custom/](../../coda/custom/); LoongSage discovers it automatically, see [Custom Extensions](./custom-extensions.md).
 
 ## 2. Minimal Example
