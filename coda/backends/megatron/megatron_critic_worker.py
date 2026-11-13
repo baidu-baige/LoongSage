@@ -120,6 +120,11 @@ class MegatronCriticWorker(MegatronTrainWorker):
           ``pre_wrap_hook=`` argument would replace that hook), so the HF load
           never sees the value head. Hooks are chained, so it returns the model.
         """
+        if type(provider).__name__ == "DeepSeekV41VLModelProvider":
+            raise NotImplementedError(
+                "The critic does not support the DeepSeek-V4.1 vision model: the value head would be "
+                "installed on the wrapper instead of its language_model"
+            )
         provider.share_embeddings_and_output_weights = False
         hidden_size = provider.hidden_size
         sequence_parallel = bool(provider.sequence_parallel)

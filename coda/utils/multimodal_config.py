@@ -19,6 +19,8 @@ logger = logging.getLogger(__name__)
 # Modalities whose processing logic is implemented. VIDEO / AUDIO only have reserved interfaces.
 SUPPORTED_MODALITIES = (ModalityKind.IMAGE,)
 
+DEEPSEEK_V41_MODEL_TYPE = "deepseek_v41"
+
 
 def multimodal_enabled(config) -> bool:
     """Return True when `multimodal.enable` is set; tolerate configs without the block."""
@@ -55,7 +57,77 @@ def validate_multimodal_config(config: DictConfig) -> DictConfig:
         _validate_multimodal_keys(ds.dataset.get("multimodal_keys"), modalities, f"data_sources[{idx}]")
 
     _link_sglang_enable_multimodal(config)
+    if read_hf_model_type(config.get("hf_model_path")) == DEEPSEEK_V41_MODEL_TYPE:
+        _validate_dsv41_multimodal(config)
     return config
+
+
+# Default `multimodal.image` pixel bounds (conf/default.yaml); V4.1 plans images from `vision_*` instead.
+_DEFAULT_IMAGE_PIXELS = (65536, 16777216)
+
+
+def _validate_dsv41_multimodal(config: DictConfig) -> None:
+    """DeepSeek-V4.1 image-modality constraints that would otherwise fail late or silently.
+
+    Raises:
+        ValueError: On the first violated constraint.
+    """
+    sglang_args = config.rollout.sglang_args
+
+    if rollout_model_override_args(config).get("vision_n_layers") == 0:
+        raise ValueError(
+            "multimodal.enable=true on DeepSeek-V4.1 needs the vision tower: remove "
+            'vision_n_layers=0 from rollout.sglang_args.json_model_override_args'
+        )
+
+    for key in ("pp_size", "pipeline_parallel_size", "attn_cp_size"):
+        if int(sglang_args.get(key) or 1) != 1:
+            raise ValueError(f"DeepSeek-V4.1 vision requires rollout.sglang_args.{key}=1, got {sglang_args.get(key)}")
+    a2a = sglang_args.get("moe_a2a_backend")
+    if a2a not in (None, "none", "megamoe"):
+        raise ValueError(
+            f"DeepSeek-V4.1 vision supports moe_a2a_backend none or megamoe only, got {a2a!r} "
+            "(rollout.sglang_args.moe_a2a_backend)"
+        )
+
+    backend = sglang_args.get("image_processor_backend")
+    if backend != "pil":
+        raise ValueError(
+            "DeepSeek-V4.1 vision needs rollout.sglang_args.image_processor_backend='pil' so rollout and "
+            f"training patchify identically, got {backend!r}"
+        )
+
+    model_cfg = (config.get("megatron") or {}).get("model") or {}
+    if model_cfg.get("moe_router_fusion"):
+        raise ValueError("DeepSeek-V4.1 vision needs megatron.model.moe_router_fusion=false")
+    if model_cfg.get("freeze_vision_model") is False:
+        raise ValueError(
+            "DeepSeek-V4.1 vision trains with a frozen vision tower so that the trainer and the rollout engine "
+            "see the same image features; remove megatron.model.freeze_vision_model=false"
+        )
+
+    image = config.multimodal.get("image")
+    pixels = (int(image.min_pixels), int(image.max_pixels)) if image is not None else _DEFAULT_IMAGE_PIXELS
+    if pixels != _DEFAULT_IMAGE_PIXELS:
+        raise ValueError(
+            "multimodal.image.min_pixels/max_pixels have no effect on DeepSeek-V4.1 (images are planned from "
+            f"the checkpoint's vision_* config); leave them at {_DEFAULT_IMAGE_PIXELS}, got {pixels}"
+        )
+
+
+def rollout_model_override_args(config) -> dict:
+    """`rollout.sglang_args.json_model_override_args` as a plain dict (empty when unset).
+
+    Accepts the JSON-string form used in recipes as well as a YAML mapping.
+    """
+    rollout = getattr(config, "rollout", None)
+    sglang_args = getattr(rollout, "sglang_args", None) if rollout is not None else None
+    raw = sglang_args.get("json_model_override_args") if sglang_args is not None else None
+    if not raw:
+        return {}
+    if isinstance(raw, DictConfig):
+        return dict(OmegaConf.to_container(raw, resolve=True))
+    return json.loads(raw) if isinstance(raw, str) else dict(raw)
 
 
 def read_hf_model_type(hf_path: str | None) -> str | None:
@@ -69,6 +141,29 @@ def read_hf_model_type(hf_path: str | None) -> str | None:
         return json.loads(cfg_file.read_text()).get("model_type")
     except (OSError, ValueError):
         return None
+
+
+def select_dsv41_vision(hf_config, enable: bool) -> None:
+    """Make the Megatron-Bridge build the DeepSeek-V4.1 vision tower only when `multimodal.enable` is set.
+
+    The released checkpoint always carries a `vision_config`, and the bridge builds the vision model
+    whenever it is present. Without `multimodal.enable` the config is cleared, so the same checkpoint
+    trains and exports as the text-only model. Other model families are left alone.
+
+    Args:
+        hf_config: The `config` of the bridge's `hf_pretrained`; the bridge reads this same object
+            when it builds the provider and the weight mappings.
+        enable: `multimodal_enabled(config)`.
+
+    Raises:
+        ValueError: `enable` is true but the checkpoint has no `vision_config`.
+    """
+    if getattr(hf_config, "model_type", None) != DEEPSEEK_V41_MODEL_TYPE:
+        return
+    if enable and not getattr(hf_config, "vision_config", None):
+        raise ValueError("multimodal.enable=true but the DeepSeek-V4.1 checkpoint has no vision_config")
+    if not enable:
+        hf_config.vision_config = None
 
 
 def validate_vlm_parallel_config(config: DictConfig, model_cfg: DictConfig, hf_path: str | None) -> None:

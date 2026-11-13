@@ -127,9 +127,14 @@ class AgentFlow:
 
     def _init_tokenizer(self) -> None:
         """Initialize tokenizer from config."""
+        from coda.utils.multimodal_config import rollout_model_override_args
+
         tokenizer_cfg = self.config.agentflow.tokenizer
         self.tokenizer_manager = create_tokenizer_manager(
-            tokenizer_cfg, self.config.hf_model_path, getattr(self.config, "multimodal", None)
+            tokenizer_cfg,
+            self.config.hf_model_path,
+            getattr(self.config, "multimodal", None),
+            rollout_model_override_args(self.config),
         )
         self._resources.callback(self.tokenizer_manager.shutdown)
         logger.info(

@@ -246,8 +246,9 @@ def expand_pad_spans(folded_ids: list[int], pad_id: int, counts: list[int]) -> t
 class ProcessedImage:
     """One preprocessed image.
 
-    `tensors` holds the CPU tensors `pixel_values` and `image_grid_thw`. `png_data_uri` is the lossless
-    PNG of the pre-resized image, sent to SGLang as `image_data`.
+    `tensors` holds the CPU tensors of the image (Qwen: `pixel_values`, `image_grid_thw`; V4.1: `pixel_values`,
+    `image_grid_hw`). `png_data_uri` is the data URI sent to SGLang as `image_data`: for Qwen the lossless PNG
+    of the pre-resized image, for V4.1 the original data URI (SGLang resizes it itself).
     """
     image_hash: str
     png_data_uri: str
@@ -316,7 +317,76 @@ class ImageCache:
 # ---------------------------------------------------------------------------
 
 
-class MultimodalProcessor:
+class _ImagePipeline:
+    """Cache, in-flight dedup and thread-pool plumbing shared by the image processors.
+
+    Subclasses set `cache`, `_executor` and `_inflight`, and implement `_cache_key` and `_process_uncached`.
+    """
+
+    cache: ImageCache
+    _executor: Any
+    _inflight: dict[str, Any]
+
+    def _cache_key(self, image_hash: str) -> tuple:
+        raise NotImplementedError
+
+    def _process_uncached(self, ref: str, image_hash: str) -> ProcessedImage:
+        raise NotImplementedError
+
+    def process_image(self, ref: str, image_hash: str | None = None) -> ProcessedImage:
+        """Preprocess one data-URI image synchronously (cache aware).
+
+        Pass `image_hash` (`image_sha256(ref)`) if already known, to skip decoding the image again.
+        """
+        if image_hash is None:
+            image_hash = image_sha256(ref)
+        key = self._cache_key(image_hash)
+        cached = self.cache.get(key)
+        if cached is not None:
+            return cached
+        try:
+            entry = self._process_uncached(ref, image_hash)
+        except (MultimodalRequestError, ImportError, MemoryError):
+            raise  # server-side faults must not be reported to the client as a 400
+        except Exception as exc:
+            logger.warning("image processing failed: %s", exc, exc_info=True)
+            raise MultimodalRequestError(f"failed to process image: {exc}") from exc
+        self.cache.put(key, entry)
+        return entry
+
+    def _forget_inflight(self, ref: str, fut: Any) -> None:
+        if self._inflight.get(ref) is fut:
+            del self._inflight[ref]
+
+    async def prepare(self, refs: list[str], hashes: ImageHashCache | None = None) -> list[ProcessedImage]:
+        """Preprocess `refs` concurrently on the processor's own thread pool.
+
+        Call from the event loop thread only (the `hashes` memo is read here). Concurrent calls for the
+        same data URI, e.g. the n samples of one prompt, share one in-flight job.
+        """
+        import asyncio
+
+        if not refs:
+            return []
+        loop = asyncio.get_running_loop()
+        futures: dict[str, asyncio.Future] = {}
+        for ref in refs:
+            if ref in futures:
+                continue
+            fut = self._inflight.get(ref)
+            if fut is None:
+                digest = None if hashes is None else hashes[ref]
+                fut = loop.run_in_executor(self._executor, self.process_image, ref, digest)
+                self._inflight[ref] = fut
+                fut.add_done_callback(partial(self._forget_inflight, ref))
+            futures[ref] = fut
+        # shield: one cancelled request must not cancel the job other requests are waiting on.
+        results = await asyncio.gather(*(asyncio.shield(f) for f in futures.values()))
+        by_ref = dict(zip(futures, results))
+        return [by_ref[r] for r in refs]
+
+
+class MultimodalProcessor(_ImagePipeline):
     """Pre-resizes images and runs the HF image processor (`hf_processor`, e.g. Qwen3-VL's) on the Router side."""
 
     def __init__(
@@ -355,26 +425,8 @@ class MultimodalProcessor:
         # data URI -> in-flight `process_image` future; only touched from the event loop thread.
         self._inflight: dict[str, Any] = {}
 
-    def process_image(self, ref: str, image_hash: str | None = None) -> ProcessedImage:
-        """Preprocess one data-URI image synchronously (cache aware).
-
-        Pass `image_hash` (`image_sha256(ref)`) if already known, to skip decoding the image again.
-        """
-        if image_hash is None:
-            image_hash = image_sha256(ref)
-        key = (image_hash, self.min_pixels, self.max_pixels)
-        cached = self.cache.get(key)
-        if cached is not None:
-            return cached
-        try:
-            entry = self._process_uncached(ref, image_hash)
-        except (MultimodalRequestError, ImportError, MemoryError):
-            raise  # server-side faults must not be reported to the client as a 400
-        except Exception as exc:
-            logger.warning("image processing failed: %s", exc, exc_info=True)
-            raise MultimodalRequestError(f"failed to process image: {exc}") from exc
-        self.cache.put(key, entry)
-        return entry
+    def _cache_key(self, image_hash: str) -> tuple:
+        return (image_hash, self.min_pixels, self.max_pixels)
 
     def _process_uncached(self, ref: str, image_hash: str) -> ProcessedImage:
         from qwen_vl_utils import process_vision_info
@@ -409,37 +461,6 @@ class MultimodalProcessor:
             num_tokens=num_tokens,
             nbytes=processed_image_nbytes(png_data_uri, tensors),
         )
-
-    def _forget_inflight(self, ref: str, fut: Any) -> None:
-        if self._inflight.get(ref) is fut:
-            del self._inflight[ref]
-
-    async def prepare(self, refs: list[str], hashes: ImageHashCache | None = None) -> list[ProcessedImage]:
-        """Preprocess `refs` concurrently on the processor's own thread pool.
-
-        Call from the event loop thread only (the `hashes` memo is read here). Concurrent calls for the
-        same data URI, e.g. the n samples of one prompt, share one in-flight job.
-        """
-        import asyncio
-
-        if not refs:
-            return []
-        loop = asyncio.get_running_loop()
-        futures: dict[str, asyncio.Future] = {}
-        for ref in refs:
-            if ref in futures:
-                continue
-            fut = self._inflight.get(ref)
-            if fut is None:
-                digest = None if hashes is None else hashes[ref]
-                fut = loop.run_in_executor(self._executor, self.process_image, ref, digest)
-                self._inflight[ref] = fut
-                fut.add_done_callback(partial(self._forget_inflight, ref))
-            futures[ref] = fut
-        # shield: one cancelled request must not cancel the job other requests are waiting on.
-        results = await asyncio.gather(*(asyncio.shield(f) for f in futures.values()))
-        by_ref = dict(zip(futures, results))
-        return [by_ref[r] for r in refs]
 
     @staticmethod
     def _load_pils(images: list[ProcessedImage]) -> list[Any]:
@@ -539,3 +560,113 @@ class MultimodalProcessor:
                 f"(spans {actual[1]} vs {expected[1]}, {len(actual[0])} vs {len(expected[0])} tokens); "
                 "this model's pad layout is unsupported"
             )
+
+
+# ---------------------------------------------------------------------------
+# DeepSeek-V4.1 image processor
+# ---------------------------------------------------------------------------
+
+_DSV41_VISION_KEYS = (
+    "vision_patch_size",
+    "vision_downsample_ratio",
+    "vision_max_n_token",
+    "vision_min_pixels",
+    "vision_max_wh_ratio",
+)
+
+
+def load_dsv41_vision_args(model_path: str, overrides: dict[str, Any] | None = None) -> Any:
+    """Vision preprocessing args of a V4.1 checkpoint, in the attribute form SGLang's image helpers expect.
+
+    `overrides` is the rollout's `json_model_override_args`; its `vision_*` entries win over `config.json`,
+    so the Router plans images exactly like the SGLang server does.
+    """
+    import json
+    import os
+    from types import SimpleNamespace
+
+    from sglang.srt.configs.deepseek_v41 import normalize_deepseek_v41_config
+
+    with open(os.path.join(model_path, "config.json")) as f:
+        values = normalize_deepseek_v41_config(json.load(f))
+    for key, value in (overrides or {}).items():
+        if key.startswith("vision_"):
+            values[key] = value
+    missing = [k for k in _DSV41_VISION_KEYS if k not in values and k != "vision_max_wh_ratio"]
+    if missing:
+        raise ValueError(f"{model_path}/config.json has no vision config (missing {missing})")
+    values.setdefault("vision_max_wh_ratio", None)
+    return SimpleNamespace(**{k: values[k] for k in _DSV41_VISION_KEYS})
+
+
+def dsv41_image_token_estimator(vision_args: Any):
+    """Returns `ref -> token count`, reading only the image header (no pixel decode)."""
+
+    def estimate(ref: str) -> int:
+        import io
+
+        from PIL import Image
+        from sglang.srt.multimodal.deepseek_v41_image_processing import num_image_tokens, plan_image_grid
+
+        with Image.open(io.BytesIO(parse_data_uri(ref))) as image:
+            width, height = image.size
+        n_llm_h, n_llm_w, _, _ = plan_image_grid(width, height, vision_args)
+        return num_image_tokens(n_llm_h, n_llm_w)
+
+    return estimate
+
+
+class Dsv41ImageProcessor(_ImagePipeline):
+    """Router-side image preprocessing for DeepSeek-V4.1, using SGLang's own patchify code.
+
+    Stands alone (not a `MultimodalProcessor`): there is no HF processor, and the image resize plan is
+    fixed by the checkpoint's `vision_*` config. `ProcessedImage.png_data_uri` is the original data URI
+    (SGLang decodes and patchifies it again); `tensors` holds `pixel_values` (bf16 `[N, 3, p, p]`) and
+    `image_grid_hw` (`[[n_vit_h, n_vit_w]]`).
+    """
+
+    def __init__(
+        self,
+        vision_args: Any,
+        image_token_id: int,
+        *,
+        cache_max_bytes: int = DEFAULT_IMAGE_CACHE_MAX_BYTES,
+        num_workers: int = 4,
+    ):
+        from concurrent.futures import ThreadPoolExecutor
+
+        self.vision_args = vision_args
+        self.image_pad_id = int(image_token_id)
+        self.patch_size = int(vision_args.vision_patch_size)
+        self.merge_size = int(vision_args.vision_downsample_ratio)
+        self.min_pixels = int(vision_args.vision_min_pixels)
+        self.max_n_token = int(vision_args.vision_max_n_token)
+
+        self.cache = ImageCache(cache_max_bytes)
+        self._executor = ThreadPoolExecutor(max_workers=max(1, num_workers), thread_name_prefix="mm-proc")
+        self._inflight: dict[str, Any] = {}
+
+    def _cache_key(self, image_hash: str) -> tuple:
+        return (image_hash,)
+
+    def _process_uncached(self, ref: str, image_hash: str) -> ProcessedImage:
+        import io
+
+        import torch
+        from PIL import Image
+        from sglang.srt.multimodal.deepseek_v41_image_processing import num_image_tokens, patchify_image, to_rgb
+
+        with Image.open(io.BytesIO(parse_data_uri(ref))) as handle:
+            image = to_rgb(handle)
+        patches, n_vit_h, n_vit_w, n_llm_h, n_llm_w = patchify_image(image, self.vision_args)
+        tensors = {
+            "pixel_values": patches,
+            "image_grid_hw": torch.tensor([[n_vit_h, n_vit_w]], dtype=torch.int64),
+        }
+        return ProcessedImage(
+            image_hash=image_hash,
+            png_data_uri=ref,
+            tensors=tensors,
+            num_tokens=num_image_tokens(n_llm_h, n_llm_w),
+            nbytes=processed_image_nbytes(ref, tensors),
+        )

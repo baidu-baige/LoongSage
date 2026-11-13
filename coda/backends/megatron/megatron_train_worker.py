@@ -43,7 +43,7 @@ from megatron.bridge.models import GPTModelProvider
 
 from coda.backends.train_worker import TrainWorker
 from coda.utils.memory_utils import print_memory, clear_memory
-from coda.utils.multimodal_config import validate_vlm_parallel_config
+from coda.utils.multimodal_config import multimodal_enabled, select_dsv41_vision, validate_vlm_parallel_config
 from coda.utils.checkpoint_utils import (
     DIST_CKPT_DIR_NAME, find_latest_ckpt_path, update_latest, get_ckpt_dir,
 )
@@ -219,6 +219,7 @@ class MegatronTrainWorker(TrainWorker):
         # If checkpoint exists: structure only (weights restored from ckpt later)
         # Otherwise: load HF weights into model
         self.bridge = AutoBridge.from_hf_pretrained(config.hf_model_path)
+        select_dsv41_vision(self.bridge.hf_pretrained.config, multimodal_enabled(config))
         provider = self.bridge.to_megatron_provider(load_weights=not has_checkpoint)
 
         model_config_dict = OmegaConf.to_container(config.megatron.model)

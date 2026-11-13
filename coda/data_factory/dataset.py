@@ -322,6 +322,7 @@ class Dataset:
         multimodal_keys=None,
         max_image_tokens=None,
         image_pixel_bounds=None,
+        image_token_estimator=None,
     ):
         """Load and preprocess the dataset from *path*.
 
@@ -344,12 +345,16 @@ class Dataset:
                           one data URI per placeholder in the prompt text.  `None` = text-only dataset.
             max_image_tokens: Optional cap on the estimated vision tokens summed over all images of one prompt.
                           Samples above it are dropped.  Independent of *max_length*, which only counts text
-                          characters.  Needs *image_pixel_bounds*.  `None` disables the check.
+                          characters.  Needs *image_pixel_bounds* or *image_token_estimator*.  `None` disables the check.
             image_pixel_bounds: `(min_pixels, max_pixels)` the router resizes images into (see `multimodal.image`);
                           used to estimate image tokens.  The estimate assumes a Qwen3-VL token size of 32x32 pixels.
+            image_token_estimator: Optional `data_uri -> token count` for models whose image token count is not
+                          a function of the pixel bounds (DeepSeek-V4.1).  Takes precedence over *image_pixel_bounds*.
         """
-        if max_image_tokens is not None and image_pixel_bounds is None:
-            raise ValueError("max_image_tokens requires image_pixel_bounds=(min_pixels, max_pixels)")
+        if max_image_tokens is not None and image_pixel_bounds is None and image_token_estimator is None:
+            raise ValueError(
+                "max_image_tokens requires image_pixel_bounds=(min_pixels, max_pixels) or an image_token_estimator"
+            )
         multimodal_keys = dict(multimodal_keys) if multimodal_keys else None
         columns = {key for key in (prompt_key, label_key, metadata_key) if key}
         if multimodal_keys:
@@ -389,7 +394,9 @@ class Dataset:
             self.origin_prompts = origin_prompts
 
         if max_image_tokens is not None:
-            self.origin_prompts = self.filter_large_images(self.origin_prompts, max_image_tokens, image_pixel_bounds)
+            self.origin_prompts = self.filter_large_images(
+                self.origin_prompts, max_image_tokens, image_pixel_bounds, image_token_estimator
+            )
 
         self.epoch_id = -1
         self.seed = seed
@@ -465,7 +472,10 @@ class Dataset:
 
     @staticmethod
     def filter_large_images(
-        origin_prompts: list[Trajectory], max_image_tokens: int, image_pixel_bounds: tuple[int, int]
+        origin_prompts: list[Trajectory],
+        max_image_tokens: int,
+        image_pixel_bounds: tuple[int, int] | None = None,
+        image_token_estimator=None,
     ) -> list[Trajectory]:
         """Remove prompts whose images add up to more than *max_image_tokens* estimated vision tokens.
 
@@ -474,12 +484,17 @@ class Dataset:
         Args:
             origin_prompts:     List of `Trajectory` objects to filter.
             max_image_tokens:   Maximum allowed estimated image tokens per prompt (inclusive).
-            image_pixel_bounds: `(min_pixels, max_pixels)` used for the token estimate.
+            image_pixel_bounds: `(min_pixels, max_pixels)` used for the Qwen-style token estimate.
+            image_token_estimator: Optional `data_uri -> token count`; replaces the pixel-bounds estimate.
 
         Returns:
             Filtered list of `Trajectory` objects.
         """
-        min_pixels, max_pixels = image_pixel_bounds
+        if image_token_estimator is None:
+            min_pixels, max_pixels = image_pixel_bounds
+
+            def image_token_estimator(url):
+                return estimate_data_uri_tokens(url, min_pixels, max_pixels)
 
         def _image_tokens(prompt) -> int:
             if isinstance(prompt, str):
@@ -493,7 +508,7 @@ class Dataset:
                     if isinstance(part, dict) and part.get("type") == "image_url":
                         value = part.get("image_url")
                         url = value.get("url") if isinstance(value, dict) else value
-                        total += estimate_data_uri_tokens(url, min_pixels, max_pixels)
+                        total += image_token_estimator(url)
             return total
 
         filtered = [p for p in origin_prompts if _image_tokens(p.prompt) <= max_image_tokens]
