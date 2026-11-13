@@ -115,9 +115,11 @@ class Router:
         config: Any,
         *,
         middleware_kwargs: dict[str, Any] | None = None,
+        lora_name: str | None = None,
     ) -> None:
         """Initialize routing state, HTTP client, and FastAPI app."""
         self.config = config
+        self._lora_name = lora_name
         self.rollout_worker_load_threshold = config.rollout_worker_load_threshold
         self.accumulate_reasoning = config.accumulate_reasoning
 
@@ -591,6 +593,7 @@ class Router:
             try:
                 slot = self._select_slot(request_id)
                 body_bytes = self._set_routed_dp_rank(body_bytes, slot)
+                body_bytes = self._set_lora_path(body_bytes)
                 target_url = f"{slot.worker_url.rstrip('/')}/generate"
 
                 generate_client = httpx.AsyncClient(timeout=self.config.proxy_timeout_seconds)
@@ -625,6 +628,19 @@ class Router:
             finally:
                 if slot is not None:
                     self._finish_slot(slot)
+
+    def _set_lora_path(self, body_bytes: bytes) -> bytes:
+        """Default ``lora_path`` to the served adapter (LoRA merge=false)."""
+        if not self._lora_name:
+            return body_bytes
+        try:
+            payload = json.loads(body_bytes)
+        except (TypeError, ValueError):
+            logger.warning("[route] cannot parse upstream body to set lora_path")
+            return body_bytes
+        if payload.get("lora_path") is None:
+            payload["lora_path"] = self._lora_name
+        return json.dumps(payload).encode("utf-8")
 
     def _set_routed_dp_rank(self, body_bytes: bytes, slot: WorkerSlot) -> bytes:
         """Add ``routed_dp_rank`` to the /generate body so SGLang routes the request

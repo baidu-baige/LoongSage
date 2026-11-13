@@ -530,11 +530,27 @@ index 8188c99..c2780c3 100644
      def _register_static_scale_ones(self, layer: Module) -> None:
          device = layer.w13_weight.device
          for name in (
+diff --git a/python/sglang/srt/lora/layers.py b/python/sglang/srt/lora/layers.py
+index 0386a3c..3166b0d 100644
+--- a/python/sglang/srt/lora/layers.py
++++ b/python/sglang/srt/lora/layers.py
+@@ -1027,6 +1027,11 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
+         # initializes FusedMoE with its own moe_runner for base path
+         super().__init__(base_layer, lora_backend)
+ 
++        # Alias base expert params onto the wrapper so post-wrap load_weights finds
++        # `experts.w13_weight` instead of silently skipping `experts.base_layer.*`.
++        for name, param in base_layer.named_parameters(recurse=False):
++            self.register_parameter(name, param)
++
+         lora_backend.is_moe_lora = True
+ 
+         # Match the factor layout and physical rank allocated by the memory pool.
 diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
-index dcec0aa..034cba6 100644
+index dcec0aa..624fd13 100644
 --- a/python/sglang/srt/managers/io_struct.py
 +++ b/python/sglang/srt/managers/io_struct.py
-@@ -2152,6 +2152,25 @@ class DestroyWeightsUpdateGroupReqOutput(BaseReq, kw_only=True):
+@@ -2152,6 +2152,39 @@ class DestroyWeightsUpdateGroupReqOutput(BaseReq, kw_only=True):
      message: str
  
  
@@ -550,6 +566,20 @@ index dcec0aa..034cba6 100644
 +    gloo_port: int = 29500
 +    flush_cache: bool = True
 +    torch_empty_cache: bool = False
++    # LoRA adapter sync: the channel carries only lora_A/lora_B for `lora_name`.
++    lora_adapter_sync: bool = False
++    lora_name: Optional[str] = None
++    lora_config_dict: Optional[Dict[str, Any]] = None  # PEFT: r, lora_alpha, target_modules
++    lora_pinned: bool = False
++    lora_id: Optional[str] = None  # set by the TokenizerManager
++
++    def to_lora_ref(self) -> LoRARef:
++        return LoRARef(
++            lora_id=self.lora_id,
++            lora_name=self.lora_name,
++            lora_path="__tensor__",
++            pinned=self.lora_pinned,
++        )
 +
 +
 +class UpdateWeightsFromChannelReqOutput(BaseReq, kw_only=True):
@@ -620,7 +650,7 @@ index 2381b3a..a506736 100644
          """Reject freeing/restoring model weights while the CUDA IPC weight
          cache is active: the weights are shared with the daemon via CUDA IPC, so
 diff --git a/python/sglang/srt/managers/tokenizer_control_mixin.py b/python/sglang/srt/managers/tokenizer_control_mixin.py
-index df58b81..25a58c5 100644
+index df58b81..dfab14a 100644
 --- a/python/sglang/srt/managers/tokenizer_control_mixin.py
 +++ b/python/sglang/srt/managers/tokenizer_control_mixin.py
 @@ -80,6 +80,8 @@ from sglang.srt.managers.io_struct import (
@@ -640,7 +670,7 @@ index df58b81..25a58c5 100644
      ("update_weight_version", UpdateWeightVersionReqOutput),
      ("get_weights_by_name", GetWeightsByNameReqOutput),
      ("release_memory_occupation", ReleaseMemoryOccupationReqOutput),
-@@ -631,6 +634,23 @@ class TokenizerControlMixin:
+@@ -631,6 +634,80 @@ class TokenizerControlMixin:
  
          return success, message
  
@@ -651,6 +681,8 @@ index df58b81..25a58c5 100644
 +    ) -> Tuple[bool, str]:
 +        """Update weights by receiving from the TransferMesh channel."""
 +        self.auto_create_handle_loop()
++        if obj.lora_adapter_sync:
++            return await self._update_lora_adapter_from_channel(obj)
 +        async with self.model_update_lock.writer_lock:
 +            if obj.weight_version == "":
 +                return False, "weight_version must not be empty"
@@ -660,6 +692,61 @@ index df58b81..25a58c5 100644
 +                self._update_weight_version_if_provided(obj.weight_version)
 +                message += f" Weight version updated to {obj.weight_version}."
 +            return success, message
++
++    async def _update_lora_adapter_from_channel(
++        self: TokenizerManager,
++        obj: UpdateWeightsFromChannelReqInput,
++    ) -> Tuple[bool, str]:
++        """Swap adapter `obj.lora_name` for the channel tensors under a fresh lora_id (no upsert).
++
++        Holds model_update_lock.writer_lock (drains in-flight generates) then
++        lora_update_lock, the same order generate() uses.
++        """
++        if obj.weight_version == "":
++            return False, "weight_version must not be empty"
++        if not get_lora().enable_lora:
++            return False, "LoRA adapter sync requires the server to run with --enable-lora."
++        if not obj.lora_name or not obj.lora_config_dict:
++            return False, "LoRA adapter sync requires lora_name and lora_config_dict."
++        if not (get_parallel().dp_size == 1 or get_parallel().enable_dp_attention):
++            return False, "LoRA adapter sync requires dp_size == 1 or dp attention."
++
++        async with self.model_update_lock.writer_lock:
++            async with self.lora_update_lock:
++                if obj.lora_name in self.pending_lora_unloads:
++                    return False, (
++                        f"LoRA adapter '{obj.lora_name}' has an incomplete unload. "
++                        "Retry the unload before syncing it again."
++                    )
++
++                old_ref = self.lora_registry.get_all_adapters().get(obj.lora_name)
++                if old_ref is not None:
++                    await self.lora_registry.unregister(obj.lora_name)
++                    await self.lora_registry.wait_for_unload(old_ref.lora_id)
++
++                new_ref = LoRARef(
++                    lora_name=obj.lora_name,
++                    lora_path="__tensor__",
++                    pinned=obj.lora_pinned,
++                )
++                obj.lora_id = new_ref.lora_id
++                results = await self.update_weights_from_channel_communicator(obj)
++                success, message = FanOutCommunicator.merge_results(results)
++                if success:
++                    await self.lora_registry.register(new_ref)
++                    self.lora_ref_cache[obj.lora_name] = new_ref
++                    self._update_weight_version_if_provided(obj.weight_version)
++                    message += f" Weight version updated to {obj.weight_version}."
++                else:
++                    # "__tensor__" adapters can't reload from disk: keep the name unregistered.
++                    self.lora_ref_cache.pop(obj.lora_name, None)
++                logger.info(
++                    "LoRA adapter sync from channel: name=%s lora_id=%s success=%s",
++                    obj.lora_name,
++                    new_ref.lora_id,
++                    success,
++                )
++                return success, message
 +
      async def _unload_lora_adapter_locked(
          self: TokenizerManager,
@@ -679,10 +766,10 @@ index 5058c3f..4e9684e 100644
          parameter = self.model_runner.weight_exporter.get_weights_by_name(
              recv_req.name, recv_req.truncate_size
 diff --git a/python/sglang/srt/model_executor/model_runner_components/weight_updater.py b/python/sglang/srt/model_executor/model_runner_components/weight_updater.py
-index 80965e5..7395618 100644
+index 80965e5..d0a3a1b 100644
 --- a/python/sglang/srt/model_executor/model_runner_components/weight_updater.py
 +++ b/python/sglang/srt/model_executor/model_runner_components/weight_updater.py
-@@ -434,6 +434,40 @@ class WeightUpdater:
+@@ -434,6 +434,76 @@ class WeightUpdater:
              logger.error(f"IPC weight update failed: {e}")
              return False, str(e)
  
@@ -713,12 +800,48 @@ index 80965e5..7395618 100644
 +                local_ip=get_local_ip_auto(),
 +            )
 +            channel = create_receiver_channel(meta)
++            if recv_req.lora_adapter_sync:
++                return self._load_lora_adapter_from_channel(recv_req, channel)
 +            self.get_model().load_weights(channel.get_iterator())
 +            return True, "Succeeded to update weights from channel."
 +        except Exception as e:
 +            error_msg = f"Failed to update weights from channel: {e}."
 +            logger.error(error_msg)
 +            return False, error_msg
++
++    def _load_lora_adapter_from_channel(self: WeightUpdater, recv_req, channel):
++        """Replace adapter `recv_req.lora_name` with the channel tensors.
++
++        Drains the channel first: the receive is collective and must complete on every rank.
++        """
++        tensors = {name: t.to("cpu") for name, t in channel.get_iterator()}
++        lora_manager = self.get_model_runner().lora_manager
++        if lora_manager is None:
++            return False, "LoRA adapter sync requires --enable-lora."
++
++        name = recv_req.lora_name
++        for old_ref in [r for r in lora_manager.lora_refs.values() if r.lora_name == name]:
++            result = lora_manager.unload_lora_adapter(old_ref)
++            if not result.success:
++                return False, (
++                    f"Failed to unload previous LoRA adapter '{name}' "
++                    f"({old_ref.lora_id}): {result.error_message}"
++                )
++
++        new_ref = recv_req.to_lora_ref()
++        result = lora_manager.load_lora_adapter_from_tensors(
++            new_ref, tensors, recv_req.lora_config_dict
++        )
++        if not result.success:
++            lora_manager.unload_lora_adapter(new_ref)
++            return False, (
++                f"Failed to load LoRA adapter '{name}' from channel: "
++                f"{result.error_message}"
++            )
++        return True, (
++            f"Succeeded to load LoRA adapter '{name}' ({len(tensors)} tensors) "
++            "from channel."
++        )
 +
  
  def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):

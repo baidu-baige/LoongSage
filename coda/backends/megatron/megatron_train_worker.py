@@ -239,6 +239,7 @@ class MegatronTrainWorker(TrainWorker):
         # that need post-override setup (e.g. DeepSeek-V4 hash MoE auto-setting
         # pipeline_model_parallel_layout when PP > 1) run before finalize().
         provider.apply_overrides_and_finalize(overrides=overrides)
+        self.lora = None  # set by subclasses that train LoRA adapters (see MegatronActorWorker)
         self._configure_provider(provider)
         megatron_ddp_config = DistributedDataParallelConfig(
             **OmegaConf.to_container(config.megatron.ddp_config)
@@ -269,6 +270,8 @@ class MegatronTrainWorker(TrainWorker):
             logger.info(f"[Rank {self.rank}] Checkpoint loaded from {ckpt_dir}")
         self.offloaded = False
         self.params_offloaded = False
+        self._frozen_param_list = None
+        self._frozen_param_cpu = {}
 
     def _configure_provider(self, provider) -> None:
         """Hook to adjust the finalized model provider before DDP wrapping.
@@ -417,6 +420,8 @@ class MegatronTrainWorker(TrainWorker):
         for model in self.model:
             for buffer in model.buffers + model.expert_parallel_buffers:
                 buffer.offload_to_cpu(move_params, move_grads)
+        if move_params:
+            self._offload_frozen_params()
 
 
     def _onload_model(self, move_params: bool = True, move_grads: bool = True):
@@ -428,6 +433,57 @@ class MegatronTrainWorker(TrainWorker):
         for model in self.model:
             for buffer in model.buffers + model.expert_parallel_buffers:
                 buffer.reload_from_cpu(move_params, move_grads)
+        if move_params:
+            self._onload_frozen_params()
+
+    def _frozen_params(self) -> list[torch.nn.Parameter]:
+        """LoRA-frozen base params: not in DDP buffers, so offloaded separately.
+
+        Views that do not own their storage stay on GPU (resizing would hit aliases).
+        """
+        if self.lora is None:
+            return []
+        if self._frozen_param_list is None:
+            params, skipped = [], 0
+            for chunk in self.model:
+                for p in chunk.parameters():
+                    if p.requires_grad or not p.is_cuda:
+                        continue
+                    if (
+                        p.storage_offset() == 0
+                        and p.untyped_storage().nbytes() == p.numel() * p.element_size()
+                    ):
+                        params.append(p)
+                    else:
+                        skipped += 1
+            self._frozen_param_list = params
+            logger.info(
+                f"[Rank {self.rank}] frozen-param offload: {len(params)} params "
+                f"({sum(p.numel() * p.element_size() for p in params) / 2**30:.2f} GiB), "
+                f"{skipped} non-owning views kept on GPU"
+            )
+        return self._frozen_param_list
+
+    def _offload_frozen_params(self):
+        for p in self._frozen_params():
+            storage = p.untyped_storage()
+            if storage.nbytes() == 0:
+                continue
+            cpu = self._frozen_param_cpu.get(p)
+            if cpu is None:
+                cpu = torch.empty_like(p.data, device="cpu", pin_memory=True)
+                self._frozen_param_cpu[p] = cpu
+            # Always copy: TensorBackuper.restore() may have rewritten the param.
+            cpu.copy_(p.data, non_blocking=True)
+            storage.resize_(0)
+
+    def _onload_frozen_params(self):
+        for p in self._frozen_params():
+            storage = p.untyped_storage()
+            if storage.nbytes() != 0:
+                continue
+            storage.resize_(p.numel() * p.element_size())
+            p.data.copy_(self._frozen_param_cpu[p], non_blocking=True)
 
 
     def _move_optimizer(self, device):

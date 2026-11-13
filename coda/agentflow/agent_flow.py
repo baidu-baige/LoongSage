@@ -16,6 +16,8 @@ import httpx
 from fastapi import status
 
 from coda.agentflow.agent.base_agent import BaseAgent
+from coda.transfer_mesh import CODA_LORA_ADAPTER_NAME
+from coda.utils.lora_utils import lora_delta_sync_enabled
 from coda.reward.reward import Reward
 from coda.agentflow.trajectory_store import (
     FloatSeq,
@@ -207,6 +209,7 @@ class AgentFlow:
         self.router = Router(
             config=router_config,
             middleware_kwargs={k: v for k, v in vars(self).items() if not k.startswith("_")},
+            lora_name=CODA_LORA_ADAPTER_NAME if lora_delta_sync_enabled(self.config) else None,
         )
         self.router.start_background(host="0.0.0.0", port=router_port)
         logger.info("[init] router ready at %s", self.router_url)

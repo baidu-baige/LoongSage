@@ -1,5 +1,6 @@
 """training entry """
 import asyncio
+import dataclasses
 import threading
 import ray
 import hydra
@@ -23,11 +24,12 @@ from coda.controller.train_manager import TrainManager
 from coda.controller.rollout_manager import RolloutManager
 from coda.controller.teacher_manager import TeacherManager
 from coda.controller.sft_sampler import SFTSampler, validate_config
-from coda.transfer_mesh import ChannelMeta
+from coda.transfer_mesh import ChannelMeta, CODA_LORA_ADAPTER_NAME
 from coda.utils.checkpoint_utils import get_tracker_file, resolve_dist_ckpt_dir, should_save
 from coda.utils.tracking import configure_tracking, time_marker, TimeMarkerAcc, track
 from coda.utils import logging_utils
 from coda.utils.multimodal_config import validate_multimodal_config
+from coda.utils.lora_utils import hf_lora_target_modules, lora_delta_sync_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +87,16 @@ class Trainer:
         self._validate_config()
         self.is_colocated = self.config.colocate
         self.is_fully_async = self.config.fully_async.enable
+        self._lora_delta_sync = lora_delta_sync_enabled(self.config)
+        self._lora_config_dict = None
+        if self._lora_delta_sync:
+            lora = self.config.megatron.lora
+            self._lora_config_dict = {
+                "peft_type": "LORA",
+                "r": int(lora.rank),
+                "lora_alpha": float(lora.alpha),
+                "target_modules": hf_lora_target_modules(lora.target_modules),
+            }
         self._init_tracking()
 
         self.scheduler = ResourceScheduler(self.config)
@@ -264,9 +276,25 @@ class Trainer:
                 train_world_size=train_world_size,
                 recreate=recreate,
             )
+        if self._lora_delta_sync:
+            meta.lora_name = CODA_LORA_ADAPTER_NAME
+            meta.lora_config_dict = self._lora_config_dict
         logger.info("[channel_meta] ChannelMeta: %s", meta)
         return meta
 
+    def _push_weights(self, meta: ChannelMeta, weight_version: int, full_sync: bool) -> None:
+        """LoRA merge=false: unmerged base on initial sync / recreate, then the adapter."""
+        if not self._lora_delta_sync:
+            self._update_weights(meta, weight_version=weight_version)
+            return
+        if full_sync or meta.recreate:
+            self._update_weights(
+                dataclasses.replace(meta, lora_adapter_sync=False), weight_version=weight_version
+            )
+            meta = dataclasses.replace(meta, recreate=False)  # reuse the channel just built
+        self._update_weights(
+            dataclasses.replace(meta, lora_adapter_sync=True), weight_version=weight_version
+        )
 
     def _update_weights(self, meta: ChannelMeta, weight_version: int) -> None:
         """Update weights for both train and rollout managers concurrently.
@@ -417,7 +445,7 @@ class Trainer:
         with time_marker("update_weights", step=step):
             channel_meta = self._init_channel_meta()
             current_weight_version += 1
-            self._update_weights(channel_meta, weight_version=current_weight_version)
+            self._push_weights(channel_meta, current_weight_version, full_sync=False)
         return current_weight_version
 
     def _compute_teacher(self, splited_batch_refs: list, step: int) -> list:
@@ -441,7 +469,7 @@ class Trainer:
         if self.is_colocated:
             self.rollout_manager.offload_kv()
         channel_meta = self._init_channel_meta()
-        self._update_weights(channel_meta, weight_version=current_weight_version)
+        self._push_weights(channel_meta, current_weight_version, full_sync=True)
         if self.is_colocated:
             self.rollout_manager.onload_kv()
         self.rollout_manager.health_monitoring_resume()

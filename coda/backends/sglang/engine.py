@@ -16,6 +16,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
 from coda.backends.rollout_worker import RolloutWorker
 from coda.utils.logging_utils import redact_secrets
+from coda.utils.lora_utils import hf_lora_target_modules, lora_delta_sync_enabled
 logger = logging.getLogger(__name__)
 
 class SglangEngine(RolloutWorker):
@@ -357,6 +358,16 @@ def _compute_server_args(
     elif worker_type == "decode":
         kwargs["disaggregation_mode"] = "decode"
         kwargs["prefill_round_robin_balance"] = True
+
+    if lora_delta_sync_enabled(config):
+        lora = config.megatron.lora
+        kwargs["enable_lora"] = True
+        kwargs["max_lora_rank"] = int(lora.rank)
+        kwargs["lora_target_modules"] = hf_lora_target_modules(lora.target_modules)
+        kwargs["max_loras_per_batch"] = 1
+        # Only the adapter is re-sent each step; the base must survive colocate release.
+        if config.colocate:
+            kwargs["enable_weights_cpu_backup"] = True
 
     for key, value in engine_args.items():
         kwargs[key] = value

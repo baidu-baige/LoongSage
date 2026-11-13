@@ -578,6 +578,9 @@ def create_channel(
 # ---------------------------------------------------------------------------
 
 
+CODA_LORA_ADAPTER_NAME = "coda_lora"
+
+
 @dataclass
 class ChannelMeta:
     """Configuration for creating / recreating a TransferMeshChannel.
@@ -626,6 +629,11 @@ class ChannelMeta:
     timeout: float = 300.0
     gloo_port: int = 29500
     local_ip: str | None = None
+
+    # LoRA merge=false: adapter-only round, served adapter name, PEFT config.
+    lora_adapter_sync: bool = False
+    lora_name: str | None = None
+    lora_config_dict: dict | None = None
 
 
 _channel: TransferMeshChannel | None = None
