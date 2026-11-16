@@ -161,6 +161,65 @@ class _VocabParallelEntropy(torch.autograd.Function):
         return softmax_logits, None
 
 
+# Upper bound on the per-chunk temporary of the metric-only entropy.  At TP=8
+# with fp32 logits this is ~17k tokens per chunk and replaces the two full
+# [tokens, vocab_shard] temporaries of ``_VocabParallelEntropy.forward``
+# (~60 GiB at a 262k-token micro-batch).
+_ENTROPY_CHUNK_BYTES = 2 * 1024 ** 3
+
+
+def _entropy_chunk_rows(logits: torch.Tensor) -> int:
+    """Rows (tokens) per chunk so one chunk's fp32 temporaries fit the budget."""
+    # One fp32 chunk for exp(x - max); a non-fp32 input adds its fp32 copy.
+    copies = 1 if logits.dtype == torch.float32 else 2
+    bytes_per_row = max(1, logits.size(-1)) * 4 * copies
+    return max(1, _ENTROPY_CHUNK_BYTES // bytes_per_row)
+
+
+@torch.no_grad()
+def _vocab_parallel_entropy_chunked(
+    logits: torch.Tensor,
+    process_group: dist.ProcessGroup,
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    """Metric-only TP-sharded entropy, chunked along the token dimension.
+
+    Uses ``H = M + log(S1) - S2 / S1`` with ``M = max x``,
+    ``S1 = sum exp(x - M)`` and ``S2 = sum exp(x - M) * x`` over the full
+    (TP-gathered) vocabulary.  Never mutates ``logits``: the fused CE that
+    follows consumes them in place.  Both collectives sit outside the chunk
+    loops, so every TP rank issues exactly two regardless of its chunk count.
+    """
+    if temperature <= 0:
+        raise ValueError(f"temperature must be > 0, got {temperature}")
+    num_tokens = logits.size(0)
+    chunk = _entropy_chunk_rows(logits)
+    inv_t = 1.0 / temperature
+
+    logits_max = torch.empty(num_tokens, 1, dtype=torch.float32, device=logits.device)
+    for start in range(0, num_tokens, chunk):
+        logits_max[start:start + chunk] = logits[start:start + chunk].amax(dim=-1, keepdim=True).float()
+    if temperature != 1.0:
+        logits_max.mul_(inv_t)
+    dist.all_reduce(logits_max, op=dist.ReduceOp.MAX, group=process_group)
+
+    sums = torch.empty(num_tokens, 2, dtype=torch.float32, device=logits.device)
+    for start in range(0, num_tokens, chunk):
+        x = logits[start:start + chunk].float()
+        if temperature != 1.0:
+            x = x * inv_t
+        e = torch.sub(x, logits_max[start:start + chunk])
+        e.exp_()
+        sums[start:start + chunk, 0] = e.sum(dim=-1)
+        e.mul_(x)
+        sums[start:start + chunk, 1] = e.sum(dim=-1)
+        del e, x
+    dist.all_reduce(sums, group=process_group)
+
+    sum_exp, sum_exp_x = sums[:, 0:1], sums[:, 1:2]
+    return (logits_max + sum_exp.log() - sum_exp_x / sum_exp).squeeze(-1)
+
+
 def compute_entropy(
     total_lengths: list[int],
     response_lengths: list[int],

@@ -337,3 +337,68 @@ class TestSplitTrajGroupByDp:
         result = split_traj_group_by_dp(groups, dp_size=2, num_mini_batch=1)
         sums = [sum(g.token_length for g in part) for part in result]
         assert sums[0] == sums[1]
+
+
+# ===========================================================================
+# split_traj_group_by_dp(tree_cost=True)
+# ===========================================================================
+
+def _chain_group(pid: str, prompt: int, turns: list[int], resp: int) -> TrajectoryGroup:
+    """One trajectory whose Segment rows chain by shared prefix: row k = prompt + the first
+    k+1 turns + its own response (a caterpillar, like multi-turn agent rows)."""
+    stream, segs, spine = [], [], list(range(10**6, 10**6 + prompt))
+    nxt = 2 * 10**6
+    for k, t in enumerate(turns):
+        spine = spine + list(range(nxt, nxt + t)); nxt += t
+        row = spine + list(range(nxt, nxt + resp)); nxt += resp
+        segs.append(Segment(token_start=len(stream), token_end=len(stream) + len(row),
+                            logprob_start=0, logprob_end=resp, segment_id=k))
+        stream += row
+    t = Trajectory(trajectory_id=f"{pid}_t0", prompt_id=pid)
+    t.tokens, t.segments = stream, segs
+    return TrajectoryGroup(prompt_id=pid, trajectories=[t])
+
+
+class TestSplitTrajGroupByDpTreeCost:
+
+    def test_tree_cost_counts_shared_prefix_once(self):
+        from coda.data_factory.data_processor import _tree_trajectory_cost
+        g = _chain_group("p", prompt=100, turns=[10, 10, 10], resp=5)
+        rows = [s.token_end - s.token_start for s in g.trajectories[0].segments]
+        nodes = 100 + 30 + 3 * 5            # spine once + every response
+        assert sum(rows) > nodes
+        c = _tree_trajectory_cost(g.trajectories[0])
+        assert nodes <= c < sum(rows) + 10**5
+
+    def test_balances_tree_cost_where_row_split_does_not(self):
+        # Equal Segment counts and row tokens that the row split balances by pairing the two
+        # deep chains (prompts 1000 + 5000) against the two flat ones (3000 + 3000). Deep rows
+        # share most tokens, flat rows share none, so that pairing is badly off in tree cost.
+        deep = [_chain_group(f"d{i}", prompt=p, turns=[50] * 8, resp=50)
+                for i, p in enumerate((1000, 5000))]
+        flat = []
+        for i in range(2):
+            g = _chain_group(f"f{i}", prompt=3000, turns=[50] * 8, resp=50)
+            tr = g.trajectories[0]                  # break sharing: distinct tokens per row
+            tr.tokens = list(range(len(tr.tokens)))
+            flat.append(g)
+        from coda.data_factory.data_processor import _get_group_tree_loads
+        groups = deep + flat
+
+        def spread(parts):
+            loads = [sum(_get_group_tree_loads(p)) for p in parts]
+            return max(loads) / min(loads)
+
+        row = split_traj_group_by_dp(groups, dp_size=2, num_mini_batch=1)
+        tree = split_traj_group_by_dp(groups, dp_size=2, num_mini_batch=1, tree_cost=True)
+        assert sorted(g.prompt_id for p in tree for g in p) == sorted(g.prompt_id for g in groups)
+        assert [len(p) for p in tree] == [2, 2]
+        assert spread(row) > 1.3 and spread(tree) < 1.15
+
+    def test_untrainable_segments_ignored(self):
+        from coda.data_factory.data_processor import _tree_trajectory_cost
+        g = _chain_group("p", prompt=100, turns=[10, 10], resp=5)
+        tr = g.trajectories[0]
+        base = _tree_trajectory_cost(tr)
+        tr.segments.append(Segment(token_start=0, token_end=0, trainable=False))
+        assert _tree_trajectory_cost(tr) == base

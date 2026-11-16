@@ -28,7 +28,7 @@ from coda.backends.megatron.data import (
     get_data_iterator,
 )
 from coda.backends.megatron.model import (
-    forward_only, train_minibatch, is_main_rank, reduce_dict,
+    forward_only, forward_only_uses_tree, train_minibatch, is_main_rank, reduce_dict,
 )
 from coda.utils.tracking import time_tracker, track
 from coda.algorithms.kl_policy import build_kl_policies
@@ -467,7 +467,8 @@ class MegatronActorWorker(MegatronTrainWorker):
         Recovers the original Segment-row order under dynamic / padded batching.
         """
         data_iterator, num_microbatches_list = get_data_iterator(
-            self.config.trainer, self.model, rollout_data
+            self.config.trainer, self.model, rollout_data,
+            tree_budget=forward_only_uses_tree(self.config, pg_policy),
         )
 
         collected_all: dict[str, list[torch.Tensor]] = {}
@@ -605,7 +606,8 @@ class MegatronActorWorker(MegatronTrainWorker):
             rollout_data: The complete rollout batch for this DP rank.
         """
         data_iterator, num_microbatches = get_data_iterator(
-            self.config.trainer, self.model, rollout_data
+            self.config.trainer, self.model, rollout_data,
+            tree_budget=bool(self.config.trainer.get("tree_pack", False)),
         )
         global_padding_count, global_padding_ratio = (
             data_iterator[0].get_global_padding_stats()
