@@ -9,8 +9,8 @@ engine gets the whole GPU back afterwards: its weights alone need ~19.5 of the 2
 is file based: the step merges the adapters into the dense FP8 weights of ``hf_model_path`` (the
 serving checkpoint), and the rollout engines reload it from disk (see ``patch.py``). Routed experts never change, so the engine's file-backed expert pages stay valid.
 
-Environment (``trainer.env_vars``): ``STREAM_BASE_CKPT`` is the pristine pruned checkpoint the
-model is built from and the merge starts from; ``STREAM_ENGRAM_CKPT`` holds the engram tables.
+The saved config supplies ``dsv41_4090.base_ckpt`` (pristine model/merge source) and
+``dsv41_4090.orig_ckpt`` (engram tables); no separate path arguments or environment are needed.
 """
 from __future__ import annotations
 
@@ -23,29 +23,13 @@ import time
 
 import ray
 import torch
+from omegaconf import OmegaConf
 
 logger = logging.getLogger(__name__)
 
 # coda/custom/dsv41_4090/stream_worker.py -> repository root
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 STEP_ENTRY = "import sys; from coda.custom.dsv41_4090.streaming import main; sys.exit(main())"
-
-
-def to_trajectories(batch):
-    """LoongSage RolloutBatch -> [{group, prompt_ids, resp_ids, old_logp, mask, reward}]."""
-    out = []
-    old_all = batch.get("rollout_log_probs")
-    for i in range(len(batch["tokens"])):
-        tokens = batch["tokens"][i].tolist()
-        resp_len = int(batch["response_lengths"][i])
-        total = int(batch["total_lengths"][i]) if "total_lengths" in batch else len(tokens)
-        tokens = tokens[:total]
-        old = old_all[i].float().tolist()[:resp_len] if old_all else [0.0] * resp_len
-        mask = batch["loss_masks"][i].float().tolist()[:resp_len]
-        out.append({"group": str(batch["prompt_id"][i]), "prompt_ids": tokens[:total - resp_len],
-                    "resp_ids": tokens[total - resp_len:], "old_logp": old, "mask": mask,
-                    "has_old": bool(old_all), "reward": float(batch["rewards"][i])})
-    return out
 
 
 class MegatronStreamActorWorker:
@@ -57,16 +41,26 @@ class MegatronStreamActorWorker:
     def validate_config(config):
         if config.critic.enable:
             raise ValueError("MegatronStreamActorWorker does not support a critic")
-        return config
+        if config.opd.enable or config.algorithm.ref_kl.enable:
+            raise ValueError("Streaming currently supports policy training without OPD/ref-KL")
+        if config.trainer.forward_only or config.trainer.qat or config.trainer.use_fp32_lm_head:
+            raise ValueError("Streaming uses adapter-only training and merged-weight fake quantization; "
+                             "forward_only, trainer.qat and use_fp32_lm_head are not supported")
+        if config.trainer.num_nodes * config.trainer.num_gpus_per_node != 1:
+            raise ValueError("Streaming requires exactly one training GPU")
+        for key in ("tensor_model_parallel_size", "pipeline_model_parallel_size",
+                    "context_parallel_size", "expert_model_parallel_size", "expert_tensor_parallel_size"):
+            if config.megatron.model.get(key, 1) != 1:
+                raise ValueError(f"Streaming requires {key}=1")
+        from coda.backends.megatron.megatron_actor_worker import MegatronActorWorker
+
+        return MegatronActorWorker.validate_config(config)
 
     def get_ip_port(self):
         return "127.0.0.1", 0
 
     def init(self, config, master_addr=None, master_port=None):
         self.config = config
-        self.serve_ckpt = str(config.hf_model_path)
-        self.base_ckpt = os.environ["STREAM_BASE_CKPT"]
-        self.engram_ckpt = os.environ["STREAM_ENGRAM_CKPT"]
         self.work_dir = os.path.join(str(config.checkpoint_path), "stream_state")
         os.makedirs(self.work_dir, exist_ok=True)
         return {"world_size": 1, "rank": 0}
@@ -74,16 +68,14 @@ class MegatronStreamActorWorker:
     def train(self, step, rollout_data_ref):
         t0 = time.time()
         batch = ray.get(rollout_data_ref[0].ref)
-        trajectories = to_trajectories(batch)
-        torch.save(trajectories, os.path.join(self.work_dir, "trajectories.pt"))
+        # Preserve the standard batch, including routing records and segment/group metadata.
+        torch.save(batch, os.path.join(self.work_dir, "rollout_batch.pt"))
+        OmegaConf.save(self.config, os.path.join(self.work_dir, "config.yaml"))
         log_path = os.path.join(self.work_dir, f"train_step{step}.log")
-        cmd = [sys.executable, "-c", STEP_ENTRY,
-               "--work-dir", self.work_dir, "--serve-ckpt", self.serve_ckpt,
-               "--base-ckpt", self.base_ckpt, "--engram-ckpt", self.engram_ckpt,
-               "--lr", str(float(self.config.megatron.optimizer.lr))]
+        cmd = [sys.executable, "-c", STEP_ENTRY, "--work-dir", self.work_dir, "--step", str(step)]
         with open(log_path, "w") as log:
             rc = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT,
-                                cwd=REPO_ROOT, env=dict(os.environ)).returncode
+                                cwd=REPO_ROOT).returncode
         if rc != 0:
             tail = open(log_path).read()[-3000:]
             raise RuntimeError(f"stream train step {step} failed (rc={rc}); log {log_path}:\n{tail}")

@@ -12,7 +12,7 @@ state, run GRPO on the trajectories, merge the adapters into the serving checkpo
 exit.
 
     python -c "from coda.custom.dsv41_4090.streaming import main; main()" \
-        --work-dir DIR --serve-ckpt SERVE --base-ckpt BASE --engram-ckpt ENGRAM
+        --work-dir DIR --step 1
 """
 from __future__ import annotations
 
@@ -30,26 +30,9 @@ import torch
 TAIL = (36, 37, 38, 39)
 
 
-def _patch_te_skip_init():
-    """TE materializes meta params on CUDA during reset_parameters; streaming has no init."""
-    import transformer_engine.pytorch.module.base as te_base
-
-    if getattr(te_base._Parameter.reset_parameters, "_coda_skip", False):
-        return
-    orig = te_base._Parameter.reset_parameters
-
-    def reset_parameters(self, defer_init=False):
-        if os.environ.get("MEGATRON_SKIP_PARAM_INIT"):
-            return
-        return orig(self, defer_init=defer_init)
-
-    reset_parameters._coda_skip = True
-    te_base._Parameter.reset_parameters = reset_parameters
-
-
 def build_streaming_model(ckpt: str, engram_ckpt: str,
                           tail=TAIL, lora_dim: int = 16, lora_alpha: int = 32,
-                          log=print):
+                          log=print, routing_replay=False):
     """Build the meta model, page weights per layer, and wrap the tail with LoRA."""
     from megatron.bridge import AutoBridge
     import megatron.bridge.models.deepseek.deepseek_v41_bridge  # noqa: F401
@@ -80,6 +63,10 @@ def build_streaming_model(ckpt: str, engram_ckpt: str,
                       ("recompute_granularity", None), ("moe_token_dispatcher_type", "alltoall")):
         setattr(provider, name, val)
     provider.moe_flex_dispatcher_backend = None
+    provider.moe_enable_routing_replay = routing_replay
+    provider.calculate_per_token_loss = True
+    provider.variable_seq_lengths = True
+    provider.moe_router_load_balancing_type = "none"
     from megatron.core.utils import init_method_normal, scaled_init_method_normal
     provider.init_method = init_method_normal(0.02)
     provider.output_layer_init_method = scaled_init_method_normal(0.02, provider.num_layers)
@@ -197,51 +184,6 @@ def build_streaming_model(ckpt: str, engram_ckpt: str,
     return model, layers, load_layer, pool
 
 
-def grpo_step(model, optimizer, trajectories, clip_ratio=2.0):
-    """GRPO with group z-score advantages, token-mean loss and truncated IS weights."""
-    groups = {}
-    for r in trajectories:
-        groups.setdefault(r["group"], []).append(r)
-    optimizer.zero_grad(set_to_none=True)
-    n_tok = max(1, sum(int(sum(r["mask"])) for r in trajectories))
-    st = {"groups": len(groups), "mixed": 0, "diff": 0.0, "rows": 0}
-    for _, rs in groups.items():
-        rewards = torch.tensor([r["reward"] for r in rs], device="cuda", dtype=torch.float32)
-        if len(rs) < 2 or float(rewards.std()) == 0.0:
-            continue
-        st["mixed"] += 1
-        adv = (rewards - rewards.mean()) / (rewards.std() + 1e-6)
-        prompt = rs[0]["prompt_ids"]
-        max_resp = max(len(r["resp_ids"]) for r in rs)
-        seq = [prompt + r["resp_ids"] + [1] * (max_resp - len(r["resp_ids"])) for r in rs]
-        ids = torch.tensor(seq, device="cuda")
-        pos = torch.arange(ids.size(1), device="cuda").unsqueeze(0).expand_as(ids)
-        out = model(ids, position_ids=pos, attention_mask=None)
-        logits = out[:, len(prompt) - 1: len(prompt) - 1 + max_resp].float()
-        logp = torch.log_softmax(torch.nan_to_num(logits, posinf=60, neginf=-60).clamp(-60, 60), -1)
-        terms = []
-        for j, r in enumerate(rs):
-            n = len(r["resp_ids"])
-            tgt = torch.tensor(r["resp_ids"], device="cuda")
-            lp = logp[j, :n].gather(-1, tgt[:, None])[:, 0]
-            old = (torch.tensor(r["old_logp"][:n], device="cuda", dtype=torch.float32)
-                   if r.get("has_old") else lp.detach())
-            m = torch.tensor(r["mask"][:n], device="cuda", dtype=torch.float32)
-            w = torch.exp(lp.detach() - old).clamp(max=clip_ratio)
-            terms.append(-(adv[j] * w * torch.exp(lp - lp.detach()) * m).sum() / n_tok)
-            st["diff"] += float(((lp.detach() - old).abs() * m).sum() / m.sum().clamp(min=1))
-            st["rows"] += 1
-        sum(terms).backward()
-        del out, logits, logp
-    params = [p for p in model.parameters() if p.requires_grad]
-    finite = all(p.grad is None or bool(torch.isfinite(p.grad).all()) for p in params)
-    gn = float(torch.nn.utils.clip_grad_norm_(params, 1.0)) if st["mixed"] else 0.0
-    if st["mixed"] and finite:
-        optimizer.step()
-    st["diff"] /= max(1, st["rows"])
-    return gn, finite, st
-
-
 # Merge the LoRA adapters into the dense FP8 weights the rollout engine serves. Base weights are
 # always read from the pristine checkpoint and the merged result is written to the serving
 # checkpoint at the same byte offsets, so repeated merges never accumulate. Dense weights are E4M3
@@ -331,9 +273,8 @@ def _forward_with_served_weights(model):
     return wrapped
 
 
-def merge_adapters(adapters, ckpt, layers=TAIL, alpha_over_r=2.0, base_ckpt=None):
+def merge_adapters(adapters, ckpt, base_ckpt, layers=TAIL, alpha_over_r=2.0):
     """adapters: Megatron param name -> tensor. Returns the number of tensors written."""
-    base_ckpt = base_ckpt or os.environ.get("STREAM_BASE_CKPT") or ckpt
     base, serve = _headers(base_ckpt), _headers(ckpt)
     written = 0
     for layer in layers:
@@ -362,18 +303,25 @@ def merge_adapters(adapters, ckpt, layers=TAIL, alpha_over_r=2.0, base_ckpt=None
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--work-dir", required=True)
-    ap.add_argument("--serve-ckpt", required=True)
-    ap.add_argument("--base-ckpt", required=True)
-    ap.add_argument("--engram-ckpt", required=True)
-    ap.add_argument("--lr", type=float, default=1e-4)
-    ap.add_argument("--clip", type=float, default=2.0)
+    ap.add_argument("--step", type=int, required=True)
     a = ap.parse_args()
 
     os.environ.setdefault("MEGATRON_SKIP_PARAM_INIT", "1")
     t0 = time.time()
-    trajectories = torch.load(os.path.join(a.work_dir, "trajectories.pt"))
-    model, _, _, _ = build_streaming_model(ckpt=a.base_ckpt, engram_ckpt=a.engram_ckpt, tail=TAIL,
-                                           log=lambda m: print(m, flush=True))
+    import ray
+    from omegaconf import OmegaConf
+    from types import SimpleNamespace
+    from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+    from coda.backends.megatron.megatron_actor_worker import MegatronActorWorker
+    from coda.custom.dsv41_4090.stream_worker import MegatronStreamActorWorker
+    from coda.data_factory.data_processor import Box
+
+    config = OmegaConf.load(os.path.join(a.work_dir, "config.yaml"))
+    config = MegatronStreamActorWorker.validate_config(config)
+    batch = torch.load(os.path.join(a.work_dir, "rollout_batch.pt"), weights_only=False)
+    model, _, _, _ = build_streaming_model(ckpt=config.dsv41_4090.base_ckpt,
+                                           engram_ckpt=config.dsv41_4090.orig_ckpt,
+                                           routing_replay=config.trainer.use_rollout_routing_replay)
     t_build = time.time() - t0
     trainable = {n: p for n, p in model.named_parameters() if p.requires_grad}
     adapter_path = os.path.join(a.work_dir, "adapter.pt")
@@ -384,29 +332,50 @@ def main():
                 trainable[k].data.copy_(v)
     names = sorted(trainable)
     params = [trainable[n] for n in names]
-    opt = torch.optim.AdamW(params, lr=a.lr, betas=(0.9, 0.99), weight_decay=0.0)
+    # Only adapters require gradients, so standard DDP allocates buffers for them alone.
+    class StreamingActor(MegatronActorWorker):
+        """Specialize initialization/metric transport; inherit the complete training cycle."""
+
+        def __init__(self, config, model):
+            self.config, self.rank, self.world_size = config, 0, 1
+            self.model = [DistributedDataParallel(
+                model.config, DistributedDataParallelConfig(**OmegaConf.to_container(config.megatron.ddp_config)),
+                model, disable_bucketing=True,
+            )]
+            self._forward_only = False
+            self.kl_policies = {}
+            self._quant = SimpleNamespace(qat=False)
+            self._build_optimizer()
+
+        def _track_metrics(self, step, rollout_data, metrics):
+            for key in ("m2po_metrics", "is_metrics", "kl_metrics", "adv_metrics"):
+                metrics.update(rollout_data.get(key, {}))
+            self.step_metrics = metrics
+
+    actor = StreamingActor(config, model)
     opt_path = os.path.join(a.work_dir, "optimizer.pt")
     if os.path.exists(opt_path):
         state = torch.load(opt_path, map_location="cuda")
-        if state.get("names") == names:
-            opt.load_state_dict(state["state"])
+        if state.get("format") != "standard_actor_v1" or state.get("names") != names:
+            raise ValueError("Optimizer checkpoint is not from the standard streaming actor; use a new work directory")
+        actor.optimizer.load_state_dict(state["state"])
+        actor.scheduler.load_state_dict(state["scheduler"])
 
-    model.train()
-    gn, finite, st = grpo_step(model, opt, trajectories, clip_ratio=a.clip)
+    ray.init(address="auto", ignore_reinit_error=True)
+    actor.train(a.step, [Box(ray.put(batch))])
+    if not all(bool(torch.isfinite(p).all()) for p in params):
+        raise RuntimeError("Non-finite adapter weights after standard actor training")
     adapters = {n: trainable[n].detach().cpu() for n in names}
-    merged = 0
-    if st["mixed"] and finite:
-        torch.save(adapters, adapter_path + ".tmp")
-        os.replace(adapter_path + ".tmp", adapter_path)
-        torch.save({"names": names, "state": opt.state_dict()}, opt_path + ".tmp")
-        os.replace(opt_path + ".tmp", opt_path)
-        merged = merge_adapters(adapters, ckpt=a.serve_ckpt, layers=TAIL, alpha_over_r=2.0,
-                                base_ckpt=a.base_ckpt)
-    rewards = [t["reward"] for t in trajectories]
+    torch.save(adapters, adapter_path + ".tmp")
+    os.replace(adapter_path + ".tmp", adapter_path)
+    torch.save({"format": "standard_actor_v1", "names": names, "state": actor.optimizer.state_dict(),
+                "scheduler": actor.scheduler.state_dict()}, opt_path + ".tmp")
+    os.replace(opt_path + ".tmp", opt_path)
+    merged = merge_adapters(adapters, ckpt=config.hf_model_path, base_ckpt=config.dsv41_4090.base_ckpt)
+    rewards = batch["rewards"]
     metrics = {
-        "train/grad_norm": gn, "train/grad_finite": float(finite),
-        "train/mixed_groups": st["mixed"], "train/groups": st["groups"],
-        "train/is_logprob_abs_diff": st["diff"], "train/merged_tensors": merged,
+        **actor.step_metrics,
+        "train/merged_tensors": merged,
         "train/reward_mean": sum(rewards) / max(1, len(rewards)),
         "train/adapter_norm": float(sum(p.detach().float().pow(2).sum() for p in params) ** 0.5),
         "perf/train_build_seconds": t_build, "perf/train_seconds": time.time() - t0,

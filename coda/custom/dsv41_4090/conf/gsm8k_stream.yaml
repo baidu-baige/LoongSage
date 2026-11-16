@@ -8,7 +8,7 @@
 # step it merges the adapters into the serving checkpoint, which the rollout engine reloads.
 #
 #   T=coda/custom/dsv41_4090/tools
-#   # pruned base checkpoint (STREAM_BASE_CKPT, SGLANG_FILE_EXPERTS_CKPT): 64 experts per layer
+#   # pruned base checkpoint (dsv41_4090.base_ckpt): 64 experts per layer
 #   python $T/build_pruned.py --src /root/DeepSeek-V4.1-Flash --dst /root/dsv41-k64 \
 #     --mask mask_top64.npy --drop-engram-tables --expert-fp8
 #   # serving checkpoint (hf_model_path): everything but the routed experts; the trainer writes it
@@ -72,6 +72,7 @@ rollout:
     swa_prefix_tails: 1
     disable_cuda_graph: true
     load_format: auto
+    json_model_override_args: '{"vision_n_layers": 0}'
     attention_backend: dsv4
     dsv4_attn_backend: flashmla
     enable_decoder_swa_bounded_replay: false
@@ -95,21 +96,24 @@ trainer:
   num_nodes: 1
   mini_batch_size: 64
   micro_batch_size: 1
-  max_tokens_per_gpu: 2048
+  # 1024 amortizes layer paging while leaving room for the offloaded rollout engine.
+  max_tokens_per_gpu: 1024
   use_dynamic_batch_size: true
-  use_rollout_routing_replay: false
+  use_rollout_routing_replay: true
   use_fp32_lm_head: false
   save_freq: -1
   save_checkpoint: false
   async_save: false
   env_vars:
     MEGATRON_SKIP_PARAM_INIT: "1"
-    STREAM_BASE_CKPT: "${dsv41_4090.base_ckpt}"
-    STREAM_ENGRAM_CKPT: "${dsv41_4090.orig_ckpt}"
     PYTORCH_ALLOC_CONF: "expandable_segments:True,pinned_max_cached_size_mb:32"
     TORCHINDUCTOR_COMPILE_THREADS: "1"
 
 megatron:
+  ddp_config:
+    use_distributed_optimizer: false
+    overlap_grad_reduce: false
+    overlap_param_gather: false
   model:
     tensor_model_parallel_size: 1
     pipeline_model_parallel_size: 1

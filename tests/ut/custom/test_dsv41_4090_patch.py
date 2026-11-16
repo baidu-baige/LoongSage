@@ -1,5 +1,6 @@
 """Unit tests for coda/custom/dsv41_4090/patch.py (stock controller + streaming recipe)."""
 from unittest.mock import MagicMock, patch
+from pathlib import Path
 
 import pytest
 from omegaconf import OmegaConf
@@ -21,10 +22,12 @@ def make_config(stream):
         "trainer": {"backend": "megatron", "num_nodes": 1, "num_gpus_per_node": 1, "env_vars": {}},
         "algorithm": {"advantage_estimator": "grpo"},
         "critic": {"enable": False},
+        "megatron": {"model": {"expert_tensor_parallel_size": 1}},
     }
     if stream:
         cfg["dsv41_4090"] = {"stream": True}
-    return OmegaConf.create(cfg)
+    defaults = OmegaConf.load(Path(__file__).resolve().parents[3] / "conf/default.yaml")
+    return OmegaConf.merge(defaults, cfg)
 
 
 def build_train_manager(config):
@@ -63,6 +66,20 @@ class TestTrainManager:
         config.critic.enable = True
         with pytest.raises(ValueError, match="critic"):
             build_train_manager(config)
+
+    def test_standard_actor_validation_is_preserved(self):
+        config = make_config(stream=True)
+        config.trainer.use_rollout_log_probs = True
+        config.algorithm.is_correction.enable = True
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            MegatronStreamActorWorker.validate_config(config)
+
+    def test_replay_enables_megatron_router_replay(self):
+        config = make_config(stream=True)
+        config.trainer.use_rollout_routing_replay = True
+        result = MegatronStreamActorWorker.validate_config(config)
+        assert result.megatron.model.moe_enable_routing_replay
+        assert result.megatron.model.calculate_per_token_loss
 
 
 class TestRolloutManager:
