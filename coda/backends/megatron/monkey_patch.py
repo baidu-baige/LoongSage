@@ -1,4 +1,4 @@
-"""Monkey-patches for Megatron-Core.
+"""Monkey-patches for Megatron-Core and its kernel dependencies.
 
 All patches are applied at module import time. Import this module before
 any Megatron objects that depend on these patches are instantiated.
@@ -277,8 +277,49 @@ class _ShapeAgnosticLaunchCache(dict):
         return super().__contains__(self._normalize(key))
 
 
+def _patch_fa4_causal_unbounded_window():
+    """Stop FA4 from resolving Transformer Engine's causal window to an empty local window.
+
+    Symptom (B200, Qwen3.8-27B, head_dim 256, flash-attn-4 >= 4.0.0b30): the first
+    training backward asserts "SM100 backward with head_dim=256 does not support
+    local attention". The forward before it already returns all zeros.
+
+    Root cause:
+      TE encodes causal as ``window_size=(-1, 0)`` (-1 = no left limit). FA4's
+      ``_resolve_causal_local_window`` only treats -1 as unbounded when *both*
+      sides are negative (since Dao-AILab/flash-attention#2490), so ``(-1, 0)``
+      becomes local attention with a left window of -1. Token i may then attend
+      only to keys in ``[i + 1, i]``, which is empty, so every output row is 0.
+      Builds without the dedicated hd256 backward kernel (b39+) do not assert and
+      train on the zeros silently. Tracked upstream in
+      Dao-AILab/flash-attention#3084.
+
+    Fix: under ``causal=True``, map a negative left window to ``None`` before FA4
+    resolves it. This matches flash-attn-4 <= 4.0.0b29, which also resolved a
+    causal ``(-1, 0)`` to plain causal. Sliding windows ``(>= 0, 0)`` and
+    non-causal windows are passed through unchanged.
+    """
+    try:
+        module = importlib.import_module("flash_attn.cute.interface")
+    except Exception:  # pylint: disable=broad-except
+        # FA4 not installed; a patch must never be the reason startup fails.
+        return
+    original = getattr(module, "_resolve_causal_local_window", None)
+    if original is None or getattr(original, "_coda_causal_unbounded_window", False):
+        return
+
+    def _patched_resolve(causal, window_size_left, window_size_right, mask_mod=None):
+        if causal and window_size_left is not None and window_size_left < 0:
+            window_size_left = None
+        return original(causal, window_size_left, window_size_right, mask_mod)
+
+    _patched_resolve._coda_causal_unbounded_window = True
+    module._resolve_causal_local_window = _patched_resolve
+
+
 _patch_distributed_optimizer_init()
 _patch_fp32_shard_leaf()
 _patch_fused_adam_fp32_master_remainder()
 _patch_csa_cute_launch_cache()
+_patch_fa4_causal_unbounded_window()
 
