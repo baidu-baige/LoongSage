@@ -25,3 +25,6 @@ def test_unsupported_configs():
     cfg = _cfg()
     cfg.trainer.use_dynamic_batch_size = False
     assert "dynamic" in tree_pack_unsupported_reason(cfg)
+    cfg = _cfg()
+    cfg.multimodal = {"enable": True}
+    assert "multimodal" in tree_pack_unsupported_reason(cfg)

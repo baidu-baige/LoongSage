@@ -447,7 +447,7 @@ def forward_only(
     teacher_keys = [k for k in data_iterator[0].rollout_data if k.startswith("teacher_")]
     # Tree micro-batches need no PG-KL policy (it reads row-wise logits) and the policy
     # outputs; callers with another closure (e.g. the critic's value head) keep rows.
-    tree_pack = forward_only_uses_tree(config, pg_policy)
+    tree_pack = forward_only_uses_tree(config, pg_policy) and output_fn is compute_forward_only_outputs
     lm_rows_only = _install_tree_patches(config, model) if tree_pack else False
     tree_cache = _TreeChunkCache(len(model))
 

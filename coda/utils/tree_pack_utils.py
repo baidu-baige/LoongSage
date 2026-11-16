@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from omegaconf import DictConfig
 
+from coda.utils.multimodal_config import multimodal_enabled
+
 # Default cost of a tree sequence in node-equivalents (empirical; tune per model and hardware).
 TREE_ATTN_PAIR_COST = 9.15e-6   # one (query, key) pair of causal full attention
 TREE_LEVEL_COST = 4200.0        # one serial GDN level (a round of varlen kernel calls)
@@ -28,4 +30,6 @@ def tree_pack_unsupported_reason(config: DictConfig) -> str | None:
         return f"attention_backend={m.get('attention_backend')!r} (needs 'flash')"
     if not config.trainer.use_dynamic_batch_size:
         return "use_dynamic_batch_size=False (node budgets need dynamic batching)"
+    if multimodal_enabled(config):
+        return "multimodal.enable=True (image inputs are not supported by tree packing)"
     return None

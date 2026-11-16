@@ -95,7 +95,8 @@ class MegatronCriticWorker(MegatronTrainWorker):
         * MTP (multi-token prediction): off, it reuses ``output_layer``, which
           the critic replaces with the value head;
         * ``output_layer`` is dropped from ``keep_fp32_weights``, so the value
-          head follows the model precision.
+          head follows the model precision;
+        * tree packing: off, the value head reads per-row values.
         """
         config.megatron.optimizer = config.critic.optimizer
         config.megatron.scheduler = config.critic.scheduler
@@ -103,6 +104,9 @@ class MegatronCriticWorker(MegatronTrainWorker):
         config.megatron.model.moe_enable_routing_replay = False
         config.megatron.model.mtp_num_layers = None
         config.megatron.keep_fp32_weights.pop("output_layer", None)
+        # Tree packing targets the policy's LM head; the value head consumes
+        # per-row values, so the critic always runs the row path.
+        config.trainer.tree_pack = False
 
         super().init(config, master_addr, master_port)
         logger.info(f"[Rank {self.rank}] MegatronCriticWorker initialization complete")
