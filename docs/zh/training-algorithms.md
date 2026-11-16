@@ -1,6 +1,6 @@
 # 训练算法
 
-框架目前仅支持**类 GRPO**（critic-free）算法族：advantage 直接由 reward 在组内或批内归一化得到，不训练 value model，因此暂不支持 PPO 等需要 critic 的算法。整条算法链路被拆分为若干独立组件——advantage 估计、policy loss、离策略保护（IS correction、M2PO，即 Second-Moment Trust Policy Optimization、OPSM，即 Off-Policy Sequence Masking）、正则项（entropy / ref KL）和 loss 聚合——所有开关集中在配置的 `algorithm` 节，其中 advantage 与 policy loss 支持注册自定义实现，详见[自定义RL算法开发指南](./custom-algorithm.md)。
+框架支持**类 GRPO**（critic-free）算法族，advantage 由 reward 在 prompt 组内归一化得到；也支持 **PPO**，由共卡的 critic 用 GAE 估计逐 token 的 advantage（见 §1.6）。整条算法链路被拆分为若干独立组件——advantage 估计、policy loss、离策略保护（IS correction、M2PO，即 Second-Moment Trust Policy Optimization、OPSM，即 Off-Policy Sequence Masking）、正则项（entropy / ref KL）和 loss 聚合——所有开关集中在配置的 `algorithm` 节，其中 advantage 与 policy loss 支持注册自定义实现，详见[自定义RL算法开发指南](./custom-algorithm.md)。
 
 一个 mini-batch 内各组件的执行顺序为：（可选）重算 `old_log_probs` →（可选）ref model 前向 →（可选）M2PO 掩码 →（可选）IS 权重计算 → advantage 计算 → actor 前向得到 `log_probs` →（可选）OPSM 掩码 → policy loss →（可选）乘 OPSM / IS 权重 → 聚合，（可选）再叠加 entropy 与 ref KL 项。
 
@@ -8,17 +8,19 @@
 
 ### 1.1.Advantage 估计
 
-`algorithm.advantage_estimator` 当前内置 `grpo`（默认）。它把每条 trajectory 的标量 reward 归一化为 advantage，并广播到该 trajectory 的每个 response token。归一化方式由 `algorithm.advantage_norm_mode` 控制：
+`algorithm.advantage_estimator` 内置 `grpo`（默认）和 `gae`（PPO，见 §1.6）。`grpo` 把每条 trajectory 的标量 reward 归一化为 advantage，并广播到该 trajectory 的每个 response token。归一化方式由 `algorithm.advantage_norm_mode` 控制：
 
 | 取值 | 含义 |
 | --- | --- |
 | `group_zscore`（默认） | 同一 prompt 组内 z-score：`(x - mean) / std` |
 | `group_mean` | 组内去均值：`x - mean` |
-| `batch_zscore` | 跨所有 DP rank 的全批 z-score |
-| `batch_mean` | 跨所有 DP rank 的全批去均值 |
 | `none` | 直接使用原始 reward |
 
-`batch_*` 模式会在 DP 组内 all-reduce 统计量，因此不同 DP rank 上的样本共享同一组 mean/std；`group_*` 模式要求每个 prompt 组的 trajectory 数量一致（即 `num_trajectories_per_prompt`）。
+`group_*` 模式要求每个 prompt 组的 trajectory 数量一致（即 `num_trajectories_per_prompt`）。`advantage_norm_mode` 只对 `grpo` 生效，`gae` 会忽略它。
+
+整个 step 上的归一化是独立于 estimator 的一步：开启 `algorithm.use_masked_whiten: true` 后，任意 estimator 返回的 advantage 都会做白化 `(A - mean) / std`。mean 和无偏 std 在该 step 的全部 response token（`raw_loss_masks`）上统计，并在 DP 组内 all-reduce。
+
+所有 estimator 都会上报 `train/adv_zero_ratio`：advantage 全为 0 的 Segment 行占比，在可选的白化之后统计。
 
 ### 1.2.Policy loss
 
@@ -28,6 +30,7 @@
 | --- | --- | --- |
 | `grpo`（默认） | token 级 `exp(logπ - logπ_old)` | 非对称裁剪（`clip_ratio_low` / `clip_ratio_high`，默认 0.2 / 0.28，即 DAPO 的 clip-higher）；对负 advantage 额外做 dual-clip（`clip_ratio_c`，默认 10.0） |
 | `gspo` | 序列级 `exp(mean(Δlogp))` | 序列级比率、token 级梯度路由，见 [GSPO](https://arxiv.org/pdf/2507.18071)；仅使用 `clip_ratio_low` / `clip_ratio_high` |
+| `ppo` | token 级，同 `grpo` | 与 `grpo` 是同一个 clipped surrogate（PPO 和 GRPO 只在 advantage 上不同）；标准 PPO 设置为 `clip_ratio_low = clip_ratio_high = 0.2`、`clip_ratio_c = 3.0` |
 
 行为策略 `logπ_old` 默认由训练引擎在每个 step 开始时重算；设置 `trainer.use_rollout_log_probs: true` 可改用推理引擎返回的 `rollout_log_probs`（此时不能启用 IS correction 和 M2PO，见下节）。
 
@@ -73,6 +76,17 @@ algorithm:
     enable: true
     delta: 0.1
 ```
+
+### 1.6.PPO（GAE + critic）
+
+开启 `critic.enable: true`，同时设 `algorithm.advantage_estimator: gae`，一般还会设 `algorithm.policy_loss: ppo`。critic 是第二个 Megatron 模型，并行配置和 actor 一致，有自己的 optimizer、scheduler 和 checkpoint（见[配置参考 §7.3](./config-reference.md)）。它和 actor 共卡，每个 step 先于 actor 执行：
+
+1. 用更新前的 critic 做一次 forward-only 得到 `old_values`。value head（`hidden -> 1`，替换 LM head）的读取位置和 log-prob 相同：位置 `t-1` 的 value 对应 response 的第 `t` 个 token。
+2. 用 rollout 的 `token_rewards` 和 `algorithm.ppo.gamma` / `algorithm.ppo.lam` 计算 GAE，mask 为 0 的 token 不算一步，bootstrap value 和累计 advantage 原样跨过它们。`returns = advantages + old_values`；之后可选的 `use_masked_whiten` 只对 advantages 做白化，returns 不变。
+3. clipped value loss：`0.5 * max((V - R)^2, (clip(V, V_old ± ppo.value_clip) - R)^2)`，按 `loss_agg_mode` 聚合，指标以 `critic/` 前缀上报。
+4. advantage 交给 actor，actor 直接使用。GAE 和白化每个 step 只算一次。
+
+对 reference model 的 KL 只作为 loss 项（`ref_kl`）加入。`step <= critic.critic_warmup` 时只训练 critic。当前限制：`num_trajectories_per_prompt == 1`；每条 trajectory 只能有一个 Segment，即不支持上下文压缩和 subagent；不能和 OPD 同时开启。
 
 ## 2.无偏 Loss 聚合
 

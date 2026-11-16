@@ -9,11 +9,15 @@ logger = logging.getLogger(__name__)
 
 LATEST_ITERATION_FILE = "latest_checkpointed_iteration.txt"
 DIST_CKPT_CONFIG_FILE = "metadata.json"
+# Name of the policy's dist checkpoint dir under ``train_step_{step}/``. Other
+# trainable models of the same run (e.g. the PPO critic) sit next to it under
+# their own name and share the step's tracker file.
+DIST_CKPT_DIR_NAME = "dist_ckpt"
 
 
-def get_ckpt_dir(checkpoint_base_dir, step):
-    """Build the dist_ckpt directory path for a given step."""
-    return os.path.join(checkpoint_base_dir, f"train_step_{step}", "dist_ckpt")
+def get_ckpt_dir(checkpoint_base_dir, step, name=DIST_CKPT_DIR_NAME):
+    """Build the dist checkpoint directory path ``train_step_{step}/{name}``."""
+    return os.path.join(checkpoint_base_dir, f"train_step_{step}", name)
 
 
 def get_hf_dir(checkpoint_base_dir, step):
@@ -30,8 +34,16 @@ def get_data_source_dir(checkpoint_base_dir, step):
     return os.path.join(checkpoint_base_dir, f"train_step_{step}", "data_source")
 
 
-def find_latest_ckpt_path(checkpoint_base_dir):
-    """Locate the latest checkpoint by tracker_file, return path or None."""
+def should_save(config, step) -> bool:
+    """Whether ``step`` is a checkpoint step: every ``trainer.save_freq`` steps and the last step."""
+    save_freq = config.trainer.save_freq
+    if save_freq <= 0:
+        return False
+    return step % save_freq == 0 or step == config.total_steps
+
+
+def find_latest_ckpt_path(checkpoint_base_dir, name=DIST_CKPT_DIR_NAME):
+    """Locate ``train_step_{latest}/{name}`` via the tracker file, return path or None."""
     if not os.path.isdir(checkpoint_base_dir):
         return None
     latest_file = get_tracker_file(checkpoint_base_dir)
@@ -40,7 +52,7 @@ def find_latest_ckpt_path(checkpoint_base_dir):
     try:
         with open(latest_file, "r") as f:
             step = f.read().strip()
-        ckpt_dir = get_ckpt_dir(checkpoint_base_dir, step)
+        ckpt_dir = get_ckpt_dir(checkpoint_base_dir, step, name=name)
         if not os.path.isdir(ckpt_dir):
             logger.warning(f"Tracker file points to non-existent checkpoint dir: {ckpt_dir}")
             return None

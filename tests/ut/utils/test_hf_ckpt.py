@@ -70,3 +70,18 @@ def test_save_like_source_rejects_mismatch(tmp_path):
                          {"layers.0.attn.wq.weight"})
     with pytest.raises(RuntimeError, match="not produced"):
         save_like_source(iter([]), str(src), str(tmp_path / "o4"), {"layers.0.norm.weight"})
+
+
+def test_save_like_source_integer_casts(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    save_file({"tid2eid": torch.arange(12).view(4, 3), "packed": torch.zeros(2, 2, dtype=torch.uint8)},
+              str(src / "model.safetensors"))
+    out = tmp_path / "out"
+    table = torch.arange(12, 24, dtype=torch.int32).view(4, 3)  # int32 -> source I64: lossless widening
+    save_like_source(iter([("tid2eid", table)]), str(src), str(out), {"tid2eid"})
+    got = _load(out)["tid2eid"]
+    assert got.dtype == torch.int64 and torch.equal(got, table.long())
+    for bad in (torch.zeros(2, 2, dtype=torch.int8), torch.zeros(2, 2, dtype=torch.int32)):  # narrowing / sign change
+        with pytest.raises(ValueError, match="dtype"):
+            save_like_source(iter([("packed", bad)]), str(src), str(tmp_path / "o"), {"packed"})

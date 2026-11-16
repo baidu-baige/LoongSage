@@ -18,6 +18,8 @@ from fastapi import status
 from coda.agentflow.agent.base_agent import BaseAgent
 from coda.reward.reward import Reward
 from coda.agentflow.trajectory_store import (
+    FloatSeq,
+    IntSeq,
     Trajectory,
     TrajectoryStore,
     TrajectoryStatus,
@@ -81,6 +83,8 @@ class AgentFlow:
         self.retry_limit = self.config.rollout.retry_limit
         self.accumulate_reasoning = self.config.agentflow.router.accumulate_reasoning
         self.r3_enabled = self.config.trainer.use_rollout_routing_replay
+        router_cfg = self.config.agentflow.router
+        self.r3_decode_workers = int(router_cfg.get("r3_decode_workers", 0))
         self.max_response_len_per_trajectory = int(self.config.data_sources[0].max_response_len_per_trajectory)
         self.partial_rollout_enabled = self.config.rollout.partial
         self.mask_offpolicy_in_partial_rollout = self.config.rollout.mask_offpolicy_in_partial_rollout
@@ -106,6 +110,7 @@ class AgentFlow:
         self._generate_sem = asyncio.Semaphore(self._max_connections)
         self._control_sem = asyncio.Semaphore(self._max_connections)
         self._control_client: httpx.AsyncClient | None = None
+        self._generate_client: httpx.AsyncClient | None = None
 
         # Per-data-source agent classes and reward functions (keyed by ds index)
         self.ds_agent_classes: dict[int, type[BaseAgent] | None] = {}
@@ -123,7 +128,9 @@ class AgentFlow:
     def _init_tokenizer(self) -> None:
         """Initialize tokenizer from config."""
         tokenizer_cfg = self.config.agentflow.tokenizer
-        self.tokenizer_manager = create_tokenizer_manager(tokenizer_cfg, self.config.hf_model_path)
+        self.tokenizer_manager = create_tokenizer_manager(
+            tokenizer_cfg, self.config.hf_model_path, getattr(self.config, "multimodal", None)
+        )
         self._resources.callback(self.tokenizer_manager.shutdown)
         logger.info(
             "[init] tokenizer=%s manager=%s workers=%d",
@@ -176,7 +183,20 @@ class AgentFlow:
             limits=httpx.Limits(max_connections=self._max_connections),
         )
 
+        # Shared client for generate calls: creating one per trajectory loads the CA bundle synchronously and blocks
+        # the event loop. Connections are not reused (generate calls last seconds to minutes): a reused idle
+        # connection can be closed by uvicorn's 5s keep-alive while this loop is stalled, which surfaces as
+        # httpx.ReadError.
+        self._generate_client = httpx.AsyncClient(
+            timeout=float(router_config.proxy_timeout_seconds),
+            limits=httpx.Limits(
+                max_connections=self._max_connections,
+                max_keepalive_connections=0,
+            ),
+        )
+
         async def _shutdown_router() -> None:
+            await self._generate_client.aclose()
             await self._control_client.aclose()
             await self.router.shutdown()
             self.router = None
@@ -307,8 +327,9 @@ class AgentFlow:
         # 4. Wait for Router middleware writes to finish.
         await self._wait_inflight_requests_complete()
 
-        # 5. Mark remaining active trajectories as ABORTED.
-        aborted: list[Trajectory] = []
+        # 5. Mark remaining active trajectories as ABORTED. Keep ids, not objects, so each
+        # emit can free its original as soon as the snapshot is taken.
+        aborted_ids: list[str] = []
         for tid in list(self.trajectory_store.trajectory_data.keys()):
             attempts = self.trajectory_store.trajectory_data.get(tid)
             if not attempts:
@@ -319,10 +340,15 @@ class AgentFlow:
             logger.info("[abort] Marking trajectory=%s attempt=%d as ABORTED", tid, latest.attempt_id)
             latest.status = TrajectoryStatus.ABORTED
             self.trajectory_store.update(tid, latest)
-            aborted.append(latest)
-        if aborted:
-            await asyncio.gather(*[self._emit_terminal_trajectory(t) for t in aborted])
-        logger.info("[abort] complete aborted=%d", len(aborted))
+            aborted_ids.append(tid)
+        latest = attempts = None
+        if aborted_ids:
+            await asyncio.gather(*[self._emit_aborted(tid) for tid in aborted_ids])
+        logger.info("[abort] complete aborted=%d", len(aborted_ids))
+
+    async def _emit_aborted(self, trajectory_id: str) -> None:
+        if attempts := self.trajectory_store.trajectory_data.get(trajectory_id):
+            await self._emit_terminal_trajectory(attempts[-1])
 
     async def _wait_inflight_requests_complete(self) -> None:
         """Wait for Router middleware handlers after rollout tasks are cancelled."""
@@ -433,7 +459,7 @@ class AgentFlow:
                 )
             masked_tokens = sum(1 for mask in attempt_traj_template.loss_masks if mask)
             zero_tokens = existing_response_len - masked_tokens
-            attempt_traj_template.loss_masks = [0] * existing_response_len
+            attempt_traj_template.loss_masks = IntSeq([0] * existing_response_len)
             logger.info(
                 "[partial_resume] partial rollout resume: [%s] masked %d existing loss tokens "
                 "(response_len=%d pre_zero=%d rollout_weight_versions_len=%d)",
@@ -549,18 +575,14 @@ class AgentFlow:
 
         async with self._generate_sem:
             messages = copy.deepcopy(_active_chat(traj))  # already normalized to list[dict] by _build_messages
-            generate_client = httpx.AsyncClient(timeout=float(self.config.agentflow.router.proxy_timeout_seconds))
-            try:
-                response = await generate_client.post(
-                    f"{self.router_url}/{traj.trajectory_id}/{attempt_id}/v1/chat/completions",
-                    json={
-                        "model": "default",
-                        "messages": messages,
-                        "max_tokens": int(ds_cfg.max_response_len_per_trajectory),
-                    },
-                )
-            finally:
-                await generate_client.aclose()
+            response = await self._generate_client.post(
+                f"{self.router_url}/{traj.trajectory_id}/{attempt_id}/v1/chat/completions",
+                json={
+                    "model": "default",
+                    "messages": messages,
+                    "max_tokens": int(ds_cfg.max_response_len_per_trajectory),
+                },
+            )
         is_context_length_exceeded = False
         if response.status_code == httpx.codes.BAD_REQUEST:
             try:
@@ -579,7 +601,11 @@ class AgentFlow:
             logger.warning("[%s] Trajectory not found in store after single-turn", traj.trajectory_id)
         if reward_fn:
             reward_messages = copy.deepcopy(_active_chat(traj_out) if traj_out else messages)
-            return reward_fn(
+            # Off the event loop: a reward_fn can be CPU-heavy (e.g. sympy), and running it
+            # inline would stall every other concurrent rollout. Multi-turn agents already
+            # wrap their reward_fn in asyncio.to_thread for the same reason.
+            return await asyncio.to_thread(
+                reward_fn,
                 reward_messages, traj.label,
                 traj_out.model_dump() if traj_out else {},
                 max_tokens=int(ds_cfg.max_response_len_per_trajectory),
@@ -617,7 +643,7 @@ class AgentFlow:
         if n > 0:
             token_rewards = [0.0] * n
             token_rewards[-1] = reward.final_reward
-            traj.token_rewards = token_rewards
+            traj.token_rewards = FloatSeq(token_rewards)
         self.trajectory_store.update(trajectory_id, traj)
         logger.debug("[%s] Stored reward=%s", trajectory_id, reward.final_reward)
         if dump_path := self.config.agentflow.dump_trajectory_path:
@@ -638,21 +664,49 @@ class AgentFlow:
         except Exception as exc:
             logger.warning("[%s] Failed to dump trajectory: %s", traj.trajectory_id, exc)
 
+    @staticmethod
+    def _copy_for_queue(trajectory: Trajectory) -> Trajectory:
+        """Deep-copy a terminal trajectory, sharing its multimodal tensors by reference.
+
+        The store drops the original right after the queue write, so the (large) per-image tensors
+        need not be duplicated. Runs synchronously on the event loop, so nothing observes the
+        temporarily detached field.
+        """
+        inputs = trajectory.multimodal_train_inputs
+        if not inputs:
+            return trajectory.model_copy(deep=True)
+        trajectory.multimodal_train_inputs = None
+        try:
+            copy = trajectory.model_copy(deep=True)
+        finally:
+            trajectory.multimodal_train_inputs = inputs
+        copy.multimodal_train_inputs = inputs
+        return copy
+
     async def _emit_terminal_trajectory(self, trajectory: Trajectory) -> None:
         """Push a terminal trajectory to the queue and remove it from the store.
         Eval trajectories share this queue; RolloutSampler splits them out by is_eval.
         """
-        write_task = asyncio.create_task(
-            asyncio.to_thread(self.traj_queue.add, trajectory.model_copy(deep=True))
-        )
+        # R3 rows are a view of a growable buffer: clone them rather than deep-copy the
+        # spare capacity along with the rest of the trajectory.
+        routed_experts = trajectory.rollout_routed_experts
+        trajectory.rollout_routed_experts = None
+        trajectory_id = trajectory.trajectory_id
+        try:
+            snapshot = self._copy_for_queue(trajectory)
+            if routed_experts is not None:
+                snapshot.rollout_routed_experts = routed_experts.clone()
+        finally:
+            trajectory.rollout_routed_experts = routed_experts
+            # Delete before the queue write so the original is freed now, not after every
+            # concurrent emit (abort, step end) has finished.
+            self.trajectory_store.delete([trajectory_id])
+        del trajectory, routed_experts
+        write_task = asyncio.create_task(asyncio.to_thread(self.traj_queue.add, snapshot))
+        del snapshot
         self._inflight_queue_write_futures.add(write_task)
         write_task.add_done_callback(self._inflight_queue_write_futures.discard)
-        try:
-            await write_task
-        finally:
-            # Delete unconditionally: even if the queue write fails the trajectory
-            # should not remain in the store (the write error is already logged by the caller).
-            self.trajectory_store.delete([trajectory.trajectory_id])
+        await write_task
 
     async def _reemit_existing(self, traj: Trajectory) -> Reward:
         """Re-emit an already-terminal trajectory (partial rollout resume)."""

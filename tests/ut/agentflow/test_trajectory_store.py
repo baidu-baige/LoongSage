@@ -1,6 +1,8 @@
 """Unit tests for ``coda.agentflow.trajectory_store``."""
 
 from coda.agentflow.trajectory_store import (
+    FloatSeq,
+    IntSeq,
     Segment,
     Trajectory,
     TrajectoryGroup,
@@ -150,6 +152,26 @@ class TestTrajectoryModels:
         assert traj.loss_masks[turn2.logprob_start:turn2.logprob_end] == [1, 1]
         assert traj.token_rewards[-1] == 1.0
 
+    def test_per_token_fields_are_packed_and_list_like(self) -> None:
+        """Per-token fields hold no GC-visible element objects but still behave like lists."""
+        import copy
+        import gc
+        import pickle
+
+        traj = Trajectory(trajectory_id="t", tokens=[1, 2, 3], rollout_log_probs=[-0.5])
+        assert isinstance(traj.tokens, IntSeq) and isinstance(traj.rollout_log_probs, FloatSeq)
+        assert gc.get_referents(traj.tokens) == [IntSeq]
+
+        traj.tokens.extend([4, 5])
+        traj.tokens[1:3] = [9]
+        del traj.tokens[0]
+        assert traj.tokens == [9, 4, 5] and traj.tokens[0:2] == [9, 4]
+        assert [0, *traj.tokens] == [0, 9, 4, 5]
+
+        for clone in (copy.deepcopy(traj), pickle.loads(pickle.dumps(traj)), traj.model_copy(deep=True)):
+            assert type(clone.tokens) is IntSeq and clone.tokens == [9, 4, 5]
+        assert traj.model_dump()["tokens"] == [9, 4, 5]
+
 class TestTrajectoryGroup:
     """Tests for TrajectoryGroup model."""
 
@@ -273,3 +295,19 @@ class TestTrajectoryStore:
         store.clear()
 
         assert store.trajectory_data == {}
+
+
+def test_trajectory_prompt_accepts_content_parts():
+    parts = [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}]}]
+    traj = Trajectory(trajectory_id="t", prompt_id="p", prompt=parts)
+    assert traj.prompt == parts
+
+
+def test_multimodal_train_inputs_defaults_to_none_and_is_excluded_from_dump():
+    traj = Trajectory(trajectory_id="t", prompt_id="p")
+    assert traj.multimodal_train_inputs is None
+    traj.multimodal_train_inputs = [
+        {"token_start": 1, "token_end": 5, "image_hash": "h", "tensors": {"pixel_values": object()}}
+    ]
+    assert "multimodal_train_inputs" not in traj.model_dump()
+    assert "multimodal_train_inputs" not in traj.model_dump_json()

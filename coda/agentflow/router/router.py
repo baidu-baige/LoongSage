@@ -8,7 +8,7 @@ import threading
 import time
 from collections import Counter
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 import uvicorn
@@ -23,8 +23,8 @@ from coda.agentflow.utils import build_request_id
 class WorkerPayload(PydanticModel):
     """Worker management payload."""
     worker_url: str
-    # Number of attention-DP groups inside the worker (SGLang ``--dp-size`` when
-    # ``--enable-dp-attention`` is on). The router uses it to assign each request to
+    # Number of attention-DP groups inside the worker (SGLang ``--attn-dp-size``).
+    # The router uses it to assign each request to
     # a specific DP group via ``routed_dp_rank`` instead of SGLang load-balancing
     # internally. 1 means "no DP attention" (nothing to route).
     dp_size: int = 1
@@ -146,8 +146,11 @@ class Router:
         self.trajectory_store = (middleware_kwargs or {}).get("trajectory_store")
         self.app = FastAPI()
         self._setup_routes()
+        # Callbacks run on shutdown to release middleware-owned resources (e.g. R3 decode pool).
+        self._shutdown_callbacks: list[Callable[[], None]] = []
         middleware_context = dict(middleware_kwargs or {})
         middleware_context["inflight_requests"] = self.inflight_requests
+        middleware_context["shutdown_callbacks"] = self._shutdown_callbacks
         self._setup_middlewares(
             resolve_middleware_chain(config.middleware),
             middleware_context,
@@ -702,3 +705,8 @@ class Router:
             if self._thread.is_alive():
                 logger.warning("[shutdown] router thread did not stop within %ss", _join_timeout)
         self._server = self._thread = None
+        for callback in self._shutdown_callbacks:
+            try:
+                callback()
+            except Exception as e:
+                logger.warning("[shutdown] shutdown callback %r failed: %s", callback, e)

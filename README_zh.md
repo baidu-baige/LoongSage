@@ -63,6 +63,7 @@ ______________________________________________________________________
 
 ## 📰 最新动态 (News)
 
+- **[2026-11]** 发布首个正式版本 [v0.2.0](https://github.com/baidu-baige/LoongSage/releases/tag/v0.2.0)：DeepSeek-V4.1 训练、PPO 与 SFT、Qwen3-VL 图像模态 RL、SGLang 0.5.23！
 - **[2026-10]** 支持 DeepSeek-V4.1-Flash [QAT 训练](conf/dsv41_flash/)，并新增 [RLCD2 训练配方](conf/rlcd2/)！
 - **[2026-10]** 技术报告 [*LoongSage: A Production-Grade, High-Efficiency Agentic RL Framework for Frontier LLMs with Validated Recipes*](https://arxiv.org/abs/2610.16352) 已在 arXiv 发布！
 - **[2026-09]** 原生支持黑盒智能体 OpenCode、Codex 与 Claude Code，无需改动智能体代码即可直接用于 RL 训练（配方见 [`conf/qwen3_coder_30b_a3b/`](conf/qwen3_coder_30b_a3b/)）！
@@ -85,6 +86,28 @@ ______________________________________________________________________
 | 数据 | [`data_factory/`](coda/data_factory/) | 管理数据集加载、可续采数据源、采样过滤机制以及基于负载均衡的数据切分分发。 |
 | 传输 | [`transfer_mesh/`](coda/transfer_mesh/) | 训练与推理引擎之间的高性能统一数据传输通道。 |
 | 调度 | [`resource_scheduler/`](coda/resource_scheduler/) | 基于 Ray Placement Group 实现 GPU 资源的精细化分配，完美支持同卡复用与分离式部署。 |
+
+______________________________________________________________________
+
+## 📦 支持的模型 (Supported Models)
+
+训练侧通过 Megatron-Bridge 的 `AutoBridge` 加载模型，推理侧由 SGLang 提供服务，框架内没有针对单个模型的适配代码，因此理论上 Megatron-Bridge 与 SGLang 同时支持的模型均可训练。下表以外的模型可能需要自行调整并行与显存相关配置。
+
+以下模型已通过 [`conf/`](conf/) 中的配方验证：
+
+| 模型 | 配方 | 硬件（节点数 × 8 卡） |
+| :--- | :--- | :--- |
+| DeepSeek-V4.1-Flash（原始 FP8/MXFP4 权重，QAT） | [`dsv41_flash/`](conf/dsv41_flash/)：DAPO、SWE、SFT | H20 × 6 |
+| DeepSeek-V4.1-Flash（BF16） | [`dsv41_flash_bf16/`](conf/dsv41_flash_bf16/)：DAPO、SWE | B200 × 5–6，H20 × 6 |
+| DeepSeek-V4-Flash（BF16） | [`dsv4_flash_bf16/`](conf/dsv4_flash_bf16/)：DAPO、SWE | H20 × 6–8，GB200 × 8 |
+| Qwen3-30B-A3B | [`qwen3_30b_a3b/`](conf/qwen3_30b_a3b/)：DAPO、GSM8K、BCP、MOPD | H20 × 1 |
+| Qwen3-Coder-30B-A3B-Instruct | [`qwen3_coder_30b_a3b/`](conf/qwen3_coder_30b_a3b/)：Claude Code、Codex、OpenCode、mini-SWE | H20 × 2–4 |
+| Qwen3-VL-30B-A3B-Instruct | [`qwen3_vl_30b_a3b/`](conf/qwen3_vl_30b_a3b/)：GRPO（geo3k 单图、MMRB 多图） | H20 × 1 |
+| Qwen3.8-27B | [`qwen3.8_27b/`](conf/qwen3.8_27b/)：DAPO | H20 × 1 |
+| Qwen3-4B | [`qwen3_4b/`](conf/qwen3_4b/)：DAPO、SFT | H800 × 1，H20 × 1 |
+| StartLux-Decision-v1.1-4B-AutoThink | [`rlcd2/`](conf/rlcd2/)：RLCD2 | H20 × 1 |
+
+QAT（`trainer.qat`）目前仅支持 DeepSeek-V4.1，其他模型均以 BF16 训练。
 
 ______________________________________________________________________
 
@@ -162,7 +185,6 @@ ______________________________________________________________________
 以下为后续主要开发计划，欢迎通过 Issue 参与讨论与共建：
 
 - [ ] 低精度训练支持
-- [ ] PPO能力支持
 - [ ] MTP/DSpark
 - [ ] 全异步场景下的多数据源、多智能体支持
 - [x] SFT能力支持（`run_mode: sft`，示例见 `conf/qwen3_4b/sft_h20_1node.yaml`）

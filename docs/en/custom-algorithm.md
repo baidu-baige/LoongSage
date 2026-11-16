@@ -13,7 +13,7 @@ Modules under `coda/custom/` are imported automatically so that `@register_*` ex
 
 ## 2. Custom Advantage
 
-The function signature is `(config, rollout_data) -> list[Tensor]`. The fields available in `rollout_data` include `rewards` (the scalar reward of each trajectory), `prompt_id` (used for within-group normalization), `response_lengths`, and so on; the return value is a list of per-trajectory advantage tensors, each of shape `(response_len_i,)`.
+The function signature is `(config, rollout_data) -> (advantages, returns)`. The fields available in `rollout_data` include `rewards` (the scalar reward of each trajectory), `prompt_id` (used for within-group normalization), `response_lengths`, and so on. Both return values are lists of per-trajectory tensors, each of shape `(response_len_i,)`; `returns` are the value targets of a critic, so a critic-free estimator returns its advantages twice. The optional step-wide whitening (`algorithm.use_masked_whiten`) is applied by the framework afterwards, so an estimator should not whiten itself.
 
 ```python
 import torch
@@ -25,7 +25,8 @@ def reward_centered(config, rollout_data):
     rewards = torch.tensor(rollout_data["rewards"], dtype=torch.float32)
     lengths = rollout_data["response_lengths"]
     adv = rewards - rewards.mean()
-    return list(torch.repeat_interleave(adv, torch.tensor(lengths)).split(lengths))
+    advantages = list(torch.repeat_interleave(adv, torch.tensor(lengths)).split(lengths))
+    return advantages, advantages  # no critic: returns = advantages
 ```
 
 ## 3. Custom GRPO-like Loss

@@ -125,8 +125,8 @@ class SglangEngine(RolloutWorker):
             # DP attention: report the attention-DP group count so the router can pin
             # each request to one via routed_dp_rank, instead of letting SGLang's
             # internal DataParallelController distribute. 1 = no DP attention.
-            if server_args.enable_dp_attention:
-                payload["dp_size"] = server_args.dp_size
+            if server_args.attn_dp_size > 1:
+                payload["dp_size"] = server_args.attn_dp_size
             response = requests.post(
                 f"http://{self.router_ip}:{self.router_port}/add_worker",
                 json=payload,

@@ -23,7 +23,9 @@ from coda.utils.checkpoint_utils import (
     get_hf_dir,
     get_tracker_file,
     resolve_dist_ckpt_dir,
+    should_save,
 )
+from omegaconf import OmegaConf
 
 KEY = "ref_dist_ckpt_path"
 
@@ -120,3 +122,31 @@ class TestStudentPathsUnchanged:
         assert get_hf_dir("/b", 5) == os.path.join("/b", "train_step_5", "hf_model")
         assert get_data_source_dir("/b", 5) == os.path.join("/b", "train_step_5", "data_source")
         assert get_tracker_file("/b") == "/b/latest_checkpointed_iteration.txt"
+
+
+class TestCriticCheckpointLayout:
+    """PPO: the critic saves next to the actor under train_step_N/ and shares the tracker."""
+
+    def test_named_dirs_share_the_step_dir(self):
+        assert get_ckpt_dir("/b", 5, name="critic_dist_ckpt") == os.path.join("/b", "train_step_5", "critic_dist_ckpt")
+
+    def test_warmup_resume_finds_critic_but_not_actor(self, tmp_path):
+        """Tracker written by the critic during warmup: actor falls back to HF, critic resumes."""
+        base = tmp_path / "run"
+        (base / "train_step_3" / "critic_dist_ckpt").mkdir(parents=True)
+        (base / "latest_checkpointed_iteration.txt").write_text("3")
+
+        assert find_latest_ckpt_path(str(base)) is None
+        assert find_latest_ckpt_path(str(base), name="critic_dist_ckpt") == str(
+            base / "train_step_3" / "critic_dist_ckpt"
+        )
+
+
+@pytest.mark.parametrize(
+    "save_freq, step, expected",
+    [(-1, 10, False), (0, 10, False), (5, 5, True), (5, 6, False), (5, 7, True)],
+)
+def test_should_save(save_freq, step, expected):
+    """Every save_freq steps plus always the final step (total_steps=7)."""
+    config = OmegaConf.create({"trainer": {"save_freq": save_freq}, "total_steps": 7})
+    assert should_save(config, step) is expected

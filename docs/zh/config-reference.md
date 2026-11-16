@@ -24,6 +24,19 @@
 | `total_steps` | `3000` | 训练总步数。 | — |
 | `log_level` | `INFO` | 全局日志级别。 | 取值 `DEBUG` / `INFO` / `WARNING` / `ERROR` / `CRITICAL`。 |
 
+### 1.1 multimodal（图像模态）
+
+用于开启 VLM 训练的图像输入。默认全部关闭，纯文本训练不读取该节。数据格式与启动示例见 [运行指南](run-guide.md#任务八使用图像训练视觉语言模型qwen3-vl)。
+
+| 参数 | 默认 | 说明 | 约束 |
+| --- | --- | --- | --- |
+| `multimodal.enable` | `false` | 是否开启图像模态训练。开启后 Router 会加载 `hf_model_path` 的 HF processor，把每张图片展开成模型实际看到的 image pad token，训练侧再把图像张量送入模型。 | 需安装 `qwen-vl-utils`（启动时校验）。为 `false` 时任何数据源都不能设置 `dataset.multimodal_keys`。 |
+| `multimodal.modalities` | `[image]` | 启用的模态列表。 | `enable=true` 时不能为空。目前只实现 `image`，`video` / `audio` 为预留项，填写会报错。 |
+| `multimodal.image.min_pixels` | `65536` | 单张图片像素数下限。像素数更小的图片会在 HF processor 之前被 Router 放大到该值。全局生效，对所有数据源一致。 | `> 0` 且 `<= max_pixels`；须 `>=` processor 的 `shortest_edge`，在 processor 加载时校验。 |
+| `multimodal.image.max_pixels` | `16777216` | 单张图片像素数上限（4096x4096），更大的图片会被缩小到该值。Qwen3-VL 每 32x32 像素 1 个 token，因此单张图最多 16384 个 image token。 | `> 0`；须 `<=` processor 的 `longest_edge`，在 processor 加载时校验。 |
+
+`multimodal.enable=true` 时 `rollout.sglang_args.enable_multimodal` 会被自动置为 `true`；若同时显式写成 `false`，会报配置错误。
+
 ## 2. 全异步（fully_async）
 
 以下开关用于启用「rollout 与训练并发运行」的全异步流水线。详细原理与调优建议见 [全异步模式](fully-async-mode.md)。
@@ -45,11 +58,13 @@
 | `dataset.prompt_data_path` | `???` | prompt 数据集路径，支持 `.jsonl` / `.parquet`；可加行切片后缀 `data.jsonl@[0:1000]`。 | 必填。 |
 | `dataset.eval_prompt_data_path` | `null` | 评测集路径，格式同上。 | `null` 表示禁用 eval；同时需 `rollout.eval.interval > 0` 才会真正运行 eval。 |
 | `dataset.max_prompt_len` | `null` | 单个 prompt 允许的最大字符数，超长样本会在加载时丢弃。 | `null` 关闭过滤；这里是**字符**长度，不是 token 长度。 |
+| `dataset.max_image_tokens` | `null` | 单个 prompt 全部图片的估算 token 数之和上限，超限样本会在加载时丢弃。 | `null` 关闭过滤；按图片头部尺寸和 `multimodal.image.{min_pixels,max_pixels}` 估算，假设 Qwen3-VL 每 32x32 像素 1 个 token；与 `max_prompt_len` 相互独立。 |
+| `dataset.multimodal_keys` | `null` | 模态到数据列的映射，如 `{image: images}`。`images` 列按顺序存放 prompt 文本中每个 `<image>` 占位符对应的一个 base64 data URI（`data:image/...;base64,...`）。 | `null` 表示纯文本数据集。需 `multimodal.enable=true`；key 必须在 `multimodal.modalities` 中；目前只实现 `image`。占位符数量必须等于该列的元素个数。 |
 | `dataset.input_key` | `???` | prompt 文本或 message 列的列名。 | 必填。 |
 | `dataset.label_key` | `???` | 参考答案 / label 列的列名。 | 必填；不需要时可显式设为 `null`。 |
 | `dataset.metadata_key` | `metadata` | 每行 metadata dict 的列名。列值会原样交给 agent，即 `trajectory["metadata"]`。schema 不固定，可放任意样本级信息（如 `{"difficulty": "hard"}`）。 | 列值须为 dict；缺省时视为空 dict。 |
 | `dataset.shuffle` | `true` | 是否对训练集做 shuffle。 | eval 集始终不 shuffle。 |
-| `dataset.data_pre_processor` | `null` | 原始样本预处理器名，在构建 messages 前对每条原始数据生效（用 `@register_data_pre_processor` 注册；见 [data_pre_processor.py](../../coda/data_factory/data_pre_processor.py)）。内置：`gsm8k`。 | `null` 表示不做预处理。 |
+| `dataset.data_pre_processor` | `null` | 原始样本预处理器名，在构建 messages 前对每条原始数据生效（用 `@register_data_pre_processor` 注册；见 [data_pre_processor.py](../../coda/data_factory/data_pre_processor.py)）。内置：`gsm8k`；`geo3k`（把存放 HF 图像结构的 `images` 列转成 data URI，补齐缺失的 `<image>` 占位符，并追加 `\boxed{}` 格式指令）。 | `null` 表示不做预处理。 |
 | `dataset.buffer_replay_strategy` | `null` | Buffer 回放策略名（用 `@register_buffer_replay_strategy` 注册；见 [data_source.py](../../coda/data_factory/data_source.py)）。 | 仅 `RolloutDataSourceWithBuffer` 生效；`null` 等价于 `fifo`。 |
 
 ### 3.2 agent / reward / 其他
@@ -191,7 +206,9 @@ Agent 侧的 Router 与 tokenizer，以及 trajectory dump 等框架级能力。
 | `megatron.model.pipeline_model_parallel_size` | `1` | Pipeline Parallel 大小（PP）。 | 同上，参与 `TP × PP × CP`。 |
 | `megatron.model.virtual_pipeline_model_parallel_size` | `null` | Virtual PP（VPP）大小，用于减小 PP bubble。 | 需 PP > 1。 |
 | `megatron.model.context_parallel_size` | `1` | Context Parallel 大小（CP，序列切分）。 | 与 `cp_partition_mode` 配套；参与 `TP × PP × CP`。 |
-| `megatron.model.cp_partition_mode` | `zigzag` | CP 切分方式，`zigzag` 等。 | 仅 CP > 1 时生效。 |
+| `megatron.model.cp_partition_mode` | `zigzag` | CP 切分方式，`zigzag` 等。 | 仅 CP > 1 时生效。`multimodal.enable=true` 且 CP > 1 时只接受 `zigzag`。 |
+| `megatron.model.freeze_vision_model` | 未设置 | 冻结视觉塔（Qwen3-VL）。 | Megatron-Bridge 对 Qwen3-VL-MoE 默认取 `True`，请显式设置；未设置时会打印 warning。 |
+| `megatron.model.freeze_language_model` | 未设置 | 冻结语言模型（Qwen3-VL）。 | 同上。要训练语言模型须设为 `false`。 |
 | `megatron.model.expert_model_parallel_size` | `1` | MoE 的 Expert Parallel（EP）。 | 非 MoE 模型保持 1。要求训练总卡数能被 `ETP × EP × PP` 整除。 |
 | `megatron.model.expert_tensor_parallel_size` | `null` | MoE 专家部分的 TP 大小。 | `null` 表示与 `tensor_model_parallel_size` 相同，该值即上式中的 `ETP`。 |
 | `megatron.model.overlap_p2p_comm` | `false` | PP 阶段 P2P 通信是否与计算 overlap。 | PP > 1 时才有收益。 |
@@ -229,6 +246,24 @@ Agent 侧的 Router 与 tokenizer，以及 trajectory dump 等框架级能力。
 > - `megatron.scheduler`  → `megatron.core.optimizer_param_scheduler.OptimizerParamScheduler` 构造参数；其中 `max_lr` / `min_lr` / `init_lr` / `start_wd` / `end_wd` 未显式设置时会自动从 `megatron.optimizer.lr` / `min_lr` / `weight_decay` 兜底。
 
 
+### 7.3 `critic`（PPO value 模型）
+
+critic 是 PPO 中和 actor 一起训练的第二个 Megatron 模型。它总是和 actor 共卡：每个 critic rank 都钉在对应 actor rank 所在的 bundle 上。critic 复用 `megatron.model` / `megatron.ddp_config`，并行配置和 actor 完全相同，只有 optimizer、LR schedule 和 checkpoint 是自己独立的。
+
+| 字段 | 默认值 | 说明 | 约束 |
+| --- | --- | --- | --- |
+| `critic.enable` | `false` | 是否训练 PPO critic。 | 需要 `algorithm.advantage_estimator: gae`、`num_trajectories_per_prompt == 1`；不能和 `opd.enable` 同时开启；每条 trajectory 只能有一个 Segment（暂不支持多 Segment）。 |
+| `critic.optimizer` | 见 yaml | critic 的 optimizer。对 critic 整体替换 `megatron.optimizer`，不继承 actor 的配置。 | `min_lr` 没有显式设置时按 `critic.optimizer.lr` 推导。 |
+| `critic.scheduler` | 见 yaml | critic 的 LR scheduler。对 critic 整体替换 `megatron.scheduler`，不继承 actor 的配置。 | `max_lr` / `min_lr` / `init_lr` / `start_wd` / `end_wd` 没有显式设置时按 critic 的 optimizer 推导。 |
+| `critic.critic_warmup` | `0` | `step <= critic_warmup` 时只训练 critic，actor 既不训练也不保存。 | `>= 0`。 |
+| `critic.value_head_init_std` | `0.02` | value head 权重正态初始化的 std，bias 初始为 0。 | head 跟随模型精度。 |
+
+critic 的 checkpoint 同步保存到 `train_step_N/critic_dist_ckpt`，和 actor 的 `dist_ckpt` 放在同一个 step 目录下，两者共用 `latest_checkpointed_iteration.txt`：
+- warmup 期间由 critic 写 tracker。
+- warmup 之后由 actor 写 tracker。同一个 step 里，critic 总是先保存完成。
+
+如果 resume 的 step 落在 warmup 内，该 step 下没有 actor 的 `dist_ckpt`，actor 会直接从 HF 权重启动，这和它在 warmup 期间的真实状态一致。
+
 ## 8. OPD（On-Policy Distillation）
 
 OPD（On-Policy Distillation）在 RL 流程中额外挂载若干 teacher 模型，把 teacher 的分布作为软目标，用可配置的 KL 项与 policy gradient 项混合，形成 `L = (1-gkd_ratio) × [A - pg_ratio × KL_token] + gkd_ratio × L_GKD`。详见 [在线蒸馏 (On-Policy Distillation)](on-policy-distillation.md)。
@@ -264,14 +299,18 @@ OPD（On-Policy Distillation）在 RL 流程中额外挂载若干 teacher 模型
 
 | 参数 | 默认 | 说明 | 约束 |
 | --- | --- | --- | --- |
-| `algorithm.advantage_estimator` | `grpo` | advantage 估计方法名。 | 通过 registry 注册；当前内置 `grpo`。 |
-| `algorithm.advantage_norm_mode` | `group_zscore` | advantage 归一化模式。 | `none` / `group_mean` / `group_zscore` / `batch_mean` / `batch_zscore`；`group_*` 要求同组 trajectory 数一致。 |
-| `algorithm.policy_loss` | `grpo` | policy loss 名。 | 内置 `grpo` / `gspo`；GSPO 见 [论文](https://arxiv.org/pdf/2507.18071)。 |
+| `algorithm.advantage_estimator` | `grpo` | advantage 估计方法名。 | 通过 registry 注册；当前内置 `grpo`、`gae`（PPO：advantage 由 critic 计算，需要 `critic.enable`）。 |
+| `algorithm.advantage_norm_mode` | `group_zscore` | `grpo` 的组内 reward 归一化方式。 | `none` / `group_mean` / `group_zscore`；`group_*` 要求同组 trajectory 数一致；`gae` 忽略此项。 |
+| `algorithm.use_masked_whiten` | `false` | 对任意 estimator 的 advantage，在整个 step 的全部 response token 上做白化（DP 内 all-reduce）。 | 在 estimator 之后执行；PPO 的 returns 不做白化。 |
+| `algorithm.policy_loss` | `grpo` | policy loss 名。 | 内置 `grpo` / `ppo`（与 `grpo` 同一个 clipped surrogate）/ `gspo`；GSPO 见 [论文](https://arxiv.org/pdf/2507.18071)。 |
+| `algorithm.ppo.value_clip` | `0.2` | critic value loss 围绕 old values 的裁剪范围。 | 仅 `advantage_estimator: gae` 时使用。 |
+| `algorithm.ppo.gamma` | `1.0` | GAE 折扣因子。 | 仅 `advantage_estimator: gae` 时使用。 |
+| `algorithm.ppo.lam` | `0.95` | GAE lambda。 | 仅 `advantage_estimator: gae` 时使用。 |
 | `algorithm.loss_agg_mode` | `token-mean` | loss 聚合方式。 | `token-mean` / `seq-mean-token-mean`。 |
 | `algorithm.entropy_coef` | `0.0` | entropy 正则系数。 | 非零时 loss 中减去 `entropy_coef × entropy`。 |
 | `algorithm.clip_ratio_low` | `0.2` | GRPO / GSPO 的下侧 clip。 | 与 `clip_ratio_high` 组合成非对称裁剪（DAPO clip-higher）。 |
 | `algorithm.clip_ratio_high` | `0.28` | 上侧 clip。 | 同上。 |
-| `algorithm.clip_ratio_c` | `10.0` | 负 advantage 的 dual-clip 上界。 | 仅 `policy_loss: grpo` 生效。 |
+| `algorithm.clip_ratio_c` | `10.0` | 负 advantage 的 dual-clip 上界。 | 仅 `policy_loss: grpo` / `ppo` 生效。 |
 
 ### 9.2 is_correction（重要性采样修正）
 
@@ -314,7 +353,7 @@ OPD（On-Policy Distillation）在 RL 流程中额外挂载若干 teacher 模型
 | `trainer.use_rollout_log_probs` | `false` | 使用推理引擎返回的 `rollout_log_probs` 替代训练侧重算的 `old_log_probs`。 | 与 IS correction、M2PO 互斥。 |
 | `trainer.use_rollout_routing_replay` | `false` | 使用推理端记录的 MoE routing 结果做 replay。 | 用于对齐推理/训练 MoE 路由。 |
 | `trainer.use_fp32_lm_head` | `false` | LM head 是否使用 FP32 计算。 | 数值敏感场景可开启。 |
-| `trainer.forward_only` | `false` | 训练 worker 只做前向：不包 DDP（不分配梯度 buffer），也不构建 optimizer / LR scheduler。worker 只持有权重并同步给 rollout 引擎，每步仍重算 `old_log_probs` 并上报 IS / k3 等前向指标，但不做反向和参数更新。适合只评估训推一致性或只采样的场景，可省下梯度 buffer 与优化器状态的显存。 | `run_mode: rollout-only` 时自动置为 `true`。权重从不更新，因此不支持保存：开启时需 `trainer.save_freq <= 0`，否则启动报错。任何需要训练的任务都必须为 `false`。 |
+| `trainer.forward_only` | `false` | 训练 worker 只做前向：不包 DDP（不分配梯度 buffer），也不构建 optimizer / LR scheduler。worker 只持有权重并同步给 rollout 引擎，每步仍重算 `old_log_probs` 并上报 IS / k3 等前向指标，但不做反向和参数更新。适合只评估训推一致性或只采样的场景，可省下梯度 buffer 与优化器状态的显存。 | `run_mode: rollout-only` 时自动置为 `true`，同时把 `critic.enable` 置为 `false`。不能与 `critic.enable` 同时开启，否则启动报错。权重从不更新，因此不支持保存：开启时需 `trainer.save_freq <= 0`，否则启动报错。任何需要训练的任务都必须为 `false`。 |
 | `trainer.temperature` | `1.0` | 采样温度。eval 轮次在 `rollout.eval.temperature` 非 `null` 时改用后者。 | 由 Router 管理，`completion_params.temperature` 不生效。 |
 | `trainer.mini_batch_size` | `64` | 每次 optimizer step 消费的 trajectory 数 `M`。`num_mini_batch = (B × N) / M`。 | `(B × N) % M == 0`；且每个数据源需满足 `num_prompts_per_step % (dp_size × num_mini_batch) == 0`。两者都启动即校验，满足后 `M % dp_size == 0` 自动成立。详见 [11.9](#119-dp-与-batch-尺寸)。 |
 | `trainer.micro_batch_size` | `8` | 每张 GPU 单次前向的样本数。 | 仅当 `use_dynamic_batch_size: false` 时要求 `mini_batch_size % micro_batch_size == 0`；开启动态 batch 后本项失效。 |
@@ -354,7 +393,7 @@ OPD（On-Policy Distillation）在 RL 流程中额外挂载若干 teacher 模型
   - `run_mode: default`
   - `rollout.sampler.num_oversample: 0`（额外容量由 `fully_async.stale_steps` 提供）
 - 目前 `data_sources` 只允许一个数据源。
-- 需满足 `B × N` 能被 `trainer.mini_batch_size` 整除，且强烈建议 `M % N == 0`（否则拿不齐完整 group）。其中 `B = num_prompts_per_step`、`N = num_trajectories_per_prompt`、`M = mini_batch_size`。
+- 和同步模式一样，需满足 `B × N` 能被 `trainer.mini_batch_size` 整除。其中 `B = num_prompts_per_step`、`N = num_trajectories_per_prompt`、`M = mini_batch_size`。trainer 每次取出一整个 step（`B` 个 group），因此 `M` 不必是 `N` 的整数倍。
 
 ### 11.4 Partial rollout
 

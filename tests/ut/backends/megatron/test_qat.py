@@ -14,7 +14,7 @@ from megatron.bridge.models.conversion.param_mapping import (  # noqa: E402
 )
 
 from coda.backends.megatron import qat  # noqa: E402
-from coda.utils.quant_formats import CkptQuant, QuantScheme  # noqa: E402
+from coda.utils.quant_formats import CkptQuant, QuantScheme, UnsupportedQuant  # noqa: E402
 
 FP8 = QuantScheme("fp8_block", (32, 32))
 FP4 = QuantScheme("mxfp4", (1, 32))
@@ -82,25 +82,62 @@ GOOD_ROLLOUT = {"backend": "sglang", "env_vars": {"SGLANG_OPT_FP8_WO_A_GEMM": "0
                 "sglang_args": {"flashinfer_mxfp4_moe_precision": "bf16", "disable_shared_experts_fusion": True}}
 
 
-def _cfg(enable, rollout=GOOD_ROLLOUT):
-    return OmegaConf.create({"trainer": {"qat": enable}, "rollout": rollout})
+def _cfg(enable, rollout=GOOD_ROLLOUT, rounding="threshold"):
+    return OmegaConf.create({"run_mode": "default", "trainer": {"qat": enable, "qat_weight_rounding": rounding},
+                             "rollout": rollout})
 
 
-def _plan(monkeypatch, m, enable, ckpt=CKPT, rollout=GOOD_ROLLOUT):
-    monkeypatch.setattr(qat, "read_ckpt_quant", lambda path: ckpt)
+def _plan(monkeypatch, m, enable, ckpt=CKPT, rollout=GOOD_ROLLOUT, unsupported=None, rounding="threshold"):
+    monkeypatch.setattr(qat, "scan_ckpt_quant", lambda path: (ckpt, unsupported or {}))
     monkeypatch.setattr(qat.os.path, "isdir", lambda path: True)
-    return qat.QuantPlan(_bridge(m), [m], "/ckpt", _cfg(enable, rollout))
+    monkeypatch.setattr(qat.torch.distributed, "get_rank", lambda: 0)
+    return qat.QuantPlan(_bridge(m), [m], "/ckpt", _cfg(enable, rollout, rounding))
 
 
-def test_plan_snap_and_hooks(monkeypatch):
+@pytest.mark.parametrize("rounding", ["threshold", "nearest"])
+def test_plan_snap_and_hooks(monkeypatch, rounding):
     m = _toy()
     keep = m.norm.weight.clone()
-    plan = _plan(monkeypatch, m, enable=True)
+    plan = _plan(monkeypatch, m, enable=True, rounding=rounding)
     assert plan.quantized and [n for n, _, _ in plan.snap_params] == ["wq_b.weight", "wo_a.weight", "experts.weight0"]
     assert [n for n, _, _ in plan.act_modules] == ["wq_b"]  # wo_a: bf16 act; experts: W4A16
-    assert plan.count_off_grid() == 3
-    assert plan.snap_() == 3 and plan.count_off_grid() == 0
+    before = [p.clone() for _, p, _ in plan.snap_params]
+    assert plan.snap_() == 3
+    for (_, p, scheme), thr, b in zip(plan.snap_params, plan._snap_thresholds, before):
+        assert (thr is None) == (rounding == "nearest")
+        assert not torch.equal(p, b) and torch.equal(p, scheme.snap_(b, thr))
+        assert torch.equal(scheme.snap_(p.clone()), p)  # on the grid
     assert torch.equal(m.norm.weight, keep)
+
+
+def test_plan_rejects_unknown_rounding(monkeypatch):
+    with pytest.raises(ValueError, match="qat_weight_rounding"):
+        _plan(monkeypatch, _toy(), enable=True, rounding="stochastic")
+
+
+@pytest.mark.parametrize(
+    "mapping,n,full,tp",
+    [
+        (ColumnParallelMapping("x", "a"), 1, (128, 64), 2),  # dim-0 shard
+        (RowParallelMapping("x", "a"), 1, (64, 128), 4),  # dim-1 shard
+        (GatedMLPMapping("x", gate="g", up="u"), 2, (128, 64), 2),  # [g_r; u_r]
+        (GatedMLPMapping("x", gate="g", up="u"), 2, (64, 64), 1),  # EP expert, unsharded
+    ],
+)
+def test_thresholds_follow_checkpoint_layout(monkeypatch, mapping, n, full, tp):
+    """Every TP rank's local thresholds are the matching slices of the full checkpoint tensors'."""
+    names = qat.hf_names(mapping)
+    O, I = full
+    whole = {nm: qat._thresholds_fn(mapping, [nm], torch.Size(full), full)(0, O, "cpu") for nm in names}
+    dim0 = isinstance(mapping, (ColumnParallelMapping, GatedMLPMapping))
+    o, i = (O // tp, I) if dim0 else (O, I // tp)
+    for rank in range(tp):
+        monkeypatch.setattr(type(mapping), "tp_rank", property(lambda self, r=rank: r))
+        fn = qat._thresholds_fn(mapping, names, torch.Size((o * n, i)), full)
+        got = torch.cat([fn(r0, min(r0 + 24, o * n), "cpu") for r0 in range(0, o * n, 24)])  # uneven chunks
+        rs = slice(rank * o, (rank + 1) * o) if dim0 else slice(None)
+        cs = slice(None) if dim0 else slice(rank * i, (rank + 1) * i)
+        torch.testing.assert_close(got, torch.cat([whole[nm][rs, cs] for nm in names]), rtol=0, atol=0)
 
 
 def test_plan_without_qat_only_encodes(monkeypatch):
@@ -111,13 +148,35 @@ def test_plan_without_qat_only_encodes(monkeypatch):
 def test_plan_bf16_ckpt(monkeypatch):
     plan = _plan(monkeypatch, _toy(), enable=False, ckpt={})
     assert not plan.quantized
-    with pytest.raises(ValueError, match="needs a quantized checkpoint"):
+    with pytest.raises(ValueError, match="no trained tensor"):
         _plan(monkeypatch, _toy(), enable=True, ckpt={})
     # only untrained tensors (e.g. the engram table) quantized
     table = {"layers.1.engram.embed.weight": CkptQuant(FP8, "layers.1.engram.embed.scale", (64, 64))}
     assert not _plan(monkeypatch, _toy(), enable=False, ckpt=table).quantized
     with pytest.raises(ValueError, match="no trained tensor"):
         _plan(monkeypatch, _toy(), enable=True, ckpt=table)
+
+
+def _unsupported(name, dtype="F8_E4M3", shape=(96, 64)):
+    return {name: UnsupportedQuant("unsupported quantized layout", name[: -len(".weight")] + ".scale", dtype, shape)}
+
+
+def test_plan_unsupported_layout(monkeypatch, caplog):
+    # e.g. MTP e_proj kept FP8 with fp32 scales in the BF16 DeepSeek-V4 checkpoint, never mapped
+    unused = _unsupported("mtp.0.e_proj.weight")
+    with caplog.at_level("INFO", logger=qat.__name__):
+        assert not _plan(monkeypatch, _toy(), enable=False, ckpt={}, unsupported=unused).quantized
+    assert "skipping 1 unmapped tensors" in caplog.text and "mtp.0.e_proj.weight" in caplog.text
+    assert _plan(monkeypatch, _toy(), enable=True, unsupported=unused).snap_params
+    # a mapped tensor with an unsupported layout: export-checked without QAT, an error with QAT
+    for name in ("layers.0.attn.wq_b.weight", "layers.9.attn.wq_b.weight"):  # also on another PP stage
+        caplog.clear()
+        with caplog.at_level("INFO", logger=qat.__name__):
+            assert _plan(monkeypatch, _toy(), enable=False, ckpt={}, unsupported=_unsupported(name)).quantized
+        assert "1 trained tensors" in caplog.text and name in caplog.text and "skipping" not in caplog.text
+        ckpt = {n: q for n, q in CKPT.items() if n != name}
+        with pytest.raises(NotImplementedError, match=name):
+            _plan(monkeypatch, _toy(), enable=True, ckpt=ckpt, unsupported=_unsupported(name))
 
 
 def test_adapter_rejects_unmodeled_rollout(monkeypatch):
@@ -127,25 +186,37 @@ def test_adapter_rejects_unmodeled_rollout(monkeypatch):
     _plan(monkeypatch, _toy(), enable=False, rollout=bad)  # no QAT -> no numerics constraints
 
 
-def test_encode(monkeypatch):
+def test_check_export(monkeypatch):
     m = _toy()
     plan = _plan(monkeypatch, m, enable=True)
     plan.snap_()
+    q, s = FP8.quant(m.wq_b.weight.data)
+    q4, s4 = FP4.quant(m.experts.weight0.data[:64])
     other = torch.randn(64).bfloat16()
-    out = dict(plan.encode([
-        ("layers.0.attn.wq_b.weight", m.wq_b.weight.data),
-        ("layers.0.ffn.experts.0.w1.weight", m.experts.weight0.data[:64]),
+    good = [
+        ("layers.0.attn.wq_b.weight", q), ("layers.0.attn.wq_b.scale", s),
+        ("layers.0.ffn.experts.0.w1.scale", s4), ("layers.0.ffn.experts.0.w1.weight", q4),  # any order
         ("layers.0.attn_norm.weight", other),
-    ]))
-    assert list(out) == ["layers.0.attn.wq_b.weight", "layers.0.attn.wq_b.scale", "layers.0.ffn.experts.0.w1.weight",
-                         "layers.0.ffn.experts.0.w1.scale", "layers.0.attn_norm.weight"]
-    assert out["layers.0.attn.wq_b.weight"].dtype == torch.float8_e4m3fn
-    assert out["layers.0.ffn.experts.0.w1.weight"].dtype == torch.int8
-    assert out["layers.0.attn_norm.weight"] is other
-    # decode back == snapped training weight (the rollout receives exactly the training weights)
-    assert torch.equal(FP8.dequant(out["layers.0.attn.wq_b.weight"], out["layers.0.attn.wq_b.scale"]), m.wq_b.weight)
-    assert torch.equal(FP4.dequant(out["layers.0.ffn.experts.0.w1.weight"], out["layers.0.ffn.experts.0.w1.scale"]),
-                       m.experts.weight0[:64])
+    ]
+    out = list(plan.check_export(good))
+    assert [n for n, _ in out] == [n for n, _ in good] and out[-1][1] is other
+    # bridge exported bf16 for a tensor the checkpoint stores quantized (same shape for FP8)
+    with pytest.raises(RuntimeError, match="must re-quantize"):
+        list(plan.check_export([("layers.0.attn.wq_b.weight", m.wq_b.weight.data)]))
+    with pytest.raises(RuntimeError, match="must re-quantize"):
+        list(plan.check_export([("layers.0.ffn.experts.0.w1.weight", m.experts.weight0.data[:64])]))
+
+
+def test_check_export_unsupported_layout(monkeypatch):
+    name = "layers.0.attn.wq_b.weight"
+    ckpt = {n: q for n, q in CKPT.items() if n != name}
+    plan = _plan(monkeypatch, _toy(), enable=False, ckpt=ckpt, unsupported=_unsupported(name))
+    w = torch.randn(96, 64)
+    stored = [(name, w.to(torch.float8_e4m3fn)), ("layers.0.attn.wq_b.scale", torch.ones(1, 1))]
+    assert [n for n, _ in plan.check_export(stored)] == [n for n, _ in stored]
+    for bad in (w.bfloat16(), w[:32].to(torch.float8_e4m3fn)):
+        with pytest.raises(RuntimeError, match=r"stores F8_E4M3 \(96, 64\).*must re-quantize"):
+            list(plan.check_export([(name, bad)]))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
