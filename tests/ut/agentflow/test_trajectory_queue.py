@@ -906,6 +906,12 @@ class TestGroupRm:
         assert [t.reward for t in group.trajectories] == [0.5, 0.5]
         assert queue.is_empty()
 
+    def test_claim_returns_queued_objects(self):
+        queue = TrajQueue(group_sizes={0: 2}, group_rm_ds={0})
+        self._fill(queue)
+        trajs = queue.claim_group_rm("100")
+        assert all(t is queue.groups["100"][t.trajectory_id] for t in trajs)
+
     def test_claim_only_once(self):
         queue = TrajQueue(group_sizes={0: 2}, group_rm_ds={0})
         self._fill(queue)

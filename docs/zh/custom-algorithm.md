@@ -13,7 +13,7 @@ advantage 与 policy loss 通过 [registry.py](../../coda/algorithms/registry.py
 
 ## 2. 自定义 advantage
 
-函数签名为 `(config, rollout_data) -> list[Tensor]`。`rollout_data` 中可用的字段包括 `rewards`（每条 trajectory 的标量 reward）、`prompt_id`（组内归一化用）、`response_lengths` 等；返回值为逐 trajectory 的 advantage 张量列表，每个张量形状为 `(response_len_i,)`。
+函数签名为 `(config, rollout_data) -> (advantages, returns)`。`rollout_data` 中可用的字段包括 `rewards`（每条 trajectory 的标量 reward）、`prompt_id`（组内归一化用）、`response_lengths` 等。两个返回值都是逐 trajectory 的张量列表，每个张量形状为 `(response_len_i,)`；`returns` 是 critic 的 value 回归目标，没有 critic 的 estimator 把 advantages 原样再返回一次即可。整个 step 的白化（`algorithm.use_masked_whiten`）由框架在 estimator 之后统一执行，estimator 内部不需要也不应该再做白化。
 
 ```python
 import torch
@@ -25,7 +25,8 @@ def reward_centered(config, rollout_data):
     rewards = torch.tensor(rollout_data["rewards"], dtype=torch.float32)
     lengths = rollout_data["response_lengths"]
     adv = rewards - rewards.mean()
-    return list(torch.repeat_interleave(adv, torch.tensor(lengths)).split(lengths))
+    advantages = list(torch.repeat_interleave(adv, torch.tensor(lengths)).split(lengths))
+    return advantages, advantages  # no critic: returns = advantages
 ```
 
 ## 3. 自定义类 GRPO loss

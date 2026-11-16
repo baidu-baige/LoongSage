@@ -91,7 +91,7 @@ data_source:
 
 - `messages[i]` 和 `contexts[i]`（即 `Trajectory.model_dump()`）对应第 i 条 trajectory，`label` 由整组共享。按相同顺序为每条 trajectory 返回一个 `Reward`。
 - `group_rm` 必须是 `async def`。它在 AgentFlow 的 event loop 上被 await，函数内的阻塞调用会卡住所有 rollout；阻塞或 CPU 密集的逻辑请用 `await asyncio.to_thread(...)` 包起来。
-- 单轮和多轮模式下，都在整组 trajectory 结束后调用一次；打分完成前，该组不会交给 trainer。如果同时实现了 `__call__`，会先逐条执行 `__call__`，再由 `group_rm` 覆盖结果；逐条的分数可以在 `contexts[i]["reward"]` 中读到。
+- 单轮和多轮模式下，都在整组 trajectory 结束后调用一次；打分完成前，该组不会交给 trainer。如果同时实现了 `__call__`，会先逐条执行 `__call__`，再由 `group_rm` 覆盖结果；逐条的分数可以在 `contexts[i]["reward"]` 中读到。`is_correct` 例外：组级分数的正负不代表答案对错，所以默认保留 `__call__` 的判定；需要覆盖时在 `group_rm` 返回的 `Reward` 里显式设置 `is_correct`。
 - 抛异常或返回值不合法时，整组标记为 FAILED，由 `status` filter 丢弃。
 - 含 aborted 或 failed trajectory 的组不打分。partial rollout 续跑后，组内全部完成时打分一次；abort 前已经打过分的组不会重复打分。
 - 配置了 `agentflow.dump_trajectory_path` 时，每条 trajectory 的 JSON 仍在 `__call__` 之后 dump，其中的 `reward` 是 `__call__` 的结果（只实现 `group_rm` 时为占位的 0）。`group_rm` 的结果另外追加到同目录的 `group_rm.jsonl`，每组一行，包含 `prompt_id`、`status`（`ok`/`failed`）、`error`，以及每条 trajectory 的 `trajectory_id`、`attempt_id`、`reward`、`is_correct`、`is_valid`、`extra_info`；按 `trajectory_id` 与 JSON 文件对应。

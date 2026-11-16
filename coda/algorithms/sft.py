@@ -37,10 +37,11 @@ def sft_loss(
 def sft_advantage(
     config: DictConfig,
     rollout_data: RolloutBatch,
-) -> list[torch.Tensor]:
-    """Constant advantage of 1: SFT has no reward signal to normalise."""
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """Constant advantage of 1: SFT has no reward signal to normalise. Returns ``(advantages, advantages)``."""
     device = rollout_data["loss_masks"][0].device if rollout_data["loss_masks"] else None
-    return [
+    advantages = [
         torch.ones(length, dtype=torch.float32, device=device)
         for length in rollout_data["response_lengths"]
     ]
+    return advantages, advantages

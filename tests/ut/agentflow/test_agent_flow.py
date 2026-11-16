@@ -11,7 +11,7 @@ import pytest
 from omegaconf import OmegaConf
 
 from coda.agentflow.agent_flow import AgentFlow
-from coda.agentflow.trajectory_store import Trajectory, TrajectoryStatus, Segment, Triplet, TrajectoryStore
+from coda.agentflow.trajectory_store import FloatSeq, Trajectory, TrajectoryStatus, Segment, Triplet, TrajectoryStore
 from coda.agentflow.utils import CONTEXT_LENGTH_EXCEEDED
 from coda.reward.reward import Reward
 
@@ -87,26 +87,23 @@ def _make_agent_flow(rollout_mode: str = "single_turn", retry_limit: int = 1,
 
     # Control-plane requests (abort / session / wait) go through the shared
     # `_control_client`; replace it with an AsyncMock so those assertions are
-    # transparent. The generation hot path builds a fresh per-request client
-    # inline (see `_patch_generation_client`), so it is patched per-test.
+    # transparent. The generation hot path uses the shared `_generate_client`
+    # (see `_patch_generation_client`), which is patched per-test.
     af._control_client = AsyncMock()
     return af
 
 
 @contextmanager
-def _patch_generation_client(post=None):
-    """Patch the per-request ``httpx.AsyncClient`` created inline by
-    ``_execute_single_turn`` for the generation call.
+def _patch_generation_client(af, post=None):
+    """Install a mock shared generation client on ``af`` for ``_execute_single_turn``.
 
-    Yields the mock client so tests can set/assert on ``.post``. ``.aclose`` is
-    an AsyncMock so the ``finally: await client.aclose()`` path works.
+    Yields the mock client so tests can set/assert on ``.post``.
     """
     client = AsyncMock()
-    client.aclose = AsyncMock()
     if post is not None:
         client.post = post
-    with patch("coda.agentflow.agent_flow.httpx.AsyncClient", return_value=client):
-        yield client
+    af._generate_client = client
+    yield client
 
 
 # ---------------------------------------------------------------------------
@@ -556,6 +553,34 @@ class TestAbort:
         assert write_done is True
 
     @pytest.mark.asyncio
+    async def test_cancelled_emit_write_still_lands_before_abort_returns(self):
+        """Cancelling an emit mid-write must not cancel the write, and abort() must wait for it."""
+        import threading
+
+        af = _make_agent_flow()
+        af._control_client.post = AsyncMock(return_value=MagicMock(status_code=200, json=lambda: {}))
+        started, release = threading.Event(), threading.Event()
+        added = []
+
+        def _blocking_add(traj):
+            started.set()
+            release.wait(timeout=5)
+            added.append(traj.trajectory_id)
+
+        af.traj_queue.add = _blocking_add
+        emit = asyncio.create_task(af._emit_terminal_trajectory(_completed("t1")))
+        while not started.is_set():
+            await asyncio.sleep(0.001)
+        emit.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await emit
+
+        threading.Timer(0.05, release.set).start()
+        await af.abort()
+
+        assert added == ["t1"]
+
+    @pytest.mark.asyncio
     async def test_calls_wait_inflight_requests_complete(self):
         """abort() step 4 must call the router's wait_inflight_requests_complete endpoint."""
         af = _make_agent_flow()
@@ -794,6 +819,44 @@ class TestEmitTerminalTrajectory:
         af.traj_queue.add.assert_called_once()
         assert "t1" not in af.trajectory_store.trajectory_data
 
+    @pytest.mark.asyncio
+    async def test_queued_copy_shares_multimodal_tensors(self):
+        import torch
+
+        af = _make_agent_flow()
+        traj = _make_trajectory("t1")
+        tensors = {"pixel_values": torch.zeros(4, 4), "image_grid_thw": torch.tensor([[1, 2, 2]])}
+        traj.multimodal_train_inputs = [{"token_start": 0, "token_end": 4, "tensors": tensors}]
+        af.trajectory_store.add(traj.trajectory_id, traj)
+        af.traj_queue.add = MagicMock()
+
+        await af._emit_terminal_trajectory(traj)
+
+        queued = af.traj_queue.add.call_args.args[0]
+        assert queued.multimodal_train_inputs[0]["tensors"]["pixel_values"] is tensors["pixel_values"]
+
+
+class TestCopyForQueue:
+    def test_text_only_trajectory_is_deep_copied(self):
+        traj = _make_trajectory("t1")
+        copy = AgentFlow._copy_for_queue(traj)
+        assert copy is not traj and copy.trajectory_id == "t1"
+        assert copy.multimodal_train_inputs is None
+
+    def test_multimodal_tensors_shared_and_other_fields_deep_copied(self):
+        import torch
+
+        traj = _make_trajectory("t1")
+        pixel = torch.zeros(4, 4)
+        items = [{"token_start": 0, "token_end": 4, "tensors": {"pixel_values": pixel}}]
+        traj.multimodal_train_inputs = items
+
+        copy = AgentFlow._copy_for_queue(traj)
+
+        assert copy.multimodal_train_inputs[0]["tensors"]["pixel_values"] is pixel
+        assert traj.multimodal_train_inputs is items  # original restored
+        assert copy is not traj and copy.tokens is not traj.tokens
+
 
 # ---------------------------------------------------------------------------
 # group_rm
@@ -813,8 +876,8 @@ def _make_group_rm_flow(group_rm) -> AgentFlow:
 def _completed(tid: str) -> Trajectory:
     traj = _make_trajectory(tid, TrajectoryStatus.COMPLETED)
     traj.prompt_id = "p1"
-    traj.rollout_log_probs = [0.0, 0.0, 0.0]
-    traj.token_rewards = [0.0, 0.0, 0.0]
+    traj.rollout_log_probs = FloatSeq([0.0, 0.0, 0.0])
+    traj.token_rewards = FloatSeq([0.0, 0.0, 0.0])
     return traj
 
 
@@ -829,7 +892,9 @@ class TestGroupRm:
         group_rm.assert_not_called()
         assert af.traj_queue.pop_group() is None
 
-        await af._emit_terminal_trajectory(_completed("t2"))
+        t2 = _completed("t2")
+        t2.is_correct = True  # __call__ verdict, opposite to the group_rm reward sign
+        await af._emit_terminal_trajectory(t2)
         group_rm.assert_awaited_once()
         messages, label, contexts = group_rm.await_args.args
         assert len(messages) == 2 and label == "correct"
@@ -838,9 +903,23 @@ class TestGroupRm:
 
         group = af.traj_queue.pop_group()
         t1, t2 = group.trajectories
-        assert (t1.reward, t1.is_correct, t1.token_rewards) == (1.0, True, [0.0, 0.0, 1.0])
-        assert (t2.reward, t2.is_correct) == (0.0, False)
+        # is_correct keeps the __call__ verdict; group_rm rewards are relative scores.
+        assert (t1.reward, t1.is_correct, t1.token_rewards) == (1.0, False, [0.0, 0.0, 1.0])
+        assert (t2.reward, t2.is_correct) == (0.0, True)
         assert t1.metadata["rank"] == 0 and t1.metadata["group_rm_scored"] is True
+
+    @pytest.mark.asyncio
+    async def test_explicit_is_correct_overrides_call_verdict(self):
+        group_rm = AsyncMock(return_value=[
+            Reward(final_reward=0.0, is_correct=True), Reward(final_reward=1.0, is_correct=False)])
+        af = _make_group_rm_flow(group_rm)
+        t2 = _completed("t2")
+        t2.is_correct = True
+        await af._emit_terminal_trajectory(_completed("t1"))
+        await af._emit_terminal_trajectory(t2)
+
+        t1, t2 = af.traj_queue.pop_group().trajectories
+        assert (t1.is_correct, t2.is_correct) == (True, False)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("result", [
@@ -909,7 +988,7 @@ class TestGroupRm:
         if group_rm.side_effect is None:
             assert record["status"] == "ok" and record["error"] is None
             assert [t["reward"] for t in record["trajectories"]] == [1.0, 0.0]
-            assert [t["is_correct"] for t in record["trajectories"]] == [True, False]
+            assert [t["is_correct"] for t in record["trajectories"]] == [False, False]
         else:
             assert record["status"] == "failed" and "judge down" in record["error"]
             assert "reward" not in record["trajectories"][0]
@@ -1448,7 +1527,7 @@ class TestExecuteSingleTurn:
         af, traj = self._setup(completion_params={})
         mock_resp = MagicMock()
         mock_resp.raise_for_status = MagicMock()
-        with _patch_generation_client() as client:
+        with _patch_generation_client(af) as client:
             client.post = AsyncMock(return_value=mock_resp)
             await af._execute_single_turn(traj, 0)
             body = client.post.call_args.kwargs["json"]
@@ -1461,7 +1540,7 @@ class TestExecuteSingleTurn:
         af, traj = self._setup(completion_params={"top_p": 0.9, "top_k": 50})
         mock_resp = MagicMock()
         mock_resp.raise_for_status = MagicMock()
-        with _patch_generation_client() as client:
+        with _patch_generation_client(af) as client:
             client.post = AsyncMock(return_value=mock_resp)
             await af._execute_single_turn(traj, 0)
             body = client.post.call_args.kwargs["json"]
@@ -1496,7 +1575,7 @@ class TestExecuteSingleTurn:
             json={"error": {"type": CONTEXT_LENGTH_EXCEEDED, "message": "exhausted"}},
             request=httpx.Request("POST", "http://router/t-overlong/0/v1/chat/completions"),
         )
-        with _patch_generation_client() as client:
+        with _patch_generation_client(af) as client:
             client.post = AsyncMock(return_value=response)
             reward = await af._execute_single_turn(traj, 0)
 
@@ -1519,7 +1598,7 @@ class TestExecuteSingleTurn:
         }
         mock_resp = MagicMock()
         mock_resp.raise_for_status = MagicMock()
-        with _patch_generation_client() as client:
+        with _patch_generation_client(af) as client:
             client.post = AsyncMock(return_value=mock_resp)
             await af._execute_single_turn(traj, 0)
             body = client.post.call_args.kwargs["json"]

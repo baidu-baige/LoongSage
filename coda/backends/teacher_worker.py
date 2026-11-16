@@ -44,14 +44,22 @@ class TeacherWorker(ABC):
         return ray.util.get_node_ip_address(), http_utils.find_available_port(20000)
 
     @abstractmethod
-    def init(self, config: DictConfig, **kwargs):
-        """Initialize teacher worker."""
+    def init(self, config: DictConfig, master_addr: str, master_port: int):
+        """Initialize teacher worker.
+
+        Args:
+            config: Run config (this process's own copy).
+            master_addr: Address of rank 0 of this teacher group.
+            master_port: Free port on ``master_addr`` for this group's
+                torch.distributed rendezvous; each teacher group is its own
+                world and gets its own port.
+        """
         self.config = config
 
         logging_utils.configure_logger(level=config.log_level)
 
-        os.environ["MASTER_ADDR"] = config.opd.master_addr
-        os.environ["MASTER_PORT"] = str(config.opd.master_port)
+        os.environ["MASTER_ADDR"] = master_addr
+        os.environ["MASTER_PORT"] = str(master_port)
         os.environ["WORLD_SIZE"] = str(self.world_size)
         os.environ["RANK"] = str(self.rank)
         nccl_timeout = (

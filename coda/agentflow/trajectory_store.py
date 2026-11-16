@@ -1,12 +1,118 @@
 """Trajectory data models and store for AgentFlow."""
 
+from array import array
 from enum import Enum
 import logging
 from typing import Any, Literal
 
 from pydantic import BaseModel as PydanticModel, Field
+from pydantic_core import core_schema
 
 logger = logging.getLogger(__name__)
+
+
+class _PackedSeq(array):
+    """Per-token sequence packed in an ``array`` that behaves like a ``list``.
+
+    A list of N ints is N GC-visible pointers that every full collection walks; with
+    long-context trajectories that made gen2 pauses take seconds. Slices read as lists,
+    writes accept any iterable, ``==`` compares with lists, and copy/pickle keep the type.
+    """
+
+    __slots__ = ()
+    _TYPECODE = "q"
+
+    def __new__(cls, values: Any = ()):
+        if isinstance(values, array) and values.typecode == cls._TYPECODE:
+            obj = super().__new__(cls, cls._TYPECODE)
+            obj.frombytes(values.tobytes())
+            return obj
+        return super().__new__(cls, cls._TYPECODE, values)
+
+    @classmethod
+    def _from_bytes(cls, data: bytes) -> "_PackedSeq":
+        obj = super().__new__(cls, cls._TYPECODE)
+        obj.frombytes(data)
+        return obj
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return super().__getitem__(index).tolist()
+        return super().__getitem__(index)
+
+    def __setitem__(self, index, value) -> None:
+        if isinstance(index, slice) and not (
+            isinstance(value, array) and value.typecode == self._TYPECODE
+        ):
+            value = array(self._TYPECODE, value)
+        super().__setitem__(index, value)
+
+    def extend(self, values) -> None:
+        """Append values, converting a non-matching iterable to this packed typecode first."""
+        if not (isinstance(values, array) and values.typecode == self._TYPECODE):
+            values = array(self._TYPECODE, values)
+        super().extend(values)
+
+    def __iadd__(self, values):
+        self.extend(values)
+        return self
+
+    def __add__(self, other):
+        return self.tolist() + list(other)
+
+    def __radd__(self, other):
+        return list(other) + self.tolist()
+
+    def __eq__(self, other) -> bool:
+        if isinstance(other, array):
+            return array.__eq__(self, other)
+        if isinstance(other, (list, tuple)):
+            return len(self) == len(other) and self.tolist() == list(other)
+        return NotImplemented
+
+    def __ne__(self, other) -> bool:
+        eq = self.__eq__(other)
+        return eq if eq is NotImplemented else not eq
+
+    __hash__ = None
+
+    def __repr__(self) -> str:
+        return repr(self.tolist())
+
+    def __copy__(self):
+        return type(self)(self)
+
+    def __deepcopy__(self, memo):
+        return type(self)(self)
+
+    def __reduce_ex__(self, protocol):
+        # array's own __reduce_ex__ rebuilds via cls(typecode, list) for protocol < 3.
+        return (type(self)._from_bytes, (self.tobytes(),))
+
+    @classmethod
+    def __get_pydantic_core_schema__(cls, source_type, handler):
+        """Pydantic schema: validate incoming values into this type, serialize as a plain list."""
+        def validate(value):
+            return value if type(value) is cls else cls(value)
+
+        return core_schema.no_info_plain_validator_function(
+            validate,
+            serialization=core_schema.plain_serializer_function_ser_schema(lambda v: v.tolist()),
+        )
+
+
+class IntSeq(_PackedSeq):
+    """Packed int64 sequence (token ids, masks, weight versions)."""
+
+    __slots__ = ()
+    _TYPECODE = "q"
+
+
+class FloatSeq(_PackedSeq):
+    """Packed float64 sequence (log-probs, token rewards)."""
+
+    __slots__ = ()
+    _TYPECODE = "d"
 
 
 class TrajectoryStatus(str, Enum):
@@ -50,21 +156,15 @@ class Triplet(PydanticModel):
         loss_this_turn     = trajectory.loss_masks[t.logprob_start : t.logprob_end]
     """
 
-    # Start index in trajectory.tokens (inclusive).
-    # For the first turn in a segment: equals the delta_prompt start position.
-    # For subsequent turns in the same segment: equals segment.token_start,
-    # so the slice covers the full accumulated context from segment start.
+    # Half-open range in trajectory.tokens. The first turn of a segment starts at its delta prompt; later
+    # turns start at segment.token_start, so the slice covers the full context. token_end is the end of
+    # this turn's response.
     token_start: int
-
-    # End index in trajectory.tokens (exclusive). Always the end of this turn's response.
     token_end: int
 
-    # Start index in the response_length space (loss_masks / rollout_log_probs) for this
-    # turn's LLM-generated response tokens (inclusive).  Skips any tool-output tokens
-    # that precede this turn's response in the response_length array.
+    # Half-open range in response space (loss_masks / rollout_log_probs) covering only this turn's LLM
+    # response; tool-output tokens before it are skipped.
     logprob_start: int
-
-    # End index in the response_length space for this turn's LLM response (exclusive).
     logprob_end: int
 
     # Reserved: per-triplet reward.
@@ -77,24 +177,20 @@ class Triplet(PydanticModel):
 class Segment(PydanticModel):
     """A node in the trajectory's segment tree.
 
-    In the common (white-box, no compaction, no subagent) case this tree degenerates into
-    a single linear chain — identical to today's behavior. Segments branch when the agent's
-    prompt is no longer a prefix extension of the active segment:
+    Normally (white-box, no compaction, no subagent) the tree is a single linear chain. A new segment
+    starts when the agent's prompt is no longer a prefix extension of the active segment:
 
-      * origin="compact"  — context compaction (e.g. auto-compact). The new segment carries
-        a fresh prompt (usually "summary + recent turns") that does not share a token prefix
-        with the old segment, but is still the SAME timeline continuing — not a parallel branch.
-      * origin="subagent" — the agent forked a subtask with its own independent message
-        sequence. This is a genuine tree branch: the mainline resumes from the parent segment
-        once the subagent finishes, and the subagent's own turns never reappear as a mainline
-        prefix. Currently a placeholder only: no tokens/loss are stored for it (see
-        `trainable`/`token_start`/`token_end` below); it exists purely to reserve the tree
-        shape for a future iteration that does train on subagent content.
+      * origin="compact": context compaction (e.g. auto-compact). The new prompt (usually "summary +
+        recent turns") shares no token prefix with the old segment, but it is the same timeline continuing.
+      * origin="subagent": the agent forked a subtask with its own message sequence, a real branch. The
+        mainline resumes from the parent segment when the subagent finishes, and the subagent's own turns
+        never reappear as a mainline prefix. Currently a placeholder: no tokens or loss are stored for it
+        (see `trainable` / `token_start` / `token_end`), it only reserves the tree shape for training on
+        subagent content later.
 
-    `trajectory.segments` remains a flat list (for zero-cost pydantic / Ray serialization and
-    to keep `data_processor.py`'s `for seg in traj.segments` iteration unchanged); the tree is
-    encoded via `segment_id` / `parent_segment_id` as a parent pointer, flattened into an
-    indexable list instead of a linked object graph.
+    `trajectory.segments` stays a flat list (cheap pydantic / Ray serialization, and `data_processor.py`
+    keeps iterating `for seg in traj.segments`). The tree is encoded as a parent pointer
+    (`segment_id` / `parent_segment_id`) in that list, not as a linked object graph.
     """
 
     triplets: list[Triplet] = Field(default_factory=list)
@@ -116,30 +212,27 @@ class Segment(PydanticModel):
 
     # --- Tree addressing ---
 
-    # This segment's own index into trajectory.segments. Assigned by the parser when the
-    # segment is created; stable for the segment's lifetime.
+    # Index into trajectory.segments, assigned by the parser at creation; stable for the segment's lifetime.
     segment_id: int = 0
 
-    # Parent segment's segment_id. None only for the trajectory's very first segment.
-    # For origin="compact": the segment whose context this compaction replaced.
-    # For origin="subagent": the mainline (or ancestor subagent) segment this branch forked from.
+    # segment_id of the parent; None only for the first segment.
+    # "compact": the segment whose context was replaced.
+    # "subagent": the mainline (or ancestor subagent) segment this branch forked from.
     parent_segment_id: int | None = None
 
     # Why this segment was opened:
-    #   "root"     — the trajectory's first segment.
-    #   "compact"  — context compaction; mainline continuation, NOT a parallel branch.
-    #   "subagent" — a forked subtask branch; a genuine tree branch under parent_segment_id.
+    #   "root"     : the trajectory's first segment.
+    #   "compact"  : context compaction, a mainline continuation (not a parallel branch).
+    #   "subagent" : a forked subtask, a real branch under parent_segment_id.
     origin: Literal["root", "compact", "subagent"] = "root"
 
-    # Nesting depth. 0 for mainline segments (root/compact); parent.depth + 1 for a subagent
-    # branch, so nested subagents (subagent calling a subagent) are distinguishable.
+    # 0 for mainline segments (root/compact), parent.depth + 1 for subagent branches, so nested
+    # subagents (a subagent calling a subagent) are distinguishable.
     depth: int = 0
 
-    # Whether this segment's tokens participate in loss. Defaults to True for mainline
-    # (root/compact) segments. For origin="subagent", currently always False: subagent
-    # branches are not trained on yet — the Segment node is created purely as a tree-shape
-    # placeholder (see token_start/token_end above), so a later iteration can flip this to
-    # True and start storing real token/loss data without changing the tree schema.
+    # Whether this segment's tokens participate in loss. True by default (mainline root/compact segments);
+    # always False for origin="subagent" for now (tree-shape placeholder, see the class docstring), and
+    # flipping it later needs no schema change.
     trainable: bool = True
 
 
@@ -238,19 +331,18 @@ class Trajectory(PydanticModel):
     # Retry counter for this trajectory (0 = first attempt).
     attempt_id: int = 0
 
-    # First / last weight version under which this trajectory produced a generate response,
-    # across its whole lifetime (including partial-rollout resumes). Stamped per-turn in
-    # update_trajectory from payload.weight_version — independent of whether the turn emitted
-    # tokens — so a version crossing is always recorded even for a 0-token resume turn, and
-    # they survive prune/restore that mutate rollout_weight_versions.
-    # span = end - start measures how far this trajectory drifted off-policy. -1 = unset.
+    # First / last weight version under which this trajectory produced a generate response, across its
+    # whole lifetime (partial-rollout resumes included). Stamped per turn in update_trajectory from
+    # payload.weight_version, independent of whether the turn emitted tokens, so a version crossing is
+    # recorded even for a 0-token resume turn. They also survive prune/restore, which mutate
+    # rollout_weight_versions. end - start shows how far it drifted off-policy. -1 = not set yet.
     start_rollout_weight_version: int = -1
     end_rollout_weight_version: int = -1
 
     # --- Core training arrays ---
     # All token ids concatenated across turns (initial_prompt + all subsequent tokens).
     # Length = initial_prompt_len + response_len.
-    tokens: list[int] = Field(default_factory=list)
+    tokens: IntSeq = Field(default_factory=IntSeq)
 
     # Final train mask in response space: 1 = include this token in loss, 0 = ignore it.
     # Zeros may come from non-trainable context tokens (tool outputs / rebuilt prompts /
@@ -260,16 +352,16 @@ class Trajectory(PydanticModel):
     # Length = response_len = len(tokens) - initial_prompt_len.
     # Includes ALL tokens after the initial prompt — tool outputs and re-appearing
     # context tokens (P_dup, S_dup) from Summary Reset are present but with mask=0.
-    loss_masks: list[int] = Field(default_factory=list)
+    loss_masks: IntSeq = Field(default_factory=IntSeq)
 
     # Log-probabilities, length = response_len (same as loss_masks).
     # LLM-generated positions: real log-probability (≤ 0).
     # All other positions (tool outputs, re-appearing prompt/summary tokens): 0.0.
-    rollout_log_probs: list[float] = Field(default_factory=list)
+    rollout_log_probs: FloatSeq = Field(default_factory=FloatSeq)
 
     # Weight version for each response-space token, aligned with rollout_log_probs.
     # Non-LLM positions use -1.
-    rollout_weight_versions: list[int] = Field(default_factory=list)
+    rollout_weight_versions: IntSeq = Field(default_factory=IntSeq)
 
     rollout_routed_experts: Any = None
 
@@ -283,14 +375,12 @@ class Trajectory(PydanticModel):
 
     # Shape = len(rollout_log_probs) = response_len.
     # All zeros except the very last position = final_reward.
-    token_rewards: list[float] = Field(default_factory=list)
+    token_rewards: FloatSeq = Field(default_factory=FloatSeq)
 
     # --- Auxiliary ---
-    # Plaintext messages grouped by segment, keyed by segment_id. chat_completions[sid]
-    # holds the messages for the segment whose segment_id == sid. Keyed (not positional)
-    # because subagent placeholder segments occupy a segments[] slot without producing a
-    # chat entry, so segment_ids are not contiguous with append order. The chat segment at
-    # active_segment_id is the live context used for resume/prefix detection.
+    # The chat messages of each segment, as {segment_id: messages}. Subagent placeholder segments have
+    # no entry, so look up by segment_id, not by position in `segments`.
+    # chat_completions[active_segment_id] is the current context, used to detect prefix extension on resume.
     chat_completions: dict[int, list[dict[str, Any]]] = Field(default_factory=dict)
 
     # True if this trajectory should be excluded from the training batch.
@@ -301,15 +391,25 @@ class Trajectory(PydanticModel):
     status: TrajectoryStatus = TrajectoryStatus.PENDING
 
     # --- Segment / Triplet index (no token duplication) ---
-    # Access a specific turn via segments[seg_i].triplets[turn_j].
+    # Access a turn via segments[seg_i].triplets[turn_j].
     segments: list[Segment] = Field(default_factory=list)
 
-    # segment_id of the segment currently being appended to. In the linear case this always
-    # equals segments[-1].segment_id. When a subagent branch is open, it stays pointing at
-    # the parent (mainline) segment the branch forked from — a subagent placeholder segment
-    # is appended to `segments` but never becomes active. Lets the parser locate "which
-    # segment do I append this turn's triplet to" in O(1) instead of re-walking the tree.
+    # segment_id of the segment that new turns are appended to.
+    # In the linear case it always equals segments[-1].segment_id. While a subagent branch is open it
+    # stays on the parent mainline segment: the subagent placeholder is appended to `segments` but never
+    # becomes active. Lets the parser find "which segment does this turn's triplet go to" in O(1)
+    # instead of walking the tree.
     active_segment_id: int = 0
+
+    # --- Multimodal training inputs ---
+    # One dict per image in prompt order, written by the Router; None for text-only trajectories.
+    #   token_start / token_end : half-open range of the image's expanded pads in `tokens`
+    #   image_hash              : sha256 of the image bytes; keys the per-shard image table
+    #   pad_id                  : image pad token id
+    #   tensors                 : processor outputs (`pixel_values`, `image_grid_thw`)
+    # Excluded from `model_dump` so the tensors never reach reward functions or trajectory dumps.
+    multimodal_train_inputs: list[dict[str, Any]] | None = Field(default=None, exclude=True)
+
 
 class TrajectoryGroup(PydanticModel):
     """A group of Trajectory objects that are n rollout trajectories from the same prompt.

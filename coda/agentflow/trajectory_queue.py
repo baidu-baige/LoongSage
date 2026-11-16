@@ -274,8 +274,12 @@ class TrajQueue:
     def claim_group_rm(self, prompt_id: str) -> list[Trajectory] | None:
         """Claim a complete, unscored group of a group_rm data source for scoring.
 
-        Returns deep copies of the group's first *group_size* trajectories and
-        adds *prompt_id* to ``_scoring``. Returns ``None`` when there is nothing to score:
+        Returns the group's first *group_size* trajectories and adds *prompt_id*
+        to ``_scoring``. They are the queued objects, not copies: while a group is
+        in ``_scoring`` no consumer pops it, and ``pop_all`` only runs after the
+        scoring task has finished or been cancelled, so the caller may mutate them
+        until ``commit_group_rm``/``release_group_rm``. Returns ``None`` when there
+        is nothing to score:
 
         - The data source does not use group_rm.
         - The group is not complete yet, i.e. the first n-1 emits of the group.
@@ -304,10 +308,10 @@ class TrajQueue:
                 self._cond.notify_all()
                 return None
             self._scoring.add(prompt_id)
-            return [t.model_copy(deep=True) for t in trajectories]
+            return trajectories
 
     def commit_group_rm(self, prompt_id: str, trajectories: list[Trajectory]) -> None:
-        """Replace a claimed group's trajectories with their scored copies and mark it ready."""
+        """Write back a claimed group's scored trajectories and mark it ready."""
         with self._cond:
             if prompt_id not in self._scoring:
                 return  # drained while scoring; drop the result

@@ -1,9 +1,15 @@
 # @package _global_
-# Qwen3-4B + DAPO, single H800 node (8 GPUs).
-# Launch: bash examples/start.sh qwen3_4b/dapo_h800_1node
-# Fill in the two ??? below, or override them on the command line:
-#   hf_model_path                         HF weight dir of Qwen3-4B
-#   data_source.dataset.prompt_data_path  dapo-math-17k.parquet
+# Qwen3-4B DAPO on a single 8-GPU H800 node (colocated rollout + training).
+#
+# 1. Download the model and dataset:
+#      hf download Qwen/Qwen3-4B --local-dir /root/Qwen3-4B
+#      hf download Haitao999/DAPO-Math-17k-unique --repo-type=dataset \
+#        --local-dir /root/DAPO-Math-17k-unique
+#
+# 2. Launch with those paths:
+#      bash examples/start.sh qwen3_4b/dapo_h800_1node \
+#        hf_model_path=/root/Qwen3-4B \
+#        data_source.dataset.prompt_data_path=/root/DAPO-Math-17k-unique
 defaults:
   - /default
   - _self_

@@ -24,6 +24,19 @@ Global run mode, randomness, checkpoint paths and logging.
 | `total_steps` | `3000` | Total training steps. | — |
 | `log_level` | `INFO` | Global log level. | One of `DEBUG` / `INFO` / `WARNING` / `ERROR` / `CRITICAL`. |
 
+### 1.1 multimodal (image modality)
+
+Switches on image input for VLM training. Everything is off by default, and text-only runs do not read this block. For the data format and a launch example see [Run Guide](run-guide.md#task-8-train-a-vision-language-model-qwen3-vl-with-images).
+
+| Field | Default | Description | Constraints |
+| --- | --- | --- | --- |
+| `multimodal.enable` | `false` | Enable image-modality training. The Router then loads the HF processor of `hf_model_path`, expands each image into the image-pad tokens the model sees, and the trainer feeds the image tensors to the model. | Requires `qwen-vl-utils` (checked at startup). When `false`, no data source may set `dataset.multimodal_keys`. |
+| `multimodal.modalities` | `[image]` | Modalities to enable. | Must be non-empty when `enable=true`. Only `image` is implemented; `video` and `audio` are reserved and rejected. |
+| `multimodal.image.min_pixels` | `65536` | Lower bound on an image's pixel count. The Router resizes smaller images up to it before the HF processor runs. Global, applies to every data source. | `> 0` and `<= max_pixels`; must be `>=` the processor's `shortest_edge`, checked when the processor loads. |
+| `multimodal.image.max_pixels` | `16777216` | Upper bound on an image's pixel count (4096x4096). Larger images are resized down to it. With Qwen3-VL (one token per 32x32 pixels) this allows at most 16384 image tokens per image. | `> 0`; must be `<=` the processor's `longest_edge`, checked when the processor loads. |
+
+`rollout.sglang_args.enable_multimodal` is set to `true` automatically when `multimodal.enable=true`. Setting it to `false` explicitly in the same run is a configuration error.
+
 ## 2. Fully-async (`fully_async`)
 
 Switches that turn on the "rollout runs concurrently with training" pipeline. See [Fully Async Mode](fully-async-mode.md) for the full design and tuning guide.
@@ -45,11 +58,13 @@ Switches that turn on the "rollout runs concurrently with training" pipeline. Se
 | `dataset.prompt_data_path` | `???` | Prompt dataset path. Supports `.jsonl` / `.parquet`, plus an optional row-slice suffix like `data.jsonl@[0:1000]`. | Required. |
 | `dataset.eval_prompt_data_path` | `null` | Eval split path, same format as above. | `null` disables eval; also requires `rollout.eval.interval > 0` for eval to actually run. |
 | `dataset.max_prompt_len` | `null` | Maximum characters allowed per prompt. Rows exceeding this are dropped at load time. | `null` disables the filter. This is a **character** length, not tokens. |
+| `dataset.max_image_tokens` | `null` | Maximum estimated image tokens summed over all images of one prompt. Rows exceeding this are dropped at load time. | `null` disables the filter. Estimated from image headers and `multimodal.image.{min_pixels,max_pixels}`, assuming Qwen3-VL's 32x32 pixels per token; independent of `max_prompt_len`. |
+| `dataset.multimodal_keys` | `null` | Maps a modality to its dataset column, e.g. `{image: images}`. The `images` column holds one base64 data URI (`data:image/...;base64,...`) per `<image>` placeholder in the prompt text, in order. | `null` means a text-only dataset. Requires `multimodal.enable=true`; each key must be listed in `multimodal.modalities`; only `image` is implemented. The placeholder count must equal the number of items in the column. |
 | `dataset.input_key` | `???` | Column holding the prompt text or message list. | Required. |
 | `dataset.label_key` | `???` | Column holding the ground-truth label. | Required; set to `null` explicitly if unused. |
 | `dataset.metadata_key` | `metadata` | Column holding per-row metadata dicts. Passed to the agent unchanged as `trajectory["metadata"]`. Schema is free-form — put whatever per-sample info your agent/reward need (e.g. `{"difficulty": "hard"}`). | Column value must be a dict; absent means an empty dict. |
 | `dataset.shuffle` | `true` | Whether to shuffle the training split. | The eval split is never shuffled. |
-| `dataset.data_pre_processor` | `null` | Name of a raw-record pre-processor applied before messages are built (register with `@register_data_pre_processor`; see [data_pre_processor.py](../../coda/data_factory/data_pre_processor.py)). Built-in: `gsm8k`. | `null` disables pre-processing. |
+| `dataset.data_pre_processor` | `null` | Name of a raw-record pre-processor applied before messages are built (register with `@register_data_pre_processor`; see [data_pre_processor.py](../../coda/data_factory/data_pre_processor.py)). Built-in: `gsm8k`; `geo3k` (converts the `images` column, which holds HF image structs, to data URIs, prepends missing `<image>` placeholders and appends the `\boxed{}` instruction). | `null` disables pre-processing. |
 | `dataset.buffer_replay_strategy` | `null` | Name of the buffer-replay-strategy function (register with `@register_buffer_replay_strategy`; see [data_source.py](../../coda/data_factory/data_source.py)). | Only used by `RolloutDataSourceWithBuffer`; `null` is equivalent to `fifo`. |
 
 ### 3.2 agent / reward / others
@@ -192,7 +207,9 @@ The `megatron` node controls parallelism, optimizer and LR scheduling for the ac
 | `megatron.model.pipeline_model_parallel_size` | `1` | Pipeline parallel size (PP). | Same as above; participates in `TP × PP × CP`. |
 | `megatron.model.virtual_pipeline_model_parallel_size` | `null` | Virtual PP (VPP) size, used to shrink PP bubbles. | Requires PP > 1. |
 | `megatron.model.context_parallel_size` | `1` | Context parallel size (CP, sequence sharding). | Paired with `cp_partition_mode`; participates in `TP × PP × CP`. |
-| `megatron.model.cp_partition_mode` | `zigzag` | CP partitioning strategy (e.g. `zigzag`). | Only used when CP > 1. |
+| `megatron.model.cp_partition_mode` | `zigzag` | CP partitioning strategy (e.g. `zigzag`). | Only used when CP > 1. With `multimodal.enable=true` and CP > 1 only `zigzag` is accepted. |
+| `megatron.model.freeze_vision_model` | unset | Freeze the vision tower (Qwen3-VL). | Megatron-Bridge defaults it to `True` for Qwen3-VL-MoE, so set it explicitly; a warning is logged when it is unset. |
+| `megatron.model.freeze_language_model` | unset | Freeze the language model (Qwen3-VL). | Same as above. Set `false` to train the language model. |
 | `megatron.model.expert_model_parallel_size` | `1` | Expert parallel size (EP) for MoE. | Keep at 1 for non-MoE models. Total trainer GPUs must be divisible by `ETP × EP × PP`. |
 | `megatron.model.expert_tensor_parallel_size` | `null` | TP size for the MoE experts. | `null` means "same as `tensor_model_parallel_size`"; that value is the `ETP` in the formula above. |
 | `megatron.model.overlap_p2p_comm` | `false` | Overlap PP P2P communication with computation. | Only worthwhile when PP > 1. |
@@ -227,6 +244,20 @@ The commented-out `recompute_*` triplet (`granularity` / `method` / `num_layers`
 > - `megatron.ddp_config` → `megatron.core.distributed.DistributedDataParallelConfig`
 > - `megatron.optimizer`  → `megatron.core.optimizer.OptimizerConfig` (`torch.dtype` fields are auto-converted from strings)
 > - `megatron.scheduler`  → constructor kwargs of `megatron.core.optimizer_param_scheduler.OptimizerParamScheduler`. If `max_lr` / `min_lr` / `init_lr` / `start_wd` / `end_wd` are not set explicitly, they default from `megatron.optimizer.lr` / `min_lr` / `weight_decay`.
+
+### 7.3 `critic` (PPO value model)
+
+The critic is a second Megatron model trained alongside the actor for PPO. It always shares the actor's GPUs (each critic rank is pinned to the matching actor rank's bundle) and reuses `megatron.model` / `megatron.ddp_config`, so its parallelism equals the actor's. Only its optimizer, LR schedule and checkpoint are its own.
+
+| Field | Default | Description | Constraints |
+| --- | --- | --- | --- |
+| `critic.enable` | `false` | Train a PPO critic. | Requires `algorithm.advantage_estimator: gae`; `num_trajectories_per_prompt == 1`; cannot be combined with `opd.enable`; one Segment per trajectory (multi-Segment is not supported yet). |
+| `critic.optimizer` | see yaml | Critic optimizer. Replaces `megatron.optimizer` for the critic; nothing is inherited from the actor. | `min_lr` defaults from `critic.optimizer.lr`. |
+| `critic.scheduler` | see yaml | Critic LR scheduler. Replaces `megatron.scheduler` for the critic; nothing is inherited from the actor. | `max_lr` / `min_lr` / `init_lr` / `start_wd` / `end_wd` default from the critic optimizer. |
+| `critic.critic_warmup` | `0` | Steps `<= critic_warmup` train only the critic; the actor is neither trained nor saved. | `>= 0`. |
+| `critic.value_head_init_std` | `0.02` | Std of the value head's normal weight init (bias starts at 0). | The head follows the model precision. |
+
+The critic checkpoint is saved synchronously to `train_step_N/critic_dist_ckpt`, next to the actor's `dist_ckpt`, and the two share `latest_checkpointed_iteration.txt`: during warmup the critic writes it, afterwards the actor does (the critic of the same step is always saved first). On resume inside warmup, the actor has no `dist_ckpt` for that step and starts from the HF weights, which is exactly its state.
 
 ## 8. OPD (On-Policy Distillation)
 
@@ -263,14 +294,18 @@ The `algorithm` node bundles advantage estimation, policy loss, off-policy safeg
 
 | Field | Default | Description | Constraints |
 | --- | --- | --- | --- |
-| `algorithm.advantage_estimator` | `grpo` | Advantage estimator name. | Registered via the registry; built-in: `grpo`. |
-| `algorithm.advantage_norm_mode` | `group_zscore` | Advantage normalization mode. | `none` / `group_mean` / `group_zscore` / `batch_mean` / `batch_zscore`; `group_*` requires equal group sizes. |
-| `algorithm.policy_loss` | `grpo` | Policy loss name. | Built-in: `grpo` / `gspo`; see [GSPO paper](https://arxiv.org/pdf/2507.18071). |
+| `algorithm.advantage_estimator` | `grpo` | Advantage estimator name. | Registered via the registry; built-in: `grpo`, `gae` (PPO: advantages computed by the critic, requires `critic.enable`). |
+| `algorithm.advantage_norm_mode` | `group_zscore` | Group-level reward normalization of `grpo`. | `none` / `group_mean` / `group_zscore`; `group_*` requires equal group sizes; ignored by `gae`. |
+| `algorithm.use_masked_whiten` | `false` | Whiten the advantages of any estimator over all response tokens of the step (DP all-reduced). | Applied after the estimator; PPO returns are not whitened. |
+| `algorithm.policy_loss` | `grpo` | Policy loss name. | Built-in: `grpo` / `ppo` (same clipped surrogate as `grpo`) / `gspo`; see [GSPO paper](https://arxiv.org/pdf/2507.18071). |
+| `algorithm.ppo.value_clip` | `0.2` | Clip range of the critic value loss around the old values. | Only with `advantage_estimator: gae`. |
+| `algorithm.ppo.gamma` | `1.0` | GAE discount factor. | Only with `advantage_estimator: gae`. |
+| `algorithm.ppo.lam` | `0.95` | GAE lambda. | Only with `advantage_estimator: gae`. |
 | `algorithm.loss_agg_mode` | `token-mean` | Loss aggregation mode. | `token-mean` / `seq-mean-token-mean`. |
 | `algorithm.entropy_coef` | `0.0` | Entropy regularization coefficient. | When non-zero, subtracts `entropy_coef × entropy` from the loss. |
 | `algorithm.clip_ratio_low` | `0.2` | Lower clip ratio for GRPO / GSPO. | Combined with `clip_ratio_high` for asymmetric clipping (DAPO clip-higher). |
 | `algorithm.clip_ratio_high` | `0.28` | Upper clip ratio. | Same as above. |
-| `algorithm.clip_ratio_c` | `10.0` | Dual-clip upper bound for negative advantages. | Only active for `policy_loss: grpo`. |
+| `algorithm.clip_ratio_c` | `10.0` | Dual-clip upper bound for negative advantages. | Only active for `policy_loss: grpo` / `ppo`. |
 
 ### 9.2 `is_correction` (importance-sampling correction)
 
@@ -313,7 +348,7 @@ The `trainer` node controls batch organization, precision, timeouts and checkpoi
 | `trainer.use_rollout_log_probs` | `false` | Use `rollout_log_probs` returned by the inference engine instead of re-computing `old_log_probs` on the training side. | Mutually exclusive with IS correction and M2PO. |
 | `trainer.use_rollout_routing_replay` | `false` | Replay MoE routing recorded on the inference side. | Used to align rollout / training MoE routing. |
 | `trainer.use_fp32_lm_head` | `false` | Compute the LM head in FP32. | Enable in precision-sensitive settings. |
-| `trainer.forward_only` | `false` | Run the train workers forward-only: no DDP wrapper (no gradient buffer) and no optimizer / LR scheduler. The workers only hold the weights and sync them to the rollout engines. Each step still recomputes `old_log_probs` and reports the forward-side metrics such as IS / k3, but runs no backward pass and no update. Use it for runs that only measure train-inference consistency or only sample; it saves the memory of the gradient buffer and optimizer state. | Forced to `true` when `run_mode: rollout-only`. Weights never change, so saving is not supported: with this on, `trainer.save_freq` must be `<= 0`, otherwise startup fails. Must be `false` for any run that trains. |
+| `trainer.forward_only` | `false` | Run the train workers forward-only: no DDP wrapper (no gradient buffer) and no optimizer / LR scheduler. The workers only hold the weights and sync them to the rollout engines. Each step still recomputes `old_log_probs` and reports the forward-side metrics such as IS / k3, but runs no backward pass and no update. Use it for runs that only measure train-inference consistency or only sample; it saves the memory of the gradient buffer and optimizer state. | Forced to `true` when `run_mode: rollout-only`, which also sets `critic.enable` to `false`. Cannot be combined with `critic.enable`, otherwise startup fails. Weights never change, so saving is not supported: with this on, `trainer.save_freq` must be `<= 0`, otherwise startup fails. Must be `false` for any run that trains. |
 | `trainer.temperature` | `1.0` | Sampling temperature. Eval rounds use `rollout.eval.temperature` instead when it is not `null`. | Router owns this value; `completion_params.temperature` is ignored. |
 | `trainer.mini_batch_size` | `64` | Trajectories `M` consumed per optimizer step. `num_mini_batch = (B × N) / M`. | `(B × N) % M == 0`; and every data source must satisfy `num_prompts_per_step % (dp_size × num_mini_batch) == 0`. Both are validated at startup, after which `M % dp_size == 0` holds automatically. See [11.9](#119-dp-and-batch-sizes). |
 | `trainer.micro_batch_size` | `8` | Samples per forward per GPU. | Only when `use_dynamic_batch_size: false` is `mini_batch_size % micro_batch_size == 0` required; with dynamic batching this field is ignored. |
@@ -353,7 +388,7 @@ The dependencies below span multiple sections and are the most common pitfalls w
   - `run_mode: default`
   - `rollout.sampler.num_oversample: 0` (extra capacity is provided by `fully_async.stale_steps`)
 - Only a single entry in `data_sources` is supported today.
-- `B × N` must be divisible by `trainer.mini_batch_size`; `M % N == 0` is strongly recommended (otherwise you cannot form complete groups). Here `B = num_prompts_per_step`, `N = num_trajectories_per_prompt`, `M = mini_batch_size`.
+- `B × N` must be divisible by `trainer.mini_batch_size`, as in synchronous mode. Here `B = num_prompts_per_step`, `N = num_trajectories_per_prompt`, `M = mini_batch_size`. The trainer fetches a whole step (`B` groups) at a time, so `M` need not be a multiple of `N`.
 
 ### 11.4 Partial rollout
 

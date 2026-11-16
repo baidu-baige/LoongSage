@@ -104,6 +104,15 @@ get_trajectory()        # 取出当前 attempt 的 Trajectory
 
 其中 3 会经由 `request_kind` HTTP 头识别；该头由 agent harness 主动注入（例如通过黑盒 agent 侧的插件机制，在请求发出前读取 session/agent 上下文信息判定是否为子 agent 分叉请求，再设置该请求头）。
 
+#### 图像请求（`multimodal.enable=true`）
+
+开启图像模态后，`TrajectoryParser`（[parser.py](../../coda/agentflow/router/parser.py) 中的 `_expand_multimodal`）在同一套 token in / token out 流程里处理图片；纯文本请求不会进入这些逻辑。图像相关的辅助代码在 [multimodal.py](../../coda/agentflow/multimodal.py)。
+
+- **输入。** 图片以 OpenAI `image_url` content part 的形式出现在 `user` 或 `tool` 消息中，内容为 base64 data URI。其他角色里的图片会被拒绝，因为 chat template 会静默丢弃它们。图片无法处理、或占位符数量与图片数量不符时，返回 HTTP 400。
+- **处理。** `MultimodalProcessor` 先把每张图缩放到 `multimodal.image.{min_pixels,max_pixels}` 范围内，再运行 `hf_model_path` 的 HF processor，得到 `pixel_values` 与 `image_grid_thw`。结果缓存在 `ImageCache` 中，这是一个 4 GiB 的 LRU，key 为图片字节的 sha256 加像素上下界，因此跨轮次、或同一 prompt 的多条 trajectory 里重复出现的图片只处理一次。启动时 `verify_expansion()` 会校验 Router 的 pad 展开结果与 HF processor 一致。
+- **两种 token 形式。** tokenizer 对每张图只输出一个 image pad token。SGLang 接收这种折叠形式和 PNG data URI（`image_data`），自行展开 pad。trajectory 中保存的是展开形式，每张图的 pad 段长度由 `image_grid_thw` 决定，因此训练回放的序列与模型实际看到的一致。后续轮次发送前会先把已保存的前缀折叠回去。
+- **训练输入。** 每出现一张新图，Router 就向 `Trajectory.multimodal_train_inputs` 追加一项（见 §2.5）。
+
 ### 2.4 TokenizerManager
 
 [tokenizer_manager.py](../../coda/agentflow/tokenizer_manager.py) 把 CPU 密集的 chat-template / encode / decode 封装成**异步接口**，用线程池（`ThreadedTokenizerManager`）或进程池（`ProcessTokenizerManager`）执行，避免阻塞 Router 的事件循环。`create_tokenizer_manager()` 按 `manager.mode` 选择后端。
@@ -116,7 +125,7 @@ get_trajectory()        # 取出当前 attempt 的 Trajectory
 
 [trajectory_store.py](../../coda/agentflow/trajectory_store.py) 定义了核心数据模型和存储。数据模型是三级对象结构：
 
-- **`Trajectory`**：一条完整 rollout。核心是几条**扁平数组**：`tokens`（全序列 token）、`loss_masks`（response 空间，1=计入 loss）、`rollout_log_probs`（response 空间，LLM 位置为真实 logprob、其余为 0）、`rollout_weight_versions`、`token_rewards`；`chat_completions: dict[int, list[dict]]` 按 `segment_id` 分别存各段的 OpenAI 消息历史（不再是单一 list）；`active_segment_id` 指向当前"主线"正在写入的 segment。
+- **`Trajectory`**：一条完整 rollout。核心是几条**扁平数组**：`tokens`（全序列 token）、`loss_masks`（response 空间，1=计入 loss）、`rollout_log_probs`（response 空间，LLM 位置为真实 logprob、其余为 0）、`rollout_weight_versions`、`token_rewards`；`chat_completions: dict[int, list[dict]]` 按 `segment_id` 分别存各段的 OpenAI 消息历史（不再是单一 list）；`active_segment_id` 指向当前"主线"正在写入的 segment。开启图像模态时，`multimodal_train_inputs: list[dict] | None` 按 prompt 顺序为每张图存一项：它在 `tokens` 中展开后 pad 段的 `token_start`/`token_end`、`image_hash`、`pad_id`，以及 `pixel_values` / `image_grid_thw` 张量。纯文本 trajectory 中为 `None`；该字段被排除在 `model_dump` 之外，张量不会进入 reward 函数或 trajectory 落盘。
 - **`Segment`**：共享同一增量上下文（可安全前缀增量 tokenize）的一组轮次，组织成一棵树：`segment_id`/`parent_segment_id` 表达父子关系，`depth` 是树深度，`origin: Literal["root","compact","subagent"]` 记录该 segment 的来源——`root` 是首个 mainline segment，`compact` 是 agent 做 context compaction（如 Summary Reset）后开的新 mainline segment，`subagent` 是子 agent/子任务分叉出的占位分支；`trainable` 标记该 segment 是否计入训练（`TrajectoryGroup.segment_count` 只统计 `trainable=True` 的段）。何时开新 segment、是否更新 `active_segment_id` 由 `build_turn_input()` 的分派逻辑决定（见 §2.3）。
 - **`Triplet`**：一个 LLM 交互轮次，以**索引区间**（`token_start/token_end`、`logprob_start/logprob_end`）指向父 `Trajectory` 的扁平数组，不复制 token。
 

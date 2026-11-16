@@ -204,3 +204,90 @@ class TestLossFunction:
         assert metrics["train/loss"] == pytest.approx(1.9)
         assert metrics["train/approx_kl"] == pytest.approx(0.25)
         assert metrics["train/opsm_clipfrac"] == pytest.approx(1.0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PPO critic: response_values / value_loss_function
+# ═══════════════════════════════════════════════════════════════════════════
+
+import coda.backends.megatron.cp_utils as _cp_mod
+
+
+def _value_config(value_clip=0.2, loss_agg_mode="token-mean"):
+    return OmegaConf.create({
+        "algorithm": {"loss_agg_mode": loss_agg_mode, "ppo": {"value_clip": value_clip}},
+        "megatron": {"model": {"cp_partition_mode": "zigzag"}},
+    })
+
+
+@pytest.fixture
+def cp1(monkeypatch):
+    cp_mpu = MagicMock()
+    cp_mpu.get_context_parallel_world_size.return_value = 1
+    monkeypatch.setattr(_cp_mod, "mpu", cp_mpu)
+
+
+class TestResponseValues:
+    def test_values_align_with_log_prob_positions(self, cp1):
+        """Value at position t-1 belongs to response token t (same slice as log-probs)."""
+        # Two packed rows: (prompt 2, response 2) and (prompt 1, response 2).
+        out = torch.arange(7, dtype=torch.bfloat16).view(1, 7, 1)
+        batch = {"total_lengths": [4, 3], "response_lengths": [2, 2]}
+        values = _loss_mod.response_values(_value_config(), batch, out)
+        assert [v.tolist() for v in values] == [[1.0, 2.0], [4.0, 5.0]]
+        assert all(v.dtype == torch.float32 for v in values)
+
+
+class TestValueLoss:
+    def _batch(self, old, returns, masks=None):
+        n = len(old)
+        return {
+            "total_lengths": [n + 1],
+            "response_lengths": [n],
+            "loss_masks": [masks if masks is not None else torch.ones(n)],
+            "old_values": [old],
+            "returns": [returns],
+        }
+
+    def _run(self, monkeypatch, vpred, batch, config=None, cp_size=1):
+        _mpu_mock.get_context_parallel_world_size.return_value = cp_size
+        monkeypatch.setattr(_loss_mod, "response_values", lambda config, batch, out: [vpred])
+        return _loss_mod.value_loss_function(
+            config or _value_config(), batch, None, None, torch.zeros(1)
+        )
+
+    def test_unclipped_is_half_mse(self, monkeypatch):
+        vpred = torch.tensor([0.1, 0.5], requires_grad=True)
+        batch = self._batch(old=torch.tensor([0.0, 0.4]), returns=torch.tensor([1.0, 0.5]))
+        loss, denom, metrics = self._run(monkeypatch, vpred, batch)
+        assert loss.item() == pytest.approx(0.5 * 0.81)
+        assert denom.item() == 2
+        assert metrics["train/value_clipfrac"] == 0.0
+        assert metrics["train/value_loss"] == pytest.approx(0.5 * 0.81)
+        assert metrics["num_tokens"] == 2 and metrics["num_sequences"] == 1
+        loss.backward()
+        assert torch.allclose(vpred.grad, torch.tensor([0.1 - 1.0, 0.0]))
+
+    def test_clip_takes_the_pessimistic_branch(self, monkeypatch):
+        # vpred moved 0.5 from old towards the return; clipped prediction stays
+        # at old + 0.2, whose error is larger, so the clipped loss is used.
+        vpred = torch.tensor([0.5], requires_grad=True)
+        batch = self._batch(old=torch.tensor([0.0]), returns=torch.tensor([1.0]))
+        loss, _, metrics = self._run(monkeypatch, vpred, batch)
+        assert loss.item() == pytest.approx(0.5 * 0.8 ** 2)
+        assert metrics["train/value_clipfrac"] == 1.0
+        loss.backward()
+        assert vpred.grad.item() == 0.0  # clipped branch has no gradient
+
+    def test_masked_tokens_are_excluded(self, monkeypatch):
+        vpred = torch.tensor([0.0, 5.0])
+        batch = self._batch(old=torch.zeros(2), returns=torch.zeros(2), masks=torch.tensor([1.0, 0.0]))
+        loss, denom, _ = self._run(monkeypatch, vpred, batch, config=_value_config(value_clip=10.0))
+        assert loss.item() == 0.0 and denom.item() == 1
+
+    def test_cp_size_premultiplies_loss(self, monkeypatch):
+        vpred = torch.tensor([0.0])
+        batch = self._batch(old=torch.zeros(1), returns=torch.ones(1))
+        loss, _, metrics = self._run(monkeypatch, vpred, batch, cp_size=2)
+        assert metrics["train/value_loss"] == pytest.approx(0.5)
+        assert loss.item() == pytest.approx(1.0)

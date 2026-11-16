@@ -17,10 +17,10 @@ index 968868c28..5b6346d98 100644
  ]
 diff --git a/src/megatron/bridge/models/deepseek/deepseek_v41_bridge.py b/src/megatron/bridge/models/deepseek/deepseek_v41_bridge.py
 new file mode 100644
-index 000000000..3a5407f4d
+index 000000000..21e9dfeef
 --- /dev/null
 +++ b/src/megatron/bridge/models/deepseek/deepseek_v41_bridge.py
-@@ -0,0 +1,220 @@
+@@ -0,0 +1,292 @@
 +# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 +#
 +# Licensed under the Apache License, Version 2.0 (the "License");
@@ -47,7 +47,11 @@ index 000000000..3a5407f4d
 +top of the V4 bridge.
 +"""
 +
++import functools
++import json
 +import logging
++import struct
++from pathlib import Path
 +
 +import torch
 +from megatron.core.models.gpt.gpt_model import GPTModel
@@ -67,6 +71,45 @@ index 000000000..3a5407f4d
 +from .deepseek_v41_config import register_deepseek_v41_config
 +
 +logger = logging.getLogger(__name__)
++
++_SCALE_DTYPES = {
++    "F8_E8M0": getattr(torch, "float8_e8m0fnu", None),
++    "F32": torch.float32,
++    "BF16": torch.bfloat16,
++    "F16": torch.float16,
++}
++
++
++def _checkpoint_dir(hf_state_dict) -> str | None:
++    """Local directory of a safetensors-backed bridge ``StateDict``, else None."""
++    path = getattr(getattr(hf_state_dict, "source", None), "path", None)
++    return str(path) if path is not None else None
++
++
++@functools.lru_cache(maxsize=None)
++def _source_quant_layout(ckpt_dir: str | None) -> dict[str, tuple[str, str, tuple[int, ...], torch.dtype]]:
++    """``X.weight`` -> (weight dtype, ``X.scale``, scale shape, scale dtype) for every weight that
++    the checkpoint stores with a scale. Read from the safetensors headers only (no tensor data)."""
++    if not ckpt_dir:
++        return {}
++    header: dict[str, dict] = {}
++    for f in sorted(Path(ckpt_dir).glob("*.safetensors")):
++        with open(f, "rb") as fh:
++            (n,) = struct.unpack("<Q", fh.read(8))
++            header.update(json.loads(fh.read(n)))
++    layout = {}
++    for scale_name, sh in header.items():
++        if not scale_name.endswith(".scale"):
++            continue
++        weight_name = scale_name[: -len(".scale")] + ".weight"
++        wh = header.get(weight_name)
++        if wh is None:
++            continue
++        scale_dtype = _SCALE_DTYPES.get(sh["dtype"])
++        if scale_dtype is None:
++            raise RuntimeError(f"{scale_name}: unsupported scale dtype {sh['dtype']}")
++        layout[weight_name] = (wh["dtype"], scale_name, tuple(sh["shape"]), scale_dtype)
++    return layout
 +
 +# Make the checkpoint's `model_type: deepseek_v41` loadable by AutoConfig. This runs at
 +# import of the deepseek bridge package, which `AutoBridge` triggers before it calls
@@ -186,15 +229,44 @@ index 000000000..3a5407f4d
 +        return int(block[0])
 +
 +    def maybe_modify_converted_hf_weight(self, task, converted_weights_dict, hf_state_dict):
-+        """Export plain (bf16) weights, also when the source checkpoint is quantized.
++        """Re-quantize to the source checkpoint's own format, like V4, with two V4.1 differences.
 +
-+        The V4 override re-quantizes against the source ``.scale`` geometry, which assumes 128x128
-+        FP8 blocks (wrong for V4.1) and reads every source scale from disk on each export. Callers
-+        that need the checkpoint format (e.g. an FP8/FP4 rollout) quantize the exported tensors
-+        themselves; saved HF checkpoints are bf16 (``save_hf_pretrained`` drops
-+        ``quantization_config``).
++        * FP8 blocks use ``quantization_config.weight_block_size`` (32x32) instead of the shared
++          helper's 128x128, and MXFP4 groups come from the scale geometry.
++        * The source ``.scale`` tensors are never read: requantization only needs their shape and
++          dtype (the values are recomputed from the weight's amax), which are taken once from the
++          safetensors headers, so a weight sync does no checkpoint I/O.
++
++        Weights without a ``.scale`` companion in the source are returned unchanged. When
++        ``task.weight_dtype`` is set the weights are returned unchanged (plain-dtype export).
 +        """
-+        return converted_weights_dict
++        if task is not None and task.weight_dtype is not None:
++            return converted_weights_dict
++        layout = _source_quant_layout(_checkpoint_dir(hf_state_dict))
++        if not layout:
++            return converted_weights_dict
++        result: dict[str, torch.Tensor] = {}
++        for hf_param, weight in converted_weights_dict.items():
++            entry = layout.get(hf_param)
++            if entry is None:
++                result[hf_param] = weight
++                continue
++            weight_dtype, scale_name, scale_shape, scale_dtype = entry
++            # Only shape/dtype of the source scale are used by the quantizers.
++            like = torch.empty(scale_shape, dtype=scale_dtype, device="meta")
++            if weight_dtype in ("I8", "U8"):
++                q, s = quantization_utils.quantize_mxfp4_e2m1_like_scale(
++                    weight, like, name=hf_param, block_size=weight.shape[1] // scale_shape[1]
++                )
++            elif weight_dtype == "F8_E4M3":
++                q, s = quantization_utils.quantize_fp8_e4m3fn_like_scale(
++                    weight, like, name=hf_param, block_size=self._fp8_block_size()
++                )
++            else:
++                raise RuntimeError(f"{hf_param}: unsupported quantized source dtype {weight_dtype}")
++            result[hf_param] = q
++            result[scale_name] = s
++        return result
 +
 +    def mapping_registry(self) -> MegatronMappingRegistry:
 +        """V4 weight-name mapping, with the indexer entries replaced for V4.1 and

@@ -74,12 +74,12 @@ class ReplicaGroup:
             # When recovering, reuse the bundle this slot was originally placed on so the
             # engine comes back on the same GPUs; otherwise take the next bundles from the
             # scheduler cursor (which already accounts for train/teacher allocations).
-            recover_bundle_index = -1
+            pinned_bundle_index = -1
             if recover and self.engine_bundle_indices[i] is not None:
-                recover_bundle_index = self.engine_bundle_indices[i]
+                pinned_bundle_index = self.engine_bundle_indices[i]
 
             rollout_actor_cls, bundle_index = self.scheduler.schedule(
-                rollout_worker_cls, num_gpu_per_engine, recover_bundle_index
+                rollout_worker_cls, num_gpu_per_engine, bundle_index=pinned_bundle_index
             )
             self.engine_bundle_indices[i] = bundle_index
 

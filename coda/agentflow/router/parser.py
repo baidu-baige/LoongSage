@@ -1,13 +1,16 @@
 """Utilities for parsing RL trajectories."""
 
-import base64
+import contextlib
 import copy
+import gc
 import logging
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Literal
 
+import orjson
+import pybase64
 import torch
 from pydantic import ValidationError
 from sglang.srt.entrypoints.openai.protocol import Tool
@@ -26,6 +29,16 @@ from sglang.srt.parser.template_detection import (
     match_rules,
 )
 
+from coda.agentflow.multimodal import (
+    ImageHashCache,
+    MultimodalRequestError,
+    expand_pad_spans,
+    extract_image_refs,
+    find_pad_spans,
+    fold_pad_spans,
+    has_images,
+    replace_images_with_hashes,
+)
 from coda.agentflow.tokenizer_manager import DEFAULT_THINK_TAGS
 from coda.agentflow.trajectory_store import (
     Segment,
@@ -70,6 +83,11 @@ _SENTINEL_TOOLS: list[Tool] = [Tool(type="function", function={"name": "_"})]
 
 # Parser fields SGLang's architecture-based detection can fill in.
 _PARSER_ATTRS = ("reasoning_parser", "tool_call_parser")
+
+# Tool-call parsers whose string parameters reach the tool verbatim. SGLang v0.5.23 strips
+# DeepSeek-V4.1 string parameters, dropping the leading/trailing newlines and indentation
+# that edit and write-file arguments depend on.
+_UNSTRIPPED_STRING_PARAM_TOOL_PARSERS = frozenset({"deepseekv41"})
 
 
 def _detect_parser_names_from_arch(model_path: str | None) -> tuple[str | None, str | None]:
@@ -200,6 +218,18 @@ class TurnInputContext:
     # must skip writing any token/loss/triplet data and must not move active_segment_id.
     is_subagent_placeholder: bool = False
 
+    # --- Multimodal (image) fields; all empty/None for text-only turns ---
+
+    # Folded ids (one pad token per image) sent to SGLang. None means `input_ids` is sent as-is.
+    send_input_ids: list[int] | None = None
+    # PNG data URIs of every image in the sent prompt, in placeholder order.
+    image_data: list[str] = field(default_factory=list)
+    # Images first seen in this turn's delta: {local_start, local_end, image_hash, tensors}, with the
+    # range relative to `delta_prompt_ids`. Empty for subagent placeholder turns.
+    new_images: list[dict[str, Any]] = field(default_factory=list)
+    # Image URI -> sha256 memo of this request, so update_trajectory rebuilds the history compare form
+    # without decoding the images again.
+    image_hashes: ImageHashCache = field(default_factory=ImageHashCache)
 
 @dataclass
 class LLMGenerateResponse:
@@ -212,16 +242,174 @@ class LLMGenerateResponse:
     routed_experts: torch.Tensor | None = None
 
 
-def deserialize_routed_experts(b64_str: str, num_entries: int) -> torch.Tensor:
-    """Decode SGLang base64+int32 bytes to a 2D torch.Tensor of shape [num_entries, block_size]."""
-    raw = base64.b64decode(b64_str)
-    flat = torch.frombuffer(bytearray(raw), dtype=torch.int32)
-    tensor = flat.reshape(num_entries, -1)
-    logger.debug(
-        "r3_deserialize: entries=%d shape=%s trajectory=%s",
-        num_entries, list(tensor.shape), tensor[0, :8].tolist() if len(tensor) > 0 else [],
+# Wire dtypes SGLang may report in meta_info["routed_experts_dtype"]; absent means int32.
+_R3_WIRE_DTYPES = {"int32": torch.int32, "int16": torch.int16, "uint8": torch.uint8}
+
+# Spare rows (fraction of the needed rows) added when the routing buffer grows.
+_R3_GROWTH = 0.125
+
+# meta_info key for output_token_logprobs already split by parse_generate_json.
+_SPLIT_LOGPROBS_KEY = "_split_output_token_logprobs"
+
+
+def _compact_expert_ids(t: torch.Tensor) -> torch.Tensor:
+    """Store expert ids in the narrowest dtype that holds them (uint8 for <=256 experts)."""
+    if t.dtype == torch.uint8:
+        return t
+    if t.numel() == 0:
+        return t.to(torch.uint8)
+    lo, hi = int(t.min()), int(t.max())
+    if lo < 0:
+        raise ValueError(f"negative expert id {lo} in routed_experts")
+    if hi <= 255:
+        return t.to(torch.uint8)
+    if hi <= 32767:
+        return t.to(torch.int16)
+    return t
+
+
+def deserialize_routed_experts(b64_str: str, num_entries: int, dtype: str = "int32") -> torch.Tensor:
+    """Decode SGLang base64 routing bytes to a compact [num_entries, layers * topk] tensor.
+
+    Args:
+        b64_str: base64-encoded routed-expert bytes from ``meta_info["routed_experts"]``.
+        num_entries: number of rows (captured token positions) the payload must split into.
+        dtype: wire dtype SGLang reported ("int32" / "int16" / "uint8"); decides the item size.
+
+    Returns:
+        A ``[num_entries, layers * topk]`` tensor, down-cast to the narrowest dtype that holds
+        the expert ids (uint8 for <=256 experts, int16 otherwise).
+    """
+    torch_dtype = _R3_WIRE_DTYPES.get(dtype)
+    if torch_dtype is None:
+        raise ValueError(f"unsupported routed_experts_dtype {dtype!r}")
+    raw = pybase64.b64decode(b64_str)
+    itemsize = torch_dtype.itemsize
+    if num_entries <= 0 or len(raw) % (num_entries * itemsize) != 0:
+        raise ValueError(
+            f"routed_experts payload of {len(raw)} bytes does not split into "
+            f"{num_entries} rows of {dtype}"
+        )
+    flat = torch.frombuffer(bytearray(raw), dtype=torch_dtype)
+    return _compact_expert_ids(flat.reshape(num_entries, -1))
+
+
+def _r3_append_rows(base: torch.Tensor, keep: int, *parts: torch.Tensor) -> torch.Tensor:
+    """``torch.cat([base[:keep], *parts])`` that writes into spare capacity of base's buffer.
+
+    The returned tensor is a prefix view of a larger buffer, so a turn costs O(new rows)
+    instead of O(trajectory). This overwrites rows at and after ``keep`` in base's storage,
+    so the caller must not keep using ``base`` or any view of it after the call.
+    """
+    if any(p.dtype != base.dtype or p.shape[1:] != base.shape[1:] for p in parts):
+        return torch.cat([base[:keep], *parts], dim=0)
+    need = keep + sum(p.size(0) for p in parts)
+    row_bytes = max(base[0:1].numel(), 1) * base.element_size()
+    storage = base.untyped_storage()
+    capacity = storage.nbytes() // row_bytes
+    if base.storage_offset() == 0 and base.is_contiguous() and capacity >= need:
+        buf = base.new_empty(0).set_(storage, 0, (capacity, *base.shape[1:]))
+    else:
+        capacity = need + int(need * _R3_GROWTH)
+        buf = base.new_empty((capacity, *base.shape[1:]))
+        buf[:keep].copy_(base[:keep])
+    pos = keep
+    for p in parts:
+        buf[pos:pos + p.size(0)].copy_(p)
+        pos += p.size(0)
+    return buf[:need]
+
+
+@contextlib.contextmanager
+def _gc_paused():
+    """Keep the cyclic GC from running inside the block."""
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        yield
+    finally:
+        if was_enabled:
+            gc.enable()
+
+
+def parse_generate_json(body: bytes) -> dict[str, Any]:
+    """Parse an SGLang /generate body and split output_token_logprobs into two flat lists.
+
+    The per-token ``[logprob, id, None]`` lists are freed with GC paused, before any young
+    collection can promote them into the generations that full collections walk.
+    """
+    with _gc_paused():
+        response_json = orjson.loads(body)
+        meta = response_json.get("meta_info") if isinstance(response_json, dict) else None
+        if isinstance(meta, dict):
+            items = meta.pop("output_token_logprobs", None)
+            if items:
+                meta[_SPLIT_LOGPROBS_KEY] = (
+                    [float(item[0]) for item in items],
+                    [int(item[1]) for item in items],
+                )
+            del items
+    return response_json
+
+
+def _decode_response_r3(meta: dict[str, Any], routed_experts_start_len: int) -> torch.Tensor | None:
+    """Pop and decode meta_info["routed_experts"], appending the synthetic terminal row.
+
+    SGLang captures positions [start_len, seqlen - 1); the extra row keeps the shape that
+    _append_routed_experts expects (its value is overwritten there).
+    """
+    b64 = meta.pop("routed_experts", None)
+    if not b64:
+        return None
+    entries = (
+        meta.get("prompt_tokens", 0) + meta.get("completion_tokens", 0) - 1 - routed_experts_start_len
     )
-    return tensor
+    if entries <= 0:
+        logger.warning("[r3] non-positive entry count (%d); skipping", entries)
+        return None
+    tensor = deserialize_routed_experts(b64, entries, meta.get("routed_experts_dtype") or "int32")
+    return torch.cat([tensor, tensor[-1:]], dim=0)
+
+
+def is_passthrough_response(response_json: dict[str, Any]) -> bool:
+    """True when a /generate body must be returned verbatim instead of parsed.
+
+    Covers error bodies (an "error" field with no generated text) and aborted requests
+    (``meta_info.finish_reason.type == "abort"``). R3 decode must be skipped for these,
+    since their payloads can be malformed and decoding would raise instead of passing through.
+    """
+    if "error" in response_json and not response_json.get("text"):
+        return True
+    finish_reason = (response_json.get("meta_info") or {}).get("finish_reason") or {}
+    return isinstance(finish_reason, dict) and finish_reason.get("type") == "abort"
+
+
+def decode_generate_body(
+    body: bytes, routed_experts_start_len: int, r3_enabled: bool
+) -> tuple[dict[str, Any], torch.Tensor | None]:
+    """Parse a /generate body and decode its R3 rows. Picklable, so it can run in a process pool.
+
+    Args:
+        body: raw SGLang /generate response bytes.
+        routed_experts_start_len: first captured token position, used to size the R3 rows.
+        r3_enabled: decode routed experts only when true and the body is not a passthrough
+            (error / abort) response.
+
+    Returns:
+        ``(response_json, routed_experts)``. ``routed_experts`` is None when R3 is disabled,
+        absent, or the body is a passthrough response.
+    """
+    response_json = parse_generate_json(body)
+    routed_experts = None
+    if (
+        r3_enabled
+        and isinstance(response_json, dict)
+        and not is_passthrough_response(response_json)
+    ):
+        routed_experts = _decode_response_r3(
+            response_json.get("meta_info") or {}, routed_experts_start_len
+        )
+    return response_json, routed_experts
 
 
 def _parse_weight_version(raw: Any) -> int:
@@ -330,18 +518,31 @@ class TrajectoryParser:
         """
         trajectory.metadata[_MASK_TOOL_ARGS_KEY] = mask_tool_call_args
         normalized_messages = self._normalize_messages(messages)
+        # Every helper below that needs an image's sha256 goes through this memo, so the request
+        # decodes and hashes each image once instead of once per helper.
+        hashes = ImageHashCache()
         if tools:
             trajectory.metadata[_REQUEST_TOOLS_KEY] = copy.deepcopy(tools)
         turn_tools = trajectory.metadata.get(_REQUEST_TOOLS_KEY)
 
         # case 1: first turn — tokenize full messages as the trajectory's root segment.
         if not trajectory.tokens:
-            input_ids = await self._tokenize_messages(normalized_messages, tools=tools)
+            # Tokenizing only needs to know that an image is there (it becomes one placeholder token),
+            # not what the image looks like. So replace each image url (a huge base64 string) with its
+            # short `sha256:<hex>` hash, to avoid copying/pickling the base64 into the tokenizer workers.
+            # Hashed lazily here and in case 4: continuation turns tokenize only the delta messages.
+            input_ids = await self._tokenize_messages(
+                self._hash_images(normalized_messages, hashes), tools=tools)
+            input_ids, send_ids, image_data, new_images = await self._expand_multimodal(
+                prefix_ids=[], delta_ids=input_ids,
+                all_messages=normalized_messages, new_messages=normalized_messages, hashes=hashes,
+            )
             await self._log_decode(input_ids, "[build_input] %s first turn: %d tokens\n%s",
                                    trajectory.trajectory_id, len(input_ids))
             # History cache holds the compare form (tool_call arguments masked only for clients that rewrite history)
             # tokenization above always used the full-argument original.
-            trajectory.metadata[_NORMALIZED_HISTORY_KEY] = self._history_compare_form(trajectory, normalized_messages)
+            trajectory.metadata[_NORMALIZED_HISTORY_KEY] = self._history_compare_form(
+                trajectory, normalized_messages, hashes)
             return TurnInputContext(
                 delta_prompt_ids=input_ids,
                 input_ids=list(input_ids),
@@ -352,6 +553,10 @@ class TrajectoryParser:
                 new_segment_parent_id=None,
                 new_segment_origin="root",
                 new_segment_depth=0,
+                send_input_ids=send_ids,
+                image_data=image_data,
+                new_images=new_images,
+                image_hashes=hashes,
             )
 
         # Detect how many of the incoming messages match the active segment's chat prefix.
@@ -359,14 +564,14 @@ class TrajectoryParser:
         normalized_history = trajectory.metadata.get(_NORMALIZED_HISTORY_KEY)
         if not isinstance(normalized_history, list):
             normalized_history = self._history_compare_form(
-                trajectory, self._normalize_messages(self._chat_segment(trajectory, active_id)))
+                trajectory, self._normalize_messages(self._chat_segment(trajectory, active_id)), hashes)
             trajectory.metadata[_NORMALIZED_HISTORY_KEY] = normalized_history
         history_len = len(normalized_history)
         # For clients that rewrite old tool_use arguments in their echo (Claude Code),
         # _history_compare_form masks those arguments out so the rewrite does not turn
         # every tool-calling turn into a spurious compaction; other protocols compare
         # the exact normalized messages.
-        incoming_compare_form = self._history_compare_form(trajectory, normalized_messages)
+        incoming_compare_form = self._history_compare_form(trajectory, normalized_messages, hashes)
         prefix_len = history_len if (
             history_len > 0
             and len(incoming_compare_form) >= history_len
@@ -382,7 +587,7 @@ class TrajectoryParser:
         if prefix_len > 0:
             return await self._build_continuation_input(
                 trajectory, normalized_messages, prefix_len, raw_new_messages, turn_tools,
-                target_segment_id=active_id,
+                target_segment_id=active_id, hashes=hashes,
             )
 
         # Case 3: prefix miss + subagent fork — new placeholder segment. Not written to
@@ -398,7 +603,13 @@ class TrajectoryParser:
                 trajectory.trajectory_id, active_id, parent.depth + 1,
             )
             subagent_messages = self._normalize_messages(messages, strip_think=False)
-            input_ids = await self._tokenize_messages(subagent_messages, tools=tools)
+            input_ids = await self._tokenize_messages(
+                self._hash_images(subagent_messages, hashes), tools=tools)
+            # Images still go to SGLang, but the placeholder turn records no training tensors.
+            input_ids, send_ids, image_data, _ = await self._expand_multimodal(
+                prefix_ids=[], delta_ids=input_ids,
+                all_messages=subagent_messages, new_messages=subagent_messages, hashes=hashes,
+            )
             return TurnInputContext(
                 delta_prompt_ids=[],
                 input_ids=input_ids,
@@ -410,6 +621,8 @@ class TrajectoryParser:
                 new_segment_origin="subagent",
                 new_segment_depth=parent.depth + 1,
                 is_subagent_placeholder=True,
+                send_input_ids=send_ids,
+                image_data=image_data,
             )
 
         # Case 4: prefix miss + not a subagent fork — context compaction. New mainline
@@ -419,11 +632,17 @@ class TrajectoryParser:
             "treating as context compaction, opening new compact segment",
             trajectory.trajectory_id, active_id, request_kind,
         )
-        input_ids = await self._tokenize_messages(normalized_messages, tools=tools)
+        input_ids = await self._tokenize_messages(
+            self._hash_images(normalized_messages, hashes), tools=tools)
+        input_ids, send_ids, image_data, new_images = await self._expand_multimodal(
+            prefix_ids=[], delta_ids=input_ids,
+            all_messages=normalized_messages, new_messages=normalized_messages, hashes=hashes,
+        )
         await self._log_decode(input_ids, "[build_input] %s compact segment: %d tokens\n%s",
                                trajectory.trajectory_id, len(input_ids))
         # Comparison form, same as the case-1 store.
-        trajectory.metadata[_NORMALIZED_HISTORY_KEY] = self._history_compare_form(trajectory, normalized_messages)
+        trajectory.metadata[_NORMALIZED_HISTORY_KEY] = self._history_compare_form(
+            trajectory, normalized_messages, hashes)
         return TurnInputContext(
             delta_prompt_ids=input_ids,
             input_ids=input_ids,
@@ -434,7 +653,74 @@ class TrajectoryParser:
             new_segment_parent_id=active_id,
             new_segment_origin="compact",
             new_segment_depth=0,
+            send_input_ids=send_ids,
+            image_data=image_data,
+            new_images=new_images,
+            image_hashes=hashes,
         )
+
+    async def _expand_multimodal(
+        self,
+        *,
+        prefix_ids: list[int],
+        delta_ids: list[int],
+        all_messages: list[dict[str, Any]],
+        new_messages: list[dict[str, Any]],
+        hashes: ImageHashCache,
+    ) -> tuple[list[int], list[int] | None, list[str], list[dict[str, Any]]]:
+        """Expand the one-pad-per-image `delta_ids` for training and build the SGLang inputs.
+
+        The tokenizer emits a single pad per image (folded form). Training needs each image expanded to N
+        pads; SGLang takes the folded form and expands the pads itself.
+
+        Args:
+            prefix_ids: Tokens already in the continued segment, in expanded form (empty for a new segment).
+            delta_ids: Newly tokenized tokens for this turn, in folded form.
+            all_messages: The whole request; every image in it is sent to SGLang.
+            new_messages: Only the not-yet-tokenized messages; only their images are recorded.
+            hashes: Per-request hash memo, reused by `prepare` so workers skip re-decoding.
+
+        Returns:
+            `(expanded_delta_ids, send_input_ids, image_data, new_images)`:
+              - expanded_delta_ids: `delta_ids` with each image pad expanded.
+              - send_input_ids: folded `prefix_ids` + `delta_ids`, the prompt sent to SGLang.
+              - image_data: PNG data URIs of all images in `all_messages`, in order.
+              - new_images: one record per image in `new_messages` (span in `expanded_delta_ids`, hash, tensors).
+            Without images, or with no multimodal processor, returns `(delta_ids, None, [], [])`.
+
+        Raises:
+            MultimodalRequestError: An image cannot be processed, or the placeholder count does not match
+                the number of images.
+        """
+        mm_processor = getattr(self.tokenizer_manager, "multimodal_processor", None)
+        if mm_processor is None or not has_images(all_messages):
+            return delta_ids, None, [], []
+        pad_id = mm_processor.image_pad_id
+
+        processed_images = await mm_processor.prepare(extract_image_refs(all_messages, hashes), hashes)
+        new_image_count = len(extract_image_refs(new_messages, hashes))
+        new_processed_images = processed_images[len(processed_images) - new_image_count:]
+        # Each pad becomes `num_tokens` pads (from image_grid_thw); `verify_expansion` checks at startup
+        # that this matches the HF processor.
+        expanded, spans = expand_pad_spans(delta_ids, pad_id, [p.num_tokens for p in new_processed_images])
+
+        send_ids = [*fold_pad_spans(prefix_ids, pad_id), *delta_ids]
+        placeholders = len(find_pad_spans(send_ids, pad_id))
+        if placeholders != len(processed_images):
+            raise MultimodalRequestError(
+                f"image placeholder count mismatch: {placeholders} in prompt vs {len(processed_images)} images"
+            )
+        new_images = [
+            {
+                "local_start": start,
+                "local_end": end,
+                "image_hash": p.image_hash,
+                "pad_id": pad_id,
+                "tensors": p.tensors,
+            }
+            for (start, end), p in zip(spans, new_processed_images)
+        ]
+        return expanded, send_ids, [p.png_data_uri for p in processed_images], new_images
 
     async def _build_continuation_input(
         self,
@@ -445,13 +731,18 @@ class TrajectoryParser:
         turn_tools: list[dict[str, Any]] | None,
         *,
         target_segment_id: int,
+        hashes: ImageHashCache,
     ) -> TurnInputContext:
         """Delta-tokenize a continuation turn appended to target_segment_id (cases 1/2)."""
         if self.enable_thinking and not self.accumulate_reasoning:
             await self._prune_last_response_think(trajectory)
 
-        delta_prompt_ids = await self._tokenize_delta_messages(
-            normalized_messages[prefix_len:]
+        new_messages = normalized_messages[prefix_len:]
+        delta_prompt_ids = await self._tokenize_delta_messages(self._hash_images(new_messages, hashes))
+        segment_ids = trajectory.tokens[trajectory.segments[target_segment_id].token_start:]
+        delta_prompt_ids, send_ids, image_data, new_images = await self._expand_multimodal(
+            prefix_ids=segment_ids, delta_ids=delta_prompt_ids,
+            all_messages=normalized_messages, new_messages=new_messages, hashes=hashes,
         )
         await self._log_decode(delta_prompt_ids,
                                "[build_input] %s continuation: +%d tokens (total=%d)\n%s",
@@ -465,63 +756,49 @@ class TrajectoryParser:
             routed_experts_start_len = trajectory.rollout_routed_experts.shape[0] - 1 - segment_offset
         return TurnInputContext(
             delta_prompt_ids=delta_prompt_ids,
-            input_ids=[*trajectory.tokens[trajectory.segments[target_segment_id].token_start:], *delta_prompt_ids],
+            input_ids=[*segment_ids, *delta_prompt_ids],
             start_new_segment=False,
             raw_new_messages=raw_new_messages,
             routed_experts_start_len=routed_experts_start_len,
             tools=turn_tools,
             target_segment_id=target_segment_id,
+            send_input_ids=send_ids,
+            image_data=image_data,
+            new_images=new_images,
+            image_hashes=hashes,
         )
 
     def build_assistant_message(
         self,
         response_json: dict[str, Any],
-        routed_experts_start_len: int = 0,
         tools: list[dict[str, Any]] | None = None,
+        routed_experts: torch.Tensor | None = None,
     ) -> tuple[LLMGenerateResponse, dict[str, Any], str | None]:
         """Decode LLM worker response and build the assistant message.
 
         Extracts response_ids/logprobs, applies reasoning and tool_call parsing,
         and returns (payload, assistant_message, finish_reason_override).
+        ``routed_experts`` is the R3 chunk already decoded by decode_generate_body; it is
+        required when R3 is enabled.
         """
         meta = response_json.get("meta_info") or {}
-        output_token_logprobs = meta.get("output_token_logprobs") or []
-        if not output_token_logprobs:
+        split = meta.pop(_SPLIT_LOGPROBS_KEY, None)
+        if split is not None:
+            logprobs, response_ids = split
+        else:
+            output_token_logprobs = meta.get("output_token_logprobs") or []
+            logprobs = [float(item[0]) for item in output_token_logprobs]
+            response_ids = [int(item[1]) for item in output_token_logprobs]
+        if not response_ids:
             raise ValueError("output_token_logprobs missing from llm worker response")
-        logprobs = [float(item[0]) for item in output_token_logprobs]
-        response_ids = [int(item[1]) for item in output_token_logprobs]
+        if self.r3_enabled and routed_experts is None:
+            raise ValueError(
+                "R3 is enabled but the llm worker response has no usable routed_experts "
+                "(check SGLang return_routed_experts support)"
+            )
 
         weight_version = _parse_weight_version(meta.get("weight_version"))
         generated_text: str = response_json.get("text") or ""
-        routed_experts = None
-        routed_experts_b64 = meta.get("routed_experts")
-        if routed_experts_b64 and self.r3_enabled:
-            prompt_tokens = meta.get("prompt_tokens", 0)
-            completion_tokens = meta.get("completion_tokens", 0)
-            # sglang captures routing for positions [start_len, seqlen - 1),
-            # dropping the terminal position Re-append a synthetic terminal row 
-            # so downstream replay (segment offset math, _append_routed_experts) 
-            # sees the same shape it always has. The terminal value is irrelevant: 
-            # _append_routed_experts overwrites it via merged[-1].copy_(merged[-2]).
-            serialized_entries = (
-                prompt_tokens + completion_tokens - 1 - routed_experts_start_len
-            )
-            logger.info(
-                "[build_assistant_message] r3: prompt=%d completion=%d start=%d -> %d entries (+1 terminal)",
-                prompt_tokens, completion_tokens, routed_experts_start_len, serialized_entries,
-            )
-            if serialized_entries > 0:
-                routed_experts = deserialize_routed_experts(
-                    routed_experts_b64, serialized_entries
-                )
-                routed_experts = torch.cat(
-                    [routed_experts, routed_experts[-1:].clone()], dim=0
-                )
-            else:
-                logger.warning(
-                    "[build_assistant_message] r3: non-positive entry count (%d); skipping",
-                    serialized_entries,
-                )
 
         payload = LLMGenerateResponse(
             generated_text=generated_text,
@@ -584,6 +861,8 @@ class TrajectoryParser:
             tools=_to_sglang_tools(tools) or _SENTINEL_TOOLS,
             tool_call_parser=self._tool_call_parser_name,
         )
+        if self._tool_call_parser_name in _UNSTRIPPED_STRING_PARAM_TOOL_PARSERS:
+            parser.detector.strip_string_param_value = False
         # Forward calls whose name is absent from the schema instead of dropping them:
         # agents may omit "tools" on follow-up turns while the LLM keeps emitting markup,
         # and a silently dropped call would leave raw markup in the assistant content.
@@ -623,6 +902,7 @@ class TrajectoryParser:
             return
         trajectory = active
 
+        base = len(trajectory.tokens)
         self._append_triplet(
             trajectory,
             delta_prompt_ids=turn_ctx.delta_prompt_ids,
@@ -631,6 +911,8 @@ class TrajectoryParser:
             weight_version=payload.weight_version,
             turn_ctx=turn_ctx,
         )
+        if turn_ctx.new_images and not turn_ctx.is_subagent_placeholder:
+            self._record_multimodal_inputs(trajectory, turn_ctx, base)
 
         if turn_ctx.is_subagent_placeholder:
             # Subagent requests/responses never enter the training data pipeline: no
@@ -659,7 +941,7 @@ class TrajectoryParser:
         else:
             trajectory.chat_completions[active_id].extend(segment_messages)
         trajectory.metadata[_NORMALIZED_HISTORY_KEY] = self._history_compare_form(
-            trajectory, self._normalize_messages(trajectory.chat_completions[active_id])
+            trajectory, self._normalize_messages(trajectory.chat_completions[active_id]), turn_ctx.image_hashes
         )
 
         logger.debug(
@@ -669,6 +951,27 @@ class TrajectoryParser:
             len(trajectory.metadata[_NORMALIZED_HISTORY_KEY]),
         )
         self.trajectory_store.update(trajectory.trajectory_id, trajectory)
+
+    @staticmethod
+    def _record_multimodal_inputs(trajectory: Trajectory, turn_ctx: TurnInputContext, base: int) -> None:
+        """Append one `multimodal_train_inputs` item per newly placed image.
+
+        `base` is the length of `trajectory.tokens` before this turn's delta was appended, so the delta-relative
+        ranges become absolute token positions. Tensors are shared by reference with the Router image cache.
+        """
+        items = trajectory.multimodal_train_inputs
+        if items is None:
+            items = trajectory.multimodal_train_inputs = []
+        for image in turn_ctx.new_images:
+            items.append(
+                {
+                    "token_start": base + image["local_start"],
+                    "token_end": base + image["local_end"],
+                    "image_hash": image["image_hash"],
+                    "pad_id": image["pad_id"],
+                    "tensors": image["tensors"],
+                }
+            )
 
     async def _tokenize_messages(
         self,
@@ -754,9 +1057,18 @@ class TrajectoryParser:
             normalized.append(entry)
         return normalized
 
+    def _hash_images(self, messages: list[dict[str, Any]], hashes: ImageHashCache) -> list[dict[str, Any]]:
+        """Swap image urls for their hashes, only when multimodal is enabled.
+
+        With the switch off the messages pass through untouched, so tokenization and prefix comparison match a
+        text-only deployment even if a request carries `image_url` parts.
+        """
+        if getattr(self.tokenizer_manager, "multimodal_processor", None) is None:
+            return messages
+        return replace_images_with_hashes(messages, hashes)
 
     def _history_compare_form(
-        self, trajectory: Trajectory, messages: list[dict[str, Any]]
+        self, trajectory: Trajectory, messages: list[dict[str, Any]], hashes: ImageHashCache | None = None
     ) -> list[dict[str, Any]]:
         """Return the prefix-comparison form of already-normalized messages.
 
@@ -764,7 +1076,11 @@ class TrajectoryParser:
         the arguments are masked out so the echo rewrite does not break the comparison; all other protocols compare
         the exact normalized messages. Applied identically to stored history and incoming messages so the two sides
         always match.
+
+        Image data URIs are replaced by their content hash first, so the stored history never holds base64
+        payloads and identical images compare equal.
         """
+        messages = self._hash_images(messages, hashes)
         if trajectory.metadata.get(_MASK_TOOL_ARGS_KEY):
             return self._mask_tool_call_args_for_compare(messages)
         return messages
@@ -1115,9 +1431,9 @@ class TrajectoryParser:
         if base is None:
             merged = routed_experts_chunk.clone()
         elif start_new_segment:
-            merged = torch.cat([base, routed_experts_chunk], dim=0)
+            merged = _r3_append_rows(base, base.size(0), routed_experts_chunk)
         else:
-            merged = torch.cat([base[:-1], routed_experts_chunk], dim=0)
+            merged = _r3_append_rows(base, base.size(0) - 1, routed_experts_chunk)
         if merged.size(0) > 1:
             merged[-1].copy_(merged[-2])
         trajectory.rollout_routed_experts = merged

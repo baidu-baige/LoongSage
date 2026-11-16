@@ -37,12 +37,20 @@ data_source:
     # to null to disable filtering.
     max_prompt_len: null
 
+    # Maximum estimated vision tokens summed over all images of one prompt. Samples above it are dropped during
+    # loading. Independent of max_prompt_len (text characters only).
+    max_image_tokens: null
+
     # Dataset column names
     input_key: ???            # Column holding the prompt text or message list.
     label_key: ???            # Column holding the ground-truth label. null = disabled.
     metadata_key: metadata    # Column holding per-row metadata dicts.
 
     shuffle: true
+
+    # Multimodal columns, e.g. {image: images}: the "images" column holds one data URI per <image>
+    # placeholder in the prompt text. Requires multimodal.enable=true. null = text-only dataset.
+    multimodal_keys: null
 
     # Registered name of a raw-record pre-processor, applied to every dataset record before messages are built.
     # Pre-processors are registered via @register_data_pre_processor("name") in
@@ -83,6 +91,16 @@ data_source:
 
 data_sources:
   - ${data_source}
+
+# Multimodal (image) training. When enabled, rollout.sglang_args.enable_multimodal is set automatically.
+multimodal:
+  enable: false
+  modalities: [image]     # only image is implemented; video / audio are reserved
+  image:
+    # Router pre-resize bounds (global). Qwen3-VL emits 1 image token per 32x32 pixels.
+    # min_pixels must be >= the processor's shortest_edge and max_pixels <= its longest_edge.
+    min_pixels: 65536
+    max_pixels: 16777216    # 4096x4096 -> at most 16384 image tokens per image
 
 rollout:
   partial: false
@@ -136,6 +154,9 @@ agentflow:
     proxy_timeout_seconds: 1800
     abort_timeout_seconds: 600
     max_connections: 512
+    # R3 only. Processes that parse /generate bodies and decode routed experts off the
+    # router event loop; 0 decodes inline.
+    r3_decode_workers: 0
     middleware:
       parser:
 
@@ -216,6 +237,32 @@ megatron:
     # output_layer: true
   optimizer_sharding_type: "dp_reshardable" # dp_reshardable|fully_reshardable
 
+# PPO critic (value model). Always co-located with the actor on the same GPUs
+# and uses the same megatron.model / megatron.ddp_config parallelism.
+critic:
+  enable: false               # requires algorithm.advantage_estimator=gae; one Segment per trajectory
+  # Replace megatron.optimizer / megatron.scheduler for the critic; nothing is
+  # inherited from the actor. Unset derived fields (optimizer.min_lr;
+  # scheduler.max_lr/min_lr/init_lr/start_wd/end_wd) follow the critic's own
+  # lr / weight_decay.
+  optimizer:
+    lr: 1.0e-6
+    weight_decay: 0.01
+    optimizer_cpu_offload: false
+    optimizer_offload_fraction: 1.0
+    # chunked optimizer state offload
+    chunked_optimizer_state_offload: false
+    optimizer_state_offload_fraction: 1.0
+    optimizer_state_offload_chunk_size_mb: 1024
+  scheduler:
+    lr_warmup_steps: 0
+    lr_decay_steps: 1
+    lr_decay_style: constant
+    wd_incr_steps: 0
+    wd_incr_style: constant
+  critic_warmup: 0            # steps <= critic_warmup train only the critic (actor is not trained or saved)
+  value_head_init_std: 0.02   # std of the value head's normal init (bias starts at 0)
+
 opd:
   enable: false
   pg_ratio: 0.0 # L = (1-gkd_ratio)*[A - pg_ratio*KL_token] + gkd_ratio*L_GKD
@@ -253,9 +300,14 @@ opd:
     PYTORCH_ALLOC_CONF: expandable_segments:True
 
 algorithm:
-  advantage_estimator: grpo
-  advantage_norm_mode: group_zscore # none|group_mean|group_zscore|batch_mean|batch_zscore
-  policy_loss: grpo # grpo|gspo
+  advantage_estimator: grpo # grpo|gae (gae = PPO, requires critic.enable)
+  advantage_norm_mode: group_zscore # none|group_mean|group_zscore (grpo only; ignored by gae)
+  use_masked_whiten: false # whiten advantages over all response tokens of the step (any estimator)
+  policy_loss: grpo # grpo|gspo|ppo (ppo = the grpo clipped surrogate)
+  ppo:                     # used when advantage_estimator=gae
+    value_clip: 0.2        # clip range of the critic value loss around old values
+    gamma: 1.0             # GAE discount
+    lam: 1.0               # GAE lambda
   loss_agg_mode: token-mean # token-mean|seq-mean-token-mean
   is_correction:
     enable: false
@@ -314,6 +366,10 @@ trainer:
   # checkpoint is quantized, independent of this switch. true: snap the quantized weights onto the
   # grid after every optimizer step and fake-quant the inputs of the linears the rollout runs as W8A8.
   qat: false
+  # Rounding of the QAT weight snap. threshold: fixed per-element thresholds, so on-grid weights
+  # (every quantized checkpoint) move with small RL updates; nearest: round-to-nearest, which
+  # freezes MXFP4 experts at lr ~1e-6 (kept for A/B).
+  qat_weight_rounding: threshold
   env_vars:
     # Inject per-rank env vars into the train worker Ray actors (runtime_env).
     PYTORCH_ALLOC_CONF: expandable_segments:True

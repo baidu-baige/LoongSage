@@ -12,7 +12,7 @@ import uuid
 from typing import Any
 
 from coda.agentflow.sandbox import register_sandbox
-from coda.agentflow.sandbox.base import SandboxClient
+from coda.agentflow.sandbox.base import SandboxClient, decode_output
 from coda.utils.path_utils import resolve_conf_path
 
 logger = logging.getLogger(__name__)
@@ -179,12 +179,15 @@ class K8sSandboxClient(SandboxClient):
             workdir: Working directory override (defaults to self.working_dir).
 
         Returns:
-            Dict with stdout, stderr, exit_code, success keys.
+            Dict with stdout, stderr, exit_code, success, timed_out, error keys.
+            ``timed_out`` is True when the command exhausted the timeout budget,
+            and ``error`` then holds a human-readable reason for the agent.
         """
         cwd = workdir or self.working_dir
         cmd = f"cd {shlex.quote(cwd)} && timeout {self.command_exec_timeout_seconds} bash -c {shlex.quote(command)}"
         logger.debug("[%s] %s", sandbox_id, cmd)
 
+        timeout_message = f"Command timed out after {self.command_exec_timeout_seconds}s"
         exec_cmd = self._kubectl(["exec", sandbox_id, "--namespace", self.namespace, "--", "bash", "-c", cmd])
         try:
             result = subprocess.run(
@@ -196,16 +199,23 @@ class K8sSandboxClient(SandboxClient):
         except subprocess.TimeoutExpired as e:
             logger.error("Command timed out after %ds: %s", self.command_exec_timeout_seconds + 10, cmd)
             return {
-                "stdout": e.stdout or "",
-                "stderr": e.stderr or "",
+                "stdout": decode_output(e.stdout),
+                "stderr": decode_output(e.stderr),
                 "exit_code": -1,
                 "success": False,
+                "timed_out": True,
+                "error": timeout_message,
             }
+        # The in-pod `timeout` wrapper exits 124 when it kills the command. It fires
+        # before the outer subprocess timeout, so this is the usual timeout path.
+        timed_out = result.returncode == 124
         return {
             "stdout": result.stdout,
             "stderr": self._filter_kubectl_noise(result.stderr),
             "exit_code": result.returncode,
             "success": result.returncode == 0,
+            "timed_out": timed_out,
+            "error": timeout_message if timed_out else "",
         }
 
     def delete(self, sandbox_id: str, **kwargs) -> None:

@@ -13,14 +13,19 @@
 A production-grade, high-efficiency Agentic RL framework for frontier LLMs with validated recipes.
 
 <p>
-  <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"></a>
-  <img src="https://img.shields.io/badge/python-3.12-blue.svg" alt="Python">
-  <img src="https://img.shields.io/badge/code-16k%20lines-brightgreen.svg" alt="LOC">
-  <img src="https://img.shields.io/badge/training-Megatron--Core-76B900.svg" alt="Megatron-Core">
-  <img src="https://img.shields.io/badge/rollout-SGLang-orange.svg" alt="SGLang">
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg?style=flat-square" alt="License"></a>
+  <img src="https://img.shields.io/badge/python-3.12-blue.svg?style=flat-square" alt="Python">
+  <img src="https://img.shields.io/badge/code-16k%20lines-brightgreen.svg?style=flat-square" alt="LOC">
+  <img src="https://img.shields.io/badge/training-Megatron--Core-76B900.svg?style=flat-square" alt="Megatron-Core">
+  <img src="https://img.shields.io/badge/rollout-SGLang-orange.svg?style=flat-square" alt="SGLang">
+  <a href="https://hub.docker.com/r/loongsage/loongsage"><img src="https://img.shields.io/docker/pulls/loongsage/loongsage.svg?style=flat-square&logo=docker&logoColor=white" alt="Docker Pulls"></a>
 </p>
 
-Join our <a href="https://github.com/baidu-baige/LoongSage/issues/25"><img src="https://img.shields.io/badge/WeChat-Group-07C160.svg?logo=wechat&logoColor=white" alt="WeChat Group" style="vertical-align: middle;"></a> community
+<p>
+  <a href="https://github.com/baidu-baige/LoongSage/issues/25"><img src="https://img.shields.io/badge/WeChat_Group-07C160?style=for-the-badge&logo=wechat&logoColor=white" alt="Join WeChat Group"></a>
+  <a href="https://www.zhihu.com/people/loongsage"><img src="https://img.shields.io/badge/Follow_on_Zhihu-0084FF?style=for-the-badge&logo=zhihu&logoColor=white" alt="Follow on Zhihu"></a>
+  <a href="mailto:loongsage@baidu.com"><img src="https://img.shields.io/badge/Email_Us-D14836?style=for-the-badge&logo=maildotru&logoColor=white" alt="Email Us"></a>
+</p>
 
 </div>
 
@@ -58,6 +63,7 @@ ______________________________________________________________________
 
 ## 📰 News
 
+- **[2026-11]** Released our first official version [v0.2.0](https://github.com/baidu-baige/LoongSage/releases/tag/v0.2.0): DeepSeek-V4.1 training, PPO and SFT, image-modality RL for Qwen3-VL, and SGLang 0.5.23!
 - **[2026-10]** Added [QAT](conf/dsv41_flash/) support for DeepSeek-V4.1-Flash and a new [RLCD2 recipe](conf/rlcd2/)!
 - **[2026-10]** Our technical report [*LoongSage: A Production-Grade, High-Efficiency Agentic RL Framework for Frontier LLMs with Validated Recipes*](https://arxiv.org/abs/2610.16352) is now available on arXiv!
 - **[2026-09]** Native support for black-box agents: OpenCode, Codex, and Claude Code can now be trained with RL out of the box, with no changes to agent code (recipes in [`conf/qwen3_coder_30b_a3b/`](conf/qwen3_coder_30b_a3b/))!
@@ -80,6 +86,28 @@ Targeting ultra-large model scenarios, LoongSage adopts a structure of **Single-
 | **Data** | [`data_factory/`](coda/data_factory/) | Manages dataset loading, resumable data sources, sampling filtering mechanisms, and data partitioning/distribution based on load balancing. |
 | **Transfer** | [`transfer_mesh/`](coda/transfer_mesh/) | A high-performance unified data transmission channel between training and inference engines. |
 | **Scheduler** | [`resource_scheduler/`](coda/resource_scheduler/) | Based on Ray Placement Groups to achieve fine-grained GPU resource allocation, perfectly supporting both intra-node multiplexing and disaggregated deployment. |
+
+______________________________________________________________________
+
+## 📦 Supported Models
+
+The training side loads models through Megatron-Bridge `AutoBridge`, and the rollout side serves them with SGLang. The framework has no per-model adaptation code, so in principle any model supported by both Megatron-Bridge and SGLang can be trained. Models outside the list below may need their parallelism and memory settings tuned.
+
+The following models have been validated with the recipes under [`conf/`](conf/):
+
+| Model | Recipes | Hardware (nodes × 8 GPUs) |
+| :--- | :--- | :--- |
+| DeepSeek-V4.1-Flash (original FP8/MXFP4 weights, QAT) | [`dsv41_flash/`](conf/dsv41_flash/): DAPO, SWE, SFT | H20 × 6 |
+| DeepSeek-V4.1-Flash (BF16) | [`dsv41_flash_bf16/`](conf/dsv41_flash_bf16/): DAPO, SWE | B200 × 5–6, H20 × 6 |
+| DeepSeek-V4-Flash (BF16) | [`dsv4_flash_bf16/`](conf/dsv4_flash_bf16/): DAPO, SWE | H20 × 6–8, GB200 × 8 |
+| Qwen3-30B-A3B | [`qwen3_30b_a3b/`](conf/qwen3_30b_a3b/): DAPO, GSM8K, BCP, MOPD | H20 × 1 |
+| Qwen3-Coder-30B-A3B-Instruct | [`qwen3_coder_30b_a3b/`](conf/qwen3_coder_30b_a3b/): Claude Code, Codex, OpenCode, mini-SWE | H20 × 2–4 |
+| Qwen3-VL-30B-A3B-Instruct | [`qwen3_vl_30b_a3b/`](conf/qwen3_vl_30b_a3b/): GRPO on geo3k (single image) and MMRB (multi-image) | H20 × 1 |
+| Qwen3.8-27B | [`qwen3.8_27b/`](conf/qwen3.8_27b/): DAPO | H20 × 1 |
+| Qwen3-4B | [`qwen3_4b/`](conf/qwen3_4b/): DAPO, SFT | H800 × 1, H20 × 1 |
+| StartLux-Decision-v1.1-4B-AutoThink | [`rlcd2/`](conf/rlcd2/): RLCD2 | H20 × 1 |
+
+QAT (`trainer.qat`) currently supports only DeepSeek-V4.1. Other models train in BF16.
 
 ______________________________________________________________________
 
@@ -157,7 +185,6 @@ Chinese documentation is available in [`docs/zh/`](docs/zh/).
 Below are our main plans for upcoming work. Discussions and contributions via Issues are welcome:
 
 - [ ] Low-precision training support
-- [ ] PPO support
 - [ ] MTP / DSpark
 - [ ] Multi-data-source and multi-agent support in fully asynchronous mode
 - [x] SFT support (`run_mode: sft`, see `conf/qwen3_4b/sft_h20_1node.yaml`)

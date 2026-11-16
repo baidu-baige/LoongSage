@@ -94,11 +94,12 @@ def test_sft_advantage_is_ones_per_segment():
         "response_lengths": [3, 1],
         "loss_masks": [torch.ones(3, dtype=torch.long), torch.zeros(1, dtype=torch.long)],
     }
-    advantages = get_advantage("sft")(None, rollout_data)
+    advantages, returns = get_advantage("sft")(None, rollout_data)
     assert [a.tolist() for a in advantages] == [[1.0, 1.0, 1.0], [1.0]]
     assert all(a.dtype == torch.float32 for a in advantages)
+    assert returns is advantages
 
 
 def test_sft_advantage_empty_batch_returns_empty():
     """An empty batch leaves device as None; the comprehension must still return []."""
-    assert get_advantage("sft")(None, {"response_lengths": [], "loss_masks": []}) == []
+    assert get_advantage("sft")(None, {"response_lengths": [], "loss_masks": []}) == ([], [])

@@ -1,6 +1,7 @@
 """Unit tests for ``coda.agentflow.router.parser``."""
 
 import asyncio
+import base64
 import copy
 import json
 from types import SimpleNamespace
@@ -20,7 +21,13 @@ pytest.importorskip(
     reason="sglang.srt.parser.template_detection is unavailable in this sglang build",
 )
 
-from coda.agentflow.router.parser import TrajectoryParser, TurnInputContext
+from coda.agentflow.router.parser import (
+    TrajectoryParser,
+    TurnInputContext,
+    decode_generate_body,
+    deserialize_routed_experts,
+    is_passthrough_response,
+)
 from coda.agentflow.router.parser_middleware import ParserMiddleware
 from coda.agentflow import tokenizer_manager
 from coda.agentflow.tokenizer_manager import (
@@ -105,11 +112,6 @@ def test_deepseek_official_family_detection(
 
 
 def test_deepseek_v41_tokenizer_uses_official_encoder() -> None:
-    # The V4.1 encoder ships with the DeepSeek-V4.1 SGLang build only.
-    pytest.importorskip(
-        "sglang.srt.entrypoints.openai.encoding_dsv41",
-        reason="the DeepSeek-V4.1 SGLang build is not installed",
-    )
     tokenizer = _wrap_deepseek_v4_tokenizer(
         FakeDeepSeekV4Tokenizer(), DEEPSEEK_V41_MODEL_FAMILY
     )
@@ -124,6 +126,85 @@ def test_deepseek_v41_tokenizer_uses_official_encoder() -> None:
     assert prompt.startswith("<｜begin▁of▁sentence｜>")
     assert "<｜User｜>inspect" in prompt
     assert prompt.endswith("<｜Assistant｜><think>")
+
+
+_DS_BOS = "<｜begin▁of▁sentence｜>"
+_DS_EOS = "<｜end▁of▁sentence｜>"
+_V41_EFFORT = "Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n"
+# deepseek-recipe's default (`high`) V4 thinking-mode effort, which SGLang v0.5.23 renders too.
+_V4_EFFORT = (
+    "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n"
+    "You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve "
+    "the root cause, rigorously stress-testing your logic against all potential paths, edge cases, "
+    "and adversarial scenarios.\n"
+    "Explicitly write out your entire deliberation process, documenting every intermediate step, "
+    "considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n"
+)
+
+
+# Fragments the tokenizer manager renders: SGLang v0.5.21's encode_messages layout, with
+# the reasoning effort of SGLang v0.5.23 (recipe's default).
+@pytest.mark.parametrize(
+    ("family", "messages", "thinking", "expected"),
+    [
+        # The empty-system probe has no generation header.
+        (DEEPSEEK_V4_MODEL_FAMILY, [{"role": "system", "content": ""}], False, _DS_BOS),
+        (DEEPSEEK_V4_MODEL_FAMILY, [{"role": "system", "content": ""}], True, _DS_BOS + _V4_EFFORT),
+        (DEEPSEEK_V41_MODEL_FAMILY, [{"role": "system", "content": ""}], False, _DS_BOS + "<｜System｜>"),
+        (DEEPSEEK_V41_MODEL_FAMILY, [{"role": "system", "content": ""}], True, _DS_BOS + "<｜System｜>" + _V41_EFFORT),
+        # A trailing assistant message keeps its reasoning and ends with EOS, no header after it.
+        (
+            DEEPSEEK_V4_MODEL_FAMILY,
+            [{"role": "user", "content": ""}, {"role": "assistant", "content": "hi", "reasoning_content": "r"}],
+            True,
+            _DS_BOS + _V4_EFFORT + "<｜User｜><｜Assistant｜><think>r</think>hi" + _DS_EOS,
+        ),
+        (
+            DEEPSEEK_V41_MODEL_FAMILY,
+            [{"role": "user", "content": ""}, {"role": "assistant", "content": "hi", "reasoning_content": "r"}],
+            True,
+            _DS_BOS + "<｜System｜>" + _V41_EFFORT + "<｜User｜><｜Assistant｜><think>r</think>hi" + _DS_EOS,
+        ),
+        # Chat mode renders no reasoning, even for the trailing assistant message.
+        (
+            DEEPSEEK_V4_MODEL_FAMILY,
+            [{"role": "user", "content": ""}, {"role": "assistant", "content": "hi", "reasoning_content": "r"}],
+            False,
+            _DS_BOS + "<｜User｜><｜Assistant｜></think>hi" + _DS_EOS,
+        ),
+        # V4 thinking mode renders recipe's default effort, before the first system content.
+        (
+            DEEPSEEK_V4_MODEL_FAMILY,
+            [{"role": "system", "content": "sys"}, {"role": "user", "content": "q"}],
+            True,
+            _DS_BOS + _V4_EFFORT + "sys<｜User｜>q<｜Assistant｜><think>",
+        ),
+        # Text parts are joined by a blank line.
+        (
+            DEEPSEEK_V41_MODEL_FAMILY,
+            [{"role": "user", "content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]}],
+            False,
+            _DS_BOS + "<｜User｜>a\n\nb<｜Assistant｜></think>",
+        ),
+    ],
+)
+def test_deepseek_recipe_wrapper_matches_official_encoder(
+    family: str, messages: list[dict], thinking: bool, expected: str
+) -> None:
+    tokenizer = _wrap_deepseek_v4_tokenizer(FakeDeepSeekV4Tokenizer(), family)
+
+    prompt = tokenizer.apply_chat_template(messages, tokenize=False, enable_thinking=thinking)
+
+    assert prompt == expected
+
+
+def test_deepseek_recipe_wrapper_rejects_non_text_content() -> None:
+    tokenizer = _wrap_deepseek_v4_tokenizer(FakeDeepSeekV4Tokenizer(), DEEPSEEK_V41_MODEL_FAMILY)
+
+    with pytest.raises(ValueError, match="text content only"):
+        tokenizer.apply_chat_template(
+            [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}], tokenize=False
+        )
 
 
 def test_deepseek_v4_empty_system_is_only_bos() -> None:
@@ -215,7 +296,9 @@ def test_deepseek_v4_continuation_strips_only_bos() -> None:
     continuation_ids = asyncio.run(parser._tokenize_delta_messages(messages[1:]))
 
     assert continuation_ids == full_ids[len(manager.non_assistant_prefix):]
-    assert bytes(continuation_ids).decode().startswith("\n\n<｜DSML｜tool_calls>")
+    # deepseek-recipe opens an assistant turn with its header even right after the system
+    # message (SGLang v0.5.21's encoder rendered the calls block right after BOS).
+    assert bytes(continuation_ids).decode().startswith("<｜Assistant｜></think>\n\n<｜DSML｜tool_calls>")
     assert "<tool_result>/repo</tool_result>" in bytes(continuation_ids).decode()
 
 
@@ -264,13 +347,13 @@ def test_deepseek_v4_process_initializer_wraps_worker_tokenizer(tmp_path) -> Non
     assert prompt.endswith("<｜Assistant｜></think>")
 
 
-def make_parser() -> TrajectoryParser:
+def make_parser(r3_enabled: bool = True) -> TrajectoryParser:
     """Create a parser with the minimum tokenizer stub needed for construction."""
     tokenizer = SimpleNamespace()
     return TrajectoryParser(
         trajectory_store=TrajectoryStore(),
         tokenizer_manager=tokenizer,
-        r3_enabled=True,
+        r3_enabled=r3_enabled,
     )
 
 
@@ -487,9 +570,104 @@ def test_append_routed_experts_keeps_single_row_unchanged() -> None:
     assert torch.equal(trajectory.rollout_routed_experts, new_chunk)
 
 
+def _b64(t: torch.Tensor) -> str:
+    return base64.b64encode(t.contiguous().numpy().tobytes()).decode()
+
+
+@pytest.mark.parametrize("wire_dtype", ["int32", "int16", "uint8"])
+def test_deserialize_routed_experts_compacts_to_uint8(wire_dtype: str) -> None:
+    rows = torch.tensor([[1, 255], [7, 0]], dtype=getattr(torch, wire_dtype))
+    out = deserialize_routed_experts(_b64(rows), 2, wire_dtype)
+    assert out.dtype == torch.uint8
+    assert torch.equal(out.long(), rows.long())
+
+
+def test_deserialize_routed_experts_keeps_wide_ids_and_rejects_bad_sizes() -> None:
+    rows = torch.tensor([[300, 1]], dtype=torch.int32)
+    assert deserialize_routed_experts(_b64(rows), 1).dtype == torch.int16
+    with pytest.raises(ValueError):
+        deserialize_routed_experts(_b64(rows), 3)
+
+
+def test_decode_generate_body_splits_logprobs_and_appends_terminal_row() -> None:
+    rows = torch.tensor([[1, 2], [3, 4], [5, 6]], dtype=torch.int32)
+    body = json.dumps({
+        "text": "hi",
+        "meta_info": {
+            "weight_version": "1",
+            "prompt_tokens": 3,
+            "completion_tokens": 2,
+            "output_token_logprobs": [[-0.1, 101, None], [-0.2, 102, None]],
+            "routed_experts": _b64(rows),
+        },
+    }).encode()
+
+    response_json, experts = decode_generate_body(body, routed_experts_start_len=1, r3_enabled=True)
+
+    meta = response_json["meta_info"]
+    assert "routed_experts" not in meta and "output_token_logprobs" not in meta
+    assert torch.equal(experts, torch.tensor([[1, 2], [3, 4], [5, 6], [5, 6]], dtype=torch.uint8))
+    payload, _, _ = make_parser().build_assistant_message(response_json, routed_experts=experts)
+    assert payload.response_ids == [101, 102] and payload.logprobs == [-0.1, -0.2]
+    assert payload.routed_experts is experts
+
+
+def test_build_assistant_message_rejects_missing_r3_when_enabled() -> None:
+    """With R3 on, a response without decoded routed experts must fail during rollout."""
+    with pytest.raises(ValueError, match="routed_experts"):
+        make_parser().build_assistant_message({
+            "text": "hi",
+            "meta_info": {"weight_version": "1", "output_token_logprobs": [[-0.1, 101]]},
+        })
+
+
+def test_decode_generate_body_skips_r3_for_abort_with_malformed_payload() -> None:
+    """An aborted response with an unparsable R3 payload must not raise; experts is None."""
+    body = json.dumps({
+        "text": "",
+        "meta_info": {
+            "prompt_tokens": 3,
+            "completion_tokens": 2,
+            "routed_experts": "not-valid-base64-rows",
+            "finish_reason": {"type": "abort", "message": "cancelled"},
+        },
+    }).encode()
+
+    response_json, experts = decode_generate_body(body, routed_experts_start_len=1, r3_enabled=True)
+
+    assert experts is None
+    assert is_passthrough_response(response_json)
+
+
+def test_decode_generate_body_skips_r3_for_error_response() -> None:
+    """An error body (no generated text) is passthrough: R3 decode is skipped."""
+    body = json.dumps({"error": "bad request", "meta_info": {}}).encode()
+
+    response_json, experts = decode_generate_body(body, routed_experts_start_len=1, r3_enabled=True)
+
+    assert experts is None
+    assert is_passthrough_response(response_json)
+
+
+def test_append_routed_experts_grows_buffer_in_place() -> None:
+    """Continuation writes into spare capacity instead of re-copying the whole map."""
+    parser = make_parser()
+    trajectory = Trajectory(trajectory_id="traj-buf", prompt_id="p", tokens=list(range(8)))
+    parser._append_routed_experts(trajectory, torch.zeros(8, 2, dtype=torch.uint8))
+    trajectory.tokens.extend([8, 9])
+    parser._append_routed_experts(trajectory, torch.ones(3, 2, dtype=torch.uint8))
+    first = trajectory.rollout_routed_experts
+    trajectory.tokens.extend([10])
+    parser._append_routed_experts(trajectory, torch.full((2, 2), 2, dtype=torch.uint8))
+
+    merged = trajectory.rollout_routed_experts
+    assert merged.untyped_storage().data_ptr() == first.untyped_storage().data_ptr()
+    assert merged[:, 0].tolist() == [0] * 7 + [1, 1, 2, 2]
+
+
 def test_build_assistant_message_decodes_weight_version() -> None:
     """Request-level SGLang weight_version should be decoded from meta_info."""
-    parser = make_parser()
+    parser = make_parser(r3_enabled=False)
 
     payload, _, _ = parser.build_assistant_message({
         "text": "hi",
@@ -574,6 +752,37 @@ def test_deepseek_v4_parsers_disabled_when_model_config_unavailable(tmp_path) ->
     parser = make_deepseek_v4_parser(str(tmp_path / "missing"))
     assert parser._reasoning_parser_name is None
     assert parser._tool_call_parser_name is None
+
+
+@pytest.fixture
+def deepseek_v41_model_dir(tmp_path) -> str:
+    (tmp_path / "config.json").write_text(json.dumps({
+        "model_type": "deepseek_v41",
+        "architectures": ["DeepseekV41ForCausalLM"],
+    }))
+    return str(tmp_path)
+
+
+def test_build_assistant_message_keeps_deepseek_v41_string_params_verbatim(
+    deepseek_v41_model_dir: str,
+) -> None:
+    """SGLang v0.5.23 strips V4.1 string parameters; the tool must get them as generated."""
+    parser = make_deepseek_v4_parser(deepseek_v41_model_dir)
+    assert parser._tool_call_parser_name == "deepseekv41"
+    generated_text = (
+        "\n\n<｜DSML｜ calls>\n"
+        '<｜DSML｜ invoke name="write">\n'
+        '<｜DSML｜ parameter name="text" string="true">\n  indented\n</｜DSML｜ parameter>\n'
+        "</｜DSML｜ invoke>\n"
+        "</｜DSML｜ calls>"
+    )
+
+    _, message, _ = parser.build_assistant_message({
+        "text": generated_text,
+        "meta_info": {"weight_version": "1", "output_token_logprobs": [[-0.1, 101]]},
+    })
+
+    assert json.loads(message["tool_calls"][0]["function"]["arguments"]) == {"text": "\n  indented\n"}
 
 
 def make_sglang_parser(**kwargs) -> TrajectoryParser:
@@ -801,7 +1010,7 @@ def test_build_assistant_message_splits_reasoning_and_tool_calls() -> None:
 
 def test_update_trajectory_records_weight_versions() -> None:
     """Trajectory bookkeeping should keep token-level versions aligned with logprobs."""
-    parser = make_parser()
+    parser = make_parser(r3_enabled=False)
     trajectory = Trajectory(
         trajectory_id="traj-version",
         prompt_id="prompt-0",
@@ -836,7 +1045,7 @@ def test_update_trajectory_records_weight_versions() -> None:
 
 def test_build_assistant_message_rejects_negative_weight_version() -> None:
     """-1 is the prompt-token / unset sentinel, so it must not come back as a real version."""
-    parser = make_parser()
+    parser = make_parser(r3_enabled=False)
 
     with pytest.raises(ValueError, match="weight_version must be >= 0"):
         parser.build_assistant_message({
@@ -878,7 +1087,7 @@ def test_append_triplet_preserves_zero_weight_version() -> None:
 @pytest.mark.parametrize("bad_version", [None, "abc"])
 def test_build_assistant_message_rejects_non_numeric_weight_version(bad_version: object) -> None:
     """Non-numeric weight_version values should fail fast."""
-    parser = make_parser()
+    parser = make_parser(r3_enabled=False)
 
     with pytest.raises(ValueError, match="weight_version must be int or str"):
         parser.build_assistant_message({
@@ -1313,7 +1522,7 @@ def test_append_triplet_subagent_placeholder_does_not_touch_flat_arrays() -> Non
 
 def test_update_trajectory_subagent_placeholder_skips_chat_and_weight_version() -> None:
     """Placeholder turns must not enter chat_completions or move weight-version scalars."""
-    parser = make_parser()
+    parser = make_parser(r3_enabled=False)
     trajectory = Trajectory(
         trajectory_id="traj-subagent-update",
         prompt_id="prompt-0",
