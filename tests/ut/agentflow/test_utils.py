@@ -2,6 +2,7 @@
 
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -15,7 +16,11 @@ from coda.agentflow.utils import (
     cli_process_pattern,
     kill_process_tree_command,
     require_docker_image,
+    spawn_process_pool,
 )
+
+# Workers re-import coda.agentflow; without this litellm blocks fetching its cost map.
+_LOCAL_COST_MAP = {"LITELLM_LOCAL_MODEL_COST_MAP": "True"}
 
 
 def test_build_request_id() -> None:
@@ -159,3 +164,70 @@ def test_kill_process_tree_reaps_children_spawned_during_grace(tmp_path: Path) -
             proc.kill()
         if pid_file.exists():
             subprocess.run(["kill", "-KILL", pid_file.read_text().strip()], check=False)
+
+
+# Set only in the test process; a forked worker would inherit it, a spawned one re-imports this module.
+_SET_IN_PARENT: str | None = None
+_INITIALIZED_WITH: str | None = None
+
+
+def _record_init(value: str) -> None:
+    global _INITIALIZED_WITH
+    _INITIALIZED_WITH = value
+
+
+def _worker_state() -> tuple[str | None, str | None]:
+    return _SET_IN_PARENT, _INITIALIZED_WITH
+
+
+def test_spawn_process_pool_spawns_and_runs_initializer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Workers start from a fresh interpreter and still run the caller's initializer."""
+    for key, value in _LOCAL_COST_MAP.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(sys.modules[__name__], "_SET_IN_PARENT", "parent")
+    pool = spawn_process_pool(1, initializer=_record_init, initargs=("tokenizer",))
+    try:
+        assert pool.submit(_worker_state).result(timeout=120) == (None, "tokenizer")
+    finally:
+        pool.shutdown(wait=True)
+
+
+_POOL_OWNER = """
+import os, sys, time
+from coda.agentflow.utils import spawn_process_pool
+pool = spawn_process_pool(1)
+print("worker=%d" % pool.submit(os.getpid).result(), flush=True)
+time.sleep(600)
+"""
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="PR_SET_PDEATHSIG is Linux-only")
+def test_spawn_process_pool_workers_die_with_parent() -> None:
+    """SIGKILL on the pool owner takes its idle worker down too, leaving no orphan."""
+    repo_root = Path(__file__).resolve().parents[3]
+    owner = subprocess.Popen(
+        [sys.executable, "-c", _POOL_OWNER],
+        cwd=repo_root,
+        env={**os.environ, **_LOCAL_COST_MAP},
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    worker = None
+    try:
+        # Imports may print banners (mini-swe-agent) to stdout before the pid line.
+        for line in owner.stdout:
+            if line.startswith("worker="):
+                worker = int(line.removeprefix("worker="))
+                break
+        assert worker is not None, "pool owner exited before reporting its worker"
+        owner.send_signal(signal.SIGKILL)
+        owner.wait(timeout=5)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not _gone(worker):
+            time.sleep(0.05)
+        assert _gone(worker)
+    finally:
+        if owner.poll() is None:
+            owner.kill()
+        if worker is not None and not _gone(worker):
+            os.kill(worker, signal.SIGKILL)
