@@ -33,19 +33,19 @@ def _normalize(text: str) -> str:
 
 
 def _outcome_reward(predicted: str | None, ground_truth: str) -> float:
-    """Binary outcome reward: 1.0 if predicted matches ground_truth, else 0.0."""
+    """Binary outcome reward: 1.0 if predicted matches ground_truth after normalisation, else 0.0.
+
+    Substring containment is deliberately not accepted: a fragment of the answer (a surname for
+    a full name, ``"200"`` for ``"2004"``) or a list of guesses that contains it would otherwise
+    receive full credit.
+    """
     if not predicted:
         return 0.0
-    expected = str(ground_truth).strip()
-    if predicted.lower() == expected.lower():
+    if str(predicted).strip().lower() == str(ground_truth).strip().lower():
         return 1.0
-    norm_pred = _normalize(predicted)
-    norm_exp = _normalize(expected)
-    if norm_pred == norm_exp:
-        return 1.0
-    if norm_exp and norm_pred and (norm_exp in norm_pred or norm_pred in norm_exp):
-        return 1.0
-    return 0.0
+    norm_pred = _normalize(str(predicted))
+    norm_exp = _normalize(str(ground_truth))
+    return 1.0 if norm_exp and norm_pred == norm_exp else 0.0
 
 
 @register_reward("bcp")
