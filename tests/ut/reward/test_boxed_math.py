@@ -10,7 +10,7 @@ from coda.reward import create_reward_fn
 
 
 def _reward():
-    return create_reward_fn(OmegaConf.create({"name": "boxed_math"}))
+    return create_reward_fn(OmegaConf.create({"name": "boxed_math", "group_rm": False}))
 
 
 def _score(response, label):

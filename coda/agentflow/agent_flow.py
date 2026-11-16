@@ -80,7 +80,7 @@ class AgentFlow:
         group_rm_ds: set[int] = set()
         for ds_index, ds_cfg in enumerate(self.config.data_sources):
             group_sizes[ds_index] = int(ds_cfg.num_trajectories_per_prompt)
-            if ds_cfg.reward.get("group_rm", False):
+            if ds_cfg.reward.group_rm:
                 group_rm_ds.add(ds_index)
         self.traj_queue = TrajQueue(group_sizes=group_sizes, group_rm_ds=group_rm_ds)
         self.retry_limit = self.config.rollout.retry_limit

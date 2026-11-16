@@ -43,7 +43,7 @@ def _make_config(rollout_mode: str = "single_turn", retry_limit: int = 1) -> Mag
     # data_sources[0] must expose real values for .get()/getattr access.
     ds = OmegaConf.create({
         "agent": {"name": "dummy_agent" if rollout_mode == "multi_turn" else ""},
-        "reward": {},
+        "reward": {"group_rm": False},
         "sandbox": {"type": "none", "max_concurrency": 0},
         "max_response_len_per_trajectory": 512,
         "completion_params": {},

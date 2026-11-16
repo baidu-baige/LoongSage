@@ -4,7 +4,7 @@ Usage:
     from coda.reward import Reward, RewardFunction, create_reward_fn
 
     # Create from config
-    reward_fn = create_reward_fn({"name": "gsm8k"})
+    reward_fn = create_reward_fn({"name": "gsm8k", "group_rm": False})
 
     # Or use directly
     from coda.reward.functions.gsm8k import GSM8KReward
@@ -41,7 +41,7 @@ def create_reward_fn(reward_config: Mapping[str, Any] | None) -> RewardFunction 
         return None
 
     cls = get_reward_class(name)
-    if reward_config.get("group_rm", False):
+    if reward_config["group_rm"]:
         if cls.group_rm is RewardFunction.group_rm:
             raise ValueError(f"reward '{name}' has group_rm=true but does not implement group_rm")
         if not inspect.iscoroutinefunction(cls.group_rm):

@@ -38,7 +38,7 @@ def _registered():
 
 
 def test_call_only_without_group_rm():
-    assert isinstance(create_reward_fn({"name": "_test_call_only"}), _CallOnly)
+    assert isinstance(create_reward_fn({"name": "_test_call_only", "group_rm": False}), _CallOnly)
 
 
 def test_group_only_with_group_rm():
@@ -54,7 +54,7 @@ def test_group_rm_enabled_but_not_implemented():
 
 def test_call_missing_when_group_rm_disabled():
     with pytest.raises(ValueError, match="does not implement __call__"):
-        create_reward_fn({"name": "_test_group_only"})
+        create_reward_fn({"name": "_test_group_only", "group_rm": False})
 
 
 def test_sync_group_rm_rejected():
