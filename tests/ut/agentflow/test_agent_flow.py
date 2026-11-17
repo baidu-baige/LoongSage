@@ -10,7 +10,7 @@ import httpx
 import pytest
 from omegaconf import OmegaConf
 
-from coda.agentflow.agent_flow import AgentFlow
+from coda.agentflow.agent_flow import AgentFlow, check_keepalive_config
 from coda.agentflow.trajectory_store import FloatSeq, Trajectory, TrajectoryStatus, Segment, Triplet, TrajectoryStore
 from coda.agentflow.utils import CONTEXT_LENGTH_EXCEEDED
 from coda.reward.reward import Reward
@@ -33,6 +33,10 @@ def _make_config(rollout_mode: str = "single_turn", retry_limit: int = 1) -> Mag
     cfg.agentflow.router.proxy_timeout_seconds = 30
     cfg.agentflow.router.max_connections = 100
     cfg.agentflow.router.abort_timeout_seconds = 600
+    cfg.agentflow.router.keepalive_seconds = 30
+    cfg.agentflow.router.agent_keepalive_seconds = 10
+    cfg.agentflow.router.upstream_keepalive_seconds = 10
+    cfg.rollout.env_vars = {"SGLANG_TIMEOUT_KEEP_ALIVE": "30"}
     cfg.agentflow.agent.name = "dummy_agent" if rollout_mode == "multi_turn" else ""
     cfg.agentflow.tokenizer = MagicMock()
     cfg.agentflow.dump_trajectory_path = ""
@@ -1604,3 +1608,33 @@ class TestExecuteSingleTurn:
             body = client.post.call_args.kwargs["json"]
 
         assert body["messages"] == [{"role": "user", "content": "mainline"}]
+
+
+# ---------------------------------------------------------------------------
+# check_keepalive_config
+# ---------------------------------------------------------------------------
+
+def _keepalive_config(keepalive=30, agent=10, upstream=10, sglang="30"):
+    return OmegaConf.create({
+        "agentflow": {"router": {
+            "keepalive_seconds": keepalive,
+            "agent_keepalive_seconds": agent,
+            "upstream_keepalive_seconds": upstream,
+        }},
+        "rollout": {"env_vars": {"SGLANG_TIMEOUT_KEEP_ALIVE": sglang}},
+    })
+
+
+def test_keepalive_defaults_pass():
+    check_keepalive_config(OmegaConf.load(
+        os.path.join(os.path.dirname(__file__), "../../../conf/default.yaml")))
+
+
+@pytest.mark.parametrize("kwargs, key", [
+    ({"keepalive": 15}, "agent_keepalive_seconds"),  # agent -> router margin 5s
+    ({"agent": 30}, "agent_keepalive_seconds"),  # client not below server
+    ({"sglang": "15"}, "upstream_keepalive_seconds"),  # router -> SGLang margin 5s
+])
+def test_keepalive_margin_too_small_rejected(kwargs, key):
+    with pytest.raises(ValueError, match=key):
+        check_keepalive_config(_keepalive_config(**kwargs))
