@@ -7,7 +7,7 @@ import shlex
 import subprocess
 from typing import Any
 
-from coda.agentflow.sandbox.base import SandboxClient
+from coda.agentflow.sandbox.base import SandboxClient, decode_output
 from coda.agentflow.sandbox import register_sandbox
 
 logger = logging.getLogger(__name__)
@@ -120,12 +120,15 @@ class DockerSandboxClient(SandboxClient):
             workdir: Working directory override (defaults to self.working_dir).
 
         Returns:
-            Dict with stdout, stderr, exit_code, success keys.
+            Dict with stdout, stderr, exit_code, success, timed_out, error keys.
+            ``timed_out`` is True when the command exhausted the timeout budget,
+            and ``error`` then holds a human-readable reason for the agent.
         """
         cwd = workdir or self.working_dir
         full_cmd = f"cd {shlex.quote(cwd)} && timeout {self.timeout} {command}"
         logger.debug(f"[{sandbox_id[:12]}] {full_cmd}")
 
+        timeout_message = f"Command timed out after {self.timeout}s"
         try:
             result = subprocess.run(
                 ["docker", "exec", sandbox_id, "bash", "-c", full_cmd],
@@ -136,16 +139,23 @@ class DockerSandboxClient(SandboxClient):
         except subprocess.TimeoutExpired as e:
             logger.error("Command timed out after %ds: %s", self.timeout + 10, full_cmd)
             return {
-                "stdout": e.stdout or "",
-                "stderr": e.stderr or "",
+                "stdout": decode_output(e.stdout),
+                "stderr": decode_output(e.stderr),
                 "exit_code": -1,
                 "success": False,
+                "timed_out": True,
+                "error": timeout_message,
             }
+        # The in-container `timeout` wrapper exits 124 when it kills the command.
+        # It fires before the outer subprocess timeout, so this is the usual path.
+        timed_out = result.returncode == 124
         return {
             "stdout": result.stdout,
             "stderr": result.stderr,
             "exit_code": result.returncode,
             "success": result.returncode == 0,
+            "timed_out": timed_out,
+            "error": timeout_message if timed_out else "",
         }
 
     def delete(self, sandbox_id: str, **kwargs) -> None:
