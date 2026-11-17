@@ -34,9 +34,9 @@ def _make_config(rollout_mode: str = "single_turn", retry_limit: int = 1) -> Mag
     cfg.agentflow.router.proxy_timeout_seconds = 30
     cfg.agentflow.router.max_connections = 100
     cfg.agentflow.router.abort_timeout_seconds = 600
-    # Mirror the real default: agents run in the driver process. A MagicMock answers
-    # .get() with a truthy mock, which would read as a worker count and start Ray actors.
-    cfg.agentflow.get = lambda key, default=None: {"agent_workers": 0}.get(key, default)
+    # Keep agents in the driver process. Left unset, a MagicMock attribute would read
+    # as a worker count and start Ray actors.
+    cfg.agentflow.agent_workers = 0
     cfg.agentflow.agent.name = "dummy_agent" if rollout_mode == "multi_turn" else ""
     cfg.agentflow.tokenizer = MagicMock()
     cfg.agentflow.dump_trajectory_path = ""

@@ -92,9 +92,9 @@ class AgentWorker:
         if (context := self._contexts.get(ds_index)) is not None:
             return context
         ds_cfg = self._ds_configs[ds_index]
-        agent_cfg = dict(ds_cfg.get("agent") or {})
-        sandbox_config = dict(ds_cfg.get("sandbox") or {})
-        sandbox_config.pop("max_concurrency", None)
+        agent_cfg = dict(ds_cfg.agent)
+        sandbox_config = dict(ds_cfg.sandbox)
+        sandbox_config.pop("max_concurrency")
         context = _DataSourceContext(
             agent_class=get_agent_class(agent_cfg["name"]),
             reward_fn=create_reward_fn(ds_cfg.reward),

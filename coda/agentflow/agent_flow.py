@@ -129,7 +129,7 @@ class AgentFlow:
 
     def _init_agent_worker_pool(self) -> None:
         """Create the out-of-process agent pool when agentflow.agent_workers > 0."""
-        num_workers = int(self.config.agentflow.get("agent_workers", 8))
+        num_workers = int(self.config.agentflow.agent_workers)
         self.agent_worker_pool: AgentWorkerPool | None = None
         if num_workers <= 0:
             return
@@ -158,7 +158,7 @@ class AgentFlow:
         self.agent_worker_pool = AgentWorkerPool(
             ds_configs=self.ds_configs,
             num_workers=num_workers,
-            max_concurrency=int(self.config.agentflow.get("agent_worker_max_concurrency", 256)),
+            max_concurrency=int(self.config.agentflow.agent_worker_max_concurrency),
             cancel_timeout_seconds=float(self.config.agentflow.router.abort_timeout_seconds),
         )
         self._resources.callback(self.agent_worker_pool.shutdown)

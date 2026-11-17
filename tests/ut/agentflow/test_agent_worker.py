@@ -134,7 +134,7 @@ def test_forwarded_env_omits_missing_pythonpath(monkeypatch):
     assert forwarded_env_vars() == {}
 
 
-def _flow_stub(agent_workers, partial, prepare_sandbox, agent_name="mini-swe", config_has_workers=True):
+def _flow_stub(partial, prepare_sandbox, agent_name="mini-swe", agentflow_cfg=None, agent_workers=8):
     """Enough of an AgentFlow for _init_agent_worker_pool, without starting a router."""
     import contextlib
     from types import SimpleNamespace
@@ -144,15 +144,16 @@ def _flow_stub(agent_workers, partial, prepare_sandbox, agent_name="mini-swe", c
     reward_fn = SimpleNamespace()
     if prepare_sandbox:
         reward_fn.prepare_sandbox = lambda *a, **k: {}
-    agentflow_cfg = {"router": {"abort_timeout_seconds": 600}}
-    if config_has_workers:
-        agentflow_cfg["agent_workers"] = agent_workers
+    if agentflow_cfg is None:
+        agentflow_cfg = {
+            "agent_workers": agent_workers,
+            "agent_worker_max_concurrency": 256,
+            "router": {"abort_timeout_seconds": 600},
+        }
     return SimpleNamespace(
-        config=OmegaConf.create({
-            "agentflow": agentflow_cfg,
-        }),
+        config=OmegaConf.create({"agentflow": agentflow_cfg}),
         partial_rollout_enabled=partial,
-        ds_configs={0: OmegaConf.create({"agent": {"name": agent_name}} if agent_name else {})},
+        ds_configs={0: OmegaConf.create({"agent": {"name": agent_name}})},
         ds_sandbox_clients={0: object()},
         ds_reward_fns={0: reward_fn},
         _resources=contextlib.AsyncExitStack(),
@@ -175,22 +176,28 @@ def test_pool_is_skipped_when_all_sources_are_single_turn():
     assert flow.agent_worker_pool is None
 
 
-def test_pool_defaults_to_eight_workers(monkeypatch):
+def test_pool_uses_default_yaml_values(monkeypatch):
+    from pathlib import Path
+
+    from omegaconf import OmegaConf
+
     from coda.agentflow import agent_flow as agent_flow_mod
 
     created = {}
 
     class _RecordingPool:
         def __init__(self, ds_configs, num_workers, max_concurrency, cancel_timeout_seconds):
-            created["num_workers"] = num_workers
+            created.update(num_workers=num_workers, max_concurrency=max_concurrency)
 
         def shutdown(self):
             pass
 
     monkeypatch.setattr(agent_flow_mod, "AgentWorkerPool", _RecordingPool)
-    flow = _flow_stub(agent_workers=None, partial=False, prepare_sandbox=True, config_has_workers=False)
+    default_yaml = Path(__file__).resolve().parents[3] / "conf" / "default.yaml"
+    agentflow_cfg = OmegaConf.to_container(OmegaConf.load(default_yaml).agentflow)
+    flow = _flow_stub(partial=False, prepare_sandbox=True, agentflow_cfg=agentflow_cfg)
     agent_flow_mod.AgentFlow._init_agent_worker_pool(flow)
-    assert created["num_workers"] == 8
+    assert created == {"num_workers": 8, "max_concurrency": 256}
 
 
 def test_partial_rollout_without_prepare_sandbox_is_rejected():
