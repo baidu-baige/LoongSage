@@ -98,11 +98,11 @@ class _RowOutputs:
         self.index = index
 
     def log_probs(self, logits, temperature):
-        from tree_pack.megatron.loss import tree_compute_log_probs
+        from coda.custom.tree_pack.megatron.loss import tree_compute_log_probs
         return tree_compute_log_probs(self.index, logits, temperature)
 
     def entropy(self, logits, temperature, with_grad):
-        from tree_pack.megatron.loss import tree_compute_entropy
+        from coda.custom.tree_pack.megatron.loss import tree_compute_entropy
         return tree_compute_entropy(self.index, logits, temperature, metric_only=not with_grad)
 
 
@@ -153,8 +153,8 @@ class TreePacker(MicroBatchPacker):
     def setup(self, model) -> str | None:
         from megatron.core.utils import get_model_config
 
-        from tree_pack.megatron.adapters import match_adapters
-        from tree_pack.megatron.lm_head import install_lm_head_row_select
+        from coda.custom.tree_pack.megatron.adapters import match_adapters
+        from coda.custom.tree_pack.megatron.lm_head import install_lm_head_row_select
 
         mc = get_model_config(model[0])
         # node positions are the root-path depth, passed as explicit position_ids
@@ -188,8 +188,8 @@ class TreePacker(MicroBatchPacker):
         logit-row budget); the trees are the items bin-packed into micro-batches."""
         from coda.backends.megatron.data import _trajectory_row_ranges
 
-        from tree_pack.core.batch import chain_branch_points
-        from tree_pack.core.plan import group_nodes, plan_sequences, plan_sequences_min_cost
+        from coda.custom.tree_pack.core.batch import chain_branch_points
+        from coda.custom.tree_pack.core.plan import group_nodes, plan_sequences, plan_sequences_min_cost
 
         opts = self.options
         if opts["max_nodes_per_gpu"]:
@@ -240,8 +240,8 @@ class TreePacker(MicroBatchPacker):
              routed_rows: Callable[[], list]) -> PackedInputs:
         from coda.backends.megatron.cp_utils import prepare_packed_seq_params
 
-        from tree_pack.core.batch import build_tree_microbatch
-        from tree_pack.megatron.lm_head import lm_head_rows
+        from coda.custom.tree_pack.core.batch import build_tree_microbatch
+        from coda.custom.tree_pack.megatron.lm_head import lm_head_rows
 
         cfg = self.config
 
