@@ -1,30 +1,10 @@
 """Unit tests for coda/utils/packing.py."""
 
-import sys
-from importlib.metadata import EntryPoint, EntryPoints
-
 import pytest
 from omegaconf import OmegaConf
 
 import coda.utils.packing as packing
 from coda.utils.packing import MicroBatchPacker, build_packer, get_packer_class
-
-PLUGIN = '''
-from coda.utils.packing import MicroBatchPacker, register_packer
-
-@register_packer("{name}")
-class Plugin(MicroBatchPacker):
-    reason = None
-    setup_reason = None
-
-    @classmethod
-    def unsupported_reason(cls, config):
-        return cls.reason
-
-    def setup(self, model):
-        self.model = model
-        return self.setup_reason
-'''
 
 
 def _config(packer="rows"):
@@ -32,17 +12,25 @@ def _config(packer="rows"):
 
 
 @pytest.fixture
-def plugin(tmp_path, monkeypatch, request):
-    """Install a fake plugin module exposed through the packer entry point group."""
+def plugin(request):
+    """Register a packer the way a ``coda/custom/`` module does (decorator on import)."""
     name = f"fake_{request.node.name}"
-    mod = f"fake_packer_{request.node.name}"
-    (tmp_path / f"{mod}.py").write_text(PLUGIN.format(name=name))
-    monkeypatch.syspath_prepend(str(tmp_path))
-    eps = EntryPoints([EntryPoint(name, f"{mod}:Plugin", packing.ENTRY_POINT_GROUP)])
-    monkeypatch.setattr(packing, "entry_points", lambda group: eps if group == packing.ENTRY_POINT_GROUP else EntryPoints([]))
+
+    @packing.register_packer(name)
+    class Plugin(MicroBatchPacker):
+        reason = None
+        setup_reason = None
+
+        @classmethod
+        def unsupported_reason(cls, config):
+            return cls.reason
+
+        def setup(self, model):
+            self.model = model
+            return self.setup_reason
+
     yield name
     packing.PACKER_REGISTRY._registry.pop(name, None)
-    sys.modules.pop(mod, None)
 
 
 def test_default_is_rows():
@@ -54,15 +42,12 @@ def test_default_is_rows():
 
 
 def test_unknown_packer_lists_choices():
-    with pytest.raises(ValueError, match="'nope'.*rows"):
+    with pytest.raises(ValueError, match="'nope'.*rows.*Skipped custom module"):
         get_packer_class("nope")
 
 
-def test_plugin_is_loaded_from_its_entry_point(plugin):
-    assert plugin not in packing.PACKER_REGISTRY
-    cls = get_packer_class(plugin)
-    assert cls.__name__ == "Plugin"
-    assert plugin in packing.PACKER_REGISTRY
+def test_custom_packer_is_found(plugin):
+    assert get_packer_class(plugin).__name__ == "Plugin"
 
 
 def test_build_runs_setup_on_the_model(plugin):

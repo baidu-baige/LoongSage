@@ -1,9 +1,10 @@
 """Pluggable micro-batch packing for the Megatron backend.
 
 A packer decides how the Segment rows of a micro-batch become model inputs. The default
-``rows`` packer is the built-in behaviour (one packed sequence per row). Plugins register
-other packers under the ``loongsage.packers`` entry point group and are selected with
-``trainer.packer``; ``trainer.packer_options`` is passed to them as-is.
+``rows`` packer is the built-in behaviour (one packed sequence per row). Other packers
+register with ``@register_packer("name")`` in ``coda/custom/`` (see
+``docs/zh/custom-extensions.md``) and are selected with ``trainer.packer``;
+``trainer.packer_options`` is passed to them as-is.
 
 Every hook of the base class returns ``None`` (or does nothing), which tells the caller
 to run its built-in row path. Kept free of Megatron imports so the controller can use it.
@@ -14,7 +15,6 @@ from __future__ import annotations
 import logging
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
-from importlib.metadata import entry_points
 from typing import Any, Callable
 
 from omegaconf import DictConfig
@@ -22,10 +22,6 @@ from omegaconf import DictConfig
 from coda.utils.registry import Registry
 
 logger = logging.getLogger(__name__)
-
-# Bumped when a hook below changes; plugins check it on import.
-PACKER_API_VERSION = 1
-ENTRY_POINT_GROUP = "loongsage.packers"
 
 PACKER_REGISTRY = Registry("micro_batch_packer")
 register_packer = PACKER_REGISTRY.register
@@ -109,16 +105,12 @@ def row_outputs(packed_seq_params):
 
 
 def get_packer_class(name: str) -> type[MicroBatchPacker]:
-    """Look ``name`` up in the registry, loading it from installed plugins if needed."""
+    """Look ``name`` up in the packer registry (custom packers register when ``coda/custom``
+    is imported, before the trainer and the workers resolve it)."""
     if name not in PACKER_REGISTRY:
-        found = entry_points(group=ENTRY_POINT_GROUP).select(name=name)
-        for ep in found:
-            ep.load()                 # importing the plugin registers it
-        if name not in PACKER_REGISTRY:
-            installed = sorted(ep.name for ep in entry_points(group=ENTRY_POINT_GROUP))
-            raise ValueError(
-                f"Unknown trainer.packer {name!r}; registered: {PACKER_REGISTRY.keys()}, "
-                f"installed plugins: {installed}")
+        raise ValueError(
+            f"Unknown trainer.packer {name!r}; registered: {PACKER_REGISTRY.keys()} "
+            "(a coda/custom module that failed to import is logged as 'Skipped custom module')")
     return PACKER_REGISTRY.get(name)
 
 
