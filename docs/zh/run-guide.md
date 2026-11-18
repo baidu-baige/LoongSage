@@ -227,9 +227,9 @@ bash examples/start.sh qwen3_coder_30b_a3b/claude_code_h20_2node \
   data_source.sandbox.kubeconfig=/path/to/kubeconfig.yaml
 ```
 
-### 任务八：使用图像训练视觉语言模型（Qwen3-VL）
+### 任务八：使用图像训练视觉语言模型（Qwen3-VL、DeepSeek-V4.1）
 
-图像模态训练默认关闭。[`conf/qwen3_vl_30b_a3b/`](../../conf/qwen3_vl_30b_a3b/) 下的预设设置了 `multimodal.enable: true`，在单机 8 卡 H20 上用 `boxed_math` 奖励跑 GRPO；Router 依赖 `qwen-vl-utils` 包（镜像未自带时 `pip install qwen-vl-utils==0.0.14`）。
+图像模态训练默认关闭。[`conf/qwen3_vl_30b_a3b/`](../../conf/qwen3_vl_30b_a3b/) 下的预设设置了 `multimodal.enable: true`，在单机 8 卡 H20 上用 `boxed_math` 奖励跑 GRPO；Qwen3-VL 的 Router 依赖 `qwen-vl-utils` 包（镜像未自带时 `pip install qwen-vl-utils==0.0.14`）。DeepSeek-V4.1 有单独的预设，见本任务末尾。
 
 **数据格式。** 带图数据集由 `data_source.dataset.multimodal_keys`（这里是 `{image: images}`）指定，包含两部分：
 
@@ -267,6 +267,25 @@ bash examples/start.sh qwen3_vl_30b_a3b/mmrb_h20_1node \
 ```
 
 两个预设都使用 TP4 x PP2、EP4，冻结视觉塔、训练语言模型（`megatron.model.freeze_vision_model: true`，`freeze_language_model: false`）。Megatron-Bridge 对 Qwen3-VL-MoE 默认把两者都置为 `True`，自己的配置里请显式写出。字段详情见 [默认配置参数手册 §1.1](config-reference.md#11-multimodal图像模态)；图像在 Router 与训练侧的流转见 `coda/agentflow/multimodal.py` 与 `coda/data_factory/data_processor.py` 中的 `put_dp_shards_to_ray`（AgentFlow 与 Controller 文档暂未发布）。
+
+**DeepSeek-V4.1（geo3k）。** [`dsv41_flash/geo3k_h20_6node`](../../conf/dsv41_flash/geo3k_h20_6node.yaml) 在 6 节点 × 8 卡 H20 上用 `boxed_math` 奖励跑 geo3k 的 GRPO，对量化后的 rollout 做 QAT（与 `dsv41_flash/` 下其他预设一致）。数据格式同上。DeepSeek-V4.1 用自带的图像处理器规划每张图，参数取自检查点 `config.json` 中的 `vision_*` 字段，因此不依赖 `qwen-vl-utils`，`multimodal.image.min_pixels/max_pixels` 也不适用。下载模型和数据：
+
+```bash
+hf download deepseek-ai/DeepSeek-V4.1-Flash-1017 --local-dir /root/DeepSeek-V4.1-Flash-1017
+hf download hiyouga/geometry3k --repo-type=dataset --local-dir /root/geometry3k
+```
+
+先在每台机器上启动 Ray 集群（见[多机训练准备](#多机训练准备)），再在 head 节点启动：
+
+```bash
+bash examples/start.sh dsv41_flash/geo3k_h20_6node \
+  checkpoint_path=/root/ckpt/dsv41_geo3k \
+  hf_model_path=/root/DeepSeek-V4.1-Flash-1017 \
+  data_source.dataset.prompt_data_path=/root/geometry3k/data/train-00000-of-00001.parquet \
+  data_source.dataset.eval_prompt_data_path=/root/geometry3k/data/validation-00000-of-00001.parquet
+```
+
+预设使用 TP4 x PP6、EP8、CP1，`cp_partition_mode: contiguous`。DeepSeek-V4.1 开启 `multimodal.enable: true` 时，启动校验会拒绝破坏训推一致性的设置，例如 `image_processor_backend` 不是 `pil`、rollout 覆盖项里 `vision_n_layers: 0`、rollout 的 `pp_size` 或 `attn_cp_size` 大于 1、`freeze_vision_model: false`。完整列表见 [默认配置参数手册 §1.1](config-reference.md#11-multimodal图像模态)。
 
 提示：各预设继承 [`default.yaml`](../../conf/default.yaml)，[`conf/qwen3_30b_a3b/`](../../conf/qwen3_30b_a3b/) 这类子目录是特定模型与机型的预设。更多可用配置见 [`conf/`](../../conf/)。
 
@@ -492,6 +511,10 @@ checkpoint_path/
 | `conf/dsv41_flash_bf16/` | `dapo_b200_5node` | DeepSeek-V4.1-Flash-BF16 | DAPO 数学 | 5 节点 xB200 |
 | | `swe_b200_6node` | DeepSeek-V4.1-Flash-BF16 | mini-SWE（R2E-Gym）| 6 节点 xB200 |
 | | `swe_h20_6node` | DeepSeek-V4.1-Flash-BF16 | mini-SWE（R2E-Gym）| 6 节点 xH20 |
+| `conf/dsv41_flash/` | `dapo_h20_6node` | DeepSeek-V4.1-Flash（原始权重，QAT） | DAPO 数学 | 6 节点 xH20 |
+| | `swe_h20_6node` | DeepSeek-V4.1-Flash（原始权重，QAT） | mini-SWE（R2E-Gym）| 6 节点 xH20 |
+| | `sft_h20_6node` | DeepSeek-V4.1-Flash（原始权重，QAT） | SFT | 6 节点 xH20 |
+| | `geo3k_h20_6node` | DeepSeek-V4.1-Flash（原始权重，QAT） | GRPO geo3k 单图（任务八） | 6 节点 xH20 |
 
 
 ## 相关文档
