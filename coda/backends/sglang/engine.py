@@ -204,6 +204,8 @@ class SglangEngine(RolloutWorker):
     @override
     def shutdown(self, timeout: float = 30.0):
         """Shutdown the SGLang engine and clean up resources."""
+        if not hasattr(self, "node_rank"):  # init() never ran
+            return
         logger.info(f"Shutdown engine {self.server_host}:{self.server_port}...")
         if self.node_rank == 0:
             worker_url = f"http://{self.server_host}:{self.server_port}"
