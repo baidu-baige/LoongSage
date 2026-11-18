@@ -3,7 +3,11 @@ import threading
 import time
 from typing import Callable
 
-from coda.agentflow.trajectory_store import Trajectory, TrajectoryGroup
+from coda.agentflow.trajectory_store import Trajectory, TrajectoryGroup, TrajectoryStatus
+
+# Set on every trajectory of a group once group_rm has scored it, so a group
+# restored by partial rollout and re-emitted unchanged is not scored twice.
+GROUP_RM_SCORED_KEY = "group_rm_scored"
 
 
 class TrajQueue:
@@ -14,14 +18,22 @@ class TrajQueue:
 
     Internally, each group stores trajectories in an insertion-ordered dict
     (trajectory_id -> Trajectory), giving O(1) lookup and removal by id.
+
+    For data sources in *group_rm_ds*, a complete group only becomes ready
+    after AgentFlow has scored it: claim_group_rm -> commit_group_rm.
     """
-    def __init__(self, group_sizes: dict[int, int], maxsize: int = 0):
+    def __init__(self, group_sizes: dict[int, int], maxsize: int = 0,
+                 group_rm_ds: frozenset[int] | set[int] = frozenset()):
         self.group_sizes = {int(k): int(v) for k, v in group_sizes.items()}
         self.maxsize = maxsize  # 0 means unlimited
         # prompt_id -> {trajectory_id -> Trajectory} (dict preserves insertion order)
         self.groups: dict[str, dict[str, Trajectory]] = {}
         # trajectory_id -> prompt_id, for quick lookup
         self.tid_pid_map: dict[str, str] = {}
+        self.group_rm_ds = {int(ds) for ds in group_rm_ds}
+        # prompt_ids of group_rm data sources being scored / already scored
+        self.group_scoring: set[str] = set()
+        self.group_scored: set[str] = set()
         self._cond = threading.Condition()
         if self.maxsize < 0:
             raise ValueError(f"maxsize must be >= 0, got {maxsize}")
@@ -55,6 +67,8 @@ class TrajQueue:
         """Remove group entry if empty. Caller must hold lock."""
         if prompt_id in self.groups and not self.groups[prompt_id]:
             del self.groups[prompt_id]
+            self.group_scoring.discard(prompt_id)
+            self.group_scored.discard(prompt_id)
 
     def _pop_n_from_group(self, prompt_id: str, n: int) -> TrajectoryGroup:
         """Pop the first *n* trajectories from a group. Caller must hold lock."""
@@ -64,6 +78,8 @@ class TrajQueue:
         for k in keys:
             items.append(group.pop(k))
             self.tid_pid_map.pop(k)
+        # Leftover trajectories (if any) form a new, unscored group.
+        self.group_scored.discard(prompt_id)
         self._cleanup_group(prompt_id)
         return TrajectoryGroup(prompt_id=prompt_id, trajectories=items)
 
@@ -73,7 +89,9 @@ class TrajQueue:
         """Find and pop the first ready group whose full prompt group satisfies will_collect. Caller must hold lock."""
         for pid, group in list(self.groups.items()):
             group_size = self._group_size_for_prompt(pid)
-            if len(group) >= group_size:
+            if len(group) >= group_size and (
+                next(iter(group.values())).ds_index not in self.group_rm_ds or pid in self.group_scored
+            ):
                 if will_collect is not None and not will_collect(group):
                     continue
                 return self._pop_n_from_group(pid, group_size)
@@ -120,6 +138,7 @@ class TrajQueue:
                     return None
                 prompt_id = self.tid_pid_map.pop(trajectory_id)
                 traj = self.groups[prompt_id].pop(trajectory_id)
+                self.group_scored.discard(prompt_id)
                 self._cleanup_group(prompt_id)
                 self._cond.notify()
                 return traj
@@ -129,6 +148,7 @@ class TrajQueue:
                         first_tid = next(iter(group))
                         traj = group.pop(first_tid)
                         self.tid_pid_map.pop(first_tid)
+                        self.group_scored.discard(prompt_id)
                         self._cleanup_group(prompt_id)
                         self._cond.notify()
                         return traj
@@ -200,13 +220,18 @@ class TrajQueue:
                 # guarding against future refactors that might continue the loop.
                 for pid, group in list(self.groups.items()):
                     group_size = self._group_size_for_prompt(pid)
-                    if len(group) >= group_size:
+                    if len(group) >= group_size and (
+                        next(iter(group.values())).ds_index not in self.group_rm_ds or pid in self.group_scored
+                    ):
                         result = self._pop_n_from_group(pid, group_size)
                         self._cond.notify()
                         return result
             elif prompt_id in self.groups:
+                group = self.groups[prompt_id]
                 group_size = self._group_size_for_prompt(prompt_id)
-                if len(self.groups[prompt_id]) >= group_size:
+                if len(group) >= group_size and (
+                    next(iter(group.values())).ds_index not in self.group_rm_ds or prompt_id in self.group_scored
+                ):
                     result = self._pop_n_from_group(prompt_id, group_size)
                     self._cond.notify()
                     return result
@@ -243,6 +268,67 @@ class TrajQueue:
                     return None  # timed out
 
     # ------------------------------------------------------------------
+    # Public API — group reward model
+    # ------------------------------------------------------------------
+
+    def claim_group_rm(self, prompt_id: str) -> list[Trajectory] | None:
+        """Claim a complete, unscored group of a group_rm data source for scoring.
+
+        Returns the group's first *group_size* trajectories and adds *prompt_id*
+        to ``group_scoring``. They are the queued objects, not copies: while a group is
+        in ``group_scoring`` no consumer pops it, and ``pop_all`` only runs after the
+        scoring task has finished or been cancelled, so the caller may mutate them
+        until ``commit_group_rm``/``release_group_rm``. Returns ``None`` when there
+        is nothing to score:
+
+        - The data source does not use group_rm.
+        - The group is not complete yet, i.e. the first n-1 emits of the group.
+        - The group is already in ``group_scoring`` (another emit is scoring it) or
+          in ``group_scored``.
+        - The group has an ABORTED or FAILED member. It is marked scored and
+          released to consumers without scoring. After partial rollout resumes
+          it, ``pop_all`` has cleared that mark, so the fully COMPLETED group is
+          scored then.
+        - Every member carries ``GROUP_RM_SCORED_KEY``: a group scored before an
+          abort and re-emitted unchanged on resume. It is marked scored and keeps
+          its previous rewards.
+        """
+        with self._cond:
+            group = self.groups.get(prompt_id)
+            if not group or prompt_id in self.group_scoring or prompt_id in self.group_scored:
+                return None
+            ds_index = next(iter(group.values())).ds_index
+            group_size = self._group_size_for(ds_index)
+            if ds_index not in self.group_rm_ds or len(group) < group_size:
+                return None
+            trajectories = list(group.values())[:group_size]
+            if (any(t.status != TrajectoryStatus.COMPLETED for t in trajectories)
+                    or all(t.metadata.get(GROUP_RM_SCORED_KEY) for t in trajectories)):
+                self.group_scored.add(prompt_id)
+                self._cond.notify_all()
+                return None
+            self.group_scoring.add(prompt_id)
+            return trajectories
+
+    def commit_group_rm(self, prompt_id: str, trajectories: list[Trajectory]) -> None:
+        """Write back a claimed group's scored trajectories and mark it ready."""
+        with self._cond:
+            if prompt_id not in self.group_scoring:
+                return  # drained while scoring; drop the result
+            self.group_scoring.discard(prompt_id)
+            group = self.groups[prompt_id]
+            for traj in trajectories:
+                if traj.trajectory_id in group:
+                    group[traj.trajectory_id] = traj
+            self.group_scored.add(prompt_id)
+            self._cond.notify_all()
+
+    def release_group_rm(self, prompt_id: str) -> None:
+        """Give up a claim without scoring, so the group can be claimed again."""
+        with self._cond:
+            self.group_scoring.discard(prompt_id)
+
+    # ------------------------------------------------------------------
     # Public API — bulk operations
     # ------------------------------------------------------------------
 
@@ -254,6 +340,8 @@ class TrajQueue:
                 all_items.extend(group.values())
             self.groups.clear()
             self.tid_pid_map.clear()
+            self.group_scoring.clear()
+            self.group_scored.clear()
             self._cond.notify_all()
             return all_items
 
@@ -263,8 +351,11 @@ class TrajQueue:
             all_groups: list[TrajectoryGroup] = []
             for prompt_id in list(self.groups.keys()):
                 while prompt_id in self.groups:
+                    group = self.groups[prompt_id]
                     group_size = self._group_size_for_prompt(prompt_id)
-                    if len(self.groups.get(prompt_id, {})) < group_size:
+                    if len(group) < group_size or (
+                        next(iter(group.values())).ds_index in self.group_rm_ds and prompt_id not in self.group_scored
+                    ):
                         break
                     all_groups.append(self._pop_n_from_group(prompt_id, group_size))
             if all_groups:
