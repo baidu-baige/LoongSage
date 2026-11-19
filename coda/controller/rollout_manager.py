@@ -8,14 +8,18 @@ import dataclasses
 import logging
  
 import ray
-import copy
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS 
 from coda.utils.health_monitor import RolloutHealthMonitor
+from coda.utils import replica_utils
 from coda.transfer_mesh import ChannelMeta
 from coda.backends.sglang.engine import SglangEngine
 from coda.backends.replica_group import ReplicaGroup
  
 logger = logging.getLogger(__name__)
+
+# ``rollout.sglang_replicas`` group names that make up PD disaggregation.
+PD_WORKER_TYPES = ("prefill", "decode")
+
 
 class RolloutManager:
     """The class to run rollout manager, A model served behind a shared router, with one or more inference replicas.
@@ -26,7 +30,7 @@ class RolloutManager:
 
     def __init__(self, config, scheduler):
         """Initialize the rollout manager.
- 
+
         Args:
             config: Configuration arguments.
             scheduler: Ray scheduler for resource allocation.
@@ -41,6 +45,11 @@ class RolloutManager:
                 monitor = RolloutHealthMonitor(replica_group)
                 monitor.start()
                 self._health_monitors.append(monitor)
+
+    @property
+    def is_pd_disaggregated(self) -> bool:
+        """True when prefill and decode run as separate replica groups."""
+        return any(g.worker_type in PD_WORKER_TYPES for g in self.replica_groups)
 
     def _validate_config(self):
         """Validates the configuration for the rollout manager."""
@@ -63,10 +72,7 @@ class RolloutManager:
 
         num_gpus_per_node = self.config.rollout.num_gpus_per_node
         for worker_type, replica_cfg in self.config.rollout.sglang_replicas.items():
-            num_gpus_per_replica = replica_cfg.num_gpus_per_replica
-            num_nodes = replica_cfg.num_nodes
-            num_gpu_per_engine = min(num_gpus_per_replica, num_gpus_per_node)
-            num_engines = num_nodes * num_gpus_per_node // num_gpu_per_engine
+            num_engines = replica_utils.num_engines(replica_cfg, num_gpus_per_node)
             if num_engines == 0:
                 continue
 
@@ -117,6 +123,27 @@ class RolloutManager:
         for r in self.replica_groups:
             r.num_new_engines = 0
  
+    def _staged_memory_op(self, op: str, tags, order: tuple[str, ...]):
+        """Run offload/onload one worker_type at a time, blocking between stages.
+
+        The KV transfer is a prefill-side RDMA write into memory regions decode
+        registered, and ``release_memory_occupation`` deregisters those regions, so the
+        receiver must be released after the sender and re-registered before it. The
+        single fan-out cannot express that: ``ReplicaGroup.offload`` only fires
+        ObjectRefs and the one ``ray.get`` at the end imposes no ordering.
+        """
+        results = []
+        for worker_type in order:
+            handles = [
+                h
+                for g in self.replica_groups
+                if g.worker_type == worker_type
+                for h in getattr(g, op)(tags)
+            ]
+            if handles:
+                results.extend(ray.get(handles))
+        return results
+
     def offload(self, tags: list[str] | None = None):
         """Offload all rollout engines to free memory.
 
@@ -124,6 +151,9 @@ class RolloutManager:
             tags: Memory tags to release (e.g. kv_cache, cuda_graph). None releases all.
         """
         self._health_monitoring_pause()
+        if self.is_pd_disaggregated:
+            # prefill first: it is the one still writing.
+            return self._staged_memory_op("offload", tags, PD_WORKER_TYPES)
         handles = []
         for g in self.replica_groups:
             handles.extend(g.offload(tags))
@@ -131,7 +161,7 @@ class RolloutManager:
 
     def onload(self, tags: list[str] | None = None):
         """Onload all rollout engines with specified tags.
- 
+
         Args:
             tags: Memory tags to onload (e.g., weights, kv_cache).
         """
@@ -140,7 +170,7 @@ class RolloutManager:
             handles.extend(g.onload(tags))
         result = ray.get(handles) if handles else []
         return result
- 
+
     def offload_kv(self):
         """Release only the KV cache (and the cuda graphs sharing that budget)."""
         self.offload(tags=[GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH])
@@ -148,11 +178,11 @@ class RolloutManager:
     def onload_weights(self):
         """Onload only the weights for all rollout engines."""
         self.onload(tags=[GPU_MEMORY_TYPE_WEIGHTS])
- 
+
     def onload_kv(self):
         """Onload only the KV cache for all rollout engines."""
         self.onload(tags=[GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH])
- 
+
     def recover_faulty_engines(self):
         """Restart any dead rollout engines and update num_new_engines for update_weights detection."""
         # Record dead indices per replica before starting.
@@ -187,16 +217,28 @@ class RolloutManager:
     def async_update_weights(self, meta: ChannelMeta, weight_version: int):
         """Async update weights for all rollout engines.
 
+        Each engine gets an explicit ``rank_base``, so engines of different
+        parallelism tile the rollout ranks without gaps or overlap.
+
         Args:
             meta: The ChannelMeta.
             weight_version: Rollout model version label to expose in SGLang responses.
         """
-        engines = [engine for replica in self.replica_groups for engine in replica.engines]
+        base_meta = dataclasses.asdict(meta)
+        base_meta["weight_version"] = str(weight_version)
         handles = []
-        for i in range(len(engines)):
-            engine_meta = copy.deepcopy(meta)
-            engine_meta.engine_id = i
-            meta_dict = dataclasses.asdict(engine_meta)
-            meta_dict["weight_version"] = str(weight_version)
-            handles.append(engines[i].update_weights_from_channel.remote(meta_dict))
+        rank_base = 0
+        for replica in self.replica_groups:
+            # The stride must equal the engine's own world size (tp_size * pp_size).
+            engine_world_size = replica.replica_config.num_gpus_per_replica
+            for engine in replica.engines:
+                meta_dict = {**base_meta, "engine_id": len(handles), "rank_base": rank_base}
+                handles.append(engine.update_weights_from_channel.remote(meta_dict))
+                rank_base += engine_world_size
+
+        rollout_world_size = meta.world_size - meta.train_world_size
+        assert rank_base == rollout_world_size, (
+            f"rank_base coverage is {rank_base}, expected rollout_world_size="
+            f"{rollout_world_size}"
+        )
         return handles

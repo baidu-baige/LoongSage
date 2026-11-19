@@ -194,8 +194,11 @@ class ParserMiddleware(BaseHTTPMiddleware):
                 # 2. Forward to LLM worker and parse response
                 response = await call_next(request)
                 response_body = await self._read_response_body(response)
+                # Set by Router._merge under PD only: the prefill half's raw reply.
+                prefill_body = getattr(request.state, "prefill_body", None)
                 parsed_response = await self._parse_generate_response(
-                    response, response_body, turn_ctx, trajectory_id
+                    response, response_body, turn_ctx, trajectory_id,
+                    prefill_body=prefill_body,
                 )
                 if isinstance(parsed_response, Response):
                     return parsed_response
@@ -369,7 +372,11 @@ class ParserMiddleware(BaseHTTPMiddleware):
             pool.shutdown(wait=False, cancel_futures=True)
 
     async def _decode_body(
-        self, body: bytes, routed_experts_start_len: int, status_code: int
+        self,
+        body: bytes,
+        routed_experts_start_len: int,
+        status_code: int,
+        prefill_body: bytes | None = None,
     ) -> tuple[dict[str, Any], Any]:
         """Run decode_generate_body in the pool when configured, else inline.
 
@@ -377,15 +384,16 @@ class ParserMiddleware(BaseHTTPMiddleware):
         skips error/abort passthrough bodies, so a malformed R3 payload cannot raise here.
         """
         r3_enabled = self.r3_enabled and status_code < status.HTTP_400_BAD_REQUEST
+        args = (body, routed_experts_start_len, r3_enabled, prefill_body)
         if self._decode_pool is not None:
             try:
                 return await asyncio.get_running_loop().run_in_executor(
-                    self._decode_pool, decode_generate_body, body, routed_experts_start_len, r3_enabled
+                    self._decode_pool, decode_generate_body, *args
                 )
             except BrokenProcessPool as e:
                 logger.error("[parse] R3 decode pool broken (%s); disabling pool, decoding inline", e)
                 self._close_decode_pool()
-        return decode_generate_body(body, routed_experts_start_len, r3_enabled)
+        return decode_generate_body(*args)
 
     async def _parse_generate_response(
         self,
@@ -393,6 +401,7 @@ class ParserMiddleware(BaseHTTPMiddleware):
         body: bytes,
         turn_ctx: TurnInputContext,
         trajectory_id: str,
+        prefill_body: bytes | None = None,
     ) -> tuple[Any, dict[str, Any], dict[str, Any], str | None] | Response:
         """Decode LLM worker response and build the assistant message.
 
@@ -401,7 +410,7 @@ class ParserMiddleware(BaseHTTPMiddleware):
         """
         try:
             response_json, routed_experts = await self._decode_body(
-                body, turn_ctx.routed_experts_start_len, response.status_code
+                body, turn_ctx.routed_experts_start_len, response.status_code, prefill_body
             )
         except json.JSONDecodeError:
             logger.warning("[parse] upstream payload non-JSON for %s: %s", trajectory_id, body[:200])

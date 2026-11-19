@@ -14,6 +14,7 @@ from coda.controller.rollout_sampler import RolloutSampler
 from coda.resource_scheduler import ResourceScheduler
 from coda.data_factory.data_source import RolloutDataSourceWithBuffer
 from coda.agentflow.agent_flow import AgentFlow
+from coda.agentflow.router.parser import ROUTED_EXPERTS_DTYPE_CHOICES
 from coda.agentflow.trajectory_store import TrajectoryGroup
 from coda.data_factory.data_processor import (
     split_traj_group_by_dp,
@@ -27,6 +28,7 @@ from coda.transfer_mesh import ChannelMeta
 from coda.utils.checkpoint_utils import get_tracker_file, resolve_dist_ckpt_dir, should_save
 from coda.utils.tracking import configure_tracking, time_marker, TimeMarkerAcc, track
 from coda.utils import logging_utils
+from coda.utils import replica_utils
 from coda.utils.multimodal_config import validate_multimodal_config
 
 logger = logging.getLogger(__name__)
@@ -204,6 +206,13 @@ class Trainer:
                 "rollout.eval.interval > 0 requires at least one dataset with eval_prompt_data_path"
             )
 
+        routed_experts_dtype = self.config.trainer.routed_experts_dtype
+        if routed_experts_dtype not in ROUTED_EXPERTS_DTYPE_CHOICES:
+            raise ValueError(
+                f"trainer.routed_experts_dtype must be one of {ROUTED_EXPERTS_DTYPE_CHOICES}, "
+                f"got {routed_experts_dtype!r}"
+            )
+
         self._validate_read_only_ckpt_paths()
 
     def _validate_read_only_ckpt_paths(self) -> None:
@@ -238,10 +247,7 @@ class Trainer:
         """
         # this world_size is for gloo ring; it spans the trainer and rollout processes
         train_world_size = self.config.trainer.num_gpus_per_node * self.config.trainer.num_nodes
-        rollout_world_size = sum(
-            replica.num_nodes * self.config.rollout.num_gpus_per_node
-            for _, replica in self.config.rollout.sglang_replicas.items()
-        )
+        rollout_world_size = replica_utils.rollout_num_gpus(self.config.rollout)
         world_size = train_world_size + rollout_world_size
         logger.info("[channel_meta] train_world_size=%d rollout_world_size=%d world_size=%d",
                     train_world_size, rollout_world_size, world_size)
@@ -283,8 +289,7 @@ class Trainer:
         train_update_ref = self.train_manager.async_update_weights(meta)
         rollout_update_ref = self.rollout_manager.async_update_weights(meta, weight_version=weight_version)
 
-        all_refs = train_update_ref + rollout_update_ref
-        ray.get(all_refs)
+        ray.get(train_update_ref + rollout_update_ref)
 
 
     async def train_loop(self) -> None:

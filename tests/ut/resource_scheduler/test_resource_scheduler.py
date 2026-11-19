@@ -70,7 +70,7 @@ class TestInit:
             trainer_gpus_per_node=2,
             trainer_num_nodes=2,
             rollout_gpus_per_node=4,
-            sglang_replicas={"r0": {"num_nodes": 1}},
+            sglang_replicas={"r0": {"num_nodes": 1, "num_gpus_per_replica": 4}},
         )
         scheduler = ResourceScheduler(config)
 
@@ -169,7 +169,7 @@ class TestCreatePlacementGroup:
         """Create a test config for ResourceScheduler."""
         return _make_config(
             colocate=False,
-            sglang_replicas={"r0": {"num_nodes": 1}},
+            sglang_replicas={"r0": {"num_nodes": 1, "num_gpus_per_replica": 4}},
         )
 
     def _scheduler_without_pg(self):
@@ -294,7 +294,7 @@ class TestSchedule:
         """Create a test config for ResourceScheduler."""
         return _make_config(
             colocate=False,
-            sglang_replicas={"r0": {"num_nodes": 1}},
+            sglang_replicas={"r0": {"num_nodes": 1, "num_gpus_per_replica": 4}},
         )
 
     def setup_method(self):
@@ -503,7 +503,7 @@ class TestIntegration:
         """Create a test config for ResourceScheduler."""
         return _make_config(
             colocate=colocate,
-            sglang_replicas={"r0": {"num_nodes": 1}},
+            sglang_replicas={"r0": {"num_nodes": 1, "num_gpus_per_replica": 4}},
         )
 
     @patch('coda.resource_scheduler.resource_scheduler.ray')

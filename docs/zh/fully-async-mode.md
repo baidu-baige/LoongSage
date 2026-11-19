@@ -42,6 +42,8 @@ capacity = int(B * (1 + stale_steps))
 
 例如，当 `B=64`、`stale_steps=1.0` 时，容量为 128 个 prompt group，即最多覆盖约 2 个训练 step 的 prompt 数量。每个 group 包含的 trajectory 数量仍由 `N` 决定。增大该参数通常可以提高流水线填充度，但也会增加策略陈旧的风险。
 
+**训练与 rollout 共用节点时，`NCCL_CUMEM_ENABLE` 要两边一致**：训练 GPU 和 rollout GPU 在同一节点时，权重同步会在两类进程之间走节点内 NCCL P2P。两端的 `NCCL_CUMEM_ENABLE` 不同，初始权重同步就会报 `Cuda failure 'invalid argument'`。默认情况下两端恰好不同：SGLang 在该变量未设置时会把它设为 `0`，训练进程则使用 NCCL 的默认值（开启）。设置 `trainer.env_vars.NCCL_CUMEM_ENABLE: "0"` 或 `rollout.env_vars.NCCL_CUMEM_ENABLE: "1"` 都可以。开启 `enable_symm_mem` 时，SGLang 会强制把它设为 `1`，此时只能用后一种。训练和 rollout 位于不同节点时，权重同步走 IB 网络，不需要设置。
+
 ## 2.原理
 
 全异步模式由三个并发实体组成：

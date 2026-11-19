@@ -10,6 +10,17 @@ from coda.backends.sglang.engine import SglangEngine
  
 logger = logging.getLogger(__name__)
 
+# Port scan start per worker type. A probe only checks that a port is free *now*,
+# so prefill and decode starting on the same node need disjoint ranges. All bases
+# stay below the kernel ephemeral range: SGLang later binds port+5.. too, and an
+# outbound connection could be handed one of those first.
+_BASE_PORT_BY_WORKER_TYPE = {
+    "regular": 2000,
+    "prefill": 4000,
+    "decode": 6000,
+}
+
+
 class ReplicaGroup:
     """A replica group of homogeneous rollout engines with the same configuration.
 
@@ -109,6 +120,7 @@ class ReplicaGroup:
             num_gpus_per_replica=self.replica_config.num_gpus_per_replica,
             worker_type=self.worker_type,
             rank_offset=self.rank_offset,
+            base_port=_BASE_PORT_BY_WORKER_TYPE[self.worker_type],
         )
  
         init_handles = [
@@ -185,54 +197,30 @@ def _allocate_rollout_engine_addr_and_ports(
     Returns:
         dict: maps rank to a dict of address/ports
     """
-    # get ports
-    # there are 4 ports we need to allocate
-    # 1. server port
-    # 2. nccl port
-    # 3. disaggregation_bootstrap_port (prefill node)
-    # 4. dist_init_addr port
-    num_replicas_per_node = max(1, num_gpus_per_node // num_gpus_per_replica)
+    # Ports per engine, offset from ``port``: +0 server, +1 nccl, +2 prefill bootstrap, +3 dist_init.
+    num_node_per_replica = max(1, num_gpus_per_replica // num_gpus_per_node)
     addr_and_ports: dict[int, dict] = {}
- 
-    visited_nodes = set()
+    # Probe ports on each engine's own node, keeping one scan cursor per host so
+    # engines sharing a node get disjoint port blocks before any of them binds.
+    next_port_by_host: dict[str, int] = {}
     for rank, engine in rollout_engines:
-        local_rank = rank - rank_offset
-        node_index = local_rank // num_replicas_per_node
-        if node_index in visited_nodes:
-            continue
-        visited_nodes.add(node_index)
- 
-        # we will set port for all replicas on this node starting with this rank.
-        # e.g. for 8 gpus, if we are restarting replica on gpu 3, we will set port for engine 3,4,5,6,7 on this node.
-        num_replicas_on_this_node = num_replicas_per_node - (local_rank % num_replicas_per_node)
-
-        start_port = base_port
-        for i in range(num_replicas_on_this_node):
-            host_addr, port = ray.get(engine.get_ip_port.remote(start_port, 4))
-            start_port = port + 100
-            current_rank = rank + i
-            addr_and_ports.setdefault(current_rank, {})
-            addr_and_ports[current_rank]["host"] = host_addr
-            addr_and_ports[current_rank]["port"] = port
-            addr_and_ports[current_rank]["nccl_port"] = port + 1
-            if worker_type == "prefill":
-                addr_and_ports[current_rank]["disaggregation_bootstrap_port"] = port + 2
-            # multi node
-            if num_gpus_per_replica > num_gpus_per_node:
-                num_node_per_replica = num_gpus_per_replica // num_gpus_per_node
-                if local_rank % num_node_per_replica == 0:
-                    # this is the first node in the replica, we need to allocate the dist_init_addr port
-                    dist_init_addr = f"{host_addr}:{port+3}"
-                    for j in range(num_node_per_replica):
-                        addr_and_ports.setdefault(rank + j, {})
-                        addr_and_ports[rank + j]["dist_init_addr"] = dist_init_addr
-            # single node
-            else:
-                addr_and_ports[current_rank]["dist_init_addr"] = f"{host_addr}:{port+3}"
- 
-    for i, _ in rollout_engines:
-        for key in ["port", "nccl_port", "dist_init_addr"]:
-            assert key in addr_and_ports[i], f"Engine {i} {key} is not set."
-        logger.info(f"Ports for engine {i}: {addr_and_ports[i]}")
- 
+        host = ray.get(engine.get_node_ip.remote())
+        _, port = ray.get(engine.get_ip_port.remote(next_port_by_host.get(host, base_port), 4))
+        next_port_by_host[host] = port + 100
+        # A multi-node replica's first rank hosts dist_init; the rest join it. The
+        # head is always started too, since kill_engine tears down whole replicas.
+        head_rank = rank - (rank - rank_offset) % num_node_per_replica
+        entry = {
+            "host": host,
+            "port": port,
+            "nccl_port": port + 1,
+            "dist_init_addr": (
+                f"{host}:{port + 3}" if head_rank == rank
+                else addr_and_ports[head_rank]["dist_init_addr"]
+            ),
+        }
+        if worker_type == "prefill":
+            entry["disaggregation_bootstrap_port"] = port + 2
+        addr_and_ports[rank] = entry
+        logger.info("Ports for engine %d: %s", rank, entry)
     return addr_and_ports

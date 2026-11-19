@@ -136,15 +136,18 @@ Controls the SGLang inference cluster, the sampler, filters and eval.
 
 `sglang_replicas` describes how the inference cluster is split by role; each role can own dedicated GPUs. By default only the `regular` group is enabled (i.e. no PD split).
 
-> **Note**: Full PD disaggregation is not supported yet. For now keep `prefill.num_nodes` and `decode.num_nodes` at `0` and use `regular` only.
+> **Note**: To enable PD disaggregation, set `regular` to `0` and give both `prefill` and `decode` nodes or replicas. See [11.5](#115-sglang-pd-disaggregation) for the constraints.
 
 | Field | Default | Description | Constraints |
 | --- | --- | --- | --- |
-| `sglang_replicas.regular.num_nodes` | `1` | Number of "unified prefill+decode" replicas (each replica owns `num_gpus_per_replica` GPUs). | Mutually exclusive with `prefill` / `decode`. |
+| `sglang_replicas.regular.num_nodes` | `1` | Nodes allotted to the regular group. The GPU budget is `num_nodes × rollout.num_gpus_per_node`, and the replica count follows from dividing it by `num_gpus_per_replica`. | Mutually exclusive with `prefill` / `decode`. |
+| `sglang_replicas.regular.num_replicas` | `null` | Explicit replica count; overrides `num_nodes` when set. | Required whenever a group needs fewer GPUs than a whole node (e.g. prefill and decode sharing one 8-GPU node, 4 each). |
 | `sglang_replicas.regular.num_gpus_per_replica` | `8` | GPUs per regular replica. | Must divide evenly against `rollout.num_gpus_per_node` or span nodes cleanly. |
-| `sglang_replicas.prefill.num_nodes` | `0` | Number of dedicated prefill replicas. | Full PD disaggregation is unsupported; keep at `0`. |
+| `sglang_replicas.prefill.num_nodes` | `0` | Nodes allotted to the dedicated prefill group. | PD disaggregation is enabled only when this and `decode` are both above `0`. |
+| `sglang_replicas.prefill.num_replicas` | `null` | Explicit prefill replica count; overrides `num_nodes` when set. |  |
 | `sglang_replicas.prefill.num_gpus_per_replica` | `8` | GPUs per prefill replica. |  |
-| `sglang_replicas.decode.num_nodes` | `0` | Number of dedicated decode replicas. |  |
+| `sglang_replicas.decode.num_nodes` | `0` | Nodes allotted to the dedicated decode group. |  |
+| `sglang_replicas.decode.num_replicas` | `null` | Explicit decode replica count; overrides `num_nodes` when set. |  |
 | `sglang_replicas.decode.num_gpus_per_replica` | `8` | GPUs per decode replica. |  |
 | `sglang_replicas.decode.sglang_args` | `{disable_cuda_graph: false}` | Overrides `rollout.sglang_args` for the decode replica (decode usually wants CUDA graph on). | Only affects the decode replica. |
 
@@ -174,7 +177,7 @@ Agent-side Router and tokenizer settings, plus framework-level trajectory dumpin
 | `agentflow.router.ip` | `""` | Router listen IP. Empty means auto-resolve to the local routable IP at runtime. | Usually no manual configuration needed. |
 | `agentflow.router.port` | `0` | Router listen port. `0` means pick a free port at runtime. | — |
 | `agentflow.router.accumulate_reasoning` | `true` | Accumulate reasoning tokens into the context across multi-turn dialogues. | If disabled, reasoning content only affects the current turn. |
-| `agentflow.router.rollout_worker_load_threshold` | `32` | Per-worker load threshold; above it the router load-balances. | Smaller values balance more aggressively at higher scheduling overhead. |
+| `agentflow.router.rollout_worker_load_threshold` | `{regular: 32, prefill: 32, decode: 16}` | In-flight requests a pinned slot may carry before the router drops stickiness and re-balances. Keyed by `worker_type`, with a key for every enabled `sglang_replicas` group (no default fallback). | Smaller values balance more aggressively but reuse less prefix cache. `prefill` / `decode` apply only under PD; they are set separately because the two pools can use different parallelism and replica counts, so one engine carries a different number of requests. |
 | `agentflow.router.proxy_timeout_seconds` | `1800` | Router → SGLang per-request timeout in seconds. | Must be `>=` the longest single-attempt generation time. |
 | `agentflow.router.abort_timeout_seconds` | `600` | Seconds to wait when aborting in-flight requests at a step boundary. | Paired with `rollout.partial`. |
 | `agentflow.router.max_connections` | `512` | Max concurrent connections accepted by the router. | Tune together with `sglang_args.max_running_requests`. |
@@ -355,6 +358,7 @@ The `trainer` node controls batch organization, precision, timeouts and checkpoi
 | `trainer.num_gpus_per_node` | `8` | GPUs per training node. | Same as above; participates in `dp_size`. |
 | `trainer.use_rollout_log_probs` | `false` | Use `rollout_log_probs` returned by the inference engine instead of re-computing `old_log_probs` on the training side. | Mutually exclusive with IS correction and M2PO. |
 | `trainer.use_rollout_routing_replay` | `false` | Replay MoE routing recorded on the inference side. | Used to align rollout / training MoE routing. |
+| `trainer.routed_experts_dtype` | `auto` | Wire encoding of the returned routed expert ids: `auto` / `int32` / `int16` / `uint8`. `auto` lets the engine pick the narrowest lossless dtype for its expert count (≤256 → uint8, ≤32768 → int16, else int32); the router decodes using `meta_info.routed_experts_dtype` (falling back to int32 for old engines). | An explicit narrow dtype fails at engine startup when the model's ids would overflow; prefill and decode must agree under PD. |
 | `trainer.use_fp32_lm_head` | `false` | Compute the LM head in FP32. | Enable in precision-sensitive settings. |
 | `trainer.forward_only` | `false` | Run the train workers forward-only: no DDP wrapper (no gradient buffer) and no optimizer / LR scheduler. The workers only hold the weights and sync them to the rollout engines. Each step still recomputes `old_log_probs` and reports the forward-side metrics such as IS / k3, but runs no backward pass and no update. Use it for runs that only measure train-inference consistency or only sample; it saves the memory of the gradient buffer and optimizer state. | Forced to `true` when `run_mode: rollout-only`, which also sets `critic.enable` to `false`. Cannot be combined with `critic.enable`, otherwise startup fails. Weights never change, so saving is not supported: with this on, `trainer.save_freq` must be `<= 0`, otherwise startup fails. Must be `false` for any run that trains. |
 | `trainer.temperature` | `1.0` | Sampling temperature. Eval rounds use `rollout.eval.temperature` instead when it is not `null`. | Router owns this value; `completion_params.temperature` is ignored. |
@@ -406,7 +410,12 @@ The dependencies below span multiple sections and are the most common pitfalls w
 
 ### 11.5 SGLang PD disaggregation
 
-- **Full PD disaggregation is not supported yet.** For now keep the single `regular` shape, i.e. both `sglang_replicas.prefill.num_nodes` and `decode.num_nodes` at `0`.
+See [PD Disaggregation](./pd-disaggregation.md) for how it works and a full configuration.
+
+- `regular` and `prefill` / `decode` are mutually exclusive: under PD, `regular` must be `0` and both `prefill` and `decode` need replicas, otherwise startup fails.
+- Every enabled group must satisfy `tp_size × pp_size == num_gpus_per_replica`, otherwise weight-sync ranks are misaligned.
+- PD disaggregation is incompatible with `rollout.env_vars.SGLANG_RUST_SERVER`.
+- `agentflow.router.rollout_worker_load_threshold` needs both a `prefill` and a `decode` key.
 
 ### 11.6 Eval
 

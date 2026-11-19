@@ -236,7 +236,7 @@ AgentFlow-related configuration is concentrated under `agentflow.*`, `rollout.*`
 | `agentflow.tokenizer.generation_prompt_kwargs` | Extra parameters passed to the chat template when generating the prompt |
 | `agentflow.router.ip` / `port` | Router listening address; leave empty to auto-resolve the local IP, port 0 to auto-assign |
 | `agentflow.router.max_connections` | The max number of connections the Router forwards to workers |
-| `agentflow.router.rollout_worker_load_threshold` | The worker load threshold for least-loaded routing |
+| `agentflow.router.rollout_worker_load_threshold` | In-flight requests a pinned slot may carry before the router drops stickiness and picks the least-loaded slot; a mapping keyed by `worker_type` (default `{regular: 32, prefill: 32, decode: 16}`), with a key for every enabled `sglang_replicas` group |
 | `agentflow.router.proxy_timeout_seconds` / `abort_timeout_seconds` | Forward request timeout / abort operation timeout |
 | `agentflow.router.accumulate_reasoning` | Whether to keep think blocks in the multi-turn history |
 | `agentflow.router.middleware` | Middleware chain config, a `{name: params}` mapping (default `{parser: null}`) |

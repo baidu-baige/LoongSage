@@ -15,6 +15,7 @@ from ray.util.placement_group import placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from ray.actor import ActorClass
 from coda.utils import logging_utils
+from coda.utils import replica_utils
 from omegaconf import DictConfig 
 
 logger = logging.getLogger(__name__)
@@ -114,10 +115,7 @@ class ResourceScheduler:
             num_gpus = trainer_config.num_gpus_per_node * trainer_config.num_nodes
         else:
             assert rollout_config.backend == "sglang"
-            rollout_num_gpus = sum(
-                replica.num_nodes * self.config.rollout.num_gpus_per_node
-                for _, replica in rollout_config.sglang_replicas.items()
-            )
+            rollout_num_gpus = replica_utils.rollout_num_gpus(rollout_config)
             teacher_num_gpus = 0
             if config.opd.enable:
                 teacher_num_gpus = config.opd.teacher_nodes * config.opd.teacher_gpus_per_node

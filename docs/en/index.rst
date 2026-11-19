@@ -53,6 +53,7 @@ Where to start
    training-algorithms.md
    on-policy-distillation.md
    fully-async-mode.md
+   pd-disaggregation.md
    train-inference-consistency.md
    model-checkpointing.md
 

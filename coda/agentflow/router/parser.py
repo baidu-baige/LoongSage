@@ -244,6 +244,8 @@ class LLMGenerateResponse:
 
 # Wire dtypes SGLang may report in meta_info["routed_experts_dtype"]; absent means int32.
 _R3_WIRE_DTYPES = {"int32": torch.int32, "int16": torch.int16, "uint8": torch.uint8}
+# Accepted values of ``trainer.routed_experts_dtype``.
+ROUTED_EXPERTS_DTYPE_CHOICES = ("auto", *_R3_WIRE_DTYPES)
 
 # Spare rows (fraction of the needed rows) added when the routing buffer grows.
 _R3_GROWTH = 0.125
@@ -352,22 +354,53 @@ def parse_generate_json(body: bytes) -> dict[str, Any]:
     return response_json
 
 
-def _decode_response_r3(meta: dict[str, Any], routed_experts_start_len: int) -> torch.Tensor | None:
+def _decode_response_r3(
+    meta: dict[str, Any],
+    routed_experts_start_len: int,
+    prefill_meta: dict[str, Any] | None = None,
+) -> torch.Tensor | None:
     """Pop and decode meta_info["routed_experts"], appending the synthetic terminal row.
 
     SGLang captures positions [start_len, seqlen - 1); the extra row keeps the shape that
     _append_routed_experts expects (its value is overwritten there).
+
+    Under PD (``prefill_meta`` set) the KV transfer moves cache contents only, so decode
+    never wrote the prompt slots of its routing table: prefill owns [start_len, prompt_len)
+    and decode owns [prompt_len, seqlen - 1).
     """
     b64 = meta.pop("routed_experts", None)
-    if not b64:
-        return None
     entries = (
         meta.get("prompt_tokens", 0) + meta.get("completion_tokens", 0) - 1 - routed_experts_start_len
     )
-    if entries <= 0:
-        logger.warning("[r3] non-positive entry count (%d); skipping", entries)
-        return None
-    tensor = deserialize_routed_experts(b64, entries, meta.get("routed_experts_dtype") or "int32")
+    if prefill_meta is None:
+        if not b64:
+            return None
+        if entries <= 0:
+            logger.warning("[r3] non-positive entry count (%d); skipping", entries)
+            return None
+        tensor = deserialize_routed_experts(b64, entries, meta.get("routed_experts_dtype") or "int32")
+        return torch.cat([tensor, tensor[-1:]], dim=0)
+
+    prefill_b64 = prefill_meta.get("routed_experts")
+    if not prefill_b64:
+        raise RuntimeError(
+            "[r3] PD prefill response carries no meta_info.routed_experts; "
+            "R3 under PD requires SGLang 0.5.23"
+        )
+    prefill_rows = meta.get("prompt_tokens", 0) - routed_experts_start_len
+    parts = [
+        deserialize_routed_experts(
+            prefill_b64, prefill_rows, prefill_meta.get("routed_experts_dtype") or "int32"
+        )
+    ]
+    decode_rows = entries - prefill_rows
+    if decode_rows:
+        if not b64:
+            raise RuntimeError("[r3] PD decode response carries no meta_info.routed_experts")
+        parts.append(
+            deserialize_routed_experts(b64, decode_rows, meta.get("routed_experts_dtype") or "int32")
+        )
+    tensor = _compact_expert_ids(torch.cat(parts, dim=0))
     return torch.cat([tensor, tensor[-1:]], dim=0)
 
 
@@ -385,7 +418,10 @@ def is_passthrough_response(response_json: dict[str, Any]) -> bool:
 
 
 def decode_generate_body(
-    body: bytes, routed_experts_start_len: int, r3_enabled: bool
+    body: bytes,
+    routed_experts_start_len: int,
+    r3_enabled: bool,
+    prefill_body: bytes | None = None,
 ) -> tuple[dict[str, Any], torch.Tensor | None]:
     """Parse a /generate body and decode its R3 rows. Picklable, so it can run in a process pool.
 
@@ -394,6 +430,8 @@ def decode_generate_body(
         routed_experts_start_len: first captured token position, used to size the R3 rows.
         r3_enabled: decode routed experts only when true and the body is not a passthrough
             (error / abort) response.
+        prefill_body: under PD, the prefill half's raw reply; only its prompt-range routing
+            is read, and only when R3 is decoded.
 
     Returns:
         ``(response_json, routed_experts)``. ``routed_experts`` is None when R3 is disabled,
@@ -406,8 +444,11 @@ def decode_generate_body(
         and isinstance(response_json, dict)
         and not is_passthrough_response(response_json)
     ):
+        prefill_meta = None
+        if prefill_body is not None:
+            prefill_meta = orjson.loads(prefill_body).get("meta_info") or {}
         routed_experts = _decode_response_r3(
-            response_json.get("meta_info") or {}, routed_experts_start_len
+            response_json.get("meta_info") or {}, routed_experts_start_len, prefill_meta
         )
     return response_json, routed_experts
 

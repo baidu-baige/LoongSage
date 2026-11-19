@@ -156,6 +156,7 @@ def make_minimal_config(**overrides):
             # requires 8 % mini_batch_size == 0 and, with num_mini_batch = 8/4 = 2,
             # also num_prompts_per_step % (dp_size * num_mini_batch) == 0.
             "mini_batch_size": 4,
+            "routed_experts_dtype": "auto",
         },
         "rollout": {
             "colocate": False,
@@ -290,6 +291,18 @@ class TestTrainerValidateConfig:
             ValueError, match=r"num_prompts_per_step \(4\) is not divisible by"
         ):
             trainer._validate_config()
+
+    def test_rejects_an_unknown_routed_experts_dtype(self):
+        config = make_minimal_config(trainer={"routed_experts_dtype": "uint16"})
+
+        with pytest.raises(ValueError, match="trainer.routed_experts_dtype"):
+            self._trainer(config)._validate_config()
+
+    @pytest.mark.parametrize("dtype", ["auto", "uint8", "int16", "int32"])
+    def test_accepts_known_routed_experts_dtypes(self, dtype):
+        config = make_minimal_config(trainer={"routed_experts_dtype": dtype})
+
+        self._trainer(config)._validate_config()
 
     def test_rollout_only_forces_forward_only(self):
         config = make_minimal_config(run_mode="rollout-only", critic={"enable": True})

@@ -111,14 +111,21 @@ rollout:
     disable_custom_all_reduce: true
     load_format: dummy #  dummy/auto
   sglang_replicas:
+    # Each group is sized by ``num_nodes`` (GPU budget = num_nodes *
+    # rollout.num_gpus_per_node) unless ``num_replicas`` is set, which pins the
+    # replica count directly. Use ``num_replicas`` when a group needs less than
+    # a whole node, e.g. prefill and decode sharing one 8-GPU node.
     regular:
-      num_nodes: 1                # Total number of GPUs for this replica group.
+      num_nodes: 1                # Number of nodes allotted to this replica group.
+      num_replicas: null          # Explicit replica count; overrides num_nodes.
       num_gpus_per_replica: 8     # Total number of GPUs for per replica.
     prefill:
-      num_nodes: 0                # Total number of GPUs for this replica group.
+      num_nodes: 0                # Number of nodes allotted to this replica group.
+      num_replicas: null          # Explicit replica count; overrides num_nodes.
       num_gpus_per_replica: 8     # Total number of GPUs for per replica.
     decode:
-      num_nodes: 0                # Total number of GPUs for this replica group.
+      num_nodes: 0                # Number of nodes allotted to this replica group.
+      num_replicas: null          # Explicit replica count; overrides num_nodes.
       num_gpus_per_replica: 8     # Total number of GPUs for per replica.
       sglang_args:                # override rollout.sglang_args
         disable_cuda_graph: false
@@ -145,10 +152,18 @@ agentflow:
     ip: "" # When empty (default), the router auto-resolves to the local machine's routable IP at runtime.
     port: 0 # When zero, the router auto-assigns a free port at runtime.
     accumulate_reasoning: true
-    rollout_worker_load_threshold: 32
+    # In-flight requests a pinned slot may carry before sticky routing re-balances,
+    # keyed by worker_type (the sglang_replicas group names).
+    rollout_worker_load_threshold:
+      regular: 32
+      # Used when PD disaggregation is enabled. Prefill and decode are set separately
+      # because the two pools can use different parallelism and different replica
+      # counts, so the number of requests one engine can carry differs between them.
+      prefill: 32
+      decode: 16
     proxy_timeout_seconds: 1800
     abort_timeout_seconds: 600
-    max_connections: 512
+    max_connections: 512  # a PD pair spends one permit but opens two connections
     # R3 only. Processes that parse /generate bodies and decode routed experts off the
     # router event loop; 0 decodes inline.
     r3_decode_workers: 0
@@ -335,6 +350,11 @@ trainer:
   num_gpus_per_node: 8
   use_rollout_log_probs: false
   use_rollout_routing_replay: false
+  # Wire dtype of returned routed expert ids: auto|int32|int16|uint8.
+  # `auto` lets the engine pick the narrowest lossless integer for its expert
+  # count (uint8 <= 256, int16 <= 32768, else int32); the router follows the
+  # dtype advertised in meta_info.routed_experts_dtype (int32 for old engines).
+  routed_experts_dtype: auto
   use_fp32_lm_head: false
   # Forward-only train worker: skip DDP (no grad buffer) and the optimizer/scheduler.
   # The worker only holds weights and syncs them to the rollout engines, so it never

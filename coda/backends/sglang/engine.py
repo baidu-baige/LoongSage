@@ -16,6 +16,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
 from coda.backends.rollout_worker import RolloutWorker
 from coda.utils.logging_utils import redact_secrets
+from coda.utils import replica_utils
 logger = logging.getLogger(__name__)
 
 class SglangEngine(RolloutWorker):
@@ -47,19 +48,38 @@ class SglangEngine(RolloutWorker):
     @classmethod
     def validate_config(cls, config):
         sglang_args = config.rollout.sglang_args
-        for _, replica_cfg in config.rollout.sglang_replicas.items():
+        num_gpus_per_node = config.rollout.num_gpus_per_node
+        engines = {}
+        for worker_type, replica_cfg in config.rollout.sglang_replicas.items():
             replica_cfg.sglang_args = OmegaConf.merge(sglang_args, replica_cfg.get("sglang_args", {}))
+            engines[worker_type] = replica_utils.num_engines(replica_cfg, num_gpus_per_node)
+            if engines[worker_type] == 0:
+                continue
+            # The weight channel's rank_base stride is num_gpus_per_replica, so it
+            # must match the engine's own world size (tp_size * pp_size).
+            pp_size = replica_cfg.sglang_args.get("pp_size", 1)
+            num_gpus = replica_cfg.num_gpus_per_replica
+            tp_size = replica_cfg.sglang_args.get("tp_size", num_gpus // pp_size)
+            assert tp_size * pp_size == num_gpus, (
+                f"{worker_type}: tp_size({tp_size}) * pp_size({pp_size}) must equal "
+                f"num_gpus_per_replica({num_gpus})"
+            )
 
-        # regular and (prefill or decode) are exclusive
-        if config.rollout.sglang_replicas.regular.num_nodes > 0:
-            assert config.rollout.sglang_replicas.prefill.num_nodes == 0
-            assert config.rollout.sglang_replicas.decode.num_nodes == 0
-        if config.rollout.sglang_replicas.regular.num_nodes == 0:
-            assert config.rollout.sglang_replicas.prefill.num_nodes > 0
-            assert config.rollout.sglang_replicas.decode.num_nodes > 0
+        if engines["regular"] > 0:
+            assert engines["prefill"] == 0 and engines["decode"] == 0, \
+                "regular and prefill/decode replicas are mutually exclusive"
+        else:
+            assert engines["prefill"] > 0 and engines["decode"] > 0, \
+                "PD disaggregation needs both prefill and decode replicas"
+
+        # The Rust server's PD hook demands bootstrap_port == port, while the
+        # framework allocates port + 2.
+        if engines["prefill"] > 0:
+            rust_server = str(config.rollout.env_vars.get("SGLANG_RUST_SERVER", "")).lower()
+            assert rust_server not in ("1", "true"), \
+                "PD disaggregation is incompatible with SGLANG_RUST_SERVER"
 
         return config
-    
 
     @override
     def init(
@@ -104,6 +124,10 @@ class SglangEngine(RolloutWorker):
         self.server_host = server_args_dict["host"]
         self.server_port = server_args_dict["port"]
 
+        # Must precede launch_server_process: the server and its scheduler children
+        # inherit this environment, and that is where mooncake reads the GID index.
+        _export_gid_index()
+
         self._init_server(server_args_dict)
 
     def _init_server(self, server_args_dict, timeout: float = 30.0):
@@ -119,6 +143,8 @@ class SglangEngine(RolloutWorker):
         if self.node_rank == 0 and self.router_ip and self.router_port:
             payload = {
                 "worker_url": f"http://{self.server_host}:{self.server_port}",
+                # Which pool the router registers this engine in.
+                "worker_type": self.worker_type,
             }
             if self.worker_type == "prefill":
                 payload["bootstrap_port"] = server_args_dict["disaggregation_bootstrap_port"]
@@ -285,6 +311,76 @@ class SglangEngine(RolloutWorker):
             timeout=180.0,
         )
 
+_NCCL_CONF_PATH = "/etc/nccl.conf"
+
+
+def _parse_nccl_ib_hca(raw: str) -> str | None:
+    """Turn an ``NCCL_IB_HCA`` value into mooncake's bare device list.
+
+    Drops NCCL's leading ``=`` and ``:port`` suffixes. A ``^`` exclusion list has
+    no device list to derive, so it yields None.
+    """
+    value = raw.strip()
+    if value.startswith("^"):
+        logger.warning("NCCL_IB_HCA %r is an exclusion list; cannot derive a device list from it", raw)
+        return None
+    devices = [d.strip().split(":")[0] for d in value.lstrip("=").split(",")]
+    return ",".join(dict.fromkeys(d for d in devices if d)) or None
+
+
+def _nccl_conf_value(path: str, key: str) -> str | None:
+    """Value of ``key`` in an nccl.conf-style ``KEY=value`` file, or None."""
+    try:
+        with open(path) as handle:
+            for line in handle:
+                entry, sep, value = line.strip().partition("=")
+                if sep and entry.strip() == key:
+                    return value
+    except OSError as e:
+        logger.warning("Cannot read %s: %s", path, e)
+    return None
+
+
+def _resolve_ib_devices(configured: str | None) -> str | None:
+    """RDMA devices for mooncake's KV transfer, resolved on this engine's machine.
+
+    Precedence: explicit config > /etc/nccl.conf > $NCCL_IB_HCA > None (mooncake
+    auto-discovery).
+    """
+    if configured:
+        return configured
+    for source, raw in (
+        (_NCCL_CONF_PATH, _nccl_conf_value(_NCCL_CONF_PATH, "NCCL_IB_HCA")),
+        ("$NCCL_IB_HCA", os.environ.get("NCCL_IB_HCA")),
+    ):
+        if raw and (devices := _parse_nccl_ib_hca(raw)):
+            logger.info("disaggregation_ib_device resolved from %s: %s", source, devices)
+            return devices
+    logger.warning(
+        "No usable NCCL_IB_HCA found; mooncake auto-discovery may pick NICs with no "
+        "route into the RDMA fabric"
+    )
+    return None
+
+
+def _export_gid_index() -> None:
+    """Export nccl.conf's NCCL_IB_GID_INDEX for mooncake, which reads it from env only.
+
+    Skipped when NCCL_IB_GID_INDEX or MC_GID_INDEX is already set.
+    """
+    if os.environ.get("NCCL_IB_GID_INDEX") or os.environ.get("MC_GID_INDEX"):
+        return
+    raw = _nccl_conf_value(_NCCL_CONF_PATH, "NCCL_IB_GID_INDEX")
+    if raw is None:
+        return
+    gid_index = raw.strip()
+    if not gid_index.isdecimal():
+        logger.warning("Ignoring invalid NCCL_IB_GID_INDEX %r in %s", raw, _NCCL_CONF_PATH)
+        return
+    os.environ["NCCL_IB_GID_INDEX"] = gid_index
+    logger.info("Exported NCCL_IB_GID_INDEX=%s from %s", gid_index, _NCCL_CONF_PATH)
+
+
 def _compute_server_args(
     config,
     rank,
@@ -340,6 +436,7 @@ def _compute_server_args(
         # always enable draft weights cpu backup so that we run training without mtp weights.
         "enable_draft_weights_cpu_backup": True,
         "enable_return_routed_experts": config.trainer.use_rollout_routing_replay,
+        "routed_experts_dtype": config.trainer.routed_experts_dtype,
         "enable_fp32_lm_head": config.trainer.use_fp32_lm_head,
         "dtype": "auto",
     }
@@ -349,6 +446,8 @@ def _compute_server_args(
 
     if worker_type == "prefill":
         kwargs["disaggregation_mode"] = "prefill"
+        # Inert while the router pins routed_dp_rank; explicit so prefill does not
+        # inherit SGLang's PD default (follow_bootstrap_room).
         kwargs["load_balance_method"] = "round_robin"
         assert (
             disaggregation_bootstrap_port is not None
@@ -356,10 +455,14 @@ def _compute_server_args(
         kwargs["disaggregation_bootstrap_port"] = disaggregation_bootstrap_port
     elif worker_type == "decode":
         kwargs["disaggregation_mode"] = "decode"
-        kwargs["prefill_round_robin_balance"] = True
 
     for key, value in engine_args.items():
         kwargs[key] = value
+
+    if worker_type in ("prefill", "decode"):
+        kwargs["disaggregation_ib_device"] = _resolve_ib_devices(
+            kwargs.get("disaggregation_ib_device")
+        )
 
     # sglang_args is a verbatim ServerArgs passthrough and may carry api_key.
     logger.info("sglang kwargs: %s", redact_secrets(kwargs))

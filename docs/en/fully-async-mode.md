@@ -42,6 +42,8 @@ capacity = int(B * (1 + stale_steps))
 
 For example, when `B=64` and `stale_steps=1.0`, the capacity is 128 prompt groups, covering up to about 2 training steps worth of prompts. The number of trajectories per group is still determined by `N`. Increasing this parameter typically improves pipeline fill rate, but also increases the risk of policy staleness.
 
+**Keep `NCCL_CUMEM_ENABLE` the same on both sides when training and rollout share a node**: if training GPUs and rollout GPUs are on the same node, weight sync between the two kinds of processes goes over intra-node NCCL P2P. If their `NCCL_CUMEM_ENABLE` values differ, the initial weight sync fails with `Cuda failure 'invalid argument'`. By default they do differ: SGLang sets the variable to `0` when it is unset, while the training processes use the NCCL default (on). Either `trainer.env_vars.NCCL_CUMEM_ENABLE: "0"` or `rollout.env_vars.NCCL_CUMEM_ENABLE: "1"` works. With `enable_symm_mem` on, SGLang forces it to `1`, so only the latter works. When training and rollout are on different nodes, weight sync goes over IB and nothing needs to be set.
+
 ## 2. Principles
 
 Fully-async mode consists of three concurrent entities:

@@ -68,6 +68,7 @@ models/
 
 # OS
 .DS_Store
+._*
 Thumbs.db
 
 # Project specific
