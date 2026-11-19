@@ -128,8 +128,11 @@ class K8sSandboxClient(SandboxClient):
         import yaml as _yaml
         manifest_yaml = _yaml.dump(manifest, default_flow_style=False)
         apply_cmd = self._kubectl(["apply", "-f", "-"])
+        # Track before apply: a pod still starting must be deletable by delete_all.
+        self._track(pod_name)
         result = subprocess.run(apply_cmd, input=manifest_yaml, capture_output=True, text=True)
         if result.returncode != 0:
+            self._untrack(pod_name)
             raise RuntimeError(
                 f"kubectl apply failed for pod {pod_name}: {result.stderr.strip()}"
             )
@@ -145,11 +148,15 @@ class K8sSandboxClient(SandboxClient):
         ])
         wait_result = subprocess.run(wait_cmd, capture_output=True, text=True)
         if wait_result.returncode != 0:
-            self._force_delete(pod_name)
+            self.delete(pod_name)
             raise RuntimeError(
                 f"Pod {pod_name} did not become Ready within {self.sandbox_creation_timeout_seconds}s: "
                 f"{wait_result.stderr.strip()}"
             )
+        if self.closed:
+            # delete_all ran while we waited; do not hand out a pod being torn down.
+            self.delete(pod_name)
+            raise RuntimeError(f"{type(self).__name__} closed while creating pod {pod_name}")
 
         logger.info("Pod %s is ready", pod_name)
         # Create /root/.venv → /opt/miniconda3/envs/testbed
@@ -221,6 +228,7 @@ class K8sSandboxClient(SandboxClient):
     def delete(self, sandbox_id: str, **kwargs) -> None:
         """Delete the identified pod."""
         self._force_delete(sandbox_id)
+        self._untrack(sandbox_id)
 
     # ------------------------------------------------------------------
     # Helpers

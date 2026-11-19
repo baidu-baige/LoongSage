@@ -205,3 +205,126 @@ def test_nonzero_exit_is_not_a_timeout(monkeypatch, make_client) -> None:
     assert result["timed_out"] is False
     assert result["error"] == ""
     assert (result["exit_code"], result["success"]) == (2, False)
+
+
+class _TrackingClient(_FakeClient):
+    """Fake backend that tracks like the real ones: before create, until delete."""
+
+    def __init__(self, fail_delete: set[str] | None = None) -> None:
+        super().__init__()
+        self.fail_delete = fail_delete or set()
+
+    def create(self, **kwargs: Any) -> str:
+        sandbox_id = f"sbx-{len(self.created_with) + 1}"
+        self._track(sandbox_id)
+        self.created_with.append(kwargs)
+        return sandbox_id
+
+    def delete(self, sandbox_id: str, **kwargs: Any) -> None:
+        if sandbox_id in self.fail_delete:
+            raise RuntimeError("engine down")
+        self.deleted.append(sandbox_id)
+        self._untrack(sandbox_id)
+
+
+def test_live_sandboxes_follow_create_and_delete() -> None:
+    client = _TrackingClient()
+    first, second = client.create(image="a"), client.create(image="b")
+    assert client.live_sandboxes() == [first, second]
+
+    client.delete(first)
+
+    assert client.live_sandboxes() == [second]
+    assert client.closed is False
+
+
+def test_delete_all_deletes_tracked_and_closes() -> None:
+    client = _TrackingClient()
+    ids = [client.create(image="x") for _ in range(5)]
+
+    deleted, failed = client.delete_all(max_workers=2)
+
+    assert (deleted, failed) == (5, [])
+    assert sorted(client.deleted) == sorted(ids)
+    assert client.live_sandboxes() == []
+    assert client.closed is True
+    with pytest.raises(RuntimeError, match="closed"):
+        client.create(image="x")
+
+
+def test_delete_all_reports_failures_and_keeps_them_tracked() -> None:
+    client = _TrackingClient(fail_delete={"sbx-2"})
+    for _ in range(3):
+        client.create(image="x")
+
+    deleted, failed = client.delete_all()
+
+    assert (deleted, failed) == (2, ["sbx-2"])
+    assert client.live_sandboxes() == ["sbx-2"]
+
+
+def test_delete_all_on_untouched_client_is_a_noop() -> None:
+    client = _FakeClient()  # never tracked anything, no __init__ chaining
+
+    assert client.delete_all() == (0, [])
+    assert client.closed is True
+
+
+def test_k8s_tracks_pod_before_apply_and_untracks_on_delete(monkeypatch) -> None:
+    client = _k8s_client()
+    seen_live: list[list[str]] = []
+
+    def fake_run(cmd, *args, **kwargs):
+        if "apply" in cmd:
+            seen_live.append(client.live_sandboxes())
+        return _completed(0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    pod = client.create(image="img")
+
+    assert seen_live == [[pod]]
+    assert client.live_sandboxes() == [pod]
+    client.delete(pod)
+    assert client.live_sandboxes() == []
+
+
+def test_k8s_failed_apply_is_not_tracked(monkeypatch) -> None:
+    client = _k8s_client()
+    monkeypatch.setattr(subprocess, "run", lambda cmd, *a, **k: _completed(1 if "apply" in cmd else 0))
+
+    with pytest.raises(RuntimeError, match="kubectl apply failed"):
+        client.create(image="img")
+    assert client.live_sandboxes() == []
+
+
+def test_k8s_pod_ready_after_close_is_deleted(monkeypatch) -> None:
+    client = _k8s_client()
+    deleted: list[list[str]] = []
+
+    def fake_run(cmd, *args, **kwargs):
+        if "wait" in cmd:
+            client.delete_all()  # SIGTERM cleanup lands while kubectl wait blocks
+        if "delete" in cmd:
+            deleted.append(cmd)
+        return _completed(0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    with pytest.raises(RuntimeError, match="closed"):
+        client.create(image="img")
+    assert client.live_sandboxes() == []
+    assert deleted  # removed by delete_all and again by create; NotFound is a success
+
+
+def test_docker_container_started_after_close_is_removed(monkeypatch) -> None:
+    client = _docker_client()
+    client.delete_all()
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, *args, **kwargs):
+        calls.append(cmd)
+        return _completed(0, stdout="cid123\n")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    with pytest.raises(RuntimeError, match="closed"):
+        client.create(image="img")
+    assert ["docker", "rm", "-f", "cid123"] in calls

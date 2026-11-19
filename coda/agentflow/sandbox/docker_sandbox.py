@@ -88,6 +88,12 @@ class DockerSandboxClient(SandboxClient):
         )
         sandbox_id = result.stdout.strip()
         logger.info(f"Container started: {sandbox_id[:12]}")
+        # docker assigns the id, so the container is tracked only once `docker run` returns.
+        try:
+            self._track(sandbox_id)
+        except RuntimeError:
+            self.delete(sandbox_id)
+            raise
 
         # Create /root/.venv symlink so tool scripts with #!/root/.venv/bin/python
         # shebang can resolve to the testbed conda environment (which has chardet
@@ -162,3 +168,4 @@ class DockerSandboxClient(SandboxClient):
         """Stop and remove the identified container."""
         logger.info(f"Removing container {sandbox_id[:12]}")
         subprocess.run(["docker", "rm", "-f", sandbox_id], capture_output=True)
+        self._untrack(sandbox_id)

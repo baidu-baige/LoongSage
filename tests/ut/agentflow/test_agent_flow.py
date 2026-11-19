@@ -4,6 +4,7 @@ import asyncio
 import tempfile
 import os
 from contextlib import contextmanager
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch, call
 
 import httpx
@@ -1604,3 +1605,45 @@ class TestExecuteSingleTurn:
             body = client.post.call_args.kwargs["json"]
 
         assert body["messages"] == [{"role": "user", "content": "mainline"}]
+
+# ---------------------------------------------------------------------------
+# delete_all_sandboxes (exit-time cleanup)
+# ---------------------------------------------------------------------------
+
+def _cleanup_stub(clients):
+    return SimpleNamespace(ds_sandbox_clients=clients)
+
+
+def test_delete_all_sandboxes_covers_driver_clients(caplog):
+    client = MagicMock()
+    client.delete_all.return_value = (3, ["sbx-x"])
+
+    with caplog.at_level("INFO", logger="coda.agentflow.agent_flow"):
+        AgentFlow.delete_all_sandboxes(_cleanup_stub({0: client, 1: None}), timeout_seconds=9)
+
+    client.delete_all.assert_called_once_with()
+    assert "ds0=deleted 3, failed 1" in caplog.text
+
+
+def test_delete_all_sandboxes_gives_up_after_timeout(caplog):
+    import threading
+    release = threading.Event()
+    slow = MagicMock()
+    slow.delete_all.side_effect = lambda: release.wait(10) and (0, [])
+
+    try:
+        with caplog.at_level("INFO", logger="coda.agentflow.agent_flow"):
+            AgentFlow.delete_all_sandboxes(_cleanup_stub({0: slow}), timeout_seconds=0.2)
+    finally:
+        release.set()
+    assert "ds0=timed out" in caplog.text
+
+
+def test_delete_all_sandboxes_reports_errors_and_noop_without_clients(caplog):
+    bad = MagicMock()
+    bad.delete_all.side_effect = RuntimeError("engine down")
+
+    with caplog.at_level("INFO", logger="coda.agentflow.agent_flow"):
+        AgentFlow.delete_all_sandboxes(_cleanup_stub({0: bad}), timeout_seconds=5)
+        AgentFlow.delete_all_sandboxes(_cleanup_stub({}), timeout_seconds=5)
+    assert "ds0=error(engine down)" in caplog.text
