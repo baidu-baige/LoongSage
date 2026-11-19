@@ -9,6 +9,7 @@ import logging
 import ray
 
 from coda.utils.http_utils import find_available_port
+from coda.utils import logging_utils
 logger = logging.getLogger(__name__)
 
 class RolloutWorker(ABC):
@@ -22,6 +23,10 @@ class RolloutWorker(ABC):
     def runtime_env_vars(cls):
         """runtime env"""
         return {}
+
+    def get_node_ip(self):
+        """IP of the node this actor landed on."""
+        return ray.util.get_node_ip_address()
 
     def get_ip_port(self, base_port=15000, consecutive=1):
         """Discover ip and free port."""
@@ -51,6 +56,7 @@ class RolloutWorker(ABC):
         self.worker_type = worker_type
         self.base_gpu_id = base_gpu_id
         self.engine_args = engine_args or {}
+        logging_utils.configure_logger(level=config.log_level)
         self.num_gpus_per_replica = num_gpus_per_replica
         # Tracks whether the prefix/KV cache has already been flushed for the current
         # weight version. Set when the offload path flushes; consumed and cleared by the

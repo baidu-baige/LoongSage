@@ -136,15 +136,18 @@ Sandbox 后端配置属于数据源，可在单数据源模板 `data_source.sand
 
 `sglang_replicas` 描述推理集群按角色的切分，每个角色都可以独立占用 GPU。默认只启用 `regular` 一个 replica group（相当于不做 PD 拆分）。
 
-> **注意**：完整的 PD 分离功能暂不支持。当前请保持 `prefill.num_nodes` 与 `decode.num_nodes` 为 `0`，只使用 `regular`。
+> **注意**：开启 PD 分离时，把 `regular` 设为 `0`，并为 `prefill` 与 `decode` 都分配节点或 replica，约束见 [11.5](#115-sglang-pd-拆分)。
 
 | 参数 | 默认 | 说明 | 约束 |
 | --- | --- | --- | --- |
-| `sglang_replicas.regular.num_nodes` | `1` | 「统一 prefill+decode」replica 数量（以 replica 为单位，每个 replica 独占 `num_gpus_per_replica` 张卡）。 | 与 `prefill` / `decode` 二者互斥使用。 |
+| `sglang_replicas.regular.num_nodes` | `1` | 分配给 regular 组的节点数，GPU 预算为 `num_nodes × rollout.num_gpus_per_node`，replica 数由预算除以 `num_gpus_per_replica` 得出。 | 与 `prefill` / `decode` 二者互斥使用。 |
+| `sglang_replicas.regular.num_replicas` | `null` | 显式指定 replica 数量，设置后覆盖 `num_nodes`。 | 当某组需要的 GPU 少于一个整节点时必须使用（例如 prefill 与 decode 共享一个 8 卡节点，各占 4 卡）。 |
 | `sglang_replicas.regular.num_gpus_per_replica` | `8` | 单个 regular replica 使用的 GPU 数。 | 需能被 `rollout.num_gpus_per_node` 整除或跨节点排布。 |
-| `sglang_replicas.prefill.num_nodes` | `0` | Prefill 专用 replica 数量。 | 完整 PD 分离暂不支持，保持 `0`。 |
+| `sglang_replicas.prefill.num_nodes` | `0` | 分配给 prefill 组的节点数。 | 与 `decode` 同时大于 `0` 才启用 PD 分离。 |
+| `sglang_replicas.prefill.num_replicas` | `null` | 显式指定 prefill replica 数量，设置后覆盖 `num_nodes`。 |  |
 | `sglang_replicas.prefill.num_gpus_per_replica` | `8` | 单个 prefill replica 的 GPU 数。 |  |
-| `sglang_replicas.decode.num_nodes` | `0` | Decode 专用 replica 数量。 |  |
+| `sglang_replicas.decode.num_nodes` | `0` | 分配给 decode 组的节点数。 |  |
+| `sglang_replicas.decode.num_replicas` | `null` | 显式指定 decode replica 数量，设置后覆盖 `num_nodes`。 |  |
 | `sglang_replicas.decode.num_gpus_per_replica` | `8` | 单个 decode replica 的 GPU 数。 |  |
 | `sglang_replicas.decode.sglang_args` | `{disable_cuda_graph: false}` | 为 decode replica 覆盖 `rollout.sglang_args`（decode 通常需要开启 CUDA graph）。 | 只影响 decode replica。 |
 
@@ -174,7 +177,7 @@ Agent 侧的 Router 与 tokenizer，以及 trajectory dump 等框架级能力。
 | `agentflow.router.ip` | `""` | Router 监听 IP。为空时运行期自动解析本机路由 IP。 | 通常无需手动配置。 |
 | `agentflow.router.port` | `0` | Router 监听端口。`0` 表示运行期自动分配。 | — |
 | `agentflow.router.accumulate_reasoning` | `true` | 多轮对话中把 reasoning tokens 一并累积到上下文。 | 关闭时思考内容只在当轮生效。 |
-| `agentflow.router.rollout_worker_load_threshold` | `32` | 单 rollout worker 的负载阈值，超过后 router 会做负载均衡调度。 | 该值越小分发越均衡，但调度开销越高。 |
+| `agentflow.router.rollout_worker_load_threshold` | `{regular: 32, prefill: 32, decode: 16}` | 单 slot 的在途请求阈值，超过后 router 放弃粘滞、改选最闲的 slot。以 `worker_type` 为键，`sglang_replicas` 中每个启用的组都要有对应键（无 default 兜底）。 | 该值越小分发越均衡，但 prefix cache 复用越少。`prefill` / `decode` 只在 PD 场景生效，分开设置是因为两池的并行度和 replica 数可以不同，单个引擎能承载的请求量也就不同。 |
 | `agentflow.router.proxy_timeout_seconds` | `1800` | Router → SGLang 单请求超时秒数。 | 需要 ≥ 单次 attempt 的最长生成时间。 |
 | `agentflow.router.abort_timeout_seconds` | `600` | step 边界 abort 未完成请求的等待秒数。 | 与 `rollout.partial` 配套。 |
 | `agentflow.router.max_connections` | `512` | Router 允许的最大并发连接数。 | 与 `sglang_args.max_running_requests` 配套调优。 |
@@ -361,6 +364,7 @@ OPD（On-Policy Distillation）在 RL 流程中额外挂载若干 teacher 模型
 | `trainer.num_gpus_per_node` | `8` | 单节点训练 GPU 数。 | 同上，参与 `dp_size` 计算。 |
 | `trainer.use_rollout_log_probs` | `false` | 使用推理引擎返回的 `rollout_log_probs` 替代训练侧重算的 `old_log_probs`。 | 与 IS correction、M2PO 互斥。 |
 | `trainer.use_rollout_routing_replay` | `false` | 使用推理端记录的 MoE routing 结果做 replay。 | 用于对齐推理/训练 MoE 路由。 |
+| `trainer.routed_experts_dtype` | `auto` | 回传的 routed expert id 在链路上的编码类型：`auto` / `int32` / `int16` / `uint8`。`auto` 由引擎按专家数选最窄的无损类型（≤256 → uint8，≤32768 → int16，否则 int32），router 按响应里的 `meta_info.routed_experts_dtype` 解码（老引擎无此字段时回退 int32）。 | 显式指定窄类型时，若模型的 id 会溢出引擎启动即报错；PD 下 prefill/decode 两侧必须一致。 |
 | `trainer.use_fp32_lm_head` | `false` | LM head 是否使用 FP32 计算。 | 数值敏感场景可开启。 |
 | `trainer.forward_only` | `false` | 训练 worker 只做前向：不包 DDP（不分配梯度 buffer），也不构建 optimizer / LR scheduler。worker 只持有权重并同步给 rollout 引擎，每步仍重算 `old_log_probs` 并上报 IS / k3 等前向指标，但不做反向和参数更新。适合只评估训推一致性或只采样的场景，可省下梯度 buffer 与优化器状态的显存。 | `run_mode: rollout-only` 时自动置为 `true`，同时把 `critic.enable` 置为 `false`。不能与 `critic.enable` 同时开启，否则启动报错。权重从不更新，因此不支持保存：开启时需 `trainer.save_freq <= 0`，否则启动报错。任何需要训练的任务都必须为 `false`。 |
 | `trainer.temperature` | `1.0` | 采样温度。eval 轮次在 `rollout.eval.temperature` 非 `null` 时改用后者。 | 由 Router 管理，`completion_params.temperature` 不生效。 |
@@ -412,7 +416,12 @@ OPD（On-Policy Distillation）在 RL 流程中额外挂载若干 teacher 模型
 
 ### 11.5 SGLang PD 拆分
 
-- **完整的 PD 分离功能暂不支持**，当前请保持 `regular` 单形态，即 `sglang_replicas.prefill.num_nodes` 与 `decode.num_nodes` 均为 `0`。
+功能说明与完整配置见 [PD 分离](./pd-disaggregation.md)。
+
+- `regular` 与 `prefill` / `decode` 互斥：PD 分离时 `regular` 必须为 `0`，`prefill` 与 `decode` 都必须有 replica，否则启动时报错。
+- 每个启用的组都要满足 `tp_size × pp_size == num_gpus_per_replica`，否则权重同步的 rank 会错位。
+- PD 分离与 `rollout.env_vars.SGLANG_RUST_SERVER` 不兼容。
+- `agentflow.router.rollout_worker_load_threshold` 需要包含 `prefill` 与 `decode` 两个键。
 
 ### 11.6 Eval
 

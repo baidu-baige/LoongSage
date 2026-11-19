@@ -4,11 +4,14 @@ import asyncio
 import inspect
 import json
 import logging
+import random
+import ssl
 import threading
 import time
 from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 import httpx
 import uvicorn
@@ -19,6 +22,20 @@ from pydantic import BaseModel as PydanticModel
 from coda.agentflow.router import resolve_middleware_chain
 from coda.agentflow.utils import build_request_id
 
+# The three ``rollout.sglang_replicas`` group names: ``regular`` is the single-form
+# topology, ``prefill`` + ``decode`` is PD disaggregation.
+WORKER_TYPE_REGULAR = "regular"
+WORKER_TYPE_PREFILL = "prefill"
+WORKER_TYPE_DECODE = "decode"
+# Abort order inside one P/D pair: decode before prefill.
+PD_ABORT_ORDER = (WORKER_TYPE_DECODE, WORKER_TYPE_PREFILL, WORKER_TYPE_REGULAR)
+# SGLang accepts bootstrap_room in [0, 2^63).
+BOOTSTRAP_ROOM_BITS = 63
+# httpx builds a fresh ``ssl.SSLContext`` (re-reading the CA bundle) inside every
+# ``AsyncClient``, synchronously on the event loop. ``_post_generate`` keeps one
+# client per request and shares only this context.
+_SSL_CONTEXT = ssl.create_default_context()
+
 
 class WorkerPayload(PydanticModel):
     """Worker management payload."""
@@ -28,6 +45,11 @@ class WorkerPayload(PydanticModel):
     # a specific DP group via ``routed_dp_rank`` instead of SGLang load-balancing
     # internally. 1 means "no DP attention" (nothing to route).
     dp_size: int = 1
+    # Which replica group the engine belongs to: regular, prefill or decode.
+    worker_type: str = WORKER_TYPE_REGULAR
+    # KV handshake port of a prefill engine (``disaggregation_bootstrap_port``);
+    # unused for the other worker types.
+    bootstrap_port: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +66,19 @@ class WorkerSlot:
 
     def __str__(self) -> str:
         return f"{self.worker_url}:{self.dp_rank}"
+
+@dataclass(frozen=True, slots=True)
+class UpstreamResult:
+    """One worker's reply to a forwarded ``/generate``, already fully read."""
+
+    status_code: int
+    headers: dict[str, str]
+    content: bytes
+
+
+def _upstream_ok(result: Any) -> bool:
+    """True only when a forward produced a 2xx reply rather than an exception."""
+    return isinstance(result, UpstreamResult) and 200 <= result.status_code < 300
 
 
 logger = logging.getLogger("Router")
@@ -108,7 +143,14 @@ class InflightRequests:
 
 
 class Router:
-    """Reverse proxy with sticky + least-loaded routing across SGLang workers."""
+    """Reverse proxy with sticky + least-loaded routing across SGLang workers.
+
+    Routing is driven by ``worker_type``: a request is dispatched to one slot per
+    registered worker type. The single-form topology registers only ``regular`` and
+    therefore fans out to one worker; PD disaggregation registers
+    ``prefill`` + ``decode`` and fans the same body out to both, with the bootstrap
+    triple injected so the two halves rendezvous over RDMA.
+    """
 
     def __init__(
         self,
@@ -118,22 +160,31 @@ class Router:
     ) -> None:
         """Initialize routing state, HTTP client, and FastAPI app."""
         self.config = config
+        # worker_type -> in-flight requests a pinned slot may carry before sticky
+        # routing re-balances
         self.rollout_worker_load_threshold = config.rollout_worker_load_threshold
         self.accumulate_reasoning = config.accumulate_reasoning
 
-        # WorkerSlot -> in-flight request count (worker + attention-DP group)
-        self.slot_request_counts: dict[WorkerSlot, int] = {}
+        # worker_type -> WorkerSlot -> in-flight request count, one pool per type
+        self.slot_request_counts: dict[str, dict[WorkerSlot, int]] = {}
         # Worker URLs quarantined from the routing pool (URL granularity)
         self.dead_workers: set[str] = set()
-        # request_id (trajectory_id#attempt_id) -> pinned WorkerSlot (sticky routing)
-        self.session_id_to_slot: dict[str, WorkerSlot] = {}
-        # URL -> attention-DP group count reported by the worker
-        self.worker_dp_size: dict[str, int] = {}
+        # request_id (trajectory_id#attempt_id) -> worker_type -> pinned WorkerSlot
+        # (sticky routing)
+        self.session_id_to_slots: dict[str, dict[str, WorkerSlot]] = {}
+        # worker_type -> URL -> attention-DP group count reported by the worker
+        self.worker_dp_size: dict[str, dict[str, int]] = {}
+        # URL -> KV handshake port, prefill only
+        self.prefill_bootstrap_port: dict[str, int] = {}
         self.inflight_requests = InflightRequests()
+        # PD failure counters, one per side
+        self.pd_prefill_failures = 0
+        self.pd_decode_timeouts = 0
 
         self._max_connections = int(config.max_connections)
         # Dedicated control client + semaphore for worker-abort requests, off the
         # forward path so an abort storm can't inflate it and pin the router loop.
+        # A PD pair spends one permit, not two.
         self._generate_sem = asyncio.Semaphore(self._max_connections)
         self._control_sem = asyncio.Semaphore(self._max_connections)
         self._control_client = httpx.AsyncClient(
@@ -237,74 +288,117 @@ class Router:
     # Worker lifecycle (synchronous — no await, safe in single asyncio loop)
     # -------------------------------------------------------------------------
 
-    def _slots_of(self, worker_url: str) -> list[WorkerSlot]:
+    def _slots_of(self, worker_type: str, worker_url: str) -> list[WorkerSlot]:
         """All DP-group slots of a worker (a single slot when DP attention is off)."""
-        return [WorkerSlot(worker_url, dp) for dp in range(self.worker_dp_size.get(worker_url, 1))]
+        dp_size = self.worker_dp_size[worker_type][worker_url]
+        return [WorkerSlot(worker_url, dp) for dp in range(dp_size)]
 
-    def _select_slot(self, request_id: str) -> WorkerSlot:
-        """Pick a (worker, DP group) slot and increment its in-flight count.
+    def _worker_type_of(self, worker_url: str) -> str | None:
+        """Reverse-lookup a URL's worker_type, or None when never registered.
 
-        Sticky per session first — the same slot for every turn of a trajectory
-        attempt, which keeps SGLang's prefix cache on one DP group — else the
-        least-loaded healthy slot.
+        A URL lives under exactly one worker_type: an engine process has one
+        ``disaggregation_mode``, and mixed registration is rejected by add_worker.
         """
-        pinned = self.session_id_to_slot.get(request_id)
-        if (
-            pinned is not None
-            and pinned.worker_url not in self.dead_workers
-            and self.slot_request_counts.get(pinned, 0) <= self.rollout_worker_load_threshold
-        ):
-            self.slot_request_counts[pinned] = self.slot_request_counts.get(pinned, 0) + 1
-            logger.info("[route] sticky %s -> %s", request_id, pinned)
-            return pinned
+        for worker_type, urls in self.worker_dp_size.items():
+            if worker_url in urls:
+                return worker_type
+        return None
 
-        available = [s for s in self.slot_request_counts if s.worker_url not in self.dead_workers]
-        if not available:
+    def _select_slots(self, request_id: str) -> dict[str, WorkerSlot]:
+        """Pick a (worker, DP group) slot per worker_type and increment its in-flight count.
+
+        For each registered worker_type: sticky per session first (the same slot for
+        every turn of a trajectory attempt, which keeps SGLang's prefix cache on one DP
+        group), else the least-loaded healthy slot. A pinned slot is abandoned once it
+        carries more than that type's ``rollout_worker_load_threshold``.
+        """
+        if not self.worker_dp_size:
             raise RuntimeError("No healthy workers available")
-        slot = min(available, key=self.slot_request_counts.__getitem__)
+        # Select a slot for every type first, then commit the writes together.
+        selected: dict[str, WorkerSlot] = {}
+        for worker_type in sorted(self.worker_dp_size):
+            counts = self.slot_request_counts[worker_type]
+            pinned = self.session_id_to_slots.get(request_id, {}).get(worker_type)
+            if (
+                pinned is not None
+                and pinned.worker_url not in self.dead_workers
+                and counts[pinned] <= self.rollout_worker_load_threshold[worker_type]
+            ):
+                selected[worker_type] = pinned
+                logger.info("[route] sticky %s -> %s (%s)", request_id, pinned, worker_type)
+                continue
+            available = [s for s in counts if s.worker_url not in self.dead_workers]
+            if not available:
+                raise RuntimeError("No healthy workers available")
+            slot = min(available, key=counts.__getitem__)
+            selected[worker_type] = slot
+            logger.info("[route] new %s -> %s (%s)", request_id, slot, worker_type)
 
-        self.session_id_to_slot[request_id] = slot
-        self.slot_request_counts[slot] += 1
-        logger.info("[route] new %s -> %s", request_id, slot)
-        return slot
+        self.session_id_to_slots[request_id] = dict(selected)
+        for worker_type, slot in selected.items():
+            self.slot_request_counts[worker_type][slot] += 1
+        return selected
 
-    def _finish_slot(self, slot: WorkerSlot) -> None:
-        """Decrement a slot's in-flight count after request completion."""
-        if slot not in self.slot_request_counts:
-            logger.error("[worker] _finish_slot: unknown slot %s — skipping decrement", slot)
-            return
-        self.slot_request_counts[slot] = max(0, self.slot_request_counts[slot] - 1)
+    def _finish_slot(self, slots: dict[str, WorkerSlot]) -> None:
+        """Decrement the in-flight count of every slot charged for one request."""
+        for worker_type, slot in slots.items():
+            counts = self.slot_request_counts.get(worker_type, {})
+            if slot not in counts:
+                logger.error(
+                    "[worker] _finish_slot: unknown slot %s (%s) — skipping decrement",
+                    slot, worker_type,
+                )
+                continue
+            counts[slot] = max(0, counts[slot] - 1)
 
     # -------------------------------------------------------------------------
     # Management API
     # -------------------------------------------------------------------------
 
     async def add_worker(self, payload: WorkerPayload) -> JSONResponse:
-        """Register a worker URL (and its attention-DP group count) for routing."""
+        """Register a worker URL with its worker_type, DP group count, and bootstrap port for routing."""
         worker_url = payload.worker_url
-        if worker_url in self.worker_dp_size:
+        worker_type = payload.worker_type
+        if self._worker_type_of(worker_url) is not None:
             return JSONResponse(
                 status_code=status.HTTP_409_CONFLICT,
                 content={"error": "Worker already exists", "worker": worker_url},
             )
+
         dp_size = max(1, int(payload.dp_size or 1))
-        self.worker_dp_size[worker_url] = dp_size
-        for slot in self._slots_of(worker_url):
-            self.slot_request_counts[slot] = 0
-        logger.info("[worker] added %s (dp_size=%d)", worker_url, dp_size)
+        self.worker_dp_size.setdefault(worker_type, {})[worker_url] = dp_size
+        counts = self.slot_request_counts.setdefault(worker_type, {})
+        for slot in self._slots_of(worker_type, worker_url):
+            counts[slot] = 0
+        if worker_type == WORKER_TYPE_PREFILL:
+            self.prefill_bootstrap_port[worker_url] = payload.bootstrap_port
+        logger.info(
+            "[worker] added %s (worker_type=%s dp_size=%d bootstrap_port=%s)",
+            worker_url, worker_type, dp_size, payload.bootstrap_port,
+        )
         return JSONResponse(
             status_code=status.HTTP_200_OK,
-            content={"status": "success", "worker": worker_url},
+            content={
+                "status": "success",
+                "worker": worker_url,
+                "worker_type": worker_type,
+            },
         )
 
     async def list_workers(self) -> JSONResponse:
         """Return active, dead, and per-slot load state."""
-        urls = list(dict.fromkeys(s.worker_url for s in self.slot_request_counts))
-        active_workers = [w for w in urls if w not in self.dead_workers]
-        slot_load = {
-            url: [self.slot_request_counts[WorkerSlot(url, dp)] for dp in range(self.worker_dp_size.get(url, 1))]
-            for url in urls
-        }
+        slot_load: dict[str, list[int]] = {}
+        worker_meta: dict[str, dict[str, Any]] = {}
+        for worker_type, dp_sizes in self.worker_dp_size.items():
+            counts = self.slot_request_counts[worker_type]
+            for url, dp_size in dp_sizes.items():
+                slot_load[url] = [counts[s] for s in self._slots_of(worker_type, url)]
+                worker_meta[url] = {
+                    "worker_type": worker_type,
+                    "dp_size": dp_size,
+                    "bootstrap_port": self.prefill_bootstrap_port.get(url),
+                }
+        active_workers = [url for url in worker_meta if url not in self.dead_workers]
         return JSONResponse(
             status_code=status.HTTP_200_OK,
             content={
@@ -312,13 +406,19 @@ class Router:
                 "dead_workers": list(self.dead_workers),
                 "load_stats": {url: sum(counts) for url, counts in slot_load.items()},
                 "slot_load_stats": slot_load,
+                "worker_meta": worker_meta,
             },
         )
 
     async def exclude_worker(self, payload: WorkerPayload) -> JSONResponse:
-        """Remove a worker from the active routing pool."""
+        """Remove a worker from the active routing pool.
+
+        Excluding a prefill worker also aborts every session pinned to it, whose
+        decode peer is waiting for a KV push that will never arrive.
+        """
         worker_url = payload.worker_url
-        if worker_url not in self.worker_dp_size:
+        worker_type = self._worker_type_of(worker_url)
+        if worker_type is None:
             return JSONResponse(
                 status_code=status.HTTP_404_NOT_FOUND,
                 content={"error": "Worker not found"},
@@ -329,16 +429,28 @@ class Router:
                 content={"error": "Worker is already excluded"},
             )
         self.dead_workers.add(worker_url)
-        logger.info("[worker] excluded %s", worker_url)
+        aborted_sessions = 0
+        if worker_type == WORKER_TYPE_PREFILL:
+            aborted_sessions = await self._abort_sessions_pinned_to_prefill(worker_url)
+        logger.info(
+            "[worker] excluded %s (worker_type=%s aborted_sessions=%d)",
+            worker_url, worker_type, aborted_sessions,
+        )
         return JSONResponse(
             status_code=status.HTTP_200_OK,
-            content={"status": "success", "worker": worker_url},
+            content={
+                "status": "success",
+                "worker": worker_url,
+                "worker_type": worker_type,
+                "aborted_sessions": aborted_sessions,
+            },
         )
 
     async def include_worker(self, payload: WorkerPayload) -> JSONResponse:
         """Restore an excluded worker to the active pool."""
         worker_url = payload.worker_url
-        if worker_url not in self.worker_dp_size:
+        worker_type = self._worker_type_of(worker_url)
+        if worker_type is None:
             return JSONResponse(
                 status_code=status.HTTP_404_NOT_FOUND,
                 content={"error": "Worker not found (never registered)"},
@@ -349,16 +461,20 @@ class Router:
                 content={"error": "Worker is already active"},
             )
         self.dead_workers.discard(worker_url)
-        logger.info("[worker] included %s", worker_url)
+        logger.info("[worker] included %s (worker_type=%s)", worker_url, worker_type)
         return JSONResponse(
             status_code=status.HTTP_200_OK,
-            content={"status": "success", "worker": worker_url},
+            content={
+                "status": "success",
+                "worker": worker_url,
+                "worker_type": worker_type,
+            },
         )
 
     async def release_session(self, trajectory_id: str, attempt_id: int) -> JSONResponse:
         """Release sticky routing state for one trajectory attempt."""
         request_id = build_request_id(trajectory_id, attempt_id)
-        released = self.session_id_to_slot.pop(request_id, None) is not None
+        released = self.session_id_to_slots.pop(request_id, None) is not None
         if released:
             logger.info("[session] released %s", request_id)
             return JSONResponse(
@@ -428,11 +544,34 @@ class Router:
                 },
             )
 
+    async def _abort_sessions_pinned_to_prefill(self, worker_url: str) -> int:
+        """Abort the decode half of every session pinned to a dead prefill worker."""
+        victims = [
+            (request_id, slots[WORKER_TYPE_DECODE])
+            for request_id, slots in self.session_id_to_slots.items()
+            if (pinned := slots.get(WORKER_TYPE_PREFILL)) is not None
+            and pinned.worker_url == worker_url
+        ]
+        await asyncio.gather(
+            *(
+                self._send_worker_abort_request(
+                    decode_slot.worker_url, {"rid": request_id, "abort_all": False}
+                )
+                for request_id, decode_slot in victims
+            ),
+        )
+        for request_id, _ in victims:
+            self.session_id_to_slots.pop(request_id, None)
+        return len(victims)
+
     async def abort_session(self, trajectory_id: str, attempt_id: int) -> JSONResponse:
-        """Abort the worker request pinned to one failed trajectory attempt."""
+        """Abort the worker request(s) pinned to one failed trajectory attempt.
+
+        Under PD both halves get an ``/abort_request``, decode first.
+        """
         request_id = build_request_id(trajectory_id, attempt_id)
-        slot = self.session_id_to_slot.get(request_id)
-        if slot is None:
+        slots = self.session_id_to_slots.get(request_id)
+        if not slots:
             return JSONResponse(
                 status_code=status.HTTP_404_NOT_FOUND,
                 content={
@@ -441,30 +580,36 @@ class Router:
                     "attempt_id": attempt_id,
                 },
             )
-        worker_url = slot.worker_url
-        failure = await self._send_worker_abort_request(
-            worker_url,
-            {"rid": request_id, "abort_all": False},
-        )
-        if failure:
+        ordered_types = [wt for wt in PD_ABORT_ORDER if wt in slots]
+        aborted = [slots[wt].worker_url for wt in ordered_types]
+        failures = []
+        for worker_type in ordered_types:
+            failure = await self._send_worker_abort_request(
+                slots[worker_type].worker_url,
+                {"rid": request_id, "abort_all": False},
+            )
+            if failure:
+                failures.append(failure)
+        if failures:
             return JSONResponse(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 content={
                     "status": "failed",
                     "trajectory_id": trajectory_id,
                     "attempt_id": attempt_id,
-                    "worker": worker_url,
-                    "error": failure,
+                    "worker": [f["worker"] for f in failures],
+                    "error": failures,
                 },
             )
-        self.session_id_to_slot.pop(request_id, None)
-        logger.info("[session] aborted failed attempt %s (worker=%s)", request_id, worker_url)
+        self.session_id_to_slots.pop(request_id, None)
+        logger.info("[session] aborted failed attempt %s (workers=%s)", request_id, aborted)
         return JSONResponse(
             status_code=status.HTTP_200_OK,
             content={
                 "status": "success",
                 "trajectory_id": trajectory_id,
                 "attempt_id": attempt_id,
+                "aborted": aborted,
             },
         )
 
@@ -472,7 +617,11 @@ class Router:
         """Abort all active workers and clear sticky session state."""
         active_workers = [
             w
-            for w in dict.fromkeys(s.worker_url for s in self.slot_request_counts)
+            for w in dict.fromkeys(
+                slot.worker_url
+                for counts in self.slot_request_counts.values()
+                for slot in counts
+            )
             if w not in self.dead_workers
         ]
         if not active_workers:
@@ -508,11 +657,12 @@ class Router:
                 },
             )
 
-        sessions_cleared = len(self.session_id_to_slot)
-        self.session_id_to_slot.clear()
+        sessions_cleared = len(self.session_id_to_slots)
+        self.session_id_to_slots.clear()
 
-        for slot in self.slot_request_counts:
-            self.slot_request_counts[slot] = 0
+        for counts in self.slot_request_counts.values():
+            for slot in counts:
+                counts[slot] = 0
 
         logger.info(
             "[abort] workers=%d/%d sessions_cleared=%d",
@@ -575,7 +725,10 @@ class Router:
         attempt_id: int,
         request: Request,
     ) -> Response:
-        """Proxy a prepared chat request to SGLang /generate."""
+        """Proxy a prepared chat request to SGLang /generate.
+
+        One target in the regular topology, a prefill/decode pair under PD.
+        """
         request_id = build_request_id(trajectory_id, attempt_id)
         body_bytes = getattr(request.state, "upstream_body", None)
         if body_bytes is None:
@@ -586,63 +739,205 @@ class Router:
             )
 
         headers = {k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")}
-        slot = None
+        slots = None
         async with self._generate_sem:
             try:
-                slot = self._select_slot(request_id)
-                body_bytes = self._set_routed_dp_rank(body_bytes, slot)
-                target_url = f"{slot.worker_url.rstrip('/')}/generate"
-
-                generate_client = httpx.AsyncClient(timeout=self.config.proxy_timeout_seconds)
-                try:
-                    worker_response = await generate_client.request(
-                        method=request.method,
-                        url=target_url,
-                        headers=headers,
-                        content=body_bytes,
+                # Inside the try: _select_slots has already charged every end.
+                slots = self._select_slots(request_id)
+                # Per-request rendezvous id shared by both halves; unrelated to rid.
+                room = random.getrandbits(BOOTSTRAP_ROOM_BITS)
+                # Build every body before creating any task.
+                bodies = {
+                    worker_type: self._inject(body_bytes, slots, worker_type=worker_type, room=room)
+                    for worker_type in slots
+                }
+                tasks = {
+                    worker_type: asyncio.create_task(
+                        self._post_generate(
+                            slots[worker_type], body, method=request.method, headers=headers
+                        )
                     )
-                    content = await worker_response.aread()
-                finally:
-                    await generate_client.aclose()
-                filtered_headers = filter_headers(dict(worker_response.headers))
-                return Response(
-                    content=content,
-                    status_code=worker_response.status_code,
-                    headers=filtered_headers,
-                    media_type=worker_response.headers.get("content-type") or None,
-                )
+                    for worker_type, body in bodies.items()
+                }
+                results = await self._dispatch(tasks)
+                return await self._merge(results, request, request_id, slots)
             except RuntimeError as exc:
                 return JSONResponse(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                     content={"error": str(exc)},
                 )
-            except httpx.RequestError as exc:
-                logger.error("[proxy] %s -> %s: %s", request_id, slot, exc)
+            finally:
+                if slots is not None:
+                    self._finish_slot(slots)
+
+    async def _dispatch(
+        self, tasks: dict[str, asyncio.Task]
+    ) -> dict[str, UpstreamResult | Exception]:
+        """Await each upstream, prefill first, keeping its response or exception.
+
+        A failed prefill stops the wait; decode is then cancelled.
+        """
+        results: dict[str, UpstreamResult | Exception] = {}
+        collect_order = sorted(tasks, key=lambda t: t != WORKER_TYPE_PREFILL)
+        try:
+            for worker_type in collect_order:
+                try:
+                    results[worker_type] = await tasks[worker_type]
+                except Exception as exc:  # noqa: BLE001 — reported by _merge
+                    results[worker_type] = exc
+                if worker_type == WORKER_TYPE_PREFILL and not _upstream_ok(
+                    results[worker_type]
+                ):
+                    break
+        finally:
+            # Drop the halves left unawaited by a bail-out or a cancelled request.
+            for task in tasks.values():
+                task.cancel()
+        return results
+
+    async def _merge(
+        self,
+        results: dict[str, UpstreamResult | Exception],
+        request: Request,
+        request_id: str,
+        slots: dict[str, WorkerSlot],
+    ) -> Response:
+        """Turn the fan-out results into one response.
+
+        decode's reply becomes the response; prefill's goes to the parser middleware
+        through ``request.state``.
+        """
+        is_pd = WORKER_TYPE_PREFILL in slots
+        if is_pd:
+            prefill_result = results[WORKER_TYPE_PREFILL]
+            if not _upstream_ok(prefill_result):
+                # A 4xx/5xx from prefill is not an exception, so both forms count.
+                self.pd_prefill_failures += 1
+                detail = (
+                    f"{type(prefill_result).__name__}: {prefill_result}"
+                    if isinstance(prefill_result, Exception)
+                    else f"status_code={prefill_result.status_code}"
+                )
+                logger.error(
+                    "[proxy] prefill failed for %s (%s): %s",
+                    request_id, slots[WORKER_TYPE_PREFILL], detail,
+                )
+                # Located by rid: AbortReq has no bootstrap_room field.
+                await self._send_worker_abort_request(
+                    slots[WORKER_TYPE_DECODE].worker_url,
+                    {"rid": request_id, "abort_all": False},
+                )
                 return JSONResponse(
                     status_code=status.HTTP_502_BAD_GATEWAY,
-                    content={"error": f"Upstream request failed: {exc}"},
+                    content={"error": f"Prefill worker failed: {detail}"},
                 )
-            finally:
-                if slot is not None:
-                    self._finish_slot(slot)
 
-    def _set_routed_dp_rank(self, body_bytes: bytes, slot: WorkerSlot) -> bytes:
-        """Add ``routed_dp_rank`` to the /generate body so SGLang routes the request
-        to ``slot``'s DP group instead of load-balancing internally.
+        primary = WORKER_TYPE_DECODE if is_pd else WORKER_TYPE_REGULAR
+        result = results[primary]
+        if isinstance(result, Exception):
+            if isinstance(result, httpx.RequestError):
+                # httpx.TimeoutException derives from RequestError, so timeouts too.
+                if is_pd:
+                    self.pd_decode_timeouts += 1
+                logger.error("[proxy] %s -> %s: %s", request_id, slots[primary], result)
+                return JSONResponse(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    content={"error": f"Upstream request failed: {result}"},
+                )
+            raise result
 
-        No-op when the worker has a single DP group, so non-DP-attention runs are
-        unaffected.
+        if is_pd:
+            request.state.prefill_body = results[WORKER_TYPE_PREFILL].content
+
+        return Response(
+            content=result.content,
+            status_code=result.status_code,
+            headers=filter_headers(result.headers),
+            media_type=result.headers.get("content-type") or None,
+        )
+
+    async def _post_generate(
+        self,
+        slot: WorkerSlot,
+        body_bytes: bytes,
+        *,
+        method: str,
+        headers: dict[str, str],
+    ) -> UpstreamResult:
+        """Forward one prepared body to one worker's ``/generate`` and read it fully."""
+        target_url = f"{slot.worker_url.rstrip('/')}/generate"
+        # Shares only the pre-built SSL context; the client itself stays per-request so
+        # one dispatch still owns exactly one connection (see ``_SSL_CONTEXT``).
+        generate_client = httpx.AsyncClient(
+            timeout=self.config.proxy_timeout_seconds, verify=_SSL_CONTEXT
+        )
+        try:
+            worker_response = await generate_client.request(
+                method=method,
+                url=target_url,
+                headers=headers,
+                content=body_bytes,
+            )
+            content = await worker_response.aread()
+        finally:
+            await generate_client.aclose()
+        return UpstreamResult(
+            status_code=worker_response.status_code,
+            headers=dict(worker_response.headers),
+            content=content,
+        )
+
+    def _inject(
+        self,
+        body_bytes: bytes,
+        slots: dict[str, WorkerSlot],
+        *,
+        worker_type: str,
+        room: int,
+    ) -> bytes:
+        """Add the per-target routing fields to one copy of the ``/generate`` body.
+
+        ``routed_dp_rank`` pins the request to ``slot``'s DP group instead of letting
+        SGLang load-balance internally. Under PD both halves also get the bootstrap
+        triple, and decode the DP group of the prefill holding the cache.
+
+        No-op when the worker has a single DP group and PD is off.
         """
-        if self.worker_dp_size.get(slot.worker_url, 1) <= 1:
+        slot = slots[worker_type]
+        is_pd = WORKER_TYPE_PREFILL in slots
+        dp_size = self.worker_dp_size.get(worker_type, {}).get(slot.worker_url, 1)
+        if dp_size <= 1 and not is_pd:
             return body_bytes
         try:
             payload = json.loads(body_bytes)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError) as exc:
+            if is_pd:
+                # Without the triple the request would hang, so fail instead of warn.
+                raise RuntimeError(
+                    "cannot parse upstream body to inject PD bootstrap fields "
+                    f"(worker={slot.worker_url})"
+                ) from exc
             logger.warning(
                 "[route] cannot parse upstream body to set routed_dp_rank (worker=%s)", slot.worker_url
             )
             return body_bytes
-        payload["routed_dp_rank"] = slot.dp_rank
+        if dp_size > 1:
+            payload["routed_dp_rank"] = slot.dp_rank
+        if is_pd:
+            prefill = slots[WORKER_TYPE_PREFILL]
+            payload["bootstrap_host"] = urlsplit(prefill.worker_url).hostname
+            payload["bootstrap_port"] = self.prefill_bootstrap_port[prefill.worker_url]
+            payload["bootstrap_room"] = room
+            prefill_dp_size = self.worker_dp_size[WORKER_TYPE_PREFILL][prefill.worker_url]
+            if worker_type == WORKER_TYPE_DECODE and prefill_dp_size > 1:
+                # Hint telling decode which prefill DP worker holds the KV cache.
+                payload["disagg_prefill_dp_rank"] = prefill.dp_rank
+            if worker_type == WORKER_TYPE_DECODE and payload.get("return_routed_experts"):
+                # Prefill covers [start_len, prompt_len); decode only needs
+                # [prompt_len, seqlen - 1). Asking decode for the wider range
+                # transports every prompt row a second time, only for the parser
+                # to discard that copy.
+                payload["routed_experts_start_len"] = len(payload["input_ids"])
         return json.dumps(payload).encode("utf-8")
 
     # -------------------------------------------------------------------------

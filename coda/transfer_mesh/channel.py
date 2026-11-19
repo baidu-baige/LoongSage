@@ -573,7 +573,8 @@ def create_channel(
 # Dynamically resolved (not needed in ChannelMeta):
 #     addr: automatically obtained via HOST_IP env var or Ray
 #     gpu_id: automatically obtained from CUDA_VISIBLE_DEVICES (physical index)
-#     rank: engine_id * dist.get_world_size() + dist.get_rank()
+#     rank: rank_base + dist.get_rank()  (rank_base defaults to
+#           engine_id * dist.get_world_size() when not supplied)
 #           [+ train_world_size for receivers]
 # ---------------------------------------------------------------------------
 
@@ -608,10 +609,12 @@ class ChannelMeta:
         If specified, use this IP directly instead of auto-detecting.
         Otherwise, detection order: HOST_IP env var → Ray.
     engine_id : int
-        Engine identifier.  Use ``0`` for single-engine setups; set to a
-        positive integer for multi-engine setups so that the rank formula
-        ``engine_id * dist.get_world_size() + dist.get_rank() + train_world_size``
-        is used.
+        Engine identifier.  Only used for logging and as the fallback rank base
+        when ``rank_base`` is not supplied.
+    rank_base : int or None
+        Rank base for this engine.  ``None`` falls back to
+        ``engine_id * dist.get_world_size()``, which only tiles correctly when
+        every engine runs the same parallelism.
     """
 
     # --- required ---
@@ -621,6 +624,7 @@ class ChannelMeta:
 
     # --- optional ---
     engine_id: int = 0
+    rank_base: int | None = None
     recreate: bool = False
     buffer_size_bytes: int = 1024 * 1024 * 1024  # 1 GiB
     timeout: float = 300.0
@@ -691,15 +695,22 @@ def _get_local_ip(local_ip: str | None) -> str:
     )
 
 
-def _compute_rank(engine_id: int, train_world_size: int, role: Role) -> int:
+def _compute_rank(
+    engine_id: int,
+    train_world_size: int,
+    role: Role,
+    rank_base: int | None = None,
+) -> int:
     """Compute the rank for the channel.
 
-    Base rank: engine_id * dist.get_world_size() + dist.get_rank()
+    Base rank: ``rank_base`` when given, else ``engine_id * dist.get_world_size()``.
     For receivers, train_world_size is added so that receiver ranks
     start after sender ranks and do not collide.
 
-    - sender:   engine_id * dist.get_world_size() + dist.get_rank()
-    - receiver: engine_id * dist.get_world_size() + dist.get_rank() + train_world_size
+    - sender:   rank_base + dist.get_rank()
+    - receiver: rank_base + dist.get_rank() + train_world_size
+
+    The fallback formula assumes every engine has the same world size.
     """
     if not dist.is_initialized():
         raise RuntimeError(
@@ -707,7 +718,8 @@ def _compute_rank(engine_id: int, train_world_size: int, role: Role) -> int:
             "This helper requires the caller to have already called dist.init_process_group()."
         )
 
-    rank = engine_id * dist.get_world_size() + dist.get_rank()
+    base = rank_base if rank_base is not None else engine_id * dist.get_world_size()
+    rank = base + dist.get_rank()
     if role == Role.RECEIVER:
         rank += train_world_size
     return rank
@@ -745,7 +757,9 @@ def _get_or_recreate_channel(meta: ChannelMeta, role: Role) -> TransferMeshChann
     if _channel is None:
         # Resolve dynamic fields
         addr = _get_local_ip(meta.local_ip)
-        rank = _compute_rank(meta.engine_id, meta.train_world_size, role)
+        rank = _compute_rank(
+            meta.engine_id, meta.train_world_size, role, meta.rank_base
+        )
         gpu_id = _get_physical_gpu_id()
 
         _channel = create_channel(
@@ -761,8 +775,8 @@ def _get_or_recreate_channel(meta: ChannelMeta, role: Role) -> TransferMeshChann
             gloo_port=meta.gloo_port,
         )
         logger.info(
-            "Channel created (rank=%s, role=%s, engine_id=%s, gpu_id=%s).",
-            rank, role, meta.engine_id, gpu_id
+            "Channel created (rank=%s, world_size=%s, rank_base=%s, role=%s, engine_id=%s, gpu_id=%s).",
+            rank, meta.world_size, meta.rank_base, role, meta.engine_id, gpu_id
         )
 
     return _channel

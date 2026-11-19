@@ -11,7 +11,11 @@ import pytest
 from fastapi import status
 from omegaconf import OmegaConf
 
-from coda.agentflow.router.router import Router, WorkerSlot
+from coda.agentflow.router.router import (
+    WORKER_TYPE_REGULAR,
+    Router,
+    WorkerSlot,
+)
 from coda.agentflow.trajectory_store import Trajectory, TrajectoryStore
 from coda.agentflow.utils import build_request_id
 
@@ -40,6 +44,31 @@ def slot(worker_url: str, dp_rank: int = 0) -> WorkerSlot:
     return WorkerSlot(worker_url, dp_rank)
 
 
+def counts_of(router: Router, worker_type: str = WORKER_TYPE_REGULAR) -> dict[WorkerSlot, int]:
+    """The in-flight pool of one worker_type.
+
+    In-flight counts are keyed by worker_type (one independent pool per type), so a
+    test that pokes the pool directly also has to announce the type — otherwise the
+    router has nothing to fan out to.
+    """
+    router.worker_dp_size.setdefault(worker_type, {})
+    return router.slot_request_counts.setdefault(worker_type, {})
+
+
+def select_one(
+    router: Router, request_id: str, worker_type: str = WORKER_TYPE_REGULAR
+) -> WorkerSlot:
+    """Pick slots for a request and return the one for a single-type topology."""
+    return router._select_slots(request_id)[worker_type]
+
+
+def finish_one(
+    router: Router, chosen: WorkerSlot, worker_type: str = WORKER_TYPE_REGULAR
+) -> None:
+    """Release one slot of a single-type topology."""
+    router._finish_slot({worker_type: chosen})
+
+
 def make_store(*specs: tuple[str, int]) -> TrajectoryStore:
     """Create a TrajectoryStore pre-populated with minimal trajectories."""
     store = TrajectoryStore()
@@ -58,7 +87,7 @@ ROUTER_BASE_CONFIG = {
     "proxy_timeout_seconds": 600.0,
     "abort_timeout_seconds": 600.0,
     "accumulate_reasoning": False,
-    "rollout_worker_load_threshold": 4,
+    "rollout_worker_load_threshold": {"regular": 4},
     "max_connections": 512,
     "middleware": {},
 }
@@ -175,9 +204,15 @@ class TestWorkerManagement:
         assert result.json() == {
             "status": "success",
             "worker": "http://worker1:8888",
+            "worker_type": "regular",
         }
         assert workers.status_code == status.HTTP_200_OK
         assert "http://worker1:8888" in workers.json()["active_workers"]
+        assert workers.json()["worker_meta"]["http://worker1:8888"] == {
+            "worker_type": "regular",
+            "dp_size": 1,
+            "bootstrap_port": None,
+        }
 
     @pytest.mark.asyncio
     async def test_add_worker_missing_url_returns_422(self):
@@ -332,12 +367,12 @@ class TestWorkerManagement:
         router = make_router()
         async with make_client(router) as client:
             await client.post("/add_worker", json={"worker_url": "http://w1:8888"})
-            router.session_id_to_slot[build_request_id("traj-001", 0)] = slot("http://w1:8888")
-            router.session_id_to_slot[build_request_id("traj-002", 0)] = slot("http://w1:8888")
+            router.session_id_to_slots[build_request_id("traj-001", 0)] = {"regular": slot("http://w1:8888")}
+            router.session_id_to_slots[build_request_id("traj-002", 0)] = {"regular": slot("http://w1:8888")}
             await client.put("/exclude_worker", json={"worker_url": "http://w1:8888"})
 
-        assert router.session_id_to_slot[build_request_id("traj-001", 0)] == slot("http://w1:8888")
-        assert router.session_id_to_slot[build_request_id("traj-002", 0)] == slot("http://w1:8888")
+        assert router.session_id_to_slots[build_request_id("traj-001", 0)]["regular"] == slot("http://w1:8888")
+        assert router.session_id_to_slots[build_request_id("traj-002", 0)]["regular"] == slot("http://w1:8888")
 
     @pytest.mark.asyncio
     async def test_exclude_preserves_other_sessions(self):
@@ -346,12 +381,12 @@ class TestWorkerManagement:
         async with make_client(router) as client:
             await client.post("/add_worker", json={"worker_url": "http://w1:8888"})
             await client.post("/add_worker", json={"worker_url": "http://w2:8888"})
-            router.session_id_to_slot[build_request_id("traj-001", 0)] = slot("http://w1:8888")
-            router.session_id_to_slot[build_request_id("traj-002", 0)] = slot("http://w2:8888")
+            router.session_id_to_slots[build_request_id("traj-001", 0)] = {"regular": slot("http://w1:8888")}
+            router.session_id_to_slots[build_request_id("traj-002", 0)] = {"regular": slot("http://w2:8888")}
             await client.put("/exclude_worker", json={"worker_url": "http://w1:8888"})
 
-        assert router.session_id_to_slot[build_request_id("traj-001", 0)] == slot("http://w1:8888")
-        assert router.session_id_to_slot[build_request_id("traj-002", 0)] == slot("http://w2:8888")
+        assert router.session_id_to_slots[build_request_id("traj-001", 0)]["regular"] == slot("http://w1:8888")
+        assert router.session_id_to_slots[build_request_id("traj-002", 0)]["regular"] == slot("http://w2:8888")
 
     @pytest.mark.asyncio
     async def test_release_session_removes_one_mapping(self):
@@ -359,8 +394,8 @@ class TestWorkerManagement:
         router = make_router()
         async with make_client(router) as client:
             await client.post("/add_worker", json={"worker_url": "http://w1:8888"})
-            router.session_id_to_slot[build_request_id("traj-001", 0)] = slot("http://w1:8888")
-            router.session_id_to_slot[build_request_id("traj-001", 1)] = slot("http://w1:8888")
+            router.session_id_to_slots[build_request_id("traj-001", 0)] = {"regular": slot("http://w1:8888")}
+            router.session_id_to_slots[build_request_id("traj-001", 1)] = {"regular": slot("http://w1:8888")}
             result = await client.delete("/release_session/traj-001/0")
 
         assert result.status_code == status.HTTP_200_OK
@@ -369,8 +404,8 @@ class TestWorkerManagement:
             "trajectory_id": "traj-001",
             "attempt_id": 0,
         }
-        assert build_request_id("traj-001", 0) not in router.session_id_to_slot
-        assert router.session_id_to_slot[build_request_id("traj-001", 1)] == slot("http://w1:8888")
+        assert build_request_id("traj-001", 0) not in router.session_id_to_slots
+        assert router.session_id_to_slots[build_request_id("traj-001", 1)]["regular"] == slot("http://w1:8888")
 
     @pytest.mark.asyncio
     async def test_release_session_not_found_returns_404(self):
@@ -390,7 +425,7 @@ class TestWorkerManagement:
         """Aborting one attempt sends its rid to the pinned worker and clears sticky routing."""
         router = make_router()
         request_id = build_request_id("traj-001", 0)
-        router.session_id_to_slot[request_id] = slot("http://w1:8888")
+        router.session_id_to_slots[request_id] = {"regular": slot("http://w1:8888")}
         router._control_client.post = AsyncMock(return_value=httpx.Response(200, json={}))
 
         async with make_client(router) as client:
@@ -401,12 +436,13 @@ class TestWorkerManagement:
             "status": "success",
             "trajectory_id": "traj-001",
             "attempt_id": 0,
+            "aborted": ["http://w1:8888"],
         }
         router._control_client.post.assert_awaited_once_with(
             "http://w1:8888/abort_request",
             json={"rid": request_id, "abort_all": False},
         )
-        assert request_id not in router.session_id_to_slot
+        assert request_id not in router.session_id_to_slots
 
     @pytest.mark.asyncio
     async def test_abort_session_not_found_returns_404(self):
@@ -432,10 +468,10 @@ class TestAbortAllWorkers:
     async def test_abort_all_success_clears_sessions_and_counts(self):
         """Successful abort-all clears sticky sessions and in-flight counts."""
         router = make_router()
-        router.slot_request_counts[slot("http://w1:8888")] = 2
-        router.slot_request_counts[slot("http://w2:8888")] = 1
-        router.session_id_to_slot[build_request_id("traj-001", 0)] = slot("http://w1:8888")
-        router.session_id_to_slot[build_request_id("traj-002", 0)] = slot("http://w2:8888")
+        counts_of(router)[slot("http://w1:8888")] = 2
+        counts_of(router)[slot("http://w2:8888")] = 1
+        router.session_id_to_slots[build_request_id("traj-001", 0)] = {"regular": slot("http://w1:8888")}
+        router.session_id_to_slots[build_request_id("traj-002", 0)] = {"regular": slot("http://w2:8888")}
         router._control_client.post = AsyncMock(
             side_effect=[httpx.Response(200, json={}), httpx.Response(200, json={})]
         )
@@ -449,16 +485,16 @@ class TestAbortAllWorkers:
             "workers_aborted": 2,
             "sessions_cleared": 2,
         }
-        assert router.session_id_to_slot == {}
-        assert router.slot_request_counts == {slot("http://w1:8888"): 0, slot("http://w2:8888"): 0}
+        assert router.session_id_to_slots == {}
+        assert counts_of(router) == {slot("http://w1:8888"): 0, slot("http://w2:8888"): 0}
 
     @pytest.mark.asyncio
     async def test_abort_all_http_failure_preserves_sessions_and_counts(self):
         """A non-2xx worker response fails abort-all without clearing router state."""
         router = make_router()
-        router.slot_request_counts[slot("http://w1:8888")] = 2
-        router.slot_request_counts[slot("http://w2:8888")] = 1
-        router.session_id_to_slot[build_request_id("traj-001", 0)] = slot("http://w1:8888")
+        counts_of(router)[slot("http://w1:8888")] = 2
+        counts_of(router)[slot("http://w2:8888")] = 1
+        router.session_id_to_slots[build_request_id("traj-001", 0)] = {"regular": slot("http://w1:8888")}
         router._control_client.post = AsyncMock(
             side_effect=[
                 httpx.Response(200, json={}),
@@ -479,17 +515,17 @@ class TestAbortAllWorkers:
         assert body["failed_workers"] == [
             {"worker": "http://w2:8888", "status_code": 500, "error": "busy"}
         ]
-        assert router.session_id_to_slot == {
-            build_request_id("traj-001", 0): slot("http://w1:8888")
+        assert router.session_id_to_slots == {
+            build_request_id("traj-001", 0): {"regular": slot("http://w1:8888")}
         }
-        assert router.slot_request_counts == {slot("http://w1:8888"): 2, slot("http://w2:8888"): 1}
+        assert counts_of(router) == {slot("http://w1:8888"): 2, slot("http://w2:8888"): 1}
 
     @pytest.mark.asyncio
     async def test_abort_all_request_exception_preserves_sessions_and_counts(self):
         """A worker request exception fails abort-all without clearing router state."""
         router = make_router()
-        router.slot_request_counts[slot("http://w1:8888")] = 2
-        router.session_id_to_slot[build_request_id("traj-001", 0)] = slot("http://w1:8888")
+        counts_of(router)[slot("http://w1:8888")] = 2
+        router.session_id_to_slots[build_request_id("traj-001", 0)] = {"regular": slot("http://w1:8888")}
         router._control_client.post = AsyncMock(side_effect=httpx.ConnectError("unreachable"))
 
         async with make_client(router) as client:
@@ -503,10 +539,10 @@ class TestAbortAllWorkers:
         assert body["failed_workers"] == [
             {"worker": "http://w1:8888", "error": "unreachable"}
         ]
-        assert router.session_id_to_slot == {
-            build_request_id("traj-001", 0): slot("http://w1:8888")
+        assert router.session_id_to_slots == {
+            build_request_id("traj-001", 0): {"regular": slot("http://w1:8888")}
         }
-        assert router.slot_request_counts == {slot("http://w1:8888"): 2}
+        assert counts_of(router) == {slot("http://w1:8888"): 2}
 
 
 # ---------------------------------------------------------------------------
@@ -569,76 +605,76 @@ class TestRoutingLogic:
         """Create a router with pre-registered workers (count=0 each)."""
         router = make_router()
         for w in workers:
-            router.slot_request_counts[slot(w)] = 0
+            counts_of(router)[slot(w)] = 0
         return router
 
     def test_sticky_routing_pins_to_same_worker(self):
         """Sticky routing returns the pinned worker and increments its count."""
         router = self._make_router_with_workers(["http://w1:8888", "http://w2:8888"])
-        router.session_id_to_slot[build_request_id("traj-001", 0)] = slot("http://w1:8888")
+        router.session_id_to_slots[build_request_id("traj-001", 0)] = {"regular": slot("http://w1:8888")}
 
-        selected = router._select_slot(build_request_id("traj-001", 0))
+        selected = select_one(router, build_request_id("traj-001", 0))
 
         assert selected == slot("http://w1:8888")
-        assert router.slot_request_counts[slot("http://w1:8888")] == 1
-        assert router.slot_request_counts[slot("http://w2:8888")] == 0
+        assert counts_of(router)[slot("http://w1:8888")] == 1
+        assert counts_of(router)[slot("http://w2:8888")] == 0
 
     def test_sticky_routing_skipped_when_worker_dead(self):
         """Sticky routing falls back to least-loaded when pinned worker is dead."""
         router = self._make_router_with_workers(["http://w1:8888", "http://w2:8888"])
-        router.session_id_to_slot[build_request_id("traj-001", 0)] = slot("http://w1:8888")
+        router.session_id_to_slots[build_request_id("traj-001", 0)] = {"regular": slot("http://w1:8888")}
         router.dead_workers.add("http://w1:8888")
 
-        selected = router._select_slot(build_request_id("traj-001", 0))
+        selected = select_one(router, build_request_id("traj-001", 0))
 
         assert selected == slot("http://w2:8888")
-        assert router.session_id_to_slot[build_request_id("traj-001", 0)] == slot("http://w2:8888")
+        assert router.session_id_to_slots[build_request_id("traj-001", 0)]["regular"] == slot("http://w2:8888")
 
     def test_sticky_routing_skipped_when_overloaded(self):
         """Sticky routing falls back when pinned worker exceeds the load threshold."""
         router = self._make_router_with_workers(["http://w1:8888", "http://w2:8888"])
-        router.session_id_to_slot[build_request_id("traj-001", 0)] = slot("http://w1:8888")
-        router.slot_request_counts[slot("http://w1:8888")] = router.rollout_worker_load_threshold + 1
+        router.session_id_to_slots[build_request_id("traj-001", 0)] = {"regular": slot("http://w1:8888")}
+        counts_of(router)[slot("http://w1:8888")] = router.rollout_worker_load_threshold["regular"] + 1
 
-        selected = router._select_slot(build_request_id("traj-001", 0))
+        selected = select_one(router, build_request_id("traj-001", 0))
 
         assert selected == slot("http://w2:8888")
-        assert router.session_id_to_slot[build_request_id("traj-001", 0)] == slot("http://w2:8888")
+        assert router.session_id_to_slots[build_request_id("traj-001", 0)]["regular"] == slot("http://w2:8888")
 
     def test_least_loaded_worker_selected(self):
         """Without a sticky pin, the least-loaded worker is selected."""
         router = self._make_router_with_workers(["http://w1:8888", "http://w2:8888"])
-        router.slot_request_counts[slot("http://w1:8888")] = 3
-        router.slot_request_counts[slot("http://w2:8888")] = 1
+        counts_of(router)[slot("http://w1:8888")] = 3
+        counts_of(router)[slot("http://w2:8888")] = 1
 
-        selected = router._select_slot(build_request_id("traj-001", 0))
+        selected = select_one(router, build_request_id("traj-001", 0))
 
         assert selected == slot("http://w2:8888")
 
     def test_retry_attempt_uses_independent_sticky_session(self):
         """A new attempt can be rebound independently from the previous attempt."""
         router = self._make_router_with_workers(["http://w1:8888", "http://w2:8888"])
-        router.session_id_to_slot[build_request_id("traj-001", 0)] = slot("http://w1:8888")
-        router.slot_request_counts[slot("http://w1:8888")] = router.rollout_worker_load_threshold + 1
+        router.session_id_to_slots[build_request_id("traj-001", 0)] = {"regular": slot("http://w1:8888")}
+        counts_of(router)[slot("http://w1:8888")] = router.rollout_worker_load_threshold["regular"] + 1
 
-        selected = router._select_slot(build_request_id("traj-001", 1))
+        selected = select_one(router, build_request_id("traj-001", 1))
 
         assert selected == slot("http://w2:8888")
-        assert router.session_id_to_slot[build_request_id("traj-001", 0)] == slot("http://w1:8888")
-        assert router.session_id_to_slot[build_request_id("traj-001", 1)] == slot("http://w2:8888")
+        assert router.session_id_to_slots[build_request_id("traj-001", 0)]["regular"] == slot("http://w1:8888")
+        assert router.session_id_to_slots[build_request_id("traj-001", 1)]["regular"] == slot("http://w2:8888")
 
     def test_no_workers_raises_runtime_error(self):
-        """_select_slot raises RuntimeError when no workers are registered."""
+        """_select_slots raises RuntimeError when no workers are registered."""
         router = make_router()
         with pytest.raises(RuntimeError, match="No healthy workers available"):
-            router._select_slot(build_request_id("traj-001", 0))
+            select_one(router, build_request_id("traj-001", 0))
 
     def test_all_workers_dead_raises_runtime_error(self):
-        """_select_slot raises RuntimeError when all workers are in the dead pool."""
+        """_select_slots raises RuntimeError when all workers are in the dead pool."""
         router = self._make_router_with_workers(["http://w1:8888"])
         router.dead_workers.add("http://w1:8888")
         with pytest.raises(RuntimeError, match="No healthy workers available"):
-            router._select_slot(build_request_id("traj-001", 0))
+            select_one(router, build_request_id("traj-001", 0))
 
     def test_accumulate_reasoning_default_false(self):
         """accumulate_reasoning defaults to False from base config."""
@@ -740,7 +776,7 @@ class TestProxyForwarding:
         of its own and only relays whatever the worker decides.
         """
         router = make_proxy_router(make_store(("req-001", 0)))
-        router.slot_request_counts[slot("http://w1:8888")] = 0
+        counts_of(router)[slot("http://w1:8888")] = 0
 
         mock_response = MagicMock()
         mock_response.status_code = status.HTTP_400_BAD_REQUEST
@@ -765,7 +801,7 @@ class TestProxyForwarding:
     async def test_proxy_forwards_request_to_worker(self):
         """Proxy forwards the request to selected worker and returns its response."""
         router = make_proxy_router(make_store(("req-001", 0)))
-        router.slot_request_counts[slot("http://w1:8888")] = 0
+        counts_of(router)[slot("http://w1:8888")] = 0
 
         mock_response = MagicMock()
         mock_response.status_code = status.HTTP_200_OK
@@ -805,13 +841,13 @@ class TestProxyForwarding:
         response_json = response.json()
         assert "choices" in response_json
         assert response_json["choices"][0]["message"]["content"] == "ok"
-        assert router.slot_request_counts[slot("http://w1:8888")] == 0  # released after request
+        assert counts_of(router)[slot("http://w1:8888")] == 0  # released after request
 
     @pytest.mark.asyncio
     async def test_proxy_sticky_routing_by_trajectory_id(self):
         """Proxy pins one trajectory/attempt pair to the selected worker."""
         router = make_proxy_router(make_store(("traj-abc", 0)))
-        router.slot_request_counts[slot("http://w1:8888")] = 0
+        counts_of(router)[slot("http://w1:8888")] = 0
 
         mock_response = MagicMock()
         mock_response.status_code = status.HTTP_200_OK
@@ -832,14 +868,14 @@ class TestProxyForwarding:
                 json={"messages": [{"role": "user", "content": "hi"}]},
             )
 
-        assert router.session_id_to_slot.get(build_request_id("traj-abc", 0)) == slot("http://w1:8888")
+        assert router.session_id_to_slots[build_request_id("traj-abc", 0)][WORKER_TYPE_REGULAR] == slot("http://w1:8888")
 
     @pytest.mark.asyncio
     async def test_proxy_attempts_keep_independent_sticky_sessions(self):
         """Different attempts keep independent sticky-session bindings."""
         router = make_proxy_router(make_store(("traj-abc", 0), ("traj-abc", 1)))
-        router.slot_request_counts[slot("http://w1:8888")] = 0
-        router.slot_request_counts[slot("http://w2:8888")] = 0
+        counts_of(router)[slot("http://w1:8888")] = 0
+        counts_of(router)[slot("http://w2:8888")] = 0
 
         mock_response = MagicMock()
         mock_response.status_code = status.HTTP_200_OK
@@ -860,20 +896,20 @@ class TestProxyForwarding:
                 json={"messages": [{"role": "user", "content": "hi"}]},
             )
             # Set load above threshold to force the second attempt to use a different worker
-            router.slot_request_counts[slot("http://w1:8888")] = router.rollout_worker_load_threshold + 1
+            counts_of(router)[slot("http://w1:8888")] = router.rollout_worker_load_threshold["regular"] + 1
             await client.post(
                 "/traj-abc/1/v1/chat/completions",
                 json={"messages": [{"role": "user", "content": "hi"}]},
             )
 
-        assert router.session_id_to_slot.get(build_request_id("traj-abc", 0)) == slot("http://w1:8888")
-        assert router.session_id_to_slot.get(build_request_id("traj-abc", 1)) == slot("http://w2:8888")
+        assert router.session_id_to_slots[build_request_id("traj-abc", 0)][WORKER_TYPE_REGULAR] == slot("http://w1:8888")
+        assert router.session_id_to_slots[build_request_id("traj-abc", 1)][WORKER_TYPE_REGULAR] == slot("http://w2:8888")
 
     @pytest.mark.asyncio
     async def test_proxy_increments_request_count_during_request(self):
         """Worker request count is 1 while the upstream request is in-flight."""
         router = make_proxy_router(make_store(("req-001", 0)))
-        router.slot_request_counts[slot("http://w1:8888")] = 0
+        counts_of(router)[slot("http://w1:8888")] = 0
         request_id = build_request_id("req-001", 0)
 
         valid_body = json.dumps({
@@ -887,7 +923,7 @@ class TestProxyForwarding:
         mock_response.aread = AsyncMock(return_value=valid_body)
 
         async def check_count(*args, **kwargs):
-            assert router.slot_request_counts[slot("http://w1:8888")] == 1
+            assert counts_of(router)[slot("http://w1:8888")] == 1
             assert router.inflight_requests.get() == {request_id: 1}
             return mock_response
 
@@ -901,7 +937,7 @@ class TestProxyForwarding:
                 json={"messages": [{"role": "user", "content": "hi"}]},
             )
 
-        assert router.slot_request_counts[slot("http://w1:8888")] == 0  # decremented after
+        assert counts_of(router)[slot("http://w1:8888")] == 0  # decremented after
         assert router.inflight_requests.get() == {}
 
     @pytest.mark.asyncio
@@ -909,8 +945,8 @@ class TestProxyForwarding:
         """proxy() never forwards more than max_connections requests at once."""
         gate = 2
         router = make_proxy_router(make_store(*[(f"req-{i}", 0) for i in range(5)]))
-        router.slot_request_counts[slot("http://w1:8888")] = 0
-        router.rollout_worker_load_threshold = 100  # keep routing from blocking admission
+        counts_of(router)[slot("http://w1:8888")] = 0
+        router.rollout_worker_load_threshold["regular"] = 100  # keep routing from blocking admission
         # Shrink the admission gate so saturation is reachable with a handful of requests.
         router._generate_sem = asyncio.Semaphore(gate)
 
@@ -965,7 +1001,7 @@ class TestProxyForwarding:
     async def test_proxy_handles_non_json_response(self):
         """Proxy returns raw bytes for non-JSON content-type responses."""
         router = make_proxy_router(make_store(("req-001", 0)))
-        router.slot_request_counts[slot("http://w1:8888")] = 0
+        counts_of(router)[slot("http://w1:8888")] = 0
 
         mock_response = MagicMock()
         mock_response.status_code = status.HTTP_200_OK
@@ -994,7 +1030,7 @@ class TestProxyForwarding:
         distinguish a forwarded 500 from a never-forwarded one.
         """
         router = make_proxy_router(make_store(("req-001", 0)))
-        router.slot_request_counts[slot("http://w1:8888")] = 0
+        counts_of(router)[slot("http://w1:8888")] = 0
 
         mock_response = MagicMock()
         mock_response.status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
@@ -1018,13 +1054,13 @@ class TestProxyForwarding:
         request_mock.assert_awaited_once()
         assert response.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
         assert response.json() == {"error": "internal"}
-        assert router.slot_request_counts[slot("http://w1:8888")] == 0  # count still released
+        assert counts_of(router)[slot("http://w1:8888")] == 0  # count still released
 
     @pytest.mark.asyncio
     async def test_proxy_network_error_returns_502(self):
         """Proxy returns 502 when the upstream connection fails."""
         router = make_proxy_router(make_store(("req-001", 0)))
-        router.slot_request_counts[slot("http://w1:8888")] = 0
+        counts_of(router)[slot("http://w1:8888")] = 0
 
         async with proxy_client(
             router,
@@ -1037,13 +1073,13 @@ class TestProxyForwarding:
             )
 
         assert response.status_code == status.HTTP_502_BAD_GATEWAY
-        assert router.slot_request_counts[slot("http://w1:8888")] == 0  # count still released
+        assert counts_of(router)[slot("http://w1:8888")] == 0  # count still released
 
     @pytest.mark.asyncio
     async def test_proxy_targets_generate_endpoint(self):
         """Proxy always forwards chat-completions requests to the worker /generate endpoint."""
         router = make_proxy_router(make_store(("req-001", 0)))
-        router.slot_request_counts[slot("http://w1:8888")] = 0
+        counts_of(router)[slot("http://w1:8888")] = 0
 
         mock_response = MagicMock()
         mock_response.status_code = status.HTTP_200_OK
@@ -1098,7 +1134,7 @@ class TestChatCompletionIntegration:
         sampling_params.max_new_tokens) is covered in test_parser.py.
         """
         router = make_proxy_router(make_store(("traj-1", 0)))
-        router.slot_request_counts[slot("http://w1:8888")] = 0
+        counts_of(router)[slot("http://w1:8888")] = 0
 
         mock_response = MagicMock()
         mock_response.status_code = status.HTTP_200_OK
@@ -1156,37 +1192,37 @@ class TestWorkerRequestCountManagement:
     def test_finish_slot_clamps_at_zero(self):
         """_finish_slot does not go below zero (max(0, count-1))."""
         router = make_router()
-        router.slot_request_counts[slot("http://w1:8888")] = 0
+        counts_of(router)[slot("http://w1:8888")] = 0
 
-        router._finish_slot(slot("http://w1:8888"))
+        finish_one(router, slot("http://w1:8888"))
 
-        assert router.slot_request_counts[slot("http://w1:8888")] == 0
+        assert counts_of(router)[slot("http://w1:8888")] == 0
 
     def test_finish_slot_does_not_affect_other_workers(self):
         """_finish_slot only decrements the targeted worker."""
         router = make_router()
-        router.slot_request_counts[slot("http://w1:8888")] = 2
-        router.slot_request_counts[slot("http://w2:8888")] = 4
+        counts_of(router)[slot("http://w1:8888")] = 2
+        counts_of(router)[slot("http://w2:8888")] = 4
 
-        router._finish_slot(slot("http://w1:8888"))
+        finish_one(router, slot("http://w1:8888"))
 
-        assert router.slot_request_counts[slot("http://w1:8888")] == 1
-        assert router.slot_request_counts[slot("http://w2:8888")] == 4
+        assert counts_of(router)[slot("http://w1:8888")] == 1
+        assert counts_of(router)[slot("http://w2:8888")] == 4
 
     def test_select_and_finish_cycle(self):
         """Multiple selects followed by matching finishes returns count to 0."""
         router = make_router()
-        router.slot_request_counts[slot("http://w1:8888")] = 0
+        counts_of(router)[slot("http://w1:8888")] = 0
 
-        worker = router._select_slot(build_request_id("t1", 0))
+        worker = select_one(router, build_request_id("t1", 0))
         assert worker == slot("http://w1:8888")
-        router._select_slot(build_request_id("t2", 0))
-        router._select_slot(build_request_id("t3", 0))
-        assert router.slot_request_counts[slot("http://w1:8888")] == 3
+        select_one(router, build_request_id("t2", 0))
+        select_one(router, build_request_id("t3", 0))
+        assert counts_of(router)[slot("http://w1:8888")] == 3
 
         for _ in range(3):
-            router._finish_slot(slot("http://w1:8888"))
-        assert router.slot_request_counts[slot("http://w1:8888")] == 0
+            finish_one(router, slot("http://w1:8888"))
+        assert counts_of(router)[slot("http://w1:8888")] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1200,9 +1236,9 @@ class TestDpAttentionRouting:
     @staticmethod
     def _register(router: Router, worker_url: str, dp_size: int = 1) -> None:
         """Register a worker and its DP groups, mirroring SglangEngine's /add_worker."""
-        router.worker_dp_size[worker_url] = dp_size
-        for s in router._slots_of(worker_url):
-            router.slot_request_counts[s] = 0
+        router.worker_dp_size.setdefault("regular", {})[worker_url] = dp_size
+        for s in router._slots_of("regular", worker_url):
+            counts_of(router)[s] = 0
 
     @pytest.mark.asyncio
     async def test_add_worker_registers_one_slot_per_dp_group(self):
@@ -1212,7 +1248,7 @@ class TestDpAttentionRouting:
             await client.post("/add_worker", json={"worker_url": "http://w1:8888", "dp_size": 2})
             workers = await client.get("/list_workers")
 
-        assert set(router.slot_request_counts) == {
+        assert set(counts_of(router)) == {
             slot("http://w1:8888", 0),
             slot("http://w1:8888", 1),
         }
@@ -1227,19 +1263,19 @@ class TestDpAttentionRouting:
         async with make_client(router) as client:
             await client.post("/add_worker", json={"worker_url": "http://w1:8888"})
 
-        assert set(router.slot_request_counts) == {slot("http://w1:8888", 0)}
+        assert set(counts_of(router)) == {slot("http://w1:8888", 0)}
 
     def test_select_slot_spreads_across_dp_groups(self):
         """New sessions land on the least-loaded DP group of the worker."""
         router = make_router()
         self._register(router, "http://w1:8888", dp_size=2)
 
-        first = router._select_slot(build_request_id("t1", 0))
-        second = router._select_slot(build_request_id("t2", 0))
+        first = select_one(router, build_request_id("t1", 0))
+        second = select_one(router, build_request_id("t2", 0))
 
         assert first == slot("http://w1:8888", 0)
         assert second == slot("http://w1:8888", 1)
-        assert router.slot_request_counts == {
+        assert counts_of(router) == {
             slot("http://w1:8888", 0): 1,
             slot("http://w1:8888", 1): 1,
         }
@@ -1250,12 +1286,12 @@ class TestDpAttentionRouting:
         self._register(router, "http://w1:8888", dp_size=2)
         request_id = build_request_id("traj-001", 0)
 
-        first = router._select_slot(request_id)
-        second = router._select_slot(request_id)
+        first = select_one(router, request_id)
+        second = select_one(router, request_id)
 
         assert first == second
-        assert router.slot_request_counts[first] == 2
-        assert router.session_id_to_slot[request_id] == first
+        assert counts_of(router)[first] == 2
+        assert router.session_id_to_slots[request_id]["regular"] == first
 
     def test_set_routed_dp_rank_injects_for_multi_dp_worker(self):
         """A multi-DP worker gets routed_dp_rank added to its /generate body."""
@@ -1263,7 +1299,7 @@ class TestDpAttentionRouting:
         self._register(router, "http://w1:8888", dp_size=2)
         body = json.dumps({"input_ids": [1, 2, 3], "rid": "r"}).encode()
 
-        out = router._set_routed_dp_rank(body, slot("http://w1:8888", 1))
+        out = router._inject(body, {"regular": slot("http://w1:8888", 1)}, worker_type="regular", room=0)
 
         assert json.loads(out)["routed_dp_rank"] == 1
 
@@ -1273,7 +1309,7 @@ class TestDpAttentionRouting:
         self._register(router, "http://w1:8888", dp_size=1)
         body = json.dumps({"input_ids": [1, 2, 3], "rid": "r"}).encode()
 
-        out = router._set_routed_dp_rank(body, slot("http://w1:8888", 0))
+        out = router._inject(body, {"regular": slot("http://w1:8888", 0)}, worker_type="regular", room=0)
 
         assert "routed_dp_rank" not in json.loads(out)
 

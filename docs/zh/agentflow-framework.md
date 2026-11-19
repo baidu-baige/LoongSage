@@ -236,7 +236,7 @@ AgentFlow 相关配置集中在 `agentflow.*`、`rollout.*`、`data_sources[*]` 
 | `agentflow.tokenizer.generation_prompt_kwargs` | 生成 prompt 时透传给 chat template 的额外参数 |
 | `agentflow.router.ip` / `port` | Router 监听地址；留空自动解析本机 IP、端口 0 自动分配 |
 | `agentflow.router.max_connections` | Router 向 worker 转发的最大连接数 |
-| `agentflow.router.rollout_worker_load_threshold` | least-loaded 路由的 worker 负载阈值 |
+| `agentflow.router.rollout_worker_load_threshold` | 单 slot 的在途请求阈值，超过后放弃粘滞、改选最闲的 slot；按 `worker_type` 为键的映射（默认 `{regular: 32, prefill: 32, decode: 16}`），每个启用的 `sglang_replicas` 组都要有对应键 |
 | `agentflow.router.proxy_timeout_seconds` / `abort_timeout_seconds` | 转发请求超时 / abort 操作超时 |
 | `agentflow.router.accumulate_reasoning` | 是否在多轮历史中保留 think 块 |
 | `agentflow.router.middleware` | 中间件链配置，映射 `{name: params}`（默认 `{parser: null}`） |

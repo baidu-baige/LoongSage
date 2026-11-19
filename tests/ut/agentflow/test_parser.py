@@ -1,5 +1,6 @@
 """Unit tests for ``coda.agentflow.router.parser``."""
 
+import array
 import asyncio
 import base64
 import copy
@@ -713,6 +714,140 @@ def test_build_assistant_message_decodes_weight_version() -> None:
     })
 
     assert payload.weight_version == 3
+
+
+# ── PD disaggregation: prefill contributes the prompt-range expert routing ──
+
+
+ROW_WIDTH = 4  # expert ids per captured position
+
+
+def _blob(rows: list[int], typecode: str = "i") -> str:
+    """base64 of one value repeated ROW_WIDTH times per row (``i`` int32, ``h`` int16, ``B`` uint8)."""
+    flat = array.array(typecode, [value for value in rows for _ in range(ROW_WIDTH)])
+    return base64.b64encode(flat.tobytes()).decode("ascii")
+
+
+def _pd_body(
+    *,
+    routed_experts: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+    routed_experts_dtype: str | None = None,
+) -> bytes:
+    meta_info = {
+        "weight_version": "7",
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "routed_experts": routed_experts,
+        "output_token_logprobs": [[-0.1, 101], [-0.2, 102]],
+    }
+    if routed_experts_dtype is not None:
+        meta_info["routed_experts_dtype"] = routed_experts_dtype
+    return json.dumps({"text": "hi", "meta_info": meta_info}).encode()
+
+
+def _decode_pd(decode: bytes, prefill: bytes, start_len: int = 0) -> torch.Tensor:
+    _, experts = decode_generate_body(decode, start_len, r3_enabled=True, prefill_body=prefill)
+    return experts
+
+
+def test_pd_concatenates_prefill_and_generated_routed_experts() -> None:
+    """Under PD prefill owns the prompt rows and decode only the generated ones."""
+    # prompt_tokens=5, completion_tokens=2 => 6 rows: prefill [0, 5), decode [5, 6).
+    experts = _decode_pd(
+        _pd_body(routed_experts=_blob([61]), prompt_tokens=5, completion_tokens=2),
+        _pd_body(routed_experts=_blob([11, 12, 13, 14, 15]), prompt_tokens=5, completion_tokens=1),
+    )
+    # 6 captured rows + the synthetic terminal row the replay path expects.
+    assert experts.shape == (7, ROW_WIDTH)
+    assert experts[:, 0].tolist() == [11, 12, 13, 14, 15, 61, 61]
+
+
+def test_pd_handles_a_single_token_completion() -> None:
+    """completion==1 leaves nothing for decode to report; prefill carries it all."""
+    experts = _decode_pd(
+        _pd_body(routed_experts="", prompt_tokens=3, completion_tokens=1),
+        _pd_body(routed_experts=_blob([21, 22, 23]), prompt_tokens=3, completion_tokens=1),
+    )
+    assert experts[:, 0].tolist() == [21, 22, 23, 23]
+
+
+def test_pd_concatenates_from_a_continuation_offset() -> None:
+    """Both halves are numbered from routed_experts_start_len, and stay adjacent."""
+    # prompt_tokens=6, completion_tokens=2, start_len=3 => prefill [3, 6), decode [6, 7).
+    experts = _decode_pd(
+        _pd_body(routed_experts=_blob([71]), prompt_tokens=6, completion_tokens=2),
+        _pd_body(routed_experts=_blob([31, 32, 33]), prompt_tokens=6, completion_tokens=1),
+        start_len=3,
+    )
+    assert experts[:, 0].tolist() == [31, 32, 33, 71, 71]
+
+
+def test_pd_rejects_prefill_without_routed_experts() -> None:
+    """Missing prefill routing would leave the prompt rows unknown; never train on it."""
+    with pytest.raises(RuntimeError, match="PD prefill response carries no"):
+        _decode_pd(
+            _pd_body(routed_experts=_blob([51]), prompt_tokens=3, completion_tokens=2),
+            _pd_body(routed_experts="", prompt_tokens=3, completion_tokens=1),
+        )
+
+
+def test_pd_rejects_decode_without_routed_experts() -> None:
+    """Decode owns the generated positions, so its blob cannot be skipped either."""
+    with pytest.raises(RuntimeError, match="PD decode response carries no"):
+        _decode_pd(
+            _pd_body(routed_experts="", prompt_tokens=3, completion_tokens=2),
+            _pd_body(routed_experts=_blob([1, 2, 3]), prompt_tokens=3, completion_tokens=1),
+        )
+
+
+def test_pd_decodes_each_half_with_its_own_wire_dtype() -> None:
+    """Each half is decoded with the dtype it advertises; absent means int32."""
+    experts = _decode_pd(
+        _pd_body(routed_experts=_blob([61], "B"), prompt_tokens=3, completion_tokens=2,
+                 routed_experts_dtype="uint8"),
+        _pd_body(routed_experts=_blob([11, 12, 13]), prompt_tokens=3, completion_tokens=1),
+    )
+    assert experts.dtype == torch.uint8
+    assert experts[:, 0].tolist() == [11, 12, 13, 61, 61]
+
+
+def test_pd_ignores_the_prefill_body_without_r3() -> None:
+    """With R3 off the prefill reply is never parsed, so a malformed one is harmless."""
+    decode = _pd_body(routed_experts="", prompt_tokens=3, completion_tokens=2)
+    _, experts = decode_generate_body(decode, 0, r3_enabled=False, prefill_body=b"not json")
+    assert experts is None
+
+
+@pytest.mark.parametrize(("typecode", "dtype"), [("B", "uint8"), ("h", "int16")])
+def test_deserialize_routed_experts_reads_narrow_wire_dtypes(typecode: str, dtype: str) -> None:
+    tensor = deserialize_routed_experts(_blob([7, 250], typecode), 2, dtype)
+    assert tensor[:, 0].tolist() == [7, 250]
+
+
+def test_engine_wire_dtype_boundaries() -> None:
+    """The engine-side helper picks the narrowest lossless integer."""
+    dtype_utils = pytest.importorskip(
+        "sglang.srt.state_capturer.routed_experts_dtype"
+    )
+    resolve = dtype_utils.resolve_routed_experts_dtype
+
+    assert [resolve(n) for n in (128, 256, 257, 32768, 32769)] == [
+        "uint8", "uint8", "int16", "int16", "int32",
+    ]
+    # Unknown expert count cannot be proven lossless: stay wide.
+    assert resolve(None) == "int32"
+    # Explicit narrow dtypes fail fast when ids would overflow.
+    with pytest.raises(ValueError, match="cannot hold"):
+        resolve(257, "uint8")
+    with pytest.raises(ValueError, match="cannot hold"):
+        resolve(32769, "int16")
+    with pytest.raises(ValueError, match="num_experts"):
+        resolve(None, "uint8")
+    with pytest.raises(ValueError, match="must be 'auto'"):
+        resolve(128, "uint16")
+    assert resolve(32769, "int32") == "int32"
 
 
 @pytest.fixture

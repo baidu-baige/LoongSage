@@ -1,3 +1,34 @@
+diff --git a/python/sglang/srt/arg_groups/field_order.py b/python/sglang/srt/arg_groups/field_order.py
+index e61963e..2004381 100644
+--- a/python/sglang/srt/arg_groups/field_order.py
++++ b/python/sglang/srt/arg_groups/field_order.py
+@@ -492,6 +492,7 @@ POSITIONAL_FIELD_ORDER = (
+     "enable_return_hidden_states",
+     "return_hidden_states_mode",
+     "enable_return_routed_experts",
++    "routed_experts_dtype",
+     "enable_return_indexer_topk",
+     "sampling_mask_max_tokens",
+     "disable_outlines_disk_cache",
+diff --git a/python/sglang/srt/arg_groups/fields/exec_.py b/python/sglang/srt/arg_groups/fields/exec_.py
+index 6094fdd..054c12c 100644
+--- a/python/sglang/srt/arg_groups/fields/exec_.py
++++ b/python/sglang/srt/arg_groups/fields/exec_.py
+@@ -158,6 +158,14 @@ class ExecFeatures(msgspec.Struct):
+     enable_return_routed_experts: A[
+         bool, "Enable returning routed experts of each layer with responses."
+     ] = False
++    routed_experts_dtype: A[
++        str,
++        "Wire dtype for returned routed expert ids. 'auto' picks the narrowest "
++        "lossless integer from the model's expert count: uint8 for <=256 experts, "
++        "int16 for <=32768, else int32. 'uint8'/'int16'/'int32' force one and are "
++        "validated at startup. The chosen dtype is advertised in "
++        "meta_info.routed_experts_dtype.",
++    ] = "auto"
+     enable_return_indexer_topk: A[
+         bool,
+         "Enable returning indexer topk indices of layers with indexer with responses.",
 diff --git a/python/sglang/srt/debug_utils/dumper.py b/python/sglang/srt/debug_utils/dumper.py
 index 094a461..c8bcd3e 100644
 --- a/python/sglang/srt/debug_utils/dumper.py
@@ -531,10 +562,10 @@ index 8188c99..c2780c3 100644
          device = layer.w13_weight.device
          for name in (
 diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
-index dcec0aa..034cba6 100644
+index dcec0aa..357f1f0 100644
 --- a/python/sglang/srt/managers/io_struct.py
 +++ b/python/sglang/srt/managers/io_struct.py
-@@ -2152,6 +2152,25 @@ class DestroyWeightsUpdateGroupReqOutput(BaseReq, kw_only=True):
+@@ -2152,6 +2152,28 @@ class DestroyWeightsUpdateGroupReqOutput(BaseReq, kw_only=True):
      message: str
  
  
@@ -544,6 +575,9 @@ index dcec0aa..034cba6 100644
 +    train_world_size: int
 +    weight_version: str
 +    engine_id: int = 0
++    # Receiver-side rank base. None falls back to engine_id * dist.get_world_size(),
++    # which only tiles correctly when every engine has the same parallelism.
++    rank_base: Optional[int] = None
 +    recreate: bool = False
 +    buffer_size_bytes: int = 256 * 1024 * 1024
 +    timeout: float = 300.0
@@ -561,7 +595,7 @@ index dcec0aa..034cba6 100644
      # The new weight version
      new_version: str
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index a50c085..44fcc1f 100644
+index a50c085..32cb901 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
 @@ -185,6 +185,7 @@ from sglang.srt.managers.io_struct import (
@@ -583,6 +617,52 @@ index a50c085..44fcc1f 100644
                  (
                      UpdateWeightVersionReqInput,
                      self.handle_update_weight_version,
+@@ -5373,6 +5378,23 @@ class Scheduler(
+             if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                 idle &= len(self.disagg_prefill_inflight_queue) == 0
+                 idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
++                # An aborted room is concluded as KVPoll.Failed without waiting for
++                # its buffered chunks, so both queues above can be empty while the
++                # transfer worker still has RDMA writes in flight. Offload follows a
++                # 200 from /flush_cache by deregistering those memory regions, which
++                # would either invalidate in-flight work requests or unmap memory
++                # whose MR is still live. _staging_outstanding is the counter the
++                # abort ack itself relies on, so gate on it here too.
++                _kv_mgr = getattr(
++                    self.disagg_prefill_bootstrap_queue, "kv_manager", None
++                )
++                # hasattr mirrors sglang's own guard in disaggregation/common/conn.py;
++                # backends older than 0.5.18 do not keep this counter.
++                if _kv_mgr is not None and hasattr(_kv_mgr, "_staging_outstanding"):
++                    # .copy() is one C-level call: worker threads mutate this
++                    # defaultdict concurrently, and iterating it directly would hit
++                    # "dictionary changed size during iteration".
++                    idle &= not any(_kv_mgr._staging_outstanding.copy().values())
+ 
+             if self.disaggregation_mode == DisaggregationMode.DECODE:
+                 idle &= len(self.disagg_decode_prealloc_queue.queue) == 0
+diff --git a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+index c1bc4a0..90c5223 100644
+--- a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
++++ b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+@@ -159,6 +159,17 @@ class SchedulerBatchResultProcessor:
+             req_to_token_pool=self.req_to_token_pool,
+             start_len=start_len,
+         )
++        if (
++            req.routed_experts is not None
++            and req.routed_experts.dtype != capturer.output_dtype
++        ):
++            # Downcast here rather than at the encoder: this also cuts the
++            # scheduler -> detokenizer hop, and every encoder path downstream
++            # (detokenizer base64, tokenizer_manager tensor path) is dtype
++            # agnostic. The dtype was validated against the model's expert
++            # count when the capturer was built, so no per-request value check
++            # is needed.
++            req.routed_experts = req.routed_experts.to(capturer.output_dtype)
+ 
+         expected_rows = max(0, seqlen - 1 - start_len)
+         if (
 diff --git a/python/sglang/srt/managers/scheduler_components/weight_updater.py b/python/sglang/srt/managers/scheduler_components/weight_updater.py
 index 2381b3a..a506736 100644
 --- a/python/sglang/srt/managers/scheduler_components/weight_updater.py
@@ -664,6 +744,48 @@ index df58b81..25a58c5 100644
      async def _unload_lora_adapter_locked(
          self: TokenizerManager,
          obj: UnloadLoRAAdapterReqInput,
+diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
+index ca3453f..710695f 100644
+--- a/python/sglang/srt/managers/tokenizer_manager.py
++++ b/python/sglang/srt/managers/tokenizer_manager.py
+@@ -177,6 +177,9 @@ from sglang.srt.server_args import (
+     PortArgs,
+     ServerArgs,
+ )
++from sglang.srt.state_capturer.routed_experts_dtype import (
++    resolve_routed_experts_dtype,
++)
+ from sglang.srt.utils import (
+     configure_gc_warning,
+     freeze_gc,
+@@ -596,6 +599,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+         self.model_path = get_model().model_path
+         self.served_model_name = get_serving().served_model_name
+         self.model_config = model_config_class.from_server_args(server_args)
++        # Wire dtype of meta_info.routed_experts. Resolved through the same
++        # helper as the scheduler's capturer so the two cannot drift; clients
++        # decode the base64 blob with this dtype.
++        self.routed_experts_dtype = (
++            resolve_routed_experts_dtype(
++                getattr(self.model_config.hf_text_config, "num_experts", None),
++                get_exec().features.routed_experts_dtype,
++            )
++            if get_exec().features.enable_return_routed_experts
++            else "int32"
++        )
+         self.is_generation = self.model_config.is_generation
+         self.context_len = self.model_config.context_len
+         self.image_token_id = self.model_config.image_token_id
+@@ -2607,6 +2621,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                     if isinstance(val, torch.Tensor):
+                         val = pybase64.b64encode(val.numpy().tobytes()).decode("utf-8")
+                     meta_info["routed_experts"] = val
++                    # Lets the client decode the blob without knowing the model;
++                    # mirrors the capturer's choice (see init_model_config).
++                    meta_info["routed_experts_dtype"] = self.routed_experts_dtype
+             if getattr(recv_obj, "indexer_topk", None):
+                 val = recv_obj.indexer_topk[i]
+                 if val is not None:
 diff --git a/python/sglang/srt/managers/tp_worker.py b/python/sglang/srt/managers/tp_worker.py
 index 5058c3f..4e9684e 100644
 --- a/python/sglang/srt/managers/tp_worker.py
@@ -679,10 +801,10 @@ index 5058c3f..4e9684e 100644
          parameter = self.model_runner.weight_exporter.get_weights_by_name(
              recv_req.name, recv_req.truncate_size
 diff --git a/python/sglang/srt/model_executor/model_runner_components/weight_updater.py b/python/sglang/srt/model_executor/model_runner_components/weight_updater.py
-index 80965e5..7395618 100644
+index 80965e5..d325119 100644
 --- a/python/sglang/srt/model_executor/model_runner_components/weight_updater.py
 +++ b/python/sglang/srt/model_executor/model_runner_components/weight_updater.py
-@@ -434,6 +434,40 @@ class WeightUpdater:
+@@ -434,6 +434,84 @@ class WeightUpdater:
              logger.error(f"IPC weight update failed: {e}")
              return False, str(e)
  
@@ -701,11 +823,23 @@ index 80965e5..7395618 100644
 +            from coda.transfer_mesh import ChannelMeta, create_receiver_channel
 +            from sglang.srt.utils.network import get_local_ip_auto
 +
++            # Pure data parallelism (replicas) builds one process group per DP
++            # group, each numbering ranks from 0, so no single rank base can separate
++            # them. Fail at setup rather than hanging in rendezvous later. Since
++            # 0.5.23 `--dp-size N --enable-dp-attention` resolves to attn_dp_size=N
++            # with dp_size=1, so dp_size alone counts replicas.
++            dp_size = get_parallel().dp_size
++            assert dp_size == 1, (
++                f"transfer-mesh weight channel requires dp_size == 1 "
++                f"(use DP attention / attn_dp_size instead), got dp_size={dp_size}"
++            )
++
 +            meta = ChannelMeta(
 +                master_addr=recv_req.master_addr,
 +                world_size=recv_req.world_size,
 +                train_world_size=recv_req.train_world_size,
 +                engine_id=recv_req.engine_id,
++                rank_base=recv_req.rank_base,
 +                recreate=recv_req.recreate,
 +                buffer_size_bytes=recv_req.buffer_size_bytes,
 +                timeout=recv_req.timeout,
@@ -713,12 +847,44 @@ index 80965e5..7395618 100644
 +                local_ip=get_local_ip_auto(),
 +            )
 +            channel = create_receiver_channel(meta)
-+            self.get_model().load_weights(channel.get_iterator())
++            model = self.get_model()
++            target_device = torch.device(self.device)
++            # One channel call carries the whole refit, so it is wrapped in the same
++            # restore/finalize pair a begin_weight_update/end_weight_update session runs
++            # (sgl-project/sglang#40777, #33743): restore in-place-packed layouts (e.g.
++            # flashinfer TRT-LLM BF16 MoE) so checkpoint-format values fit, then
++            # process_weights_after_loading turns them back into kernel layout.
++            DefaultModelLoader.restore_weights_before_loading(model, target_device)
++            model.load_weights(channel.get_iterator())
++            _postprocess_weights_after_channel_update(model, target_device)
 +            return True, "Succeeded to update weights from channel."
 +        except Exception as e:
 +            error_msg = f"Failed to update weights from channel: {e}."
 +            logger.error(error_msg)
 +            return False, error_msg
++
++
++def _postprocess_weights_after_channel_update(model, target_device):
++    """DefaultModelLoader.postprocess_weights, minus the duck-typed quant wrappers.
++
++    The MXFP4 MoE wrappers are not QuantizeMethodBase, so restore_weights_before_loading
++    already skips them. Their process_weights_after_loading reorders / interleaves
++    whatever the params hold, and their channel hot-update loaders write kernel layout
++    directly, so a second pass would scramble the experts.
++    """
++    from sglang.srt.layers.quantization.base_config import QuantizeMethodBase
++    from sglang.srt.model_loader.loader import (
++        QuantizedRLModelLoader,
++        _modules_with_quant_method,
++        device_loading_context,
++    )
++
++    if QuantizedRLModelLoader.is_reload_scenario(model):
++        return
++    for module, quant_method in _modules_with_quant_method(model):
++        if isinstance(quant_method, QuantizeMethodBase):
++            with device_loading_context(module, target_device):
++                quant_method.process_weights_after_loading(module)
 +
  
  def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):
@@ -796,3 +962,139 @@ index 19fd546..35068b0 100644
          self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
  
          if not is_nextn:
+diff --git a/python/sglang/srt/state_capturer/routed_experts.py b/python/sglang/srt/state_capturer/routed_experts.py
+index f851673..d335261 100644
+--- a/python/sglang/srt/state_capturer/routed_experts.py
++++ b/python/sglang/srt/state_capturer/routed_experts.py
+@@ -20,6 +20,11 @@ from sglang.srt.runtime_context import (
+     get_schedule,
+ )
+ from sglang.srt.state_capturer.base import BaseTopkCapturer
++from sglang.srt.state_capturer.routed_experts_dtype import (
++    resolve_routed_experts_dtype,
++)
++
++_WIRE_DTYPES = {"uint8": torch.uint8, "int16": torch.int16, "int32": torch.int32}
+ 
+ 
+ def _is_scattered_a2a_backend() -> bool:
+@@ -49,6 +54,15 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
+     ) -> Optional["RoutedExpertsCapturer"]:
+         if not get_exec().features.enable_return_routed_experts:
+             return None
++        # Narrowest lossless wire dtype; the tokenizer manager resolves the same
++        # name for meta_info.routed_experts_dtype so clients decode the blob
++        # without knowing the model.
++        output_dtype = _WIRE_DTYPES[
++            resolve_routed_experts_dtype(
++                getattr(model_config.hf_text_config, "num_experts", None),
++                get_exec().features.routed_experts_dtype,
++            )
++        ]
+         # The loader attaches this to every entry model, including wrappers.
+         # Size from the owner, independent of which runner is currently active.
+         num_fused_shared_experts = model.shared_experts_config.num_fused_shared_experts
+@@ -58,6 +72,7 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
+             max_running_requests=max_running_requests,
+             num_fused_shared_experts=num_fused_shared_experts,
+             device=device,
++            output_dtype=output_dtype,
+         )
+ 
+     def __init__(
+@@ -67,7 +82,9 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
+         max_running_requests: int,
+         num_fused_shared_experts: int,
+         device: str,
++        output_dtype: torch.dtype = torch.int32,
+     ):
++        self.output_dtype = output_dtype
+         self.num_fused_shared_experts = num_fused_shared_experts
+         topk_size = model_config.hf_text_config.num_experts_per_tok
+         num_layers = model_config.hf_text_config.num_hidden_layers
+@@ -164,14 +181,16 @@ def destroy_global_experts_capturer():
+ 
+ 
+ def extract_routed_experts_from_meta_info(data):
+-    # To solve the performance issue, we return the experts_ids in base64
+-    # We left this function for user to change it back to normal int32
++    # To solve the performance issue, we return the experts_ids in base64.
++    # The wire dtype is narrowest-fit (see meta_info.routed_experts_dtype);
++    # widen to int32 so callers keep seeing one dtype.
+     # See detokenizer_manager::_extract_routed_experts
+     routed_experts_base64 = data["meta_info"].get("routed_experts", None)
++    dtype = data["meta_info"].get("routed_experts_dtype", "int32")
+     routed_experts = np.frombuffer(
+-        pybase64.b64decode(routed_experts_base64.encode("utf-8")), dtype=np.int32
++        pybase64.b64decode(routed_experts_base64.encode("utf-8")), dtype=np.dtype(dtype)
+     )
+-    return routed_experts
++    return routed_experts.astype(np.int32, copy=False)
+ 
+ 
+ def disable_routed_experts_capture_for_draft(model: Any) -> None:
+diff --git a/python/sglang/srt/state_capturer/routed_experts_dtype.py b/python/sglang/srt/state_capturer/routed_experts_dtype.py
+new file mode 100644
+index 0000000..e452dc9
+--- /dev/null
++++ b/python/sglang/srt/state_capturer/routed_experts_dtype.py
+@@ -0,0 +1,59 @@
++"""Wire dtype selection for routed-expert ids (R3).
++
++Expert ids are non-negative and strictly smaller than ``num_experts``, so the
++narrowest integer that can represent every id is lossless on the wire. The
++scheduler (``RoutedExpertsCapturer``) downcasts to the resolved dtype before the
++tensor leaves the engine and the tokenizer manager advertises the same choice in
++``meta_info.routed_experts_dtype``, so a client can decode the base64 blob
++without knowing the model.
++
++Both sides resolve through :func:`resolve_routed_experts_dtype` so the decision
++cannot drift.
++"""
++
++from typing import Any, Optional
++
++# Narrowest first; `auto` returns the first one wide enough for every id.
++_NARROWEST_FIRST = (("uint8", 2**8), ("int16", 2**15), ("int32", 2**31))
++_CHOICES = tuple(name for name, _ in _NARROWEST_FIRST)
++
++
++def resolve_routed_experts_dtype(
++    num_experts: Optional[Any], configured: str = "auto"
++) -> str:
++    """Return the wire dtype name (``"uint8"``/``"int16"``/``"int32"``).
++
++    ``auto`` picks the narrowest lossless dtype from the model's expert count
++    (``uint8`` for <= 256 experts, ``int16`` for <= 32768, else ``int32``). Any
++    other value forces that dtype and fails fast when ids would not fit, rather
++    than silently truncating them.
++
++    An unknown expert count falls back to ``int32`` under ``auto`` and is an
++    error under an explicit narrow dtype.
++    """
++    configured = "auto" if configured is None else str(configured)
++    if configured != "auto" and configured not in _CHOICES:
++        raise ValueError(
++            f"routed_experts_dtype must be 'auto' or one of {_CHOICES}, "
++            f"got {configured!r}"
++        )
++    if num_experts is None:
++        if configured == "auto":
++            return "int32"
++        raise ValueError(
++            f"routed_experts_dtype={configured!r} requires the model config to "
++            "declare num_experts"
++        )
++    num_experts = int(num_experts)
++    if configured != "auto":
++        limit = dict(_NARROWEST_FIRST)[configured]
++        if num_experts > limit:
++            raise ValueError(
++                f"routed_experts_dtype={configured!r} cannot hold ids of a "
++                f"{num_experts}-expert model (max {limit} experts)"
++            )
++        return configured
++    for name, limit in _NARROWEST_FIRST:
++        if num_experts <= limit:
++            return name
++    return "int32"
