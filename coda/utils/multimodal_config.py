@@ -8,11 +8,15 @@ from __future__ import annotations
 
 import json
 import logging
-from pathlib import Path
 
 from omegaconf import DictConfig, OmegaConf
 
-from coda.utils.hf_config import DEEPSEEK_V41_MODEL_TYPE, read_hf_config, read_hf_model_type
+from coda.utils.hf_config import (
+    DEEPSEEK_V41_MODEL_TYPE,
+    read_hf_config,
+    read_hf_model_type,
+    read_image_pixel_bounds,
+)
 from coda.utils.types import ModalityKind
 
 logger = logging.getLogger(__name__)
@@ -216,25 +220,6 @@ def _parse_modalities(raw) -> list[ModalityKind]:
             )
         modalities.append(kind)
     return modalities
-
-
-def read_image_pixel_bounds(hf_path: str) -> tuple[int, int]:
-    """`(min_pixels, max_pixels)` the Router resizes images into, taken from the model's own processor config.
-
-    These are `size.shortest_edge` and `size.longest_edge` of `<hf_path>/preprocessor_config.json`.
-
-    Raises:
-        ValueError: The file is unreadable or does not declare both edges.
-    """
-    cfg_file = Path(str(hf_path)) / "preprocessor_config.json"
-    try:
-        size = json.loads(cfg_file.read_text()).get("size") or {}
-    except (OSError, ValueError) as e:
-        raise ValueError(f"cannot read the image pixel bounds from {cfg_file}: {e}") from e
-    shortest, longest = size.get("shortest_edge"), size.get("longest_edge")
-    if shortest is None or longest is None:
-        raise ValueError(f"{cfg_file} must declare size.shortest_edge and size.longest_edge, got size={size}")
-    return int(shortest), int(longest)
 
 
 def _validate_multimodal_keys(keys, modalities: list[ModalityKind], where: str) -> None:

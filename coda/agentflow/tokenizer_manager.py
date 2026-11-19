@@ -19,14 +19,19 @@ from pathlib import Path
 from collections.abc import Mapping
 from typing import Any
 
-from coda.utils.hf_config import DEEPSEEK_V41_MODEL_TYPE
+from coda.utils.hf_config import (
+    DEEPSEEK_V4_MODEL_TYPE,
+    DEEPSEEK_V41_MODEL_TYPE,
+    read_hf_config,
+    read_image_pixel_bounds,
+)
 from coda.utils.path_utils import resolve_conf_path
 
 logger = logging.getLogger(__name__)
 
 _PROCESS_TOKENIZER: Any = None
 DEFAULT_THINK_TAGS = ("<think>", "</think>")
-DEEPSEEK_V4_MODEL_FAMILY = "deepseek_v4"
+DEEPSEEK_V4_MODEL_FAMILY = DEEPSEEK_V4_MODEL_TYPE
 DEEPSEEK_V41_MODEL_FAMILY = DEEPSEEK_V41_MODEL_TYPE
 # DeepSeek checkpoints ship no Jinja chat template; deepseek-recipe renders them instead.
 DEEPSEEK_MODEL_FAMILIES = frozenset({DEEPSEEK_V4_MODEL_FAMILY, DEEPSEEK_V41_MODEL_FAMILY})
@@ -53,11 +58,7 @@ def _deepseek_official_family(model_path: str) -> str | None:
     V4.1 is matched before V4 because it reuses the ``DeepseekV4`` architecture
     substring (mirrors SGLang's ``is_deepseek_v41_config``).
     """
-    config_path = Path(model_path) / "config.json"
-    if not config_path.is_file():
-        return None
-    with config_path.open(encoding="utf-8") as config_file:
-        config = json.load(config_file)
+    config = read_hf_config(model_path)
     arch = (config.get("architectures") or [""])[0]
     model_type = config.get("model_type") or ""
     if model_type == DEEPSEEK_V41_MODEL_FAMILY or "DeepseekV41" in arch:
@@ -271,8 +272,6 @@ def build_multimodal_processor(multimodal_config: Any, model_path: str, tokenize
         raise ImportError(
             "multimodal.enable=true requires the `qwen-vl-utils` package (pip install qwen-vl-utils==0.0.14)"
         ) from exc
-
-    from coda.utils.multimodal_config import read_image_pixel_bounds
 
     min_pixels, max_pixels = read_image_pixel_bounds(model_path)
     processor = MultimodalProcessor(
