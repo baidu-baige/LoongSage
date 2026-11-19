@@ -120,6 +120,48 @@ def test_cancel_runs_agent_cleanup_then_propagates():
     assert agent.closed
 
 
+class _CreatingThenHangingAgent(_HangingAgent):
+    async def run_trajectory(self, payload):
+        self.sandbox_id = "sandbox-made-by-agent"
+        return await super().run_trajectory(payload)
+
+
+class _RecordingSandboxClient:
+    def __init__(self):
+        self.deleted = []
+
+    def delete(self, sandbox_id):
+        self.deleted.append(sandbox_id)
+
+
+def _cancel_attempt(agent_cls, request):
+    client = _RecordingSandboxClient()
+
+    async def scenario():
+        worker = _worker(agent_cls)
+        worker._contexts[0].sandbox_client = client
+        task = asyncio.ensure_future(worker.run_attempt(request))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+    return client
+
+
+def test_cancel_deletes_sandbox_the_agent_created():
+    """PR #51: the driver never learns this id, so the worker must delete it."""
+    client = _cancel_attempt(_CreatingThenHangingAgent, _request(sandbox_id=None))
+    assert client.deleted == ["sandbox-made-by-agent"]
+    assert _FakeAgent.instances[0].closed
+
+
+def test_cancel_leaves_driver_sandbox_to_the_driver():
+    client = _cancel_attempt(_HangingAgent, _request(sandbox_id="sandbox-from-driver"))
+    assert client.deleted == []
+
+
 def test_forwarded_env_forwards_only_pythonpath(monkeypatch):
     monkeypatch.setenv("MYSANDBOX_TOKEN", "secret")
     monkeypatch.setenv("UNRELATED_VAR", "x")

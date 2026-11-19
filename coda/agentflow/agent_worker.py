@@ -135,6 +135,14 @@ class AgentWorker:
             reward = await agent.run_trajectory(request.payload)
             return AttemptResult(reward=reward, sandbox_id=agent.sandbox_id)
         except asyncio.CancelledError:
+            # The driver only knows the sandbox it passed in, so a sandbox the agent
+            # created here would otherwise never be deleted.
+            own_sandbox = getattr(agent, "sandbox_id", None) if request.sandbox_id is None else None
+            if own_sandbox is not None and context.sandbox_client is not None:
+                try:
+                    await asyncio.shield(asyncio.to_thread(context.sandbox_client.delete, own_sandbox))
+                except Exception as exc:
+                    logger.warning("[agent-worker] delete %s after cancel failed: %s", own_sandbox, exc)
             raise
         except Exception as exc:
             return AttemptResult(
