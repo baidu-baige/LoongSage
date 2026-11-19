@@ -8,10 +8,10 @@ from types import SimpleNamespace
 
 from omegaconf import OmegaConf
 
+from coda.utils.hf_config import read_image_pixel_bounds
 from coda.utils.multimodal_config import (
     drop_dsv41_vision_if_text_only,
     multimodal_enabled,
-    read_image_pixel_bounds,
     validate_multimodal_config,
     validate_vlm_parallel_config,
 )

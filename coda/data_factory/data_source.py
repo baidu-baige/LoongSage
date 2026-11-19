@@ -31,11 +31,8 @@ from coda.data_factory import (
 )
 from coda.data_factory.dataset import Dataset
 from coda.utils.checkpoint_utils import get_data_source_dir
-from coda.utils.hf_config import DEEPSEEK_V41_MODEL_TYPE, read_hf_model_type
-from coda.utils.multimodal_config import (
-    multimodal_enabled,
-    read_image_pixel_bounds,
-)
+from coda.utils.hf_config import DEEPSEEK_V41_MODEL_TYPE, read_hf_model_type, read_image_pixel_bounds
+from coda.utils.multimodal_config import multimodal_enabled
 
 logger = logging.getLogger(__name__)
 
