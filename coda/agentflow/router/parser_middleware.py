@@ -5,7 +5,6 @@ import http
 import logging
 import traceback
 from collections import Counter, defaultdict
-from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from typing import Any, Callable, cast
 
@@ -20,7 +19,7 @@ from starlette.types import ASGIApp
 from coda.agentflow.multimodal import MultimodalRequestError
 from coda.agentflow.tokenizer_manager import DEEPSEEK_MODEL_FAMILIES
 from coda.agentflow.trajectory_store import TrajectoryStore
-from coda.agentflow.utils import CONTEXT_LENGTH_EXCEEDED, build_request_id
+from coda.agentflow.utils import CONTEXT_LENGTH_EXCEEDED, build_request_id, spawn_process_pool
 from .parser import TrajectoryParser, TurnInputContext, decode_generate_body, is_passthrough_response
 from .protocols import PROTOCOL_ADAPTERS, ProtocolAdapter
 
@@ -62,7 +61,7 @@ class ParserMiddleware(BaseHTTPMiddleware):
         self._trajectory_lock_refs: Counter[str] = Counter()
         # Body parse + R3 decode off the router event loop (0 = decode inline).
         self._decode_pool = (
-            ProcessPoolExecutor(max_workers=r3_decode_workers)
+            spawn_process_pool(r3_decode_workers)
             if r3_enabled and r3_decode_workers > 0 else None
         )
         if self._decode_pool is not None and shutdown_callbacks is not None:

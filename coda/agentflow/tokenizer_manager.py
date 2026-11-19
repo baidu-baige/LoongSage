@@ -13,12 +13,13 @@ import logging
 import os
 import types
 from abc import ABC, abstractmethod
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from pathlib import Path
 from collections.abc import Mapping
 from typing import Any
 
+from coda.agentflow.utils import spawn_process_pool
 from coda.utils.hf_config import (
     DEEPSEEK_V4_MODEL_TYPE,
     DEEPSEEK_V41_MODEL_TYPE,
@@ -733,8 +734,8 @@ class ProcessTokenizerManager(BaseTokenizerManager):
         )
         self.model_path = model_path
         self.custom_chat_template = custom_chat_template
-        self._executor = ProcessPoolExecutor(
-            max_workers=num_workers,
+        self._executor = spawn_process_pool(
+            num_workers,
             initializer=_init_process_tokenizer,
             initargs=(model_path, custom_chat_template),
         )
