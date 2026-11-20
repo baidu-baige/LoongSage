@@ -164,7 +164,7 @@ index 3a9186a..803de09 100644
      if padded_num_heads != actual_num_heads:
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/deepseek_v41.py b/megatron/core/transformer/experimental_attention_variant/dsv41/deepseek_v41.py
 new file mode 100644
-index 0000000..062ee00
+index 0000000..0520cd8
 --- /dev/null
 +++ b/megatron/core/transformer/experimental_attention_variant/dsv41/deepseek_v41.py
 @@ -0,0 +1,732 @@
@@ -213,7 +213,7 @@ index 0000000..062ee00
 +    phased_block_expand,
 +    phased_block_reduce,
 +)
-+from megatron.core.transformer.experimental_attention_variant.dsv41.ops.kernel.tilelang_sparse_mla import sparse_attn_tilelang
++from megatron.core.transformer.experimental_attention_variant.dsv41.ops.kernel.flashmla_sparse_mla import sparse_attn_flashmla
 +from megatron.core.transformer.experimental_attention_variant.dsv41.ops.kvnorm import compressed_kv_stored, kv_norm_rope_fp8
 +from megatron.core.transformer.experimental_attention_variant.dsv41.ops.quant import fake_quant_compressed_kv
 +from megatron.core.transformer.experimental_attention_variant.dsv41.ops.rope import rotary_emb_
@@ -810,7 +810,7 @@ index 0000000..062ee00
 +
 +        topk_idxs = topk_idxs.int()
 +        kv = copy_to_tensor_model_parallel_region(kv, group=self.tp_group, all_reduce_grad_fp32=True)
-+        o = sparse_attn_tilelang(q, kv, self.core_attention.attn_sink, topk_idxs, self.softmax_scale)
++        o = sparse_attn_flashmla(q, kv, self.core_attention.attn_sink, topk_idxs, self.softmax_scale)
 +        o = rotary_emb_(o, freqs_cis, rd, inverse=True)
 +
 +        o = o.view(bsz, seqlen, self.n_local_groups, -1)
@@ -2266,6 +2266,135 @@ index 0000000..eb6526b
 +        x.copy_(y)
 +        return x
 +    return y, s
+diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/flashmla_sparse_mla.py b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/flashmla_sparse_mla.py
+new file mode 100644
+index 0000000..84a94d0
+--- /dev/null
++++ b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/flashmla_sparse_mla.py
+@@ -0,0 +1,123 @@
++"""DSV4.1 sparse attention: FlashMLA forward + cuDNN DSA backward.
++
++Drop-in for LoongSage's ``sparse_attn_tilelang(q, kv, attn_sink, topk_idxs, sm_scale)``:
++q (B, S, H, D) bf16, kv (B, S_kv, D) bf16 (K = V), attn_sink (H,) fp32,
++topk_idxs (B, S, K) int32 per-batch positions into kv, -1 = invalid. Returns o (B, S, H, D).
++
++FlashMLA's sparse prefill only takes 64 or 128 query heads (SM100) or a multiple of 64 (SM90),
++so smaller local head counts (64 heads / TP) are zero-padded with a -inf sink. The backward
++runs on the real heads; cuDNN DSA accepts 8 and 16 heads.
++"""
++import inspect
++
++import torch
++
++_fwd = None
++_fwd_kw = {}
++_dsa = None
++
++
++def _ensure():
++    global _fwd, _dsa
++    if _fwd is None:
++        from flash_mla import flash_mla_sparse_fwd
++
++        # sgl-flash-mla (LoongSage's sglang image) needs use_legacy=True for the kernels that
++        # run on SM90 and SM100; FlashMLA nv_dev has no such argument.
++        if "use_legacy" in inspect.signature(flash_mla_sparse_fwd).parameters:
++            _fwd_kw["use_legacy"] = True
++        _fwd = flash_mla_sparse_fwd
++    if _dsa is None:
++        from cudnn import DSA
++
++        _dsa = DSA
++
++
++def _padded_heads(h):
++    if torch.cuda.get_device_capability()[0] >= 10:
++        for p in (64, 128):
++            if h <= p and p % h == 0:
++                return p
++    elif h % 64 == 0 or 64 % h == 0:
++        return max(h, 64)
++    raise ValueError(f"FlashMLA sparse prefill cannot pad {h} query heads")
++
++
++def _topk_align():
++    return 64 if torch.cuda.get_device_capability()[0] >= 10 else 128
++
++
++def _flat_compact_idxs(topk_idxs, s_kv):
++    """(B, S, K) local -> (B*S, K_pad) global indices with valid entries packed to the front."""
++    b, s, k = topk_idxs.shape
++    idx = topk_idxs.int()
++    if b > 1:
++        off = (torch.arange(b, device=idx.device, dtype=torch.int32) * s_kv).view(b, 1, 1)
++        idx = torch.where(idx >= 0, idx + off, -1)
++    idx = idx.reshape(b * s, k)
++    k_pad = -(-k // _topk_align()) * _topk_align()
++    if k_pad != k:
++        idx = torch.nn.functional.pad(idx, (0, k_pad - k), value=-1)
++    res = _dsa.compactify_wrapper(idx.contiguous())
++    return res["indices"].int().contiguous(), res["topk_length"].int().contiguous()
++
++
++def _fwd_flash_mla(q, kv, attn_sink, idx, topk_length, sm_scale):
++    """q (N, H, D), kv (N_kv, D), idx (N, K) global -> out (N, H, Dv), lse (N, H) natural log."""
++    n, h, d = q.shape
++    hp = _padded_heads(h)
++    if hp != h:
++        q_p = q.new_zeros(n, hp, d)
++        q_p[:, :h] = q
++        sink_p = attn_sink.new_full((hp,), float("-inf"))
++        sink_p[:h] = attn_sink
++        q, attn_sink = q_p, sink_p
++    out, _max_logits, lse = _fwd(
++        q, kv.unsqueeze(1), idx.unsqueeze(1), sm_scale, d_v=kv.shape[-1], attn_sink=attn_sink,
++        topk_length=topk_length, **_fwd_kw,
++    )
++    if hp != h:
++        out, lse = out[:, :h].contiguous(), lse[:, :h].contiguous()
++    return out, lse
++
++
++class FlashMLASparseAttention(torch.autograd.Function):
++    @staticmethod
++    def forward(ctx, q, kv, attn_sink, topk_idxs, sm_scale):
++        _ensure()
++        b, s, h, d = q.shape
++        s_kv = kv.shape[1]
++        idx, topk_length = _flat_compact_idxs(topk_idxs, s_kv)
++        q_f, kv_f = q.reshape(b * s, h, d), kv.reshape(b * s_kv, kv.shape[-1])
++        out, lse = _fwd_flash_mla(q_f, kv_f, attn_sink.float(), idx, topk_length, sm_scale)
++        # cuDNN reads only the first topk_length slots but needs in-range values everywhere.
++        idx.clamp_min_(0)
++        ctx.save_for_backward(q_f, kv_f, attn_sink, idx, topk_length, out, lse)
++        ctx.sm_scale, ctx.shapes = sm_scale, (b, s, s_kv)
++        # Return a copy: the caller applies RoPE in place, which is forbidden on a custom
++        # Function's view output and would also overwrite the `out` saved for backward.
++        return out.view(b, s, h, -1).clone()
++
++    @staticmethod
++    def backward(ctx, do):
++        q, kv, attn_sink, idx, topk_length, out, lse = ctx.saved_tensors
++        b, s, s_kv = ctx.shapes
++        do = do.reshape(out.shape)
++        # Rows with no valid key: forward wrote o = 0; force their gradients to zero
++        # (dO = 0 and lse = +inf make P = 0) instead of relying on the kernel's empty-row path.
++        empty = (topk_length == 0)[:, None]
++        do = do.masked_fill(empty[..., None], 0).contiguous()
++        lse = lse.masked_fill(empty, float("inf"))
++        topk_length = topk_length.clamp_min(1)
++        r = _dsa.sparse_attention_backward_wrapper(
++            q, kv, out, do, lse, attn_sink.float(), idx, softmax_scale=ctx.sm_scale, topk_length=topk_length,
++        )
++        dq = r["dq"].view(b, s, *q.shape[1:])
++        dkv = r["dkv"].to(kv.dtype).view(b, s_kv, -1)
++        return dq, dkv, r["d_sink"].to(attn_sink.dtype), None, None
++
++
++def sparse_attn_flashmla(q, kv, attn_sink, topk_idxs, sm_scale=None):
++    if sm_scale is None:
++        sm_scale = q.shape[-1] ** -0.5
++    return FlashMLASparseAttention.apply(q, kv, attn_sink, topk_idxs, sm_scale)
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/phased_blocks.py b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/phased_blocks.py
 new file mode 100644
 index 0000000..70ba9a6
