@@ -68,9 +68,9 @@ def _worker(agent_cls) -> AgentWorker:
 
 def _request(sandbox_id="sandbox-from-driver") -> AttemptRequest:
     return AttemptRequest(
-        ds_index=0, trajectory_id="traj0", attempt_id=0,
-        router_url="http://127.0.0.1:1/traj0/0", payload={"prompt": []},
-        max_response_len_per_trajectory=128, sandbox_id=sandbox_id,
+        ds_index=0, trajectory_id="traj0", attempt_id=0, payload={"prompt": []},
+        agent_kwargs={"router_url": "http://127.0.0.1:1/traj0/0", "max_response_len_per_trajectory": 128},
+        sandbox_id=sandbox_id,
     )
 
 

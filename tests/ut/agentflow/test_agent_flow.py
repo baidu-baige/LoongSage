@@ -1023,10 +1023,29 @@ class TestExecuteMultiTurn:
 
         assert await af._execute_multi_turn(traj, 0) is reward
         assert len(requests) == 1
-        assert requests[0].router_url.endswith(f"/{traj.trajectory_id}/0")
+        assert requests[0].agent_kwargs["router_url"].endswith(f"/{traj.trajectory_id}/0")
         assert requests[0].payload["prompt"] == traj.prompt
         # The worker's sandbox id is what gets released by the driver.
         af.ds_sandbox_clients[0].delete.assert_called_once_with("sandbox-9")
+
+    @pytest.mark.asyncio
+    async def test_worker_and_in_process_agents_get_the_same_per_attempt_kwargs(self):
+        """Both paths build the agent from one dict, so a new constructor argument the
+        driver adds reaches agents built in a worker too."""
+        from coda.agentflow.agent_worker import AttemptResult
+
+        af, traj = self._setup()
+        self._agent_completing(af, traj, Reward(final_reward=1.0, is_valid=True))
+        await af._execute_multi_turn(traj, 0)
+        in_process = af.ds_agent_classes[0].call_args.kwargs
+
+        requests = self._stub_pool(af, AttemptResult(reward=Reward(final_reward=1.0, is_valid=True)))
+        await af._execute_multi_turn(traj, 0)
+
+        # Everything the driver passes in-process, except what the worker rebuilds itself.
+        worker_built = {"reward_fn", "sandbox_client", "sandbox_id", *af.ds_configs[0].agent}
+        per_attempt = {k: v for k, v in in_process.items() if k not in worker_built}
+        assert requests[0].agent_kwargs == per_attempt
 
     @pytest.mark.asyncio
     async def test_worker_pool_error_is_raised_for_retry(self):

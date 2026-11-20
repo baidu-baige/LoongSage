@@ -553,10 +553,15 @@ class AgentFlow:
                 "metadata": {**copy.deepcopy(traj.metadata), **sandbox_context},
                 "resume": resume,
             }
+            # Agent constructor kwargs decided per attempt. Both the in-process path and
+            # the worker path build the agent from this one dict.
+            agent_kwargs = {
+                "router_url": f"{self.router_url}/{traj.trajectory_id}/{attempt_id}",
+                "max_response_len_per_trajectory": max_response_len_per_trajectory,
+            }
             if self.agent_worker_pool is None:
                 agent = agent_class(
-                    router_url=f"{self.router_url}/{traj.trajectory_id}/{attempt_id}",
-                    max_response_len_per_trajectory=max_response_len_per_trajectory,
+                    **agent_kwargs,
                     **agent_cfg,
                     reward_fn=reward_fn,
                     sandbox_client=sandbox_client,
@@ -568,9 +573,8 @@ class AgentFlow:
                     ds_index=ds_index,
                     trajectory_id=traj.trajectory_id,
                     attempt_id=attempt_id,
-                    router_url=f"{self.router_url}/{traj.trajectory_id}/{attempt_id}",
                     payload=payload,
-                    max_response_len_per_trajectory=max_response_len_per_trajectory,
+                    agent_kwargs=agent_kwargs,
                     sandbox_id=sandbox_id,
                 ))
                 result_sandbox_id = result.sandbox_id or sandbox_id

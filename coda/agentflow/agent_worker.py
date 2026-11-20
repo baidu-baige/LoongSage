@@ -42,9 +42,10 @@ class AttemptRequest:
     ds_index: int
     trajectory_id: str
     attempt_id: int
-    router_url: str
     payload: dict[str, Any]
-    max_response_len_per_trajectory: int
+    # Per-attempt agent constructor kwargs, the same dict the driver passes in-process
+    # (router_url, max_response_len_per_trajectory, ...), so both paths stay in sync.
+    agent_kwargs: dict[str, Any]
     sandbox_id: str | None = None
 
 
@@ -125,8 +126,7 @@ class AgentWorker:
         agent = None
         try:
             agent = context.agent_class(
-                router_url=request.router_url,
-                max_response_len_per_trajectory=request.max_response_len_per_trajectory,
+                **request.agent_kwargs,
                 **context.agent_cfg,
                 reward_fn=context.reward_fn,
                 sandbox_client=context.sandbox_client,
