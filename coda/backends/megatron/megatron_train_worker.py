@@ -52,6 +52,8 @@ from coda.utils.checkpoint_utils import (
     DIST_CKPT_DIR_NAME, find_latest_ckpt_path, update_latest, get_ckpt_dir,
 )
 from coda.backends.megatron.checkpoint import load_checkpoint, load_model_weights, save_checkpoint
+from coda.backends.megatron.model import _uses_mrope
+from coda.utils.tree_pack_utils import tree_pack_unsupported_reason
 from coda.utils.types import to_torch_dtype
 from coda.utils.tracking import configure_tracking
 from coda.backends.megatron.mixed_precision import KeepFP32Module
@@ -91,6 +93,11 @@ class MegatronTrainWorker(TrainWorker):
             and config.megatron.model.virtual_pipeline_model_parallel_size > 1:
             config.megatron.model.overlap_p2p_comm = True
         config.megatron.model.batch_p2p_comm = not config.megatron.model.overlap_p2p_comm
+        if config.trainer.get("tree_pack", False):
+            reason = tree_pack_unsupported_reason(config)
+            if reason:
+                logger.warning("[tree_pack] disabled, training falls back to rows: %s", reason)
+                config.trainer.tree_pack = False
 
         if config.trainer.deterministic_mode:
             config.megatron.model.deterministic_mode = True
@@ -257,6 +264,13 @@ class MegatronTrainWorker(TrainWorker):
             f"[Rank {self.rank}] Model created via Megatron-bridge "
             f"(forward_only={self._forward_only}, wrap_with_ddp={not self._forward_only})"
         )
+        if config.trainer.get("tree_pack", False):
+            if _uses_mrope(self.model[0]):
+                logger.info("[tree_pack] enabled: shared prefixes are computed once per micro-batch")
+            else:
+                logger.warning("[tree_pack] disabled, training falls back to rows: "
+                               "the model has no explicit mRoPE position_ids")
+                config.trainer.tree_pack = False
 
         # Steps 6-7: optimizer + LR scheduler (none in forward-only mode)
         if self._forward_only:
