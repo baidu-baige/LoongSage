@@ -41,7 +41,11 @@ from megatron.bridge import AutoBridge
 
 from coda.backends.train_worker import TrainWorker
 from coda.utils.memory_utils import print_memory, clear_memory
-from coda.utils.multimodal_config import validate_vlm_parallel_config
+from coda.utils.multimodal_config import (
+    drop_dsv41_vision_if_text_only,
+    multimodal_enabled,
+    validate_vlm_parallel_config,
+)
 from coda.utils.checkpoint_utils import (
     DIST_CKPT_DIR_NAME, find_latest_ckpt_path, update_latest, get_ckpt_dir,
 )
@@ -49,7 +53,7 @@ from coda.backends.megatron.checkpoint import load_checkpoint, load_model_weight
 from coda.utils.types import to_torch_dtype
 from coda.utils.tracking import configure_tracking
 from coda.backends.megatron.mixed_precision import KeepFP32Module
-from coda.backends.megatron.model_builder import build_bridge_model
+from coda.backends.megatron.model_builder import apply_model_overrides
 
 logger = logging.getLogger(__name__)
 
@@ -218,17 +222,19 @@ class MegatronTrainWorker(TrainWorker):
         # If checkpoint exists: structure only (weights restored from ckpt later)
         # Otherwise: load HF weights into model
         self.bridge = AutoBridge.from_hf_pretrained(config.hf_model_path)
+        drop_dsv41_vision_if_text_only(self.bridge.hf_pretrained.config, multimodal_enabled(config))
         megatron_ddp_config = DistributedDataParallelConfig(
             **OmegaConf.to_container(config.megatron.ddp_config)
         )
-        self.model = build_bridge_model(
-            self.bridge,
-            OmegaConf.to_container(config.megatron.model),
+        model_config = self.bridge.get_model_config()
+        apply_model_overrides(model_config, OmegaConf.to_container(config.megatron.model))
+        self._configure_provider(model_config)
+        self.model = self.bridge.get_model(
+            model_config,
             load_weights=not has_checkpoint,
-            configure=self._configure_provider,
             ddp_config=megatron_ddp_config,
             wrap_with_ddp=not self._forward_only,
-            mixed_precision_wrapper=partial(KeepFP32Module, config.megatron.keep_fp32_weights)
+            mixed_precision_wrapper=partial(KeepFP32Module, config.megatron.keep_fp32_weights),
         )
         logger.info(
             f"[Rank {self.rank}] Model created via Megatron-bridge "
@@ -252,12 +258,11 @@ class MegatronTrainWorker(TrainWorker):
         self.offloaded = False
         self.params_offloaded = False
 
-    def _configure_provider(self, provider) -> None:
+    def _configure_provider(self, model_config) -> None:
         """Hook to adjust the model config before the model is built.
 
-        Receives the finalized ``GPTModelProvider`` on the provider path, or the
-        overridden (not yet finalized) builder-backed ``ModelConfig`` otherwise
-        (see :func:`~coda.backends.megatron.model_builder.build_bridge_model`).
+        Receives the overridden (not yet finalized) builder-backed ``ModelConfig``,
+        between ``apply_model_overrides`` and ``bridge.get_model`` in :meth:`init`.
         Runs before the DDP grad buffers and the optimizer are built from the
         model's parameters. No-op by default.
         """

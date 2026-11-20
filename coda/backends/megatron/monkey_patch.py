@@ -317,9 +317,107 @@ def _patch_fa4_causal_unbounded_window():
     module._resolve_causal_local_window = _patched_resolve
 
 
+def _patch_ernie55_drop_mtp():
+    """Build ERNIE 5.5 as the decoder only (LoongSage does not train MTP).
+
+    Replaces ``docker/patch/ernie55/megatron-bridge.patch``. Two coordinated edits that
+    upstream Megatron-Bridge does not expose as config:
+
+    * ``Ernie55Config`` drops its MTP depths (truncate ``compress_ratios`` to
+      ``num_hidden_layers``, zero ``num_nextn_predict_layers`` / ``mtp_shared_last_layer``),
+      so ``get_model_config`` builds the decoder only. Applied as an instance fix-up after
+      the original ``__init__``, which only stores these fields and derives nothing from
+      them, so the post-init overwrite is equivalent to editing the body.
+    * ``check_ernie55_checkpoint_keys`` ignores the MTP tensors a released checkpoint still
+      stores, which the decoder-only mapping would otherwise reject. The in-module caller
+      resolves the name at call time, so reassigning the module attribute suffices.
+    """
+    from megatron.bridge.models.ernie import configuration_ernie55, ernie55_mappings
+
+    ernie55_config_cls = configuration_ernie55.Ernie55Config
+    if not getattr(ernie55_config_cls.__init__, "_coda_drop_mtp", False):
+        _original_init = ernie55_config_cls.__init__
+
+        def _patched_init(self, *args, **kwargs):
+            _original_init(self, *args, **kwargs)
+            if self.num_nextn_predict_layers and self.compress_ratios is not None:
+                self.compress_ratios = list(self.compress_ratios)[: self.num_hidden_layers]
+            self.num_nextn_predict_layers = 0
+            self.mtp_shared_last_layer = False
+
+        _patched_init._coda_drop_mtp = True
+        ernie55_config_cls.__init__ = _patched_init
+
+    _original_check = ernie55_mappings.check_ernie55_checkpoint_keys
+    if not getattr(_original_check, "_coda_drop_mtp", False):
+        _hf_get = ernie55_mappings._hf_get
+
+        def _patched_check(hf_config, hf_keys):
+            if not int(_hf_get(hf_config, "num_nextn_predict_layers", 0) or 0):
+                num_hidden_layers = int(_hf_get(hf_config, "num_hidden_layers", 0))
+                hf_keys = {
+                    k
+                    for k in hf_keys
+                    if not (k.startswith("model.layers.") and int(k.split(".")[2]) >= num_hidden_layers)
+                }
+            return _original_check(hf_config, hf_keys)
+
+        _patched_check._coda_drop_mtp = True
+        ernie55_mappings.check_ernie55_checkpoint_keys = _patched_check
+
+
+def _patch_auto_attention_backend_inherits():
+    """Let ``attention_backend=auto`` sub-models inherit the process-wide TE backend.
+
+    Symptom (Qwen3.8-27B, ``attention_backend: flash``): model construction asserts
+    "NVTE_FUSED_ATTN is set to 1, but attention_backend='flash' ... require 0".
+
+    Root cause:
+      ``set_attention_backend`` (called by every ``LanguageModule`` / ``VisionModule``
+      constructor) writes ``NVTE_{FLASH,FUSED,UNFUSED}_ATTN`` and, since Megatron-LM
+      e6f591f73 (#7362), asserts that every model built in the process agrees. Sub-model
+      configs that a bridge builds from scratch (e.g. the Qwen3-VL vision encoder from
+      ``get_vision_model_config``) never see the user's ``attention_backend`` and keep the
+      default ``auto``, which writes all three flags as 1. Whichever of ``auto`` and the
+      explicit backend is built second trips the assert.
+
+    Fix: when a config is ``auto`` with no pinned ``flash_attention_version``, leave the
+      env untouched instead of writing it. TE already defaults all three flags to 1 when
+      unset, so on a clean env this is the same as ``auto``; after an explicit backend
+      has been set, the ``auto`` sub-model runs on that backend. Explicit backends still
+      go through the original check, so a real conflict between two explicit backends
+      still fails. ``language_module`` / ``vision_module`` import the function by name,
+      so their module attributes are rebound too.
+    """
+    from megatron.core.models.common.language_module import language_module
+    from megatron.core.models.common.vision_module import vision_module
+    from megatron.core.transformer import utils as transformer_utils
+    from megatron.core.transformer.enums import AttnBackend
+
+    original = transformer_utils.set_attention_backend
+    if getattr(original, "_coda_auto_inherits", False):
+        return
+
+    def _patched_set_attention_backend(config):
+        backend = config.attention_backend
+        if (
+            backend in (AttnBackend.auto, "auto")
+            and getattr(config, "flash_attention_version", None) is None
+            and not getattr(config, "batch_invariant_mode", False)
+        ):
+            return
+        original(config)
+
+    _patched_set_attention_backend._coda_auto_inherits = True
+    for module in (transformer_utils, language_module, vision_module):
+        module.set_attention_backend = _patched_set_attention_backend
+
+
 _patch_distributed_optimizer_init()
 _patch_fp32_shard_leaf()
 _patch_fused_adam_fp32_master_remainder()
 _patch_csa_cute_launch_cache()
 _patch_fa4_causal_unbounded_window()
+_patch_ernie55_drop_mtp()
+_patch_auto_attention_backend_inherits()
 

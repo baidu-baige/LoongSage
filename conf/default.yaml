@@ -96,11 +96,6 @@ data_sources:
 multimodal:
   enable: false
   modalities: [image]     # only image is implemented; video / audio are reserved
-  image:
-    # Router pre-resize bounds (global). Qwen3-VL emits 1 image token per 32x32 pixels.
-    # min_pixels must be >= the processor's shortest_edge and max_pixels <= its longest_edge.
-    min_pixels: 65536
-    max_pixels: 16777216    # 4096x4096 -> at most 16384 image tokens per image
 
 rollout:
   partial: false

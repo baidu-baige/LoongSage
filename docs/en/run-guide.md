@@ -233,9 +233,9 @@ bash examples/start.sh qwen3_coder_30b_a3b/claude_code_h20_2node \
   data_source.sandbox.kubeconfig=/path/to/kubeconfig.yaml
 ```
 
-### Task 8: Train a Vision-Language Model (Qwen3-VL) with Images
+### Task 8: Train a Vision-Language Model (Qwen3-VL, DeepSeek-V4.1) with Images
 
-Image-modality training is off by default. The presets under [`conf/qwen3_vl_30b_a3b/`](../../conf/qwen3_vl_30b_a3b/) set `multimodal.enable: true` and run GRPO with `boxed_math` reward on one H20 node (8 GPUs); the Router needs the `qwen-vl-utils` package (`pip install qwen-vl-utils==0.0.14` if your image does not ship it).
+Image-modality training is off by default. The presets under [`conf/qwen3_vl_30b_a3b/`](../../conf/qwen3_vl_30b_a3b/) set `multimodal.enable: true` and run GRPO with `boxed_math` reward on one H20 node (8 GPUs); for Qwen3-VL the Router needs the `qwen-vl-utils` package (`pip install qwen-vl-utils==0.0.14` if your image does not ship it). DeepSeek-V4.1 has its own preset, described at the end of this task.
 
 **Data format.** A dataset with images has two parts, selected by `data_source.dataset.multimodal_keys` (here `{image: images}`):
 
@@ -273,6 +273,25 @@ bash examples/start.sh qwen3_vl_30b_a3b/mmrb_h20_1node \
 ```
 
 Both presets use TP4 x PP2, EP4 and freeze the vision tower while training the language model (`megatron.model.freeze_vision_model: true`, `freeze_language_model: false`). Megatron-Bridge defaults both flags to `True` for Qwen3-VL-MoE, so keep them explicit in your own configs. Field details are in [Config Reference §1.1](config-reference.md#11-multimodal-image-modality). For how images flow through the Router and the trainer, see `coda/agentflow/multimodal.py` and `put_dp_shards_to_ray` in `coda/data_factory/data_processor.py` (the AgentFlow and Controller docs are not published yet).
+
+**DeepSeek-V4.1 (geo3k).** [`dsv41_flash/geo3k_h20_6node`](../../conf/dsv41_flash/geo3k_h20_6node.yaml) runs GRPO on geo3k with `boxed_math` reward on 6 nodes x 8 H20, using QAT against a quantized rollout (the same setup as the other `dsv41_flash/` presets). It uses the same data format as above. DeepSeek-V4.1 plans each image with its own image processor, driven by the `vision_*` fields of the checkpoint's `config.json`, so it does not need `qwen-vl-utils` and `multimodal.image.min_pixels/max_pixels` do not apply. Download the model and dataset:
+
+```bash
+hf download deepseek-ai/DeepSeek-V4.1-Flash-1017 --local-dir /root/DeepSeek-V4.1-Flash-1017
+hf download hiyouga/geometry3k --repo-type=dataset --local-dir /root/geometry3k
+```
+
+Start the Ray cluster on every node first (see [Multi-node training](#multi-node-training-setup)), then launch on the head node:
+
+```bash
+bash examples/start.sh dsv41_flash/geo3k_h20_6node \
+  checkpoint_path=/root/ckpt/dsv41_geo3k \
+  hf_model_path=/root/DeepSeek-V4.1-Flash-1017 \
+  data_source.dataset.prompt_data_path=/root/geometry3k/data/train-00000-of-00001.parquet \
+  data_source.dataset.eval_prompt_data_path=/root/geometry3k/data/validation-00000-of-00001.parquet
+```
+
+The preset uses TP4 x PP6, EP8, CP1 with `cp_partition_mode: contiguous`. With `multimodal.enable: true` on DeepSeek-V4.1, startup validation rejects settings that break rollout/training consistency, for example `image_processor_backend` other than `pil`, `vision_n_layers: 0` in the rollout override, rollout `pp_size` or `attn_cp_size` above 1, and `freeze_vision_model: false`. The full list is in [Config Reference §1.1](config-reference.md#11-multimodal-image-modality).
 
 Tip: Each preset inherits from [`conf/default.yaml`](../../conf/default.yaml), and subdirectories such as [`conf/qwen3_30b_a3b/`](../../conf/qwen3_30b_a3b/) hold presets for a specific model and machine type. For more available configurations, see [`conf/`](../../conf/).
 
@@ -520,6 +539,10 @@ Besides the presets used in the tasks above, `conf/` ships the following ready-t
 | `conf/dsv41_flash_bf16/` | `dapo_b200_5node` | DeepSeek-V4.1-Flash-BF16 | DAPO math | 5 nodes × B200 |
 | | `swe_b200_6node` | DeepSeek-V4.1-Flash-BF16 | mini-SWE (R2E-Gym) | 6 nodes × B200 |
 | | `swe_h20_6node` | DeepSeek-V4.1-Flash-BF16 | mini-SWE (R2E-Gym) | 6 nodes × H20 |
+| `conf/dsv41_flash/` | `dapo_h20_6node` | DeepSeek-V4.1-Flash (original weights, QAT) | DAPO math | 6 nodes × H20 |
+| | `swe_h20_6node` | DeepSeek-V4.1-Flash (original weights, QAT) | mini-SWE (R2E-Gym) | 6 nodes × H20 |
+| | `sft_h20_6node` | DeepSeek-V4.1-Flash (original weights, QAT) | SFT | 6 nodes × H20 |
+| | `geo3k_h20_6node` | DeepSeek-V4.1-Flash (original weights, QAT) | GRPO geo3k, single image (Task 8) | 6 nodes × H20 |
 
 ## Related documents
 

@@ -4,7 +4,9 @@ import pytest
 import torch
 
 from coda.utils.multimodal_tensors import (
+    DSV41_DOWNSAMPLE_RATIO,
     add_to_image_table,
+    dsv41_span_tokens,
     merge_multimodal_batch,
     move_image_table_to_device,
     slice_segment_inputs,
@@ -178,3 +180,91 @@ class TestMoveImageTableToDevice:
         assert set(out) == {"a", "b"}
         assert torch.equal(out["b"]["pixel_values"], table["b"]["pixel_values"])
         assert out["a"]["pixel_values"].device.type == "cpu"
+
+
+def _dsv41_item(token_start, grid_hw, fill=1, n_tokens=None, n_patches=None):
+    """A DeepSeek-V4.1 item: `image_grid_hw` grid, token range sized for downsample ratio 3 unless overridden."""
+    h, w = grid_hw
+    if n_tokens is None:
+        n_tokens = -(-h // 3) * (-(-w // 3) + 1) + 2
+    return {
+        "token_start": token_start,
+        "token_end": token_start + n_tokens,
+        "image_hash": f"d{fill}" * 6,
+        "pad_id": PAD,
+        "tensors": {
+            "pixel_values": torch.full((h * w if n_patches is None else n_patches, 4), float(fill)),
+            "image_grid_hw": torch.tensor([grid_hw], dtype=torch.int64),
+        },
+    }
+
+
+class TestDsv41ImageGrid:
+    def test_consistent_segment_passes(self):
+        item = _dsv41_item(2, (6, 9))  # 2 x 3 LLM grid -> 2 * (3 + 1) + 2 = 10 tokens
+        assert item["token_end"] - item["token_start"] == 10
+        row, table = _slice([item], 0, 20, _tokens(20, (2, 12)))
+        assert row == [item["image_hash"]] and set(table) == set(row)
+
+    def test_non_multiple_of_ratio_rounds_up(self):
+        item = _dsv41_item(0, (7, 4))  # ceil(7/3) x ceil(4/3) = 3 x 2 -> 3 * 3 + 2 = 11 tokens
+        assert item["token_end"] == 11
+        row, _ = _slice([item], 0, 12, _tokens(12, (0, 11)))
+        assert row == [item["image_hash"]]
+
+    @pytest.mark.parametrize("grid", [(1, 1), (2, 3), (3, 3), (6, 9), (7, 4), (30, 31), (73, 5)])
+    def test_span_tokens_match_sglang(self, grid):
+        # The trainer-side count must equal what the rollout engine puts in the prompt.
+        sglang_ip = pytest.importorskip("sglang.srt.multimodal.deepseek_v41_image_processing")
+        patch_size = 14
+        n_llm_h, n_llm_w = sglang_ip.llm_grid(
+            grid[0] * patch_size, grid[1] * patch_size, patch_size, DSV41_DOWNSAMPLE_RATIO
+        )
+        expected = sglang_ip.num_image_tokens(n_llm_h, n_llm_w)
+        assert dsv41_span_tokens(torch.tensor([grid])) == expected
+
+    def test_wrong_token_count_raises(self):
+        item = _dsv41_item(2, (6, 9), n_tokens=9)
+        with pytest.raises(ValueError, match="needs 10"):
+            _slice([item], 0, 20, _tokens(20, (2, 11)))
+
+    def test_patch_count_mismatch_raises(self):
+        item = _dsv41_item(0, (6, 9), n_patches=50)
+        with pytest.raises(ValueError, match="image_grid_hw implies 54"):
+            _slice([item], 0, 12, _tokens(12, (0, 10)))
+
+    def test_qwen_grid_does_not_get_span_check(self):
+        # `image_grid_thw` items keep their previous behaviour: any all-pad run of the right patch count passes.
+        row, _ = _slice([_item(2, 6, 4, 1)], 0, 10, _tokens(10, (2, 6)))
+        assert row is not None
+
+    def test_missing_grid_key_raises(self):
+        item = _dsv41_item(0, (3, 3))
+        del item["tensors"]["image_grid_hw"]
+        with pytest.raises(ValueError, match="image_grid"):
+            _slice([item], 0, 10, _tokens(10, (0, 5)))
+
+    def test_same_hash_with_different_grid_raises(self):
+        table = {}
+        add_to_image_table(table, "hh", {"pixel_values": torch.zeros(6, 4), "image_grid_hw": torch.tensor([[2, 3]])})
+        add_to_image_table(table, "hh", {"pixel_values": torch.zeros(6, 4), "image_grid_hw": torch.tensor([[2, 3]])})
+        with pytest.raises(ValueError, match="two different"):
+            add_to_image_table(table, "hh", {"pixel_values": torch.zeros(6, 4), "image_grid_hw": torch.tensor([[3, 2]])})
+
+    def test_add_to_image_table_compares_pixel_shape_only(self):
+        # Pins the current behaviour: equal shape and grid with different values count as the same image.
+        table = {}
+        a = {"pixel_values": torch.zeros(6, 4), "image_grid_hw": torch.tensor([[2, 3]])}
+        b = {"pixel_values": torch.ones(6, 4), "image_grid_hw": torch.tensor([[2, 3]])}
+        add_to_image_table(table, "hh", a)
+        add_to_image_table(table, "hh", b)
+        assert table["hh"] is a
+
+    def test_merge_concatenates_hw_grids(self):
+        table = {
+            "a": {"pixel_values": torch.zeros(6, 4), "image_grid_hw": torch.tensor([[2, 3]])},
+            "b": {"pixel_values": torch.ones(4, 4), "image_grid_hw": torch.tensor([[2, 2]])},
+        }
+        merged = merge_multimodal_batch([["a"], ["b", "a"]], table)
+        assert merged["pixel_values"].shape == (16, 4)
+        assert merged["image_grid_hw"].tolist() == [[2, 3], [2, 2], [2, 3]]

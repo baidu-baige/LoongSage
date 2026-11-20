@@ -6,12 +6,16 @@
 # no tool-call format, thinking off, no length penalty. The base model then has reward variance
 # and GRPO gets a real gradient.
 #
-# Launch on every node (head first), then run on the head node only. prompt_data_path must name
-# one .jsonl/.parquet file:
-#   bash examples/start_ray_cluster.sh <master-ip>
-#   bash examples/start.sh ernie55_flash/gsm8k_h20_6node \
-#     hf_model_path=/path/to/ERNIE-5.5-Flash-Base-BF16 \
-#     data_source.dataset.prompt_data_path=/path/to/gsm8k/main/train-00000-of-00001.parquet
+# 1. Download the model and dataset:
+#      hf download baidu/ERNIE-5.5-Flash-Base-BF16 --local-dir /root/ERNIE-5.5-Flash-Base-BF16
+#      hf download openai/gsm8k --repo-type=dataset --local-dir /root/gsm8k
+#
+# 2. Launch on every node (head first), then run on the head node only.
+#    prompt_data_path must name one .jsonl/.parquet file :
+#      bash examples/start_ray_cluster.sh <master-ip>
+#      bash examples/start.sh ernie55_flash/gsm8k_h20_6node \
+#        hf_model_path=/root/ERNIE-5.5-Flash-Base-BF16 \
+#        data_source.dataset.prompt_data_path=/root/gsm8k/main/train-00000-of-00001.parquet
 defaults:
   - /default
   - _self_

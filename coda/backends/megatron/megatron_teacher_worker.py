@@ -26,10 +26,15 @@ from coda.backends.memory_pool import build_memory_pool
 from coda.backends.teacher_worker import TeacherWorker as BaseTeacherWorker
 from coda.utils.memory_utils import clear_memory
 from coda.utils.multimodal_tensors import move_image_table_to_device
-from coda.utils.multimodal_config import validate_vlm_parallel_config
+from coda.utils.multimodal_config import (
+    drop_dsv41_vision_if_text_only,
+    multimodal_enabled,
+    validate_vlm_parallel_config,
+)
 from coda.backends.megatron.checkpoint import load_model_weights
+import coda.backends.megatron.monkey_patch  # noqa: F401  # apply patches before any Megatron usage
 from coda.backends.megatron.mixed_precision import KeepFP32Module
-from coda.backends.megatron.model_builder import build_bridge_model
+from coda.backends.megatron.model_builder import apply_model_overrides
 from coda.utils.checkpoint_utils import resolve_dist_ckpt_dir
 from coda.utils.tracking import configure_tracking
 from coda.utils.types import RolloutBatch
@@ -174,9 +179,11 @@ class MegatronTeacherWorker(BaseTeacherWorker):
         )
 
         self.bridge = AutoBridge.from_hf_pretrained(hf_path)
-        self.model = build_bridge_model(
-            self.bridge,
-            OmegaConf.to_container(self.config.opd.model),
+        drop_dsv41_vision_if_text_only(self.bridge.hf_pretrained.config, multimodal_enabled(self.config))
+        model_config = self.bridge.get_model_config()
+        apply_model_overrides(model_config, OmegaConf.to_container(self.config.opd.model))
+        self.model = self.bridge.get_model(
+            model_config,
             load_weights=ckpt_dir is None,
             wrap_with_ddp=False,
             mixed_precision_wrapper=partial(KeepFP32Module, self.config.megatron.keep_fp32_weights),

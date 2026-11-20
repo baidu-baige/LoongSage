@@ -48,4 +48,3 @@ RUN git clone https://github.com/baidu-baige/LoongSage.git && cd LoongSage && pi
 RUN cd /sgl-workspace/sglang && git apply ../LoongSage/docker/patch/sglang-6d1ce5b894.patch
 RUN cd /sgl-workspace/Megatron-LM && git apply ../LoongSage/docker/patch/dsv41/megatron-core.patch
 RUN cd /sgl-workspace/Megatron-Bridge && git apply ../LoongSage/docker/patch/dsv41/megatron-bridge.patch
-RUN cd /sgl-workspace/Megatron-Bridge && git apply ../LoongSage/docker/patch/ernie55/megatron-bridge.patch

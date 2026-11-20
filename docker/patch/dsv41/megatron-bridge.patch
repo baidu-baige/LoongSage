@@ -16,10 +16,10 @@ index 5b87a5d2c..d1857d45f 100644
  ]
 diff --git a/src/megatron/bridge/models/deepseek/deepseek_v41_bridge.py b/src/megatron/bridge/models/deepseek/deepseek_v41_bridge.py
 new file mode 100644
-index 000000000..f2128a50e
+index 000000000..b1dd9e47d
 --- /dev/null
 +++ b/src/megatron/bridge/models/deepseek/deepseek_v41_bridge.py
-@@ -0,0 +1,292 @@
+@@ -0,0 +1,509 @@
 +# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 +#
 +# Licensed under the Apache License, Version 2.0 (the "License");
@@ -51,6 +51,7 @@ index 000000000..f2128a50e
 +import logging
 +import struct
 +from pathlib import Path
++from types import SimpleNamespace
 +
 +import torch
 +from megatron.core.models.gpt.gpt_model import GPTModel
@@ -66,10 +67,24 @@ index 000000000..f2128a50e
 +from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 +from megatron.bridge.models.mla_provider import MLAModelProvider
 +
-+from .deepseek_v4_gpt_bridge import DeepSeekV4GPTBridge
-+from .deepseek_v41_config import register_deepseek_v41_config
++from .deepseek_v4_gpt_bridge import (
++    DeepSeekV4GPTBridge,
++    _HCAlphaMapping,
++    _dsv4_compress_ratios,
++    deepseek_v4_supports_blackwell_fused_kernels,
++)
++from .deepseek_v41_config import (
++    DeepSeekV41ModelConfig,
++    DeepSeekV41VLModelConfig,
++    dsv41_block_spec,
++    register_deepseek_v41_config,
++)
++from .deepseek_v41_vl_provider import DeepSeekV41VLModelProvider
 +
 +logger = logging.getLogger(__name__)
++
++# Attribute path of the GPT model inside DeepSeekV41VLModel.
++_LM_PREFIX = "language_model."
 +
 +_SCALE_DTYPES = {
 +    "F8_E8M0": getattr(torch, "float8_e8m0fnu", None),
@@ -135,12 +150,193 @@ index 000000000..f2128a50e
 +      * the indexer head count comes from ``index_n_heads`` (32 for V4.1);
 +      * hash-MoE is disabled (``moe_n_hash_layers = 0``); V4.1 has no hash layers;
 +      * ``v41_hf_checkpoint`` is recorded so the engram tables can be mmapped.
++
++    Builder-backed: ``MODEL_CONFIG_CLASS`` makes ``get_model_config()`` /
++    ``get_model()`` build a ``GPTModel`` (text) or ``DeepSeekV41VLModel`` (when the HF
++    config has a ``vision_config``) from a serializable config. ``provider_bridge`` is
++    kept only for the deprecated provider path.
 +    """
 +
-+    def provider_bridge(self, hf_pretrained: PreTrainedCausalLM) -> MLAModelProvider:
-+        provider = super().provider_bridge(hf_pretrained)
-+        hf_config = hf_pretrained.config
++    MODEL_CONFIG_CLASS = DeepSeekV41ModelConfig
++    USE_MODEL_CONFIG_FOR_CONVERSION = True
 +
++    def hf_config_to_model_config_kwargs(self, hf_config) -> dict:
++        """Builder-config kwargs for the DeepSeek-V4.1 language backbone.
++
++        Reproduces the settings ``DeepSeekV4GPTBridge.provider_bridge`` /
++        ``DeepSeekV41Bridge.provider_bridge`` apply to the provider, as a flat kwargs
++        dict (``_partition_model_config_kwargs`` routes each key to the outer config or
++        the nested ``DeepSeekV41TransformerConfig``). ``norm_topk_prob`` is intentionally
++        omitted: it is not a declared config field (post-topk normalization follows from
++        ``moe_router_pre_softmax=False``), matching the builder-backed DeepSeek-V4 bridge.
++        """
++        config_kwargs = super().hf_config_to_model_config_kwargs(hf_config)
++
++        use_blackwell = deepseek_v4_supports_blackwell_fused_kernels()
++
++        # ---- Rotary embeddings (YaRN); two RoPE bases (main + compressed-KV) ----
++        rope_params = getattr(hf_config, "rope_scaling", None) or getattr(hf_config, "rope_parameters", None) or {}
++        if "compress" in rope_params:
++            main_rope_params = rope_params.get("main", {})
++            compress_rope_params = rope_params["compress"]
++        else:
++            main_rope_params = rope_params
++            compress_rope_params = rope_params
++        rotary_base = float(main_rope_params.get("rope_theta", hf_config.rope_theta))
++
++        # ---- CSA compress ratios (flattened, sliced to layers + MTP depth) ----
++        _cr = _dsv4_compress_ratios(hf_config)
++        _mtp = getattr(hf_config, "num_nextn_predict_layers", None)
++        if _mtp is None:
++            logger.warning("HF config missing 'num_nextn_predict_layers'; defaulting to 0.")
++            _mtp = 0
++        _expected = hf_config.num_hidden_layers + _mtp
++
++        config_kwargs.update(
++            # ---- Attention (V4.1 variant) ----
++            experimental_attention_variant="dsv41_hybrid",
++            multi_latent_attention=True,
++            transformer_layer_spec=dsv41_block_spec,
++            qk_layernorm=True,
++            normalization="RMSNorm",
++            add_bias_linear=False,
++            # MLA geometry
++            v_head_dim=hf_config.head_dim,
++            qk_pos_emb_head_dim=hf_config.qk_rope_head_dim,
++            rotary_percent=1.0,
++            q_lora_rank=hf_config.q_lora_rank,
++            o_groups=hf_config.o_groups,
++            o_lora_rank=hf_config.o_lora_rank,
++            # RoPE / YaRN
++            apply_rope_fusion=True,
++            rope_type="yarn",
++            rotary_base=rotary_base,
++            csa_compress_rotary_base=float(
++                getattr(hf_config, "compress_rope_theta", compress_rope_params.get("rope_theta", rotary_base))
++            ),
++            rotary_scaling_factor=float(compress_rope_params["factor"]),
++            original_max_position_embeddings=int(compress_rope_params["original_max_position_embeddings"]),
++            beta_fast=float(compress_rope_params.get("beta_fast", 32)),
++            beta_slow=float(compress_rope_params.get("beta_slow", 1)),
++            mscale=1.0,
++            mscale_all_dim=1.0,
++            # CSA
++            csa_compress_ratios=_cr[:_expected],
++            csa_window_size=hf_config.sliding_window,
++            # DSA indexer (V4.1 uses 32 heads)
++            dsa_indexer_n_heads=hf_config.index_n_heads,
++            dsa_indexer_head_dim=hf_config.index_head_dim,
++            dsa_indexer_topk=hf_config.index_topk,
++            # V4.1 runs its own tilelang sparse-MLA kernels; no megatron DSA kernel backend.
++            dsa_kernel_backend="none",
++            apply_dsa_kernel_fusion=None,
++            # ---- Hyper-Connections (mHC) ----
++            enable_hyper_connections=True,
++            use_fused_mhc=use_blackwell,
++            num_residual_streams=hf_config.hc_mult,
++            mhc_sinkhorn_iterations=hf_config.hc_sinkhorn_iters,
++            # ---- MoE ----
++            gated_linear_unit=True,
++            moe_grouped_gemm=True,
++            moe_router_pre_softmax=False,
++            moe_token_dispatcher_type="flex",
++            moe_flex_dispatcher_backend="hybridep",
++            moe_flex_dispatcher_num_sms=16,
++            moe_permute_fusion_into_hybridep=False,
++            moe_router_load_balancing_type="noaux_tc",
++            moe_shared_expert_overlap=True,
++            moe_router_score_function=hf_config.scoring_func,
++            moe_router_enable_expert_bias=True,
++            moe_router_dtype="fp32",
++            moe_permute_fusion=True,
++            moe_aux_loss_coeff=0.0,
++            moe_router_topk=hf_config.num_experts_per_tok,
++            moe_router_topk_scaling_factor=hf_config.routed_scaling_factor,
++            # V4.1 MoE routing is UNGROUPED and has no hash-routed layers.
++            moe_n_hash_layers=0,
++            moe_router_num_groups=None,
++            moe_router_group_topk=None,
++            actual_vocab_size=hf_config.vocab_size,
++            activation_func_clamp_value=hf_config.swiglu_limit,
++            moe_layer_freq=[1] * hf_config.num_hidden_layers,
++            moe_shared_expert_intermediate_size=hf_config.moe_intermediate_size * hf_config.n_shared_experts,
++            # ---- MTP ----
++            mtp_num_layers=getattr(hf_config, "num_nextn_predict_layers", 0) or None,
++            # ---- Misc ----
++            share_embeddings_and_output_weights=bool(hf_config.tie_word_embeddings),
++            # Match the provider path (the builder-config base defaults this to True).
++            deallocate_pipeline_outputs=False,
++            gradient_accumulation_fusion=True,
++            bias_dropout_fusion=True,
++            cross_entropy_fusion_impl="te",
++            cross_entropy_loss_fusion=True,
++            masked_softmax_fusion=True,
++            persist_layer_norm=True,
++            hidden_dropout=0.0,
++            attention_softmax_in_fp32=False,
++            make_vocab_size_divisible_by=1280,
++            seq_length=4096,
++        )
++
++        # V4.1-only HF fields -> v41_* (read by the ported dsv41 modules).
++        ns = SimpleNamespace()
++        apply_v41_config(ns, hf_config)
++        for key, value in vars(ns).items():
++            config_kwargs[key] = value
++        config_kwargs["v41_hf_checkpoint"] = getattr(hf_config, "name_or_path", None) or getattr(
++            hf_config, "_name_or_path", None
++        )
++        return config_kwargs
++
++    def hf_config_to_model_config(self, hf_config):
++        """Build the V4.1 builder config: text ``GPTModel`` or, with a ``vision_config``,
++        ``DeepSeekV41VLModel``.
++
++        The text branch defers to the base (``MODEL_CONFIG_CLASS = DeepSeekV41ModelConfig``).
++        The VL branch partitions the shared language kwargs plus the vision-language fields
++        against ``DeepSeekV41VLModelConfig`` + ``DeepSeekV41TransformerConfig``. The
++        transformer carries ``v41_image_token_id`` so ``get_dsv41_block_spec`` turns on image
++        routing when it builds the block.
++        """
++        vision_config = getattr(hf_config, "vision_config", None)
++        if not vision_config:
++            return super().hf_config_to_model_config(hf_config)
++
++        image_token_id = getattr(hf_config, "image_token_id", None)
++        if image_token_id is None:
++            raise ValueError("DeepSeek-V4.1 config has a vision_config but no image_token_id")
++
++        config_kwargs = self.hf_config_to_model_config_kwargs(hf_config)
++        config_kwargs.update(
++            vision_config=dict(vision_config),
++            image_token_id=int(image_token_id),
++            v41_image_token_id=int(image_token_id),
++        )
++        model_config_class = DeepSeekV41VLModelConfig
++        transformer_config_class = model_config_class.transformer_config_class
++        model_kwargs, transformer_kwargs = self._partition_model_config_kwargs(
++            config_kwargs, model_config_class, transformer_config_class
++        )
++        transformer_config = transformer_config_class(**transformer_kwargs)
++        return model_config_class(transformer=transformer_config, **model_kwargs)
++
++    def provider_bridge(self, hf_pretrained: PreTrainedCausalLM) -> MLAModelProvider:
++        # Deprecated provider path, kept for weight conversion / legacy callers. Training now
++        # uses get_model_config() / get_model() (see hf_config_to_model_config above); the base
++        # emits a FutureWarning here because MODEL_CONFIG_CLASS is set.
++        hf_config = hf_pretrained.config
++        # A checkpoint with a vision_config gets the VL provider (ViT + aligner + language model).
++        # Set it per call: the bridge instance outlives one conversion. The trainer sets
++        # vision_config to None to run the same checkpoint as a text-only model.
++        vision_config = getattr(hf_config, "vision_config", None)
++        self.PROVIDER_CLASS = DeepSeekV41VLModelProvider if vision_config else MLAModelProvider
++        provider = super().provider_bridge(hf_pretrained)
++        if vision_config:
++            image_token_id = getattr(hf_config, "image_token_id", None)
++            if image_token_id is None:
++                raise ValueError("DeepSeek-V4.1 config has a vision_config but no image_token_id")
++            provider.vision_config = dict(vision_config)
++            provider.image_token_id = int(image_token_id)
 +        # V4.1 builds its block spec with the ported plugin, not the stock
 +        # experimental-attention-variant builder. get_dsv41_block_spec runs the
 +        # standard block scaffolding (the selector now dispatches "dsv41_hybrid" to
@@ -311,13 +507,34 @@ index 000000000..f2128a50e
 +            ReplicatedMapping("decoder.layers.*.v41_engram.q_weight", "layers.*.engram.q_weight"),
 +            ReplicatedMapping("decoder.layers.*.v41_engram.k_weight", "layers.*.engram.k_weight"),
 +        ]
-+        return MegatronMappingRegistry(*base, *o_group_mapping, *indexer_mappings, *engram_mappings)
++        text_mappings = [*base, *o_group_mapping, *indexer_mappings, *engram_mappings]
++        if not getattr(self.hf_config, "vision_config", None):
++            return MegatronMappingRegistry(*text_mappings)
++
++        # With the vision tower the Megatron model is DeepSeekV41VLModel: the GPT model sits under
++        # `language_model.`. The HF names stay flat (`layers.N...`, `embed.weight`). Prefix the
++        # mappings before the registry is built, since it compiles its regexes on construction.
++        for m in text_mappings:
++            m.megatron_param = _LM_PREFIX + m.megatron_param
++            if isinstance(m, _HCAlphaMapping):
++                m._megatron_post = _LM_PREFIX + m._megatron_post
++                m._megatron_res = _LM_PREFIX + m._megatron_res
++        vision_mappings = [
++            ReplicatedMapping("vision.**", "vision.**"),
++            ReplicatedMapping("aligner.**", "aligner.**"),
++            ReplicatedMapping("image_start", "image_start"),
++            ReplicatedMapping("image_newline", "image_newline"),
++            ReplicatedMapping("image_end", "image_end"),
++            # Selects the experts of image tokens; an fp32 buffer, not trained (see TopKRouter).
++            ReplicatedMapping(f"{_LM_PREFIX}decoder.layers.*.mlp.router.expert_bias_vl", "layers.*.ffn.gate.bias_vl"),
++        ]
++        return MegatronMappingRegistry(*text_mappings, *vision_mappings)
 diff --git a/src/megatron/bridge/models/deepseek/deepseek_v41_config.py b/src/megatron/bridge/models/deepseek/deepseek_v41_config.py
 new file mode 100644
-index 000000000..39faa8998
+index 000000000..caa4d6819
 --- /dev/null
 +++ b/src/megatron/bridge/models/deepseek/deepseek_v41_config.py
-@@ -0,0 +1,65 @@
+@@ -0,0 +1,155 @@
 +# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 +#
 +# Licensed under the Apache License, Version 2.0 (the "License");
@@ -345,8 +562,14 @@ index 000000000..39faa8998
 +``PretrainedConfig`` and read by the bridge via ``getattr``.
 +"""
 +
++from dataclasses import dataclass
++from typing import Any, ClassVar
++
 +from transformers import AutoConfig
 +from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
++
++from megatron.bridge.models.gpt.model_config import BridgeGPTMLAModelConfig
++from megatron.bridge.models.transformer_config import MLATransformerConfig, TransformerConfig
 +
 +
 +class DeepseekV41Config(DeepseekV3Config):
@@ -355,15 +578,17 @@ index 000000000..39faa8998
 +    Accepts both the flat schema and the ORIGINAL release schema, which wraps the text model
 +    in ``text_config`` next to ``vision_config`` / ``quantization_config``. The wrapped form is
 +    flattened into the text-only, MTP-free config the trainer builds: the text fields move to
-+    the top level, ``vision_config`` is dropped, ``num_nextn_predict_layers`` is set to 0 and
-+    the MTP entries of ``compress_ratios`` are cut. ``quantization_config`` is kept.
++    the top level, ``num_nextn_predict_layers`` is set to 0 and the MTP entries of
++    ``compress_ratios`` are cut. ``quantization_config`` and ``vision_config`` are kept; the bridge
++    builds the vision tower only when ``vision_config`` is present (the trainer sets it to None
++    to run the same checkpoint as a text-only model).
 +    """
 +
 +    model_type = "deepseek_v41"
 +
 +    def __init__(self, **kwargs):
 +        text = kwargs.pop("text_config", None)
-+        kwargs.pop("vision_config", None)
++        vision = kwargs.pop("vision_config", None)
 +        if text is not None:
 +            text = text if isinstance(text, dict) else text.to_dict()
 +            kwargs.update({k: v for k, v in text.items() if k != "model_type"})
@@ -378,11 +603,573 @@ index 000000000..39faa8998
 +        super().__init__(**kwargs)
 +        if not hasattr(self, "rope_theta") or self.rope_theta is None:
 +            self.rope_theta = rope_theta
++        # A plain dict: the bridge and the VL model read it with item access.
++        self.vision_config = vision if vision is None or isinstance(vision, dict) else vision.to_dict()
 +
 +
 +def register_deepseek_v41_config() -> None:
 +    """Register the ``deepseek_v41`` model type with ``AutoConfig`` (idempotent)."""
 +    AutoConfig.register("deepseek_v41", DeepseekV41Config, exist_ok=True)
++
++
++@dataclass
++class DeepSeekV41TransformerConfig(MLATransformerConfig):
++    """MLA transformer config carrying the DeepSeek-V4.1-only fields.
++
++    The dsv41 block spec and the ported runtime modules read these ``v41_*``
++    attributes, which ``apply_v41_config`` populates from the HF config. Runtime-only
++    attributes (``v41_stage_bounds`` / ``v41_carry_state`` / ``v41_runtime`` and
++    ``dsa_topk_backend``) are set dynamically by ``get_dsv41_block_spec`` at build time
++    and are intentionally NOT declared here.
++    """
++
++    v41_kv_source_layer_ids: tuple[int, ...] = ()
++    v41_index_source_layer_ids: tuple[int, ...] = ()
++    v41_candidate_source_layer_id: int | None = None
++    v41_candidate_topk_blocks: int | None = None
++    v41_candidate_block_size: int | None = None
++    v41_engram_layer_ids: tuple[int, ...] = ()
++    v41_engram_num_embeddings: int | None = None
++    v41_engram_max_ngram_size: int | None = None
++    v41_engram_vocab_size: int | None = None
++    v41_engram_n_heads: int | None = None
++    v41_engram_head_dim: int | None = None
++    v41_engram_pad_token_id: int | None = None
++    v41_engram_compressed_vocab_size: int | None = None
++    # Checkpoint the engram tables are mmapped from (set by the bridge).
++    v41_hf_checkpoint: str | None = None
++    # Image-token id turns on image routing in the router / engram; None for text.
++    v41_image_token_id: int | None = None
++
++
++@dataclass(kw_only=True)
++class DeepSeekV41ModelConfig(BridgeGPTMLAModelConfig):
++    """Builder config for the DeepSeek-V4.1 language backbone (text, inner ``GPTModel``).
++
++    The builder counterpart of ``MLAModelProvider`` for V4.1: the standard GPT builder
++    constructs a ``GPTModel`` from the dsv41 block spec (carried on
++    ``transformer_layer_spec``). It nests ``DeepSeekV41TransformerConfig``.
++    """
++
++    transformer_config_class: ClassVar[type[TransformerConfig]] = DeepSeekV41TransformerConfig
++
++
++@dataclass(kw_only=True)
++class DeepSeekV41VLModelConfig(DeepSeekV41ModelConfig):
++    """Builder config for DeepSeek-V4.1 with the vision tower (``DeepSeekV41VLModel``).
++
++    Shares the V4.1 language config (and its ``v41_*`` transformer surface) and adds the
++    vision-language fields that ``DeepSeekV41VLModelProvider`` declared. ``vision_config``
++    is a plain dict, so the default config serialization round-trips it.
++    """
++
++    builder: ClassVar[str] = "megatron.bridge.models.deepseek.deepseek_v41_vl_builder.DeepSeekV41VLModelBuilder"
++
++    # Image embeddings are merged into the full-sequence embeddings first, then scattered.
++    scatter_embedding_sequence_parallel: bool = False
++    # HF ``vision_config`` as a dict (hidden_size, num_hidden_layers, patch_size, downsample_ratio ...).
++    vision_config: Any = None
++    # Id shared by all image tokens in ``input_ids`` (HF top-level ``image_token_id``).
++    image_token_id: int = 129264
++    # The tower trains on a fixed recipe; rollout engine and trainer must see the same features.
++    freeze_vision_model: bool = True
++
++
++def dsv41_block_spec(config, vp_stage=None):
++    """``get_dsv41_block_spec`` adapter for the builder path.
++
++    The GPT builder hands the OUTER model config to the ``transformer_layer_spec``
++    callable, but ``get_dsv41_block_spec`` reads and writes flat transformer-config
++    attributes. Unwrap to ``config.transformer`` (as the Kimi K3 spec does), then
++    delegate. On the legacy provider path the provider is passed directly and is not an
++    ``MCoreGPTModelConfig``, so it is used as-is.
++    """
++    from megatron.core.transformer.experimental_attention_variant.dsv41.deepseek_v41 import get_dsv41_block_spec
++    from megatron.training.models.gpt import GPTModelConfig as MCoreGPTModelConfig
++
++    if isinstance(config, MCoreGPTModelConfig):
++        config = config.transformer
++    return get_dsv41_block_spec(config, vp_stage=vp_stage)
+diff --git a/src/megatron/bridge/models/deepseek/deepseek_v41_vit.py b/src/megatron/bridge/models/deepseek/deepseek_v41_vit.py
+new file mode 100644
+index 000000000..039199461
+--- /dev/null
++++ b/src/megatron/bridge/models/deepseek/deepseek_v41_vit.py
+@@ -0,0 +1,140 @@
++# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++
++"""DeepSeek-V4.1 vision tower and aligner in plain torch.
++
++Mirrors ``sglang.srt.models.deepseek_v41_vit`` (the rollout engine) so that the trainer and the
++engine produce the same image features. Parameter names follow the HF checkpoint
++(``vision.patch_embed.proj``, ``vision.blocks.N.attn.wqkv`` ...), so the bridge maps them 1:1.
++The tower is not tensor-parallel: it is small and runs frozen, once per image.
++"""
++
++from functools import lru_cache
++
++import torch
++import torch.nn.functional as F
++from megatron.core.transformer.experimental_attention_variant.dsv41.ops.norm import RMSNorm
++from torch import nn
++
++
++@lru_cache(8)
++def get_vision_cos_sin(n_h: int, n_w: int, dim: int, theta: float):
++    """2D RoPE tables for an ``n_h x n_w`` patch grid, each ``[n_h*n_w, 1, dim]`` (fp32)."""
++    inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
++    hpos = torch.arange(n_h).unsqueeze(1).expand(n_h, n_w)
++    wpos = torch.arange(n_w).unsqueeze(0).expand(n_h, n_w)
++    freqs = torch.stack([hpos, wpos], dim=-1).reshape(-1, 2, 1).float() * inv_freq
++    freqs = freqs.flatten(1)
++    return freqs.cos().unsqueeze(1), freqs.sin().unsqueeze(1)
++
++
++def apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
++    """Half-split rotary in fp32, cast back to the input dtype."""
++    dtype = x.dtype
++    x1, x2 = x.float().chunk(2, dim=-1)
++    return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1).to(dtype)
++
++
++def image_token_types(n_llm_h: int, n_llm_w: int) -> torch.Tensor:
++    """Kind of each token in one image span: 0 start, 1 feature, 2 newline, 3 end."""
++    types = [0] + ([1] * n_llm_w + [2]) * n_llm_h + [3]
++    return torch.tensor(types, dtype=torch.int64)
++
++
++class PatchEmbed(nn.Module):
++    def __init__(self, patch_size: int, dim: int):
++        super().__init__()
++        self.proj = nn.Linear(3 * patch_size**2, dim)
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        return self.proj(x.flatten(1))
++
++
++class Attention(nn.Module):
++    """Bidirectional attention over the patches of one image."""
++
++    def __init__(self, dim: int, n_heads: int):
++        super().__init__()
++        self.n_heads = n_heads
++        self.wqkv = nn.Linear(dim, 3 * dim)
++        self.wo = nn.Linear(dim, dim)
++
++    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
++        seq, dim = x.shape
++        q, k, v = self.wqkv(x).split(dim, dim=-1)
++        q, k, v = (t.view(seq, self.n_heads, -1) for t in (q, k, v))
++        q, k = apply_rotary(q, cos, sin), apply_rotary(k, cos, sin)
++        q, k, v = (t.transpose(0, 1).unsqueeze(0) for t in (q, k, v))
++        out = F.scaled_dot_product_attention(q, k, v)
++        return self.wo(out.squeeze(0).transpose(0, 1).reshape(seq, dim))
++
++
++class MLP(nn.Module):
++    def __init__(self, dim: int, inter_dim: int):
++        super().__init__()
++        self.w1 = nn.Linear(dim, 2 * inter_dim, bias=False)
++        self.w2 = nn.Linear(inter_dim, dim, bias=False)
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        gate, up = self.w1(x).chunk(2, dim=-1)
++        return self.w2(F.silu(gate) * up)
++
++
++class Block(nn.Module):
++    def __init__(self, dim: int, n_heads: int, inter_dim: int):
++        super().__init__()
++        self.norm1 = RMSNorm(dim)
++        self.attn = Attention(dim, n_heads)
++        self.norm2 = RMSNorm(dim)
++        self.mlp = MLP(dim, inter_dim)
++
++    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
++        x = x + self.attn(self.norm1(x), cos, sin)
++        return x + self.mlp(self.norm2(x))
++
++
++class ViT(nn.Module):
++    def __init__(self, cfg: dict):
++        super().__init__()
++        dim, heads = cfg["hidden_size"], cfg["num_attention_heads"]
++        self.rope_dim = dim // heads // 2
++        self.rope_theta = float(cfg.get("rope_theta", 10000.0))
++        self.patch_embed = PatchEmbed(cfg["patch_size"], dim)
++        self.blocks = nn.ModuleList(
++            [Block(dim, heads, cfg["intermediate_size"]) for _ in range(cfg["num_hidden_layers"])]
++        )
++        self.norm = RMSNorm(dim)
++
++    def forward(self, patches: torch.Tensor, n_h: int, n_w: int) -> torch.Tensor:
++        x = self.patch_embed(patches)
++        cos, sin = get_vision_cos_sin(n_h, n_w, self.rope_dim, self.rope_theta)
++        cos, sin = cos.to(x.device), sin.to(x.device)
++        for block in self.blocks:
++            x = block(x, cos, sin)
++        return self.norm(x)
++
++
++class Aligner(nn.Module):
++    """Folds ``r x r`` ViT patches into one LLM-width feature."""
++
++    def __init__(self, vision_dim: int, dim: int, downsample_ratio: int):
++        super().__init__()
++        self.downsample_ratio = downsample_ratio
++        self.w1 = nn.Linear(vision_dim * downsample_ratio**2, dim)
++        self.w2 = nn.Linear(dim, dim)
++
++    def forward(self, x: torch.Tensor, n_h: int, n_w: int) -> torch.Tensor:
++        r = self.downsample_ratio
++        x = x.view(n_h, n_w, -1).permute(2, 0, 1)
++        x = F.pad(x, (0, -n_w % r, 0, -n_h % r))
++        x = F.unfold(x.unsqueeze(0), r, stride=r).squeeze(0).transpose(0, 1)
++        return self.w2(F.gelu(self.w1(x)))
+diff --git a/src/megatron/bridge/models/deepseek/deepseek_v41_vl_builder.py b/src/megatron/bridge/models/deepseek/deepseek_v41_vl_builder.py
+new file mode 100644
+index 000000000..da46ea4bf
+--- /dev/null
++++ b/src/megatron/bridge/models/deepseek/deepseek_v41_vl_builder.py
+@@ -0,0 +1,85 @@
++# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Model builder for DeepSeek-V4.1 with the vision tower.
++
++``DeepSeekV41VLModelBuilder`` constructs ``DeepSeekV41VLModel`` the way the legacy
++``DeepSeekV41VLModelProvider.provide`` does: the ViT and the aligner on the first
++pipeline stage, and the DeepSeek-V4.1 language model from the GPT builder (so the inner
++``GPTModel`` is built from the dsv41 block spec and the ``v41_*`` transformer config).
++"""
++
++from functools import partial
++
++from megatron.core.pipeline_parallel.utils import (
++    is_pp_first_stage,
++    is_pp_last_stage,
++    is_vp_first_stage,
++    is_vp_last_stage,
++)
++from megatron.core.process_groups_config import ProcessGroupCollection
++
++from megatron.bridge.models.deepseek.deepseek_v41_config import DeepSeekV41VLModelConfig
++from megatron.bridge.models.deepseek.deepseek_v41_vl_model import DeepSeekV41VLModel
++from megatron.bridge.models.gpt.gpt_builder import GPTModelBuilder
++
++
++class DeepSeekV41VLModelBuilder(GPTModelBuilder):
++    """Combine the DeepSeek-V4.1 language model with the ViT vision tower and the aligner."""
++
++    def build_model(
++        self,
++        pg_collection: ProcessGroupCollection,
++        pre_process: bool | None = None,
++        post_process: bool | None = None,
++        vp_stage: int | None = None,
++    ) -> DeepSeekV41VLModel:
++        """Build one DeepSeek-V4.1 VL pipeline stage.
++
++        Args:
++            pg_collection: Process groups used for distributed construction.
++            pre_process: Whether this stage owns the embeddings, the ViT and the aligner.
++            post_process: Whether this stage owns the language-model output layer.
++            vp_stage: Optional virtual pipeline stage index.
++
++        Returns:
++            A DeepSeek-V4.1 VL model stage.
++
++        Raises:
++            TypeError: If the builder was given another model config.
++        """
++        model_config = self._model_config
++        if not isinstance(model_config, DeepSeekV41VLModelConfig):
++            raise TypeError(f"Expected DeepSeekV41VLModelConfig, got {type(model_config).__name__}.")
++
++        vp_size = model_config.virtual_pipeline_model_parallel_size
++        if pre_process is None:
++            pre_process = is_vp_first_stage(vp_stage=vp_stage, vp_size=vp_size) and is_pp_first_stage(pg_collection.pp)
++        if post_process is None:
++            post_process = is_vp_last_stage(vp_stage=vp_stage, vp_size=vp_size) and is_pp_last_stage(pg_collection.pp)
++
++        model = DeepSeekV41VLModel(
++            model_config.transformer,
++            pre_process=pre_process,
++            post_process=post_process,
++            vp_stage=vp_stage,
++            model_config=model_config,
++            build_language_model=partial(super().build_model, pg_collection),
++            pg_collection=pg_collection,
++        )
++        model.freeze(freeze_vision_model=model_config.freeze_vision_model)
++        return model
++
++
++__all__ = ["DeepSeekV41VLModelBuilder"]
+diff --git a/src/megatron/bridge/models/deepseek/deepseek_v41_vl_model.py b/src/megatron/bridge/models/deepseek/deepseek_v41_vl_model.py
+new file mode 100644
+index 000000000..df061ffd4
+--- /dev/null
++++ b/src/megatron/bridge/models/deepseek/deepseek_v41_vl_model.py
+@@ -0,0 +1,182 @@
++# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++
++"""DeepSeek-V4.1 with a vision tower: ViT + aligner in front of the Megatron language model.
++
++Image tokens in ``input_ids`` all have id ``image_token_id``. Each image owns a run of them, in
++the order of ``pixel_values``. Its span is ``[image_start, features (w per row) + image_newline per
++row, image_end]``, as built by the rollout engine. The vision modules exist only on the first
++pipeline stage. Every stage still passes ``input_ids`` to the language model, because the
++DeepSeek-V4.1 router and Engram read them (see ``megatron.core...dsv41``).
++"""
++
++import torch
++import torch.distributed as dist
++import torch.nn as nn
++from megatron.core import parallel_state
++from megatron.core.tensor_parallel.mappings import scatter_to_sequence_parallel_region
++from megatron.core.transformer.module import MegatronModule
++
++from megatron.bridge.models.deepseek.deepseek_v41_vit import ViT, Aligner, image_token_types
++
++
++def merge_image_spans(
++    embeds: torch.Tensor, input_ids: torch.Tensor, image_token_id: int, spans: list[torch.Tensor]
++) -> torch.Tensor:
++    """Write ``spans`` over the image tokens of ``embeds`` ``[b, s, h]``, in row-major (pad) order."""
++    mask = input_ids == image_token_id
++    n_tokens = int(mask.sum())
++    n_span = sum(s.shape[0] for s in spans)
++    if n_tokens != n_span:
++        raise ValueError(f"input_ids has {n_tokens} image tokens but the images provide {n_span}")
++    if not spans:
++        return embeds
++    return embeds.masked_scatter(mask.unsqueeze(-1), torch.cat(spans).to(embeds.dtype))
++
++
++def select_cp_spans(spans: list[torch.Tensor], local_counts: list[int], cp_rank: int) -> list[torch.Tensor]:
++    """Keep the part of the micro-batch's image ``spans`` that falls on this context-parallel rank.
++
++    With contiguous CP each rank holds one contiguous chunk of the packed buffer, so it sees only some of the
++    image tokens, while ``spans`` cover every image of the micro-batch in token order. The chunk's image tokens
++    are therefore a contiguous run of the concatenated spans, starting after the image tokens of the lower
++    ranks. ``local_counts[r]`` is the number of image tokens in the ids of CP rank ``r``.
++    """
++    n_local = local_counts[cp_rank]
++    if n_local == 0:
++        return []
++    start = sum(local_counts[:cp_rank])
++    return [torch.cat(spans)[start : start + n_local]]
++
++
++class DeepSeekV41VLModel(MegatronModule):
++    def __init__(
++        self,
++        config,
++        pre_process: bool = True,
++        post_process: bool = True,
++        vp_stage: int | None = None,
++        *,
++        model_config=None,
++        build_language_model=None,
++        pg_collection=None,
++    ):
++        """Build the vision tower (first stage) and the DeepSeek-V4.1 language model.
++
++        Two construction contracts share this __init__:
++
++        * builder-backed: ``config`` is the transformer config, ``model_config`` is the
++          outer ``DeepSeekV41VLModelConfig`` (carries ``image_token_id`` / ``vision_config``
++          / ``share_embeddings_and_output_weights``), and ``build_language_model`` builds the
++          inner ``GPTModel`` (the GPT builder bound to its process groups);
++        * legacy provider: ``config`` is the ``DeepSeekV41VLModelProvider`` itself, which
++          also carries those fields and whose ``provide_language_model`` builds the inner model.
++          ``model_config`` / ``build_language_model`` are then left None and fall back to it.
++        """
++        super().__init__(config=config)
++        self.pre_process = pre_process
++        self.post_process = post_process
++        self.vp_stage = vp_stage
++        settings = config if model_config is None else model_config
++        self.image_token_id = settings.image_token_id
++        if pre_process:
++            cfg = settings.vision_config
++            self.downsample_ratio = cfg["downsample_ratio"]
++            self.vision = ViT(cfg)
++            self.aligner = Aligner(cfg["hidden_size"], config.hidden_size, self.downsample_ratio)
++            self.image_start = nn.Parameter(torch.zeros(config.hidden_size))
++            self.image_newline = nn.Parameter(torch.zeros(config.hidden_size))
++            self.image_end = nn.Parameter(torch.zeros(config.hidden_size))
++        if build_language_model is None:
++            build_language_model = settings.provide_language_model
++        self.language_model = build_language_model(
++            pre_process=pre_process, post_process=post_process, vp_stage=vp_stage
++        )
++        self.share_embeddings_and_output_weights = settings.share_embeddings_and_output_weights
++        self.shared_embedding_or_output_weight = self.language_model.shared_embedding_or_output_weight
++
++    def set_input_tensor(self, input_tensor) -> None:
++        self.language_model.set_input_tensor(input_tensor)
++
++    def freeze(self, freeze_vision_model: bool = True) -> None:
++        """Stop gradients for the vision tower, aligner and image marker embeddings."""
++        if self.pre_process and freeze_vision_model:
++            for module in (self.vision, self.aligner):
++                for p in module.parameters():
++                    p.requires_grad = False
++            for p in (self.image_start, self.image_newline, self.image_end):
++                p.requires_grad = False
++
++    def _image_spans(self, pixel_values: torch.Tensor, image_grid_hw: torch.Tensor) -> list[torch.Tensor]:
++        """Token spans ``[n_tokens, hidden]`` of each image, in image order."""
++        patches = pixel_values.to(self.vision.patch_embed.proj.weight.dtype)
++        r = self.downsample_ratio
++        spans, start = [], 0
++        for n_h, n_w in image_grid_hw.tolist():
++            n = n_h * n_w
++            features = self.aligner(self.vision(patches[start : start + n], n_h, n_w), n_h, n_w)
++            start += n
++            types = image_token_types(-(-n_h // r), -(-n_w // r)).to(features.device)
++            span = features.new_empty((len(types), features.shape[-1]))
++            span[types == 0] = self.image_start.to(span.dtype)
++            span[types == 1] = features
++            span[types == 2] = self.image_newline.to(span.dtype)
++            span[types == 3] = self.image_end.to(span.dtype)
++            spans.append(span)
++        if start != patches.shape[0]:
++            raise ValueError(f"image_grid_hw covers {start} patches but pixel_values has {patches.shape[0]}")
++        return spans
++
++    def _cp_local_spans(self, spans: list[torch.Tensor], input_ids: torch.Tensor) -> list[torch.Tensor]:
++        """This context-parallel rank's share of ``spans``, given its chunk of the packed ``input_ids``."""
++        pg = self.config._pg_collection
++        cp_group = getattr(pg, "cp", None)
++        if cp_group is None:
++            cp_group = parallel_state.get_context_parallel_group()
++        n_local = torch.tensor([int((input_ids == self.image_token_id).sum())], device=input_ids.device)
++        counts = [torch.zeros_like(n_local) for _ in range(dist.get_world_size(cp_group))]
++        dist.all_gather(counts, n_local, group=cp_group)
++        return select_cp_spans(spans, [int(c) for c in counts], dist.get_rank(cp_group))
++
++    def _embed(self, input_ids, pixel_values, image_grid_hw) -> torch.Tensor:
++        """Embeddings of this rank's ``input_ids`` with the images merged in, sequence-parallel scattered."""
++        embeds = self.language_model.embedding(input_ids=input_ids, position_ids=None).transpose(0, 1)
++        spans = []
++        if pixel_values is not None:
++            trainable = any(p.requires_grad for p in self.vision.parameters())
++            with torch.set_grad_enabled(torch.is_grad_enabled() and trainable):
++                spans = self._image_spans(pixel_values, image_grid_hw)
++                if self.config.context_parallel_size > 1:
++                    spans = self._cp_local_spans(spans, input_ids)
++        embeds = merge_image_spans(embeds, input_ids, self.image_token_id, spans).transpose(0, 1).contiguous()
++        if self.config.sequence_parallel:
++            pg = self.config._pg_collection
++            embeds = scatter_to_sequence_parallel_region(embeds, group=pg.tp if pg is not None else None)
++        return embeds
++
++    def forward(
++        self,
++        input_ids,
++        position_ids=None,
++        attention_mask=None,
++        pixel_values=None,
++        image_grid_hw=None,
++        **kwargs,
++    ):
++        decoder_input = self._embed(input_ids, pixel_values, image_grid_hw) if self.pre_process else None
++        return self.language_model(
++            input_ids=input_ids,
++            position_ids=position_ids,
++            attention_mask=attention_mask,
++            decoder_input=decoder_input,
++            **kwargs,
++        )
+diff --git a/src/megatron/bridge/models/deepseek/deepseek_v41_vl_provider.py b/src/megatron/bridge/models/deepseek/deepseek_v41_vl_provider.py
+new file mode 100644
+index 000000000..0c2db2bcc
+--- /dev/null
++++ b/src/megatron/bridge/models/deepseek/deepseek_v41_vl_provider.py
+@@ -0,0 +1,49 @@
++# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++
++from dataclasses import dataclass
++from typing import Any
++
++from megatron.core.models.gpt import GPTModel as MCoreGPTModel
++
++from megatron.bridge.models.mla_provider import MLAModelProvider
++
++
++@dataclass
++class DeepSeekV41VLModelProvider(MLAModelProvider):
++    """Provider for DeepSeek-V4.1 with the vision tower.
++
++    The language-model fields come from ``DeepSeekV41Bridge.provider_bridge``. The bridge picks this
++    class instead of ``MLAModelProvider`` when the HF config has a ``vision_config``.
++    """
++
++    # The image embeddings are merged into the full-sequence embeddings first, then scattered.
++    scatter_embedding_sequence_parallel: bool = False
++
++    # HF ``vision_config`` as a dict (hidden_size, num_hidden_layers, patch_size, downsample_ratio ...).
++    vision_config: Any = None
++    # Id shared by all image tokens in ``input_ids`` (HF top-level ``image_token_id``).
++    image_token_id: int = 129264
++    # The tower is trained on a fixed recipe; the rollout engine and the trainer must see the same features.
++    freeze_vision_model: bool = True
++
++    def provide(self, pre_process=None, post_process=None, vp_stage=None):
++        from megatron.bridge.models.deepseek.deepseek_v41_vl_model import DeepSeekV41VLModel
++
++        model = DeepSeekV41VLModel(self, pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
++        model.freeze(freeze_vision_model=self.freeze_vision_model)
++        return model
++
++    def provide_language_model(self, pre_process=None, post_process=None, vp_stage=None) -> MCoreGPTModel:
++        # Read by the router (expert_bias_vl), Engram and the carry plan when the block spec is built.
++        self.v41_image_token_id = self.image_token_id
++        return super().provide(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
 diff --git a/src/megatron/bridge/models/deepseek/deepseek_v4_gpt_bridge.py b/src/megatron/bridge/models/deepseek/deepseek_v4_gpt_bridge.py
 new file mode 100644
 index 000000000..bb49bde3d
