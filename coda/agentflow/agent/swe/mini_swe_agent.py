@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import os
 import platform
@@ -12,8 +13,10 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
+import httpx
 import minisweagent
 import yaml
+from openai import OpenAI
 from minisweagent.agents.default import DefaultAgent
 from minisweagent.exceptions import FormatError, InterruptAgentFlow
 from minisweagent.models import GLOBAL_MODEL_STATS
@@ -60,8 +63,34 @@ def _disable_litellm_think_extraction() -> bool:
 _disable_litellm_think_extraction()
 
 
+@functools.cache
+def _shared_http_client(keepalive_seconds: float) -> httpx.Client:
+    """Process-wide agent -> router pool, so litellm does not build a client per call."""
+    return httpx.Client(
+        limits=httpx.Limits(
+            max_connections=None, max_keepalive_connections=None, keepalive_expiry=keepalive_seconds
+        ),
+        timeout=None,
+    )
+
+
 class CodaLitellmModel(LitellmModel):
     """LitellmModel variant that preserves the assistant reply on FormatError."""
+
+    _openai_client: OpenAI | None = None
+    http_keepalive_seconds: float  # set by SWEAgent
+
+    def _query(self, messages, **kwargs):
+        """Reuse one OpenAI client per model instance over the shared HTTP pool."""
+        if self._openai_client is None:
+            model_kwargs = self.config.model_kwargs
+            self._openai_client = OpenAI(
+                api_key=model_kwargs.get("api_key"),
+                base_url=model_kwargs["api_base"],
+                http_client=_shared_http_client(self.http_keepalive_seconds),
+                max_retries=0,
+            )
+        return super()._query(messages, client=self._openai_client, **kwargs)
 
     def query(self, messages, **kwargs):
         """Query LiteLLM and preserve the raw assistant message on FormatError."""
@@ -250,6 +279,7 @@ class SWEAgent(BaseAgent):
     def __init__(
         self,
         router_url: str,
+        http_keepalive_seconds: float,
         step_limit: int = 100,
         max_response_len_per_trajectory: int = 0,
         request_timeout: int = 300,
@@ -264,6 +294,7 @@ class SWEAgent(BaseAgent):
         )
         if self.sandbox_client is None:
             raise ValueError("mini-swe agent requires data_source.sandbox")
+        self.http_keepalive_seconds = http_keepalive_seconds
         self.step_limit = step_limit
         self.request_timeout = request_timeout
         self.max_consecutive_format_errors = max_consecutive_format_errors
@@ -343,6 +374,7 @@ class SWEAgent(BaseAgent):
         env = CodaSandboxEnvironment(execute, cwd=cwd, shell_prefix=self.shell_prefix)
 
         model = get_model(config=model_cfg)
+        model.http_keepalive_seconds = self.http_keepalive_seconds
         agent = FormatErrorLimitedAgent(
             model, env,
             max_consecutive_format_errors=self.max_consecutive_format_errors,

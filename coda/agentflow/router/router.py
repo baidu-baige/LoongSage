@@ -70,6 +70,10 @@ SESSION_PROXY_ROUTES = (
 )
 
 
+class _UpstreamRequestError(Exception):
+    """Transport-level failure forwarding to a worker over aiohttp (mapped to 502)."""
+
+
 def filter_headers(headers: dict[str, str]) -> dict[str, str]:
     """Drop connection-specific upstream headers from proxied responses."""
     return {k: v for k, v in headers.items() if k.lower() not in HOP_BY_HOP}
@@ -140,6 +144,12 @@ class Router:
             timeout=config.proxy_timeout_seconds,
             limits=httpx.Limits(max_connections=self._max_connections),
         )
+        self._use_aiohttp = bool(config.use_aiohttp)
+        self._keepalive_seconds = float(config.keepalive_seconds)
+        self._upstream_keepalive_seconds = float(config.upstream_keepalive_seconds)
+        # aiohttp sessions bind to the loop they start on; built lazily on the router loop.
+        self._generate_session: Any = None
+        self._generate_session_loop: asyncio.AbstractEventLoop | None = None
         self._server: uvicorn.Server | None = None
         self._thread: threading.Thread | None = None
         self._startup_error: BaseException | None = None
@@ -593,30 +603,37 @@ class Router:
                 body_bytes = self._set_routed_dp_rank(body_bytes, slot)
                 target_url = f"{slot.worker_url.rstrip('/')}/generate"
 
-                generate_client = httpx.AsyncClient(timeout=self.config.proxy_timeout_seconds)
-                try:
-                    worker_response = await generate_client.request(
-                        method=request.method,
-                        url=target_url,
-                        headers=headers,
-                        content=body_bytes,
+                if self._use_aiohttp:
+                    content, status_code, resp_headers, media_type = await self._forward_aiohttp(
+                        request.method, target_url, headers, body_bytes
                     )
-                    content = await worker_response.aread()
-                finally:
-                    await generate_client.aclose()
-                filtered_headers = filter_headers(dict(worker_response.headers))
+                else:
+                    generate_client = httpx.AsyncClient(timeout=self.config.proxy_timeout_seconds)
+                    try:
+                        worker_response = await generate_client.request(
+                            method=request.method,
+                            url=target_url,
+                            headers=headers,
+                            content=body_bytes,
+                        )
+                        content = await worker_response.aread()
+                    finally:
+                        await generate_client.aclose()
+                    status_code = worker_response.status_code
+                    resp_headers = dict(worker_response.headers)
+                    media_type = worker_response.headers.get("content-type") or None
                 return Response(
                     content=content,
-                    status_code=worker_response.status_code,
-                    headers=filtered_headers,
-                    media_type=worker_response.headers.get("content-type") or None,
+                    status_code=status_code,
+                    headers=filter_headers(resp_headers),
+                    media_type=media_type,
                 )
             except RuntimeError as exc:
                 return JSONResponse(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                     content={"error": str(exc)},
                 )
-            except httpx.RequestError as exc:
+            except (httpx.RequestError, _UpstreamRequestError) as exc:
                 logger.error("[proxy] %s -> %s: %s", request_id, slot, exc)
                 return JSONResponse(
                     status_code=status.HTTP_502_BAD_GATEWAY,
@@ -625,6 +642,49 @@ class Router:
             finally:
                 if slot is not None:
                     self._finish_slot(slot)
+
+    def _get_generate_session(self) -> Any:
+        """Return the pooled aiohttp session for /generate, creating it on the current loop."""
+        import aiohttp
+
+        if self._generate_session is None or self._generate_session.closed:
+            self._generate_session = aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(
+                    limit=self._max_connections,
+                    keepalive_timeout=self._upstream_keepalive_seconds,
+                ),
+                timeout=aiohttp.ClientTimeout(total=self.config.proxy_timeout_seconds),
+                auto_decompress=False,  # pass upstream bytes through untouched
+            )
+            self._generate_session_loop = asyncio.get_running_loop()
+        return self._generate_session
+
+    async def _forward_aiohttp(
+        self, method: str, url: str, headers: dict[str, str], body: bytes
+    ) -> tuple[bytes, int, dict[str, str], str | None]:
+        """Forward one request over the pooled session; transport errors become 502."""
+        import aiohttp
+
+        try:
+            async with self._get_generate_session().request(method, url, headers=headers, data=body) as resp:
+                return await resp.read(), resp.status, dict(resp.headers), resp.headers.get("content-type") or None
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            raise _UpstreamRequestError(f"{type(exc).__name__}: {exc}") from exc
+
+    async def _close_generate_session(self) -> None:
+        """Close the aiohttp session on the loop that owns it (the router thread's loop)."""
+        session, loop = self._generate_session, self._generate_session_loop
+        self._generate_session = self._generate_session_loop = None
+        if session is None or session.closed:
+            return
+        try:
+            if loop is not None and loop.is_running() and loop is not asyncio.get_running_loop():
+                future = asyncio.run_coroutine_threadsafe(session.close(), loop)
+                await asyncio.wait_for(asyncio.wrap_future(future), timeout=10)
+            else:
+                await session.close()
+        except Exception as exc:
+            logger.warning("[shutdown] failed to close upstream aiohttp session: %s", exc)
 
     def _set_routed_dp_rank(self, body_bytes: bytes, slot: WorkerSlot) -> bytes:
         """Add ``routed_dp_rank`` to the /generate body so SGLang routes the request
@@ -652,7 +712,10 @@ class Router:
     def start_background(self, host: str, port: int) -> None:
         """Start uvicorn in a background thread."""
         self._server = uvicorn.Server(
-            uvicorn.Config(self.app, host=host, port=port, log_level="warning")
+            uvicorn.Config(
+                self.app, host=host, port=port, log_level="warning",
+                timeout_keep_alive=self._keepalive_seconds,
+            )
         )
         self._startup_error = None
 
@@ -686,8 +749,9 @@ class Router:
         raise RuntimeError(f"Router did not become ready within {timeout}s")
 
     async def shutdown(self) -> None:
-        """Stop uvicorn and close the upstream HTTP client."""
+        """Stop uvicorn and close the upstream HTTP clients."""
         await self._control_client.aclose()
+        await self._close_generate_session()
         if self._server is not None:
             self._server.should_exit = True
         _join_timeout = 10
