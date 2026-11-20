@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import socket
+import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -375,6 +376,26 @@ class AgentFlow:
             await self._release_sandbox(trajectory_id)
         self.trajectory_store.clear()
         await self._resources.aclose()
+
+    def delete_all_sandboxes(self, timeout_seconds: float) -> None:
+        """Delete every sandbox the driver's clients created, then stop creating.
+
+        Synchronous and loop-free so it can run from a signal handler or a ``finally``
+        around ``asyncio.run``. Covers sandboxes still being created. Gives up after
+        ``timeout_seconds``; whatever is left falls to the backend's own cleanup.
+        """
+        deadline = time.monotonic() + timeout_seconds
+        parts = []
+        for idx, client in self.ds_sandbox_clients.items():
+            if client is None:
+                continue
+            try:
+                deleted, left = client.delete_all(timeout_seconds=max(0.0, deadline - time.monotonic()))
+                parts.append(f"ds{idx}=deleted {deleted}, left {len(left)}")
+            except Exception as exc:
+                parts.append(f"ds{idx}=error({exc})")
+        if parts:
+            logger.info("[shutdown] sandbox cleanup: %s", "; ".join(parts))
 
     # -------------------------------------------------------------------------
     # Trajectory execution
