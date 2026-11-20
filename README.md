@@ -97,7 +97,7 @@ The following models have been validated with the recipes under [`conf/`](conf/)
 
 | Model | Recipes | Hardware (nodes × 8 GPUs) |
 | :--- | :--- | :--- |
-| DeepSeek-V4.1-Flash (original FP8/MXFP4 weights, QAT) | [`dsv41_flash/`](conf/dsv41_flash/): DAPO, SWE, SFT, GRPO on geo3k (single image) | H20 × 6 |
+| DeepSeek-V4.1-Flash (original FP8/MXFP4 weights, QAT) | [`dsv41_flash/`](conf/dsv41_flash/): DAPO, SWE, SFT, GRPO on geo3k (single image) and MMRB (multi-image) | H20 × 6 |
 | DeepSeek-V4.1-Flash (BF16) | [`dsv41_flash_bf16/`](conf/dsv41_flash_bf16/): DAPO, SWE | NVIDIA SM100 GPUs × 5–6, H20 × 6 |
 | DeepSeek-V4-Flash (BF16) | [`dsv4_flash_bf16/`](conf/dsv4_flash_bf16/): DAPO, SWE | H20 × 6–8, NVIDIA SM100 GPUs × 4 |
 | Qwen3-30B-A3B | [`qwen3_30b_a3b/`](conf/qwen3_30b_a3b/): DAPO, GSM8K, BCP, MOPD | H20 × 1 |

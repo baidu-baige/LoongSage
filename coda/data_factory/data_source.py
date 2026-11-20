@@ -32,7 +32,6 @@ from coda.data_factory import (
 from coda.data_factory.dataset import Dataset
 from coda.utils.checkpoint_utils import get_data_source_dir
 from coda.utils.hf_config import DEEPSEEK_V41_MODEL_TYPE, read_hf_model_type, read_image_pixel_bounds
-from coda.utils.multimodal_config import multimodal_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -184,7 +183,7 @@ class RolloutDataSource(DataSource):
     def _multimodal_keys(self) -> dict | None:
         """Return this source's `{modality: column}` mapping as a plain dict, or None when multimodal is off."""
         keys = getattr(self.dataset_config, "multimodal_keys", None)
-        if not keys or not multimodal_enabled(self.config):
+        if not keys or not self.config.multimodal.enable:
             return None
         return {str(modality): str(column) for modality, column in keys.items()}
 

@@ -33,17 +33,7 @@
 | `multimodal.enable` | `false` | 是否开启图像模态训练。开启后 Router 会加载 `hf_model_path` 的 HF processor，把每张图片展开成模型实际看到的 image pad token，训练侧再把图像张量送入模型。DeepSeek-V4.1（`model_type: deepseek_v41`）改用自带的图像处理器，按检查点 `config.json` 中的 `vision_*` 字段规划每张图。 | 除 DeepSeek-V4.1 外的模型需安装 `qwen-vl-utils`（启动时校验）。为 `false` 时任何数据源都不能设置 `dataset.multimodal_keys` 或 `dataset.max_image_tokens`。 |
 | `multimodal.modalities` | `[image]` | 启用的模态列表。 | `enable=true` 时不能为空。目前只实现 `image`，`video` / `audio` 为预留项，填写会报错。 |
 
-`multimodal.enable=true` 时 `rollout.sglang_args.enable_multimodal` 会被自动置为 `true`；若同时显式写成 `false`，会报配置错误。
-
-**DeepSeek-V4.1 的约束。** `hf_model_path` 是 DeepSeek-V4.1 检查点且 `multimodal.enable=true` 时，启动校验（`validate_multimodal_config`、`validate_vlm_parallel_config`）会拒绝：
-
-- `rollout.sglang_args.json_model_override_args` 中的 `vision_n_layers: 0`（纯文本配方会设置它，开启图像后必须保留视觉塔）。
-- `rollout.sglang_args.pp_size`、`pipeline_parallel_size` 或 `attn_cp_size` 不为 1。
-- `rollout.sglang_args.moe_a2a_backend` 不是 `none` 或 `megamoe`。
-- `rollout.sglang_args.image_processor_backend` 不是 `pil`，以保证 rollout 与训练的 patchify 完全一致。
-- `megatron.model.moe_router_fusion: true`。
-- `megatron.model.freeze_vision_model: false`。视觉塔保持冻结，训练侧与 rollout 才能看到相同的图像特征。
-- `context_parallel_size > 1` 且 `cp_partition_mode` 不是 `contiguous`。其他模型在 CP > 1 时反而不接受 `contiguous`。
+SGLang 引擎在启动时用 `multimodal.enable` 作为 `enable_multimodal` 的默认值，通常无需自己设置。`rollout.sglang_args.enable_multimodal` 里写的值优先，且不做校验：`multimodal.enable=true` 时显式写成 `false`，SGLang 会在不支持多模态的情况下启动。配置本身不会被修改。
 
 ## 2. 全异步（fully_async）
 
@@ -214,9 +204,9 @@ Agent 侧的 Router 与 tokenizer，以及 trajectory dump 等框架级能力。
 | `megatron.model.tensor_model_parallel_size` | `1` | Tensor Parallel 大小（TP）。 | 训练总卡数需能被 `TP × PP × CP` 整除，启动即校验，详见 [11.9](#119-dp-与-batch-尺寸)。 |
 | `megatron.model.pipeline_model_parallel_size` | `1` | Pipeline Parallel 大小（PP）。 | 同上，参与 `TP × PP × CP`。 |
 | `megatron.model.virtual_pipeline_model_parallel_size` | `null` | Virtual PP（VPP）大小，用于减小 PP bubble。 | 需 PP > 1。 |
-| `megatron.model.context_parallel_size` | `1` | Context Parallel 大小（CP，序列切分）。 | 与 `cp_partition_mode` 配套；参与 `TP × PP × CP`。 |
-| `megatron.model.cp_partition_mode` | `zigzag` | CP 切分方式，`zigzag` 等。 | 仅 CP > 1 时生效。`multimodal.enable=true` 且 CP > 1 时，DeepSeek-V4.1 只接受 `contiguous`，其他模型只接受 `zigzag`。 |
-| `megatron.model.freeze_vision_model` | 未设置 | 冻结视觉塔（Qwen3-VL、DeepSeek-V4.1）。 | Megatron-Bridge 对 Qwen3-VL-MoE 默认取 `True`，请显式设置；未设置时会打印 warning。DeepSeek-V4.1 开启 `multimodal.enable` 时，设为 `false` 会在启动时报错。 |
+| `megatron.model.context_parallel_size` | `1` | Context Parallel 大小（CP，序列切分）。 | 与 `cp_partition_mode` 配套；参与 `TP × PP × CP`。`multimodal.enable=true` 时，Qwen2.5-VL 要求 CP=1（启动时校验）。 |
+| `megatron.model.cp_partition_mode` | `zigzag` | CP 切分方式，`zigzag` 等。 | 仅 CP > 1 时生效。 |
+| `megatron.model.freeze_vision_model` | 未设置 | 冻结视觉塔（Qwen3-VL、DeepSeek-V4.1）。 | Megatron-Bridge 对 Qwen3-VL-MoE 默认取 `True`，请显式设置。 |
 | `megatron.model.freeze_language_model` | 未设置 | 冻结语言模型（Qwen3-VL）。 | 同上。要训练语言模型须设为 `false`。 |
 | `megatron.model.expert_model_parallel_size` | `1` | MoE 的 Expert Parallel（EP）。 | 非 MoE 模型保持 1。要求训练总卡数能被 `ETP × EP × PP` 整除。 |
 | `megatron.model.expert_tensor_parallel_size` | `null` | MoE 专家部分的 TP 大小。 | `null` 表示与 `tensor_model_parallel_size` 相同，该值即上式中的 `ETP`。 |

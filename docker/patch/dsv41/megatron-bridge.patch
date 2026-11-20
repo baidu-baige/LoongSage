@@ -932,7 +932,7 @@ new file mode 100644
 index 000000000..df061ffd4
 --- /dev/null
 +++ b/src/megatron/bridge/models/deepseek/deepseek_v41_vl_model.py
-@@ -0,0 +1,182 @@
+@@ -0,0 +1,184 @@
 +# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 +#
 +# Licensed under the Apache License, Version 2.0 (the "License");
@@ -1021,6 +1021,8 @@ index 000000000..df061ffd4
 +        self.pre_process = pre_process
 +        self.post_process = post_process
 +        self.vp_stage = vp_stage
++        # builder path: passed in; legacy provider path: carried by the provider config
++        self.pg_collection = pg_collection if pg_collection is not None else getattr(config, "_pg_collection", None)
 +        settings = config if model_config is None else model_config
 +        self.image_token_id = settings.image_token_id
 +        if pre_process:
@@ -1073,7 +1075,7 @@ index 000000000..df061ffd4
 +
 +    def _cp_local_spans(self, spans: list[torch.Tensor], input_ids: torch.Tensor) -> list[torch.Tensor]:
 +        """This context-parallel rank's share of ``spans``, given its chunk of the packed ``input_ids``."""
-+        pg = self.config._pg_collection
++        pg = self.pg_collection
 +        cp_group = getattr(pg, "cp", None)
 +        if cp_group is None:
 +            cp_group = parallel_state.get_context_parallel_group()
@@ -1094,7 +1096,7 @@ index 000000000..df061ffd4
 +                    spans = self._cp_local_spans(spans, input_ids)
 +        embeds = merge_image_spans(embeds, input_ids, self.image_token_id, spans).transpose(0, 1).contiguous()
 +        if self.config.sequence_parallel:
-+            pg = self.config._pg_collection
++            pg = self.pg_collection
 +            embeds = scatter_to_sequence_parallel_region(embeds, group=pg.tp if pg is not None else None)
 +        return embeds
 +

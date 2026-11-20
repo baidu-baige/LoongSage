@@ -27,11 +27,7 @@ from coda.backends.memory_pool import build_memory_pool
 from coda.backends.teacher_worker import TeacherWorker as BaseTeacherWorker
 from coda.utils.memory_utils import clear_memory
 from coda.utils.multimodal_tensors import move_image_table_to_device
-from coda.utils.multimodal_config import (
-    drop_dsv41_vision_if_text_only,
-    multimodal_enabled,
-    validate_vlm_parallel_config,
-)
+from coda.utils.multimodal_config import validate_vlm_parallel_config
 from coda.backends.megatron.checkpoint import load_model_weights
 import coda.backends.megatron.monkey_patch  # noqa: F401  # apply patches before any Megatron usage
 from coda.backends.megatron.mixed_precision import KeepFP32Module
@@ -179,7 +175,6 @@ class MegatronTeacherWorker(BaseTeacherWorker):
         )
 
         self.bridge = AutoBridge.from_hf_pretrained(hf_path)
-        drop_dsv41_vision_if_text_only(self.bridge.hf_pretrained.config, multimodal_enabled(self.config))
         model_config = self.bridge.get_model_config()
         # Flat setattr routes each field to the outer config or its nested transformer config and
         # raises on names neither declares; outer-config hints win on shared names.

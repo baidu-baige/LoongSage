@@ -296,13 +296,61 @@ def _symbolically_equal(pred: str, gt: str) -> bool:
     return _simplify_is_zero(diff, timeout=_SIMPLIFY_TIMEOUT_S)
 
 
+# A plain number followed by a unit written as `\text{..}` / `\mathrm{..}`, optionally squared or
+# cubed: `16.76\text{ ft}`, `100\text{ ft}^2`. A bare letter or a radical after the number is not a
+# unit (`5x`, `5\sqrt{2}`), so those never match.
+_NUMBER_WITH_UNIT = re.compile(
+    r"\s*(?P<num>-?\d+(?:\.\d+)?)\s*(?:\\,|\\ |~)?\s*"
+    r"\\(?:text|textrm|mathrm)\{[^{}]*\}\s*(?:\^\s*(?:\{\s*[23]\s*\}|[23]))?\s*"
+)
+
+
+def _is_plain_number(text: str) -> bool:
+    try:
+        float(text)
+    except ValueError:
+        return False
+    return True
+
+
+def _drop_unit(pred: str, gt: str) -> str:
+    """Return the bare number of *pred* if it is `<number><unit>` and the label is a plain number."""
+    match = _NUMBER_WITH_UNIT.fullmatch(pred)
+    if match and _is_plain_number(normalize_final_answer(gt)):
+        return match["num"]
+    return pred
+
+
+# `x \approx 5.7`: a single variable and `\approx` before the number. `\approx` is what keeps
+# normalize_final_answer from treating it like `x=5.7`.
+_VARIABLE_APPROX = re.compile(r"\s*[A-Za-z]\s*\\approx\s*(?P<rest>.+?)\s*")
+_PLAIN_NUMBER = re.compile(r"-?\d+(?:\.\d+)?")
+
+
+def _drop_variable_approx(pred: str, gt: str) -> str:
+    """Return the bare number of *pred* if it is `<letter> \\approx <number>[<unit>]` and the label is a plain number.
+
+    The number is returned unchanged, so a different rounding (`53.17` vs `53.2`) still compares
+    unequal. Anything else after the number (a second form, a remark in parentheses) leaves *pred* as is.
+    """
+    match = _VARIABLE_APPROX.fullmatch(pred)
+    if not match or not _is_plain_number(normalize_final_answer(gt)):
+        return pred
+    rest = _drop_unit(match["rest"], gt)
+    return rest.strip() if _PLAIN_NUMBER.fullmatch(rest.strip()) else pred
+
+
 def _same_answer(pred: str, gt: str) -> bool:
     """Compare two answers after normalization.
 
     Matches, in order: identical strings, equal plain numbers (270 == 270.0), and exact algebraic
     equivalence via sympy (`3\\sqrt{15}` == `\\sqrt{135}`). `\\dfrac` / `\\tfrac` are treated as `\\frac`,
-    since models and labels use them interchangeably.
+    since models and labels use them interchangeably. When the label is a plain number, a unit written
+    as `\\text{..}` after the predicted number is ignored (`100\\text{ ft}^2` == `100`), and so is a
+    `x \\approx` prefix when the number itself equals the label (`x \\approx 5.7` == `5.7`).
     """
+    pred = _drop_variable_approx(pred, gt)
+    pred = _drop_unit(pred, gt)
     pred, gt = (normalize_final_answer(_unify_fractions(s)) for s in (pred, gt))
     if pred == gt:
         return True

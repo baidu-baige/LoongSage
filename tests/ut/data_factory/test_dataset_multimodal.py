@@ -29,6 +29,28 @@ class TestBuildMessagesMultimodal(unittest.TestCase):
             ],
         )
 
+    def test_adjacent_images_get_newline_separator(self):
+        data = {"text": "<image><image><image>q", "images": [IMG_A, IMG_B, IMG_A]}
+        content = _build_messages(data, "text", KEYS)[0]["content"]
+        newline = {"type": "text", "text": "\n"}
+        self.assertEqual(
+            content,
+            [
+                {"type": "image_url", "image_url": {"url": IMG_A}},
+                newline,
+                {"type": "image_url", "image_url": {"url": IMG_B}},
+                newline,
+                {"type": "image_url", "image_url": {"url": IMG_A}},
+                {"type": "text", "text": "q"},
+            ],
+        )
+
+    def test_images_separated_by_text_get_no_extra_separator(self):
+        data = {"text": "<image>a<image>", "images": [IMG_A, IMG_B]}
+        content = _build_messages(data, "text", KEYS)[0]["content"]
+        self.assertEqual([p["type"] for p in content], ["image_url", "text", "image_url"])
+        self.assertEqual(content[1]["text"], "a")
+
     def test_multiple_placeholders_keep_order(self):
         data = {"text": "a<image>b<image>c", "images": [IMG_A, IMG_B]}
         content = _build_messages(data, "text", KEYS)[0]["content"]
@@ -225,7 +247,7 @@ class TestDatasetMaxImageTokens(unittest.TestCase):
         ds = Dataset(
             path, None, prompt_key="q", multimodal_keys=KEYS, max_image_tokens=4096, image_pixel_bounds=self.BOUNDS
         )
-        self.assertEqual([len(p.prompt[0]["content"]) for p in ds.prompts], [3, 2])
+        self.assertEqual([len(p.prompt[0]["content"]) for p in ds.prompts], [4, 2])
 
     def test_disabled_keeps_everything(self):
         path = self._write(self._records())
@@ -263,7 +285,7 @@ class TestDatasetMaxImageTokens(unittest.TestCase):
             max_image_tokens=100,
             image_token_estimator=lambda url: 100 if url == big else 1,
         )
-        self.assertEqual([len(p.prompt[0]["content"]) for p in ds.prompts], [3, 2])
+        self.assertEqual([len(p.prompt[0]["content"]) for p in ds.prompts], [4, 2])
 
 
 if __name__ == "__main__":

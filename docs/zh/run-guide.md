@@ -235,6 +235,7 @@ bash examples/start.sh qwen3_coder_30b_a3b/claude_code_h20_2node \
 
 - prompt 文本（`input_key` 对应的列）中，每张图对应一个 `<image>` 占位符。
 - `images` 列是 base64 data URI（`data:image/...;base64,...`）的列表，与占位符一一对应、顺序一致。数量不符或元素不是 data URI 时，加载阶段直接报错。
+- 连续的 `<image><image>` 在构建 messages 时会在两张图之间自动插入一个换行（`\n`）。DeepSeek-V4.1 的图像 token 之间没有起止 token，紧挨着的图像会合并成一个占位符，数量与图片数对不上。
 
 其他格式的数据集可以用 `data_pre_processor` 转换。内置的 `geo3k` 会把 [hiyouga/geometry3k](https://huggingface.co/datasets/hiyouga/geometry3k) 中的 HF 图像结构转成 data URI，并补上占位符和 `\boxed{}` 格式指令。若要限制单个 prompt 的显存占用，设置 `data_source.dataset.max_image_tokens`：图片估算 token 数之和超过该值的 prompt 会在加载时丢弃。
 
@@ -268,7 +269,7 @@ bash examples/start.sh qwen3_vl_30b_a3b/mmrb_h20_1node \
 
 两个预设都使用 TP4 x PP2、EP4，冻结视觉塔、训练语言模型（`megatron.model.freeze_vision_model: true`，`freeze_language_model: false`）。Megatron-Bridge 对 Qwen3-VL-MoE 默认把两者都置为 `True`，自己的配置里请显式写出。字段详情见 [默认配置参数手册 §1.1](config-reference.md#11-multimodal图像模态)；图像在 Router 与训练侧的流转见 `coda/agentflow/multimodal.py` 与 `coda/data_factory/data_processor.py` 中的 `put_dp_shards_to_ray`（AgentFlow 与 Controller 文档暂未发布）。
 
-**DeepSeek-V4.1（geo3k）。** [`dsv41_flash/geo3k_h20_6node`](../../conf/dsv41_flash/geo3k_h20_6node.yaml) 在 6 节点 × 8 卡 H20 上用 `boxed_math` 奖励跑 geo3k 的 GRPO，对量化后的 rollout 做 QAT（与 `dsv41_flash/` 下其他预设一致）。数据格式同上。DeepSeek-V4.1 用自带的图像处理器规划每张图，参数取自检查点 `config.json` 中的 `vision_*` 字段，因此不依赖 `qwen-vl-utils`，`multimodal.image.min_pixels/max_pixels` 也不适用。下载模型和数据：
+**DeepSeek-V4.1（geo3k）。** [`dsv41_flash/geo3k_h20_6node`](../../conf/dsv41_flash/geo3k_h20_6node.yaml) 在 6 节点 × 8 卡 H20 上用 `boxed_math` 奖励跑 geo3k 的 GRPO，对量化后的 rollout 做 QAT（与 `dsv41_flash/` 下其他预设一致）。数据格式同上。DeepSeek-V4.1 用自带的图像处理器规划每张图，参数取自检查点 `config.json` 中的 `vision_*` 字段。下载模型和数据：
 
 ```bash
 hf download deepseek-ai/DeepSeek-V4.1-Flash-1017 --local-dir /root/DeepSeek-V4.1-Flash-1017
@@ -285,7 +286,18 @@ bash examples/start.sh dsv41_flash/geo3k_h20_6node \
   data_source.dataset.eval_prompt_data_path=/root/geometry3k/data/validation-00000-of-00001.parquet
 ```
 
-预设使用 TP4 x PP6、EP8、CP1，`cp_partition_mode: contiguous`。DeepSeek-V4.1 开启 `multimodal.enable: true` 时，启动校验会拒绝破坏训推一致性的设置，例如 `image_processor_backend` 不是 `pil`、rollout 覆盖项里 `vision_n_layers: 0`、rollout 的 `pp_size` 或 `attn_cp_size` 大于 1、`freeze_vision_model: false`。完整列表见 [默认配置参数手册 §1.1](config-reference.md#11-multimodal图像模态)。
+**DeepSeek-V4.1（MMRB 多图）。** [`dsv41_flash/mmrb_h20_6node`](../../conf/dsv41_flash/mmrb_h20_6node.yaml) 在同样的 6 节点 × 8 卡 H20 上用 `boxed_math` 奖励训练多图 MMRB 数据，并丢弃图片超过 15000 token 的样本（`max_image_tokens`）。DeepSeek-V4.1 的估算值来自检查点的 `vision_*` 配置，而不是 `preprocessor_config.json` 的像素上下限。15000 沿用自 Qwen3-VL 的 MMRB 预设，没有针对 DeepSeek-V4.1 单独调过；按这个值，训练集 3922 条中丢弃 69 条，验证集 248 条中丢弃 1 条。数据集的 `images` 列已是上述格式，因此不设置 `data_pre_processor`。模型下载同上，数据下载并启动：
+
+```bash
+hf download loongsage/MMRB --include "*.parquet" --repo-type=dataset --local-dir /root/MMRB
+bash examples/start.sh dsv41_flash/mmrb_h20_6node \
+  checkpoint_path=/root/ckpt/dsv41_mmrb \
+  hf_model_path=/root/DeepSeek-V4.1-Flash-1017 \
+  data_source.dataset.prompt_data_path=/root/MMRB/train.parquet \
+  data_source.dataset.eval_prompt_data_path=/root/MMRB/validation.parquet
+```
+
+两个 DeepSeek-V4.1 预设都使用 TP4 x PP6、EP8、CP1，`cp_partition_mode: contiguous`。字段详情见 [默认配置参数手册 §1.1](config-reference.md#11-multimodal图像模态)。
 
 提示：各预设继承 [`default.yaml`](../../conf/default.yaml)，[`conf/qwen3_30b_a3b/`](../../conf/qwen3_30b_a3b/) 这类子目录是特定模型与机型的预设。更多可用配置见 [`conf/`](../../conf/)。
 
@@ -515,6 +527,7 @@ checkpoint_path/
 | | `swe_h20_6node` | DeepSeek-V4.1-Flash（原始权重，QAT） | mini-SWE（R2E-Gym）| 6 节点 xH20 |
 | | `sft_h20_6node` | DeepSeek-V4.1-Flash（原始权重，QAT） | SFT | 6 节点 xH20 |
 | | `geo3k_h20_6node` | DeepSeek-V4.1-Flash（原始权重，QAT） | GRPO geo3k 单图（任务八） | 6 节点 xH20 |
+| | `mmrb_h20_6node` | DeepSeek-V4.1-Flash（原始权重，QAT） | GRPO MMRB 多图（任务八） | 6 节点 xH20 |
 
 
 ## 相关文档
