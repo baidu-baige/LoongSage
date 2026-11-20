@@ -1621,22 +1621,25 @@ def test_delete_all_sandboxes_covers_driver_clients(caplog):
     with caplog.at_level("INFO", logger="coda.agentflow.agent_flow"):
         AgentFlow.delete_all_sandboxes(_cleanup_stub({0: client, 1: None}), timeout_seconds=9)
 
-    client.delete_all.assert_called_once_with()
-    assert "ds0=deleted 3, failed 1" in caplog.text
+    (timeout,) = client.delete_all.call_args.kwargs.values()
+    assert 0 < timeout <= 9
+    assert "ds0=deleted 3, left 1" in caplog.text
 
 
-def test_delete_all_sandboxes_gives_up_after_timeout(caplog):
-    import threading
-    release = threading.Event()
-    slow = MagicMock()
-    slow.delete_all.side_effect = lambda: release.wait(10) and (0, [])
+def test_delete_all_sandboxes_shares_one_deadline_across_clients():
+    import time
 
-    try:
-        with caplog.at_level("INFO", logger="coda.agentflow.agent_flow"):
-            AgentFlow.delete_all_sandboxes(_cleanup_stub({0: slow}), timeout_seconds=0.2)
-    finally:
-        release.set()
-    assert "ds0=timed out" in caplog.text
+    seen = []
+
+    def slow(timeout_seconds):
+        seen.append(timeout_seconds)
+        time.sleep(0.3)
+        return 0, []
+
+    clients = {i: MagicMock(**{"delete_all.side_effect": slow}) for i in range(2)}
+    AgentFlow.delete_all_sandboxes(_cleanup_stub(clients), timeout_seconds=1)
+
+    assert seen[1] <= seen[0] - 0.25
 
 
 def test_delete_all_sandboxes_reports_errors_and_noop_without_clients(caplog):

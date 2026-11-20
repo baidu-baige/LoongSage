@@ -11,6 +11,7 @@ import threading
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import wait as wait_futures
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -85,11 +86,13 @@ class SandboxClient(ABC):
         with lock:
             return sorted(live)
 
-    def delete_all(self, max_workers: int = 32) -> tuple[int, list[str]]:
-        """Close the client and delete every tracked sandbox.
+    def delete_all(self, timeout_seconds: float | None = None, max_workers: int = 32) -> tuple[int, list[str]]:
+        """Close the client and delete every tracked sandbox, in parallel.
+
+        Gives up waiting after ``timeout_seconds`` (None waits for all deletes).
 
         Returns:
-            (number deleted, ids whose delete raised).
+            (number deleted, ids still tracked: their delete raised or did not finish).
         """
         lock, live = self._live_state()
         with lock:
@@ -98,15 +101,18 @@ class SandboxClient(ABC):
         if not pending:
             return 0, []
 
-        def _delete(sandbox_id: str) -> str | None:
+        def _delete(sandbox_id: str) -> None:
             try:
                 self.delete(sandbox_id)
             except Exception as exc:
                 logger.warning("delete_all: delete %s failed: %s", sandbox_id, exc)
-                return sandbox_id
+                return
             self._untrack(sandbox_id)
-            return None
 
-        with ThreadPoolExecutor(max_workers=max(1, min(max_workers, len(pending)))) as pool:
-            failed = [sid for sid in pool.map(_delete, pending) if sid is not None]
-        return len(pending) - len(failed), failed
+        pool = ThreadPoolExecutor(max_workers=max(1, min(max_workers, len(pending))))
+        try:
+            wait_futures([pool.submit(_delete, sid) for sid in pending], timeout=timeout_seconds)
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+        left = self.live_sandboxes()
+        return len(pending) - len(left), left

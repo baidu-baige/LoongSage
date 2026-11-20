@@ -242,9 +242,9 @@ def test_delete_all_deletes_tracked_and_closes() -> None:
     client = _TrackingClient()
     ids = [client.create(image="x") for _ in range(5)]
 
-    deleted, failed = client.delete_all(max_workers=2)
+    deleted, left = client.delete_all(max_workers=2)
 
-    assert (deleted, failed) == (5, [])
+    assert (deleted, left) == (5, [])
     assert sorted(client.deleted) == sorted(ids)
     assert client.live_sandboxes() == []
     assert client.closed is True
@@ -257,10 +257,33 @@ def test_delete_all_reports_failures_and_keeps_them_tracked() -> None:
     for _ in range(3):
         client.create(image="x")
 
-    deleted, failed = client.delete_all()
+    deleted, left = client.delete_all()
 
-    assert (deleted, failed) == (2, ["sbx-2"])
+    assert (deleted, left) == (2, ["sbx-2"])
     assert client.live_sandboxes() == ["sbx-2"]
+
+
+def test_delete_all_gives_up_after_timeout() -> None:
+    import threading
+    import time
+
+    release = threading.Event()
+
+    class _Slow(_TrackingClient):
+        def delete(self, sandbox_id: str, **kwargs: Any) -> None:
+            release.wait(10)
+            super().delete(sandbox_id)
+
+    client = _Slow()
+    client.create(image="x")
+    start = time.monotonic()
+    try:
+        deleted, left = client.delete_all(timeout_seconds=0.2)
+    finally:
+        release.set()
+
+    assert time.monotonic() - start < 2
+    assert (deleted, left) == (0, ["sbx-1"])
 
 
 def test_delete_all_on_untouched_client_is_a_noop() -> None:

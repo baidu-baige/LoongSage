@@ -7,9 +7,9 @@ import json
 import logging
 import os
 import socket
+import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import wait as wait_futures
 from datetime import datetime
 from typing import Any
 
@@ -384,26 +384,18 @@ class AgentFlow:
         around ``asyncio.run``. Covers sandboxes still being created. Gives up after
         ``timeout_seconds``; whatever is left falls to the backend's own cleanup.
         """
-        clients = [c for c in self.ds_sandbox_clients.values() if c is not None]
-        if not clients:
-            return
-        pool = ThreadPoolExecutor(max_workers=len(clients))
-        try:
-            jobs = {f"ds{idx}": pool.submit(client.delete_all)
-                    for idx, client in self.ds_sandbox_clients.items() if client is not None}
-            done, _ = wait_futures(jobs.values(), timeout=timeout_seconds)
-            parts = []
-            for name, fut in jobs.items():
-                if fut not in done:
-                    parts.append(f"{name}=timed out")
-                elif fut.exception() is not None:
-                    parts.append(f"{name}=error({fut.exception()})")
-                else:
-                    deleted, failed = fut.result()
-                    parts.append(f"{name}=deleted {deleted}, failed {len(failed)}")
+        deadline = time.monotonic() + timeout_seconds
+        parts = []
+        for idx, client in self.ds_sandbox_clients.items():
+            if client is None:
+                continue
+            try:
+                deleted, left = client.delete_all(timeout_seconds=max(0.0, deadline - time.monotonic()))
+                parts.append(f"ds{idx}=deleted {deleted}, left {len(left)}")
+            except Exception as exc:
+                parts.append(f"ds{idx}=error({exc})")
+        if parts:
             logger.info("[shutdown] sandbox cleanup: %s", "; ".join(parts))
-        finally:
-            pool.shutdown(wait=False, cancel_futures=True)
 
     # -------------------------------------------------------------------------
     # Trajectory execution
