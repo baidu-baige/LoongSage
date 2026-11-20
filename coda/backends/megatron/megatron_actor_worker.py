@@ -35,6 +35,7 @@ from coda.algorithms.kl_policy import build_kl_policies
 from coda.backends.megatron.teacher_lm_head import TeacherLMHeads
 from coda.backends.megatron import qat
 from coda.utils.hf_ckpt import save_like_source
+from coda.utils.packing import build_packer
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +119,9 @@ class MegatronActorWorker(MegatronTrainWorker):
         # active policy needs teacher logits (full_kl/full_jsd). The
         # TeacherLMHeads singleton owns the lm_head lifecycle (last PP stage only).
         self.kl_policies = self._init_kl_policies()
+
+        # Step 9.5: micro-batch packer (trainer.packer), rows if it cannot run on this model
+        self.packer = build_packer(config, self.model)
 
         # forward-only also uses the backuper as its param offloader (no DDP buffers).
         if self._forward_only or config.algorithm.ref_kl.enable:
@@ -466,8 +470,9 @@ class MegatronActorWorker(MegatronTrainWorker):
         which model weights are live and which ``pg_policy`` (if any) is applied.
         Recovers the original Segment-row order under dynamic / padded batching.
         """
+        packer = self.packer if self.packer.applies(pg_policy=pg_policy) else None
         data_iterator, num_microbatches_list = get_data_iterator(
-            self.config.trainer, self.model, rollout_data
+            self.config.trainer, self.model, rollout_data, packer=packer,
         )
 
         collected_all: dict[str, list[torch.Tensor]] = {}
@@ -477,6 +482,7 @@ class MegatronActorWorker(MegatronTrainWorker):
                 data_iterator=data_iterator,
                 num_microbatches=num_microbatches,
                 pg_policy=pg_policy,
+                packer=packer,
             )
             for mb in forward_data_store:
                 for key, values in mb.items():
@@ -605,7 +611,7 @@ class MegatronActorWorker(MegatronTrainWorker):
             rollout_data: The complete rollout batch for this DP rank.
         """
         data_iterator, num_microbatches = get_data_iterator(
-            self.config.trainer, self.model, rollout_data
+            self.config.trainer, self.model, rollout_data, packer=self.packer,
         )
         global_padding_count, global_padding_ratio = (
             data_iterator[0].get_global_padding_stats()
@@ -624,6 +630,7 @@ class MegatronActorWorker(MegatronTrainWorker):
                 num_microbatches=num_microbatches[index],
                 gkd_policy=self.kl_policies.get("gkd"),
                 qat_plan=self._quant if self._quant.qat else None,
+                packer=self.packer,
             )
             if is_main_rank():
                 for k, v in metrics.items():

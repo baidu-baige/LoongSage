@@ -28,6 +28,7 @@ from coda.utils.checkpoint_utils import get_tracker_file, resolve_dist_ckpt_dir,
 from coda.utils.tracking import configure_tracking, time_marker, TimeMarkerAcc, track
 from coda.utils import logging_utils
 from coda.utils.multimodal_config import validate_multimodal_config
+from coda.utils.packing import build_packer
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +84,8 @@ class Trainer:
         self.dp_size = train_world_size // num_gpu_per_dp
         self.is_sft = Mode(self.config.run_mode) == Mode.SFT
         self._validate_config()
+        # Driver-side packer: only its DP loads are used here (workers build their own).
+        self.packer = build_packer(self.config)
         self.is_colocated = self.config.colocate
         self.is_fully_async = self.config.fully_async.enable
         self._init_tracking()

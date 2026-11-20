@@ -16,6 +16,7 @@ All three share CP-slicing and sequence packing logic via
 from __future__ import annotations
 
 import logging
+from contextlib import nullcontext
 from functools import partial
 from collections.abc import Sequence
 from typing import Any, Callable
@@ -43,6 +44,7 @@ from coda.backends.megatron.data import DataIterator
 from coda.backends.megatron.loss import loss_function
 from coda.backends.megatron.logits_utils import compute_log_probs
 from coda.utils.multimodal_tensors import merge_multimodal_batch
+from coda.utils.packing import MicroBatchPacker, PackedInputs, row_outputs
 from coda.backends.megatron.kl_ctx import (
     KLCtx,
     TeacherCtx,
@@ -181,19 +183,23 @@ def collect_replay_routers(model_chunk: torch.nn.Module) -> dict[int, RouterRepl
     return routers
 
 
+def _r3_rows(batch: dict, model_chunk: torch.nn.Module) -> list[torch.Tensor]:
+    """Per-row routed experts reshaped to ``[seq, num_layers, topk]``.
+
+    Rows arrive as read-only numpy views of the Ray object store (see put_dp_shards_to_ray).
+    """
+    mc = get_model_config(model_chunk)
+    return [torch.as_tensor(seq).reshape(len(seq), mc.num_layers, mc.moe_router_topk)
+            for seq in batch["rollout_routed_experts"]]
+
+
 def setup_routing_replay(config: DictConfig, batch: dict, model_chunk: torch.nn.Module):
     """
     Extract routing data from batch and setup Megatron RouterReplay for the current model chunk.
     Only sets replay data for the routers that live in `model_chunk` (its PP/VP stage).
     """
     model_config = get_model_config(model_chunk)
-    # Rows arrive as read-only numpy views of the Ray object store (see put_dp_shards_to_ray).
-    rollout_routed_experts = [
-        torch.as_tensor(seq).reshape(len(seq), model_config.num_layers, model_config.moe_router_topk)
-        for seq in batch["rollout_routed_experts"]
-    ]
-
-    packed_experts = prepare_routing_replay_data(rollout_routed_experts, model_config)
+    packed_experts = prepare_routing_replay_data(_r3_rows(batch, model_chunk), model_config)
 
     routers = collect_replay_routers(model_chunk)
     assert routers, "Routing replay is enabled but no live RouterReplay was found in the model chunk"
@@ -277,6 +283,15 @@ def _multimodal_forward_kwargs(batch: dict, image_table: dict | None) -> dict[st
     """
     return merge_multimodal_batch(batch.get("multimodal_train_inputs"), image_table) or {}
 
+
+def _packer_inputs(packer: MicroBatchPacker | None, batch: dict, model_chunk: torch.nn.Module,
+                   mb_key: int, training: bool) -> PackedInputs | None:
+    """The packer's inputs for this micro-batch, or None for the row path."""
+    if packer is None:
+        return None
+    return packer.pack(batch, model_chunk, mb_key, training=training,
+                       routed_rows=lambda: _r3_rows(batch, model_chunk))
+
 # ════════════════════════════════════════════════════════════════════════
 # Forward-only
 # ════════════════════════════════════════════════════════════════════════
@@ -296,6 +311,11 @@ def compute_forward_only_outputs(
     cp_partition_mode = config.megatron.model.cp_partition_mode
 
     collected = {}
+    outputs = row_outputs(packed_seq_params)
+    if outputs is not None:
+        # packer layout (no PG policy, see MicroBatchPacker.applies)
+        collected["log_probs"] = outputs.log_probs(output_tensor, temperature)
+        return torch.tensor(0.0, device=output_tensor.device), collected
     collected["log_probs"] = compute_log_probs(
         packed_targets,
         total_lengths,
@@ -331,6 +351,7 @@ def forward_only(
     num_microbatches: int,
     pg_policy=None,
     output_fn: Callable = compute_forward_only_outputs,
+    packer: MicroBatchPacker | None = None,
 ) -> list[dict[str, list[torch.Tensor]]]:
     """Run forward passes only and collect non-loss outputs (e.g., logprobs, PG KL).
 
@@ -344,6 +365,8 @@ def forward_only(
             :func:`compute_forward_only_outputs` (the default), i.e.
             ``(packed_targets, batch, packed_seq_params, config, pg_policy,
             output_tensor) -> (loss, collected)``.
+        packer: Micro-batch packer (None: rows); must match the one that built
+            ``data_iterator``.
 
     Returns:
         List of per-microbatch dicts, each mapping output names (``"log_probs"``
@@ -359,39 +382,48 @@ def forward_only(
             "tokens", "total_lengths", "response_lengths", "rollout_routed_experts", "multimodal_train_inputs",
         ]
         fetch_keys += teacher_keys
+        if packer is not None:
+            fetch_keys += packer.extra_keys()
         batch = data_iter.get_next(fetch_keys)
         tokens_list: list[torch.Tensor] = batch["tokens"]
 
         # 2. CP-slice and pack (partition mode threaded to keep zigzag/contiguous consistent)
         cp_partition_mode = config.megatron.model.cp_partition_mode
-        packed_tokens, packed_seq_params = prepare_packed_seq_params(
-            tokens_list, cp_partition_mode=cp_partition_mode,
-        )
-        target_list = [
-            torch.cat([t[1:], t.new_full((1,), 0)])
-            for t in tokens_list
-        ]
-        packed_targets, _ = prepare_packed_seq_params(
-            target_list, cp_partition_mode=cp_partition_mode,
-        )
-        position_ids = _get_position_ids(
-            model_chunk, tokens_list, packed_tokens, cp_partition_mode,
-            multimodal_rows=batch.get("multimodal_train_inputs"),
-            image_table=data_iter.image_table,
-        )
+        inputs = _packer_inputs(packer, batch, model_chunk, data_iter.offset, training=False)
+        if inputs is not None:
+            packed_tokens, packed_seq_params = inputs.tokens, inputs.packed_seq_params
+            position_ids = inputs.position_ids
+            packed_targets = None   # row_outputs carries the targets
+        else:
+            packed_tokens, packed_seq_params = prepare_packed_seq_params(
+                tokens_list, cp_partition_mode=cp_partition_mode,
+            )
+            target_list = [
+                torch.cat([t[1:], t.new_full((1,), 0)])
+                for t in tokens_list
+            ]
+            packed_targets, _ = prepare_packed_seq_params(
+                target_list, cp_partition_mode=cp_partition_mode,
+            )
+            position_ids = _get_position_ids(
+                model_chunk, tokens_list, packed_tokens, cp_partition_mode,
+                multimodal_rows=batch.get("multimodal_train_inputs"),
+                image_table=data_iter.image_table,
+            )
 
         # Handle Routing Replay (Forward Only)
         if config.trainer.use_rollout_routing_replay:
-            setup_routing_replay(config, batch, model_chunk)
+            setup_routing_replay(config, inputs.replay_batch if inputs else batch, model_chunk)
 
         # 3. Model forward
-        output = model_chunk(
-            input_ids=packed_tokens.unsqueeze(0),
-            position_ids=position_ids,
-            attention_mask=None,
-            packed_seq_params=packed_seq_params,
-            **_multimodal_forward_kwargs(batch, data_iter.image_table),
-        )
+        with inputs.forward_ctx if inputs else nullcontext():
+            output = model_chunk(
+                input_ids=packed_tokens.unsqueeze(0),
+                position_ids=position_ids,
+                attention_mask=None,
+                packed_seq_params=packed_seq_params,
+                **_multimodal_forward_kwargs(batch, data_iter.image_table),
+            )
 
         if config.trainer.use_rollout_routing_replay:
             RouterReplay.clear_global_indices()
@@ -434,6 +466,7 @@ def train_minibatch(
     gkd_policy=None,
     qat_plan=None,
     loss_fn: Callable = loss_function,
+    packer: MicroBatchPacker | None = None,
 ) -> dict[str, float]:
     """Execute a single pipeline-parallel training step.
 
@@ -452,7 +485,7 @@ def train_minibatch(
 
     Returns:
         ``loss_dict`` — aggregated/normalized metrics with ``grad_norm`` folded
-        in (empty on non-last PP stages).
+        in (empty on non-last PP stages), plus the ``packer`` metrics.
     """
     # Detect teacher fields from rollout_data (populated by collect_teacher).
     teacher_keys = [k for k in data_iterator[0].rollout_data if k.startswith("teacher_")]
@@ -484,34 +517,42 @@ def train_minibatch(
             "multimodal_train_inputs",
         ]
         keys += teacher_keys
+        if packer is not None:
+            keys += packer.extra_keys()
 
         batch = data_iter.get_next(keys)
         tokens_list: list[torch.Tensor] = batch["tokens"]
 
         # 2. CP-slice and pack (partition mode threaded to keep zigzag/contiguous consistent)
         cp_partition_mode = config.megatron.model.cp_partition_mode
-        packed_tokens, packed_seq_params = prepare_packed_seq_params(
-            tokens_list,
-            cp_partition_mode=cp_partition_mode,
-        )
-        position_ids = _get_position_ids(
-            model_chunk, tokens_list, packed_tokens, cp_partition_mode,
-            multimodal_rows=batch.get("multimodal_train_inputs"),
-            image_table=data_iter.image_table,
-        )
+        inputs = _packer_inputs(packer, batch, model_chunk, data_iter.offset, training=True)
+        if inputs is not None:
+            packed_tokens, packed_seq_params = inputs.tokens, inputs.packed_seq_params
+            position_ids = inputs.position_ids
+        else:
+            packed_tokens, packed_seq_params = prepare_packed_seq_params(
+                tokens_list,
+                cp_partition_mode=cp_partition_mode,
+            )
+            position_ids = _get_position_ids(
+                model_chunk, tokens_list, packed_tokens, cp_partition_mode,
+                multimodal_rows=batch.get("multimodal_train_inputs"),
+                image_table=data_iter.image_table,
+            )
 
         # Handle Routing Replay (Train)
         if config.trainer.use_rollout_routing_replay:
-            setup_routing_replay(config, batch, model_chunk)
+            setup_routing_replay(config, inputs.replay_batch if inputs else batch, model_chunk)
 
         # 3. Model forward
-        output = model_chunk(
-            input_ids=packed_tokens.unsqueeze(0),
-            position_ids=position_ids,
-            attention_mask=None,
-            packed_seq_params=packed_seq_params,
-            **_multimodal_forward_kwargs(batch, data_iter.image_table),
-        )
+        with inputs.forward_ctx if inputs else nullcontext():
+            output = model_chunk(
+                input_ids=packed_tokens.unsqueeze(0),
+                position_ids=position_ids,
+                attention_mask=None,
+                packed_seq_params=packed_seq_params,
+                **_multimodal_forward_kwargs(batch, data_iter.image_table),
+            )
         if config.trainer.use_rollout_routing_replay:
             RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_BACKWARD)
 
@@ -561,11 +602,14 @@ def train_minibatch(
             # master: validate_config turns off store_param_remainders under QAT.
             qat_plan.snap_()
 
-    return _collect_loss_metrics(
+    metrics = _collect_loss_metrics(
         config,
         losses,
         grad_norm.item(),
     )
+    if packer is not None:
+        packer.step_metrics(step, metrics)
+    return metrics
 
 
 # ════════════════════════════════════════════════════════════════════════

@@ -24,6 +24,7 @@ from coda.backends.megatron.data import (
     merge_rollout_batch,
     slice_rollout_batch,
 )
+from coda.utils.packing import MicroBatchPacker, PackPlan
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -759,3 +760,74 @@ class TestGetDataIteratorDynamic:
         with patch("coda.backends.megatron.data.dist.all_reduce"):
             with pytest.raises(AssertionError):
                 _iter(cfg, MagicMock(), data)
+
+
+class _GroupPacker(MicroBatchPacker):
+    """Packs each trajectory's rows as one item costed by its last row's length."""
+
+    def __init__(self, lm_budget=None, max_budget=None):
+        super().__init__(MagicMock())
+        self.lm_budget, self.max_budget = lm_budget, max_budget
+
+    def plan(self, rollout_data, mini_batch_ranges, max_budget):
+        ranges = _data_mod._trajectory_row_ranges(rollout_data["dp_local_traj_idx"])
+        rows, costs, lms = [], [], []
+        for s, e in mini_batch_ranges:
+            items = [list(range(a, b)) for a, b in ranges if s <= a and b <= e]
+            rows.append(items)
+            costs.append([rollout_data["total_lengths"][it[-1]] for it in items])
+            lms.append([len(it) for it in items])
+        return PackPlan(rows, costs, self.max_budget or max_budget, lms, self.lm_budget)
+
+
+class TestGetDataIteratorPacker:
+    """``packer.plan`` replaces single-row items; the built-in packer keeps the row path."""
+
+    def _cfg(self, max_tokens_per_gpu, mini_batch_size=4):
+        return TestGetDataIteratorDynamic()._make_config(
+            mini_batch_size=mini_batch_size, max_tokens_per_gpu=max_tokens_per_gpu)
+
+    def test_rows_packer_matches_no_packer(self):
+        _set_parallel(dp_size=1, cp_size=1, vpp_size=None)
+        data = _make_segment_rollout([[100, 200], [150], [250, 50, 75], [300]])
+        cfg = self._cfg(max_tokens_per_gpu=400)
+        with patch("coda.backends.megatron.data.dist.all_reduce"):
+            base, base_n = _iter(cfg, MagicMock(), data)
+            rows, rows_n = _iter(cfg, MagicMock(), data, packer=MicroBatchPacker(MagicMock()))
+        assert rows_n == base_n
+        assert rows[0].micro_batch_indices == base[0].micro_batch_indices
+
+    def test_plan_items_keep_their_rows_together(self):
+        _set_parallel(dp_size=1, cp_size=1, vpp_size=None)
+        data = _make_segment_rollout([[10, 20], [30], [40, 50, 60], [70]])
+        cfg = self._cfg(max_tokens_per_gpu=130)
+        with patch("coda.backends.megatron.data.dist.all_reduce"):
+            iterators, num_mbs = _iter(cfg, MagicMock(), data, packer=_GroupPacker())
+        # item costs [20, 30, 60, 70] under 130 -> 2 balanced micro-batches of 90
+        assert num_mbs == [2]
+        batches = iterators[0].micro_batch_indices
+        assert sorted(map(tuple, batches)) == [(0, 1, 6), (2, 3, 4, 5)]
+
+    def test_plan_lm_budget_adds_micro_batches(self):
+        _set_parallel(dp_size=1, cp_size=1, vpp_size=None)
+        data = _make_segment_rollout([[10, 20], [30], [40, 50, 60], [70]])
+        cfg = self._cfg(max_tokens_per_gpu=1000)
+        with patch("coda.backends.megatron.data.dist.all_reduce"):
+            iterators, num_mbs = _iter(cfg, MagicMock(), data, packer=_GroupPacker(lm_budget=3))
+        # 7 rows, at most 3 per micro-batch -> 3 micro-batches
+        assert num_mbs == [3]
+        assert all(len(b) <= 3 for b in iterators[0].micro_batch_indices)
+
+    def test_plan_rounds_vpp_up(self):
+        _set_parallel(dp_size=1, cp_size=1, vpp_size=2)
+        data = _make_segment_rollout([[10], [20], [30], [40]])
+        cfg = self._cfg(max_tokens_per_gpu=40)
+        mock_cfg = MagicMock()
+        mock_cfg.microbatch_group_size_per_vp_stage = 2
+        with patch("coda.backends.megatron.data.dist.all_reduce"), \
+                patch("coda.backends.megatron.data.get_model_config", return_value=mock_cfg):
+            _, base_n = _iter(cfg, MagicMock(), data)
+            _, plan_n = _iter(cfg, MagicMock(), data, packer=_GroupPacker())
+        # first fit needs 3: rows floor to 2, a plan rounds up to 4
+        assert base_n == [2]
+        assert plan_n == [4]

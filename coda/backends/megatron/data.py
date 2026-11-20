@@ -23,6 +23,7 @@ from omegaconf import DictConfig
 
 from megatron.core.utils import get_model_config
 from coda.utils.multimodal_tensors import move_image_table_to_device
+from coda.utils.packing import MicroBatchPacker
 from coda.utils.seqlen_balancing import get_seqlen_balanced_partitions
 from coda.utils.types import RolloutBatch
 
@@ -361,6 +362,31 @@ def _get_min_num_microbatches(total_lengths: list[int], max_tokens_per_gpu: int)
     return len(batches)
 
 
+def _partition_items(costs: list[int], lms: list[int] | None, k: int,
+                     lm_budget: int | None) -> list[list[int]]:
+    """Balanced partition into ``k`` micro-batches by cost; if a micro-batch exceeds the
+    logit-row budget, balance both loads (each normalized) instead."""
+    parts = get_seqlen_balanced_partitions(costs, k, equal_size=False)
+    if lm_budget is None or all(sum(lms[i] for i in p) <= lm_budget for p in parts):
+        return parts
+    nb = max(max(costs), 1)
+    key = [int(1e6 * (c / nb + m / lm_budget)) + 1 for c, m in zip(costs, lms)]
+    return get_seqlen_balanced_partitions(key, k, equal_size=False)
+
+
+def _num_microbatches(costs: list[int], lms: list[int] | None, max_budget: int,
+                      lm_budget: int | None) -> int:
+    """Fewest micro-batches (first-fit on cost) whose partition fits the logit-row budget."""
+    k = _get_min_num_microbatches(costs, max_budget)
+    if lm_budget is None:
+        return k
+    k = max(k, _get_min_num_microbatches(lms, lm_budget))
+    while k < len(costs) and any(
+            sum(lms[i] for i in p) > lm_budget for p in _partition_items(costs, lms, k, lm_budget)):
+        k += 1
+    return k
+
+
 def _trajectory_row_ranges(dp_local_traj_idxs: list[int]) -> list[tuple[int, int]]:
     """Group contiguous equal ``dp_local_traj_idx`` rows into [start, end) ranges.
 
@@ -383,6 +409,7 @@ def get_data_iterator(
     model: torch.nn.Module | Sequence[torch.nn.Module],
     rollout_data: RolloutBatch,
     use_single_mini_batch: bool = False,
+    packer: MicroBatchPacker | None = None,
 ) -> tuple[list[DataIterator], list[int]]:
     """Build data iterators and per minibatch num_microbatches for a rollout.
 
@@ -394,6 +421,8 @@ def get_data_iterator(
         rollout_data: The complete rollout batch for this DP rank.
         use_single_mini_batch: Treat the whole DP shard as one mini-batch instead
             of splitting it by ``config.mini_batch_size``.
+        packer: Micro-batch packer whose ``plan`` (dynamic batching only) replaces
+            bin-packing single rows by token count.
 
     Returns:
         ``(data_iterators, num_microbatches_list)``
@@ -480,11 +509,19 @@ def get_data_iterator(
     max_budget = config.max_tokens_per_gpu * cp_size
     all_num_microbatches: list[int] = []
 
+    # Items to bin-pack: the packer's plan, or single rows costed by tokens.
+    plan = packer.plan(rollout_data, mini_batch_ranges, max_budget) if packer is not None else None
+    if plan is None:
+        item_rows = [[[r] for r in range(s, e)] for s, e in mini_batch_ranges]
+        item_costs = [list(total_lengths[s:e]) for s, e in mini_batch_ranges]
+        item_lms, lm_budget = [None] * len(mini_batch_ranges), None
+    else:
+        item_rows, item_costs, max_budget = plan.item_rows, plan.item_costs, plan.max_budget
+        item_lms, lm_budget = plan.item_lms or [None] * len(item_rows), plan.lm_budget
+
     # Partition each mini-batch's Segments into micro-batches
-    for start, end in mini_batch_ranges:
-        all_num_microbatches.append(
-            _get_min_num_microbatches(total_lengths[start:end], max_budget)
-        )
+    for costs, lms in zip(item_costs, item_lms):
+        all_num_microbatches.append(_num_microbatches(costs, lms, max_budget, lm_budget))
 
     # Sync max num_microbatches across DP ranks
     num_microbatches_tensor = torch.tensor(all_num_microbatches, dtype=torch.int, device=torch.cuda.current_device())
@@ -495,26 +532,30 @@ def get_data_iterator(
         # microbatch_group_size_per_vp_stage
         _megatron_cfg = get_model_config(model[0])
         microbatch_group_size_per_vp_stage = _megatron_cfg.microbatch_group_size_per_vp_stage
-        # Floor-divide to the nearest multiple of microbatch_group_size_per_vp_stage so
-        # that VPP scheduling constraints are satisfied.  This may reduce num_microbatches
-        # below the value required to keep each microbatch within max_budget, meaning
-        # individual microbatches could exceed the token budget and risk OOM.
-        num_microbatches_tensor = torch.clamp(
-            num_microbatches_tensor // microbatch_group_size_per_vp_stage * microbatch_group_size_per_vp_stage,
-            min=1,
-        )
+        if plan is not None:
+            # A plan is sized to its budgets: round UP (extras are padding-only).
+            num_microbatches_tensor = (
+                (num_microbatches_tensor + microbatch_group_size_per_vp_stage - 1)
+                // microbatch_group_size_per_vp_stage * microbatch_group_size_per_vp_stage
+            )
+        else:
+            # Floor-divide to the nearest multiple of microbatch_group_size_per_vp_stage so
+            # that VPP scheduling constraints are satisfied.  This may reduce num_microbatches
+            # below the value required to keep each microbatch within max_budget, meaning
+            # individual microbatches could exceed the token budget and risk OOM.
+            num_microbatches_tensor = torch.clamp(
+                num_microbatches_tensor // microbatch_group_size_per_vp_stage * microbatch_group_size_per_vp_stage,
+                min=1,
+            )
 
     num_microbatches_list = num_microbatches_tensor.tolist()
 
     # Balance each micro-batch across steps
     micro_batch_indices = []
     for i, num_mbs in enumerate(num_microbatches_list):
-        start, end = mini_batch_ranges[i]
-        lengths = total_lengths[start:end]
+        lengths, lms = item_costs[i], item_lms[i]
         local_num_mbs = min(num_mbs, len(lengths))
-        partitions = get_seqlen_balanced_partitions(
-            lengths, local_num_mbs, equal_size=False
-        )
+        partitions = _partition_items(lengths, lms, local_num_mbs, lm_budget)
 
         # Check for OOM risks after forced seqlen balancing with clamped num_mbs
         for j in range(local_num_mbs):
@@ -531,8 +572,8 @@ def get_data_iterator(
                     f"exceeds max_tokens_per_gpu * cp_size ({max_budget}) "
                     f"by {partition_token_sum - max_budget} tokens."
                 )
-            for k in range(len(partitions[j])):
-                partitions[j][k] += start
+            # items -> rows, in row order inside each micro-batch
+            partitions[j] = sorted(r for it in partitions[j] for r in item_rows[i][it])
         partitions.extend([[-1]] * (num_mbs - local_num_mbs))
         micro_batch_indices.extend(partitions)
 

@@ -341,6 +341,11 @@ trainer:
   # runs backward. Use for rollout-only / inference-only runs to avoid the (large)
   # gradient buffer allocation. Must be false for any run that trains.
   forward_only: false
+  # Micro-batch packing: rows (built-in) or a packer installed as a plugin (entry point
+  # group loongsage.packers). Falls back to rows with a warning when it cannot run.
+  packer: rows
+  # Passed to the packer as-is.
+  packer_options: {}
   temperature: 1.0
   mini_batch_size: 64    # num_prompts_per_step x num_trajectories_per_prompt / mini_batch_size = num_mini_batch
   micro_batch_size: 8
