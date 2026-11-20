@@ -2,7 +2,7 @@
 
 Every LoongSage extension point is **registry- and config-driven**: add a `@register_*` decorator to your implementation and reference it by its registered name from configuration. A decorator only runs when its module is imported, so the framework has to discover your module first.
 
-[coda/custom/](../../coda/custom/) is the single directory for that: every module placed there (sub-packages included) is imported automatically, whether it registers an agent, a reward, a sandbox, an advantage estimator, a policy loss, a KL method, a data filter, or a sliding window strategy.
+[coda/custom/](../../coda/custom/) is the single directory for that: every module placed there (sub-packages included) is imported automatically, whether it registers an agent, a reward, a sandbox, an advantage estimator, a policy loss, a KL method, a data filter, a sliding window strategy, or a micro-batch packer.
 
 ```
 coda/custom/
@@ -22,8 +22,10 @@ Registries are per-process, so `coda/custom/` is loaded once in every process th
 
 | Process | Load site | Extension points covered |
 | --- | --- | --- |
-| Driver (training entry point) | `main()` in [trainer.py](../../coda/controller/trainer.py) | agent, reward, sandbox, data filter, sliding window strategy |
-| Train / teacher Ray actors | [TrainWorker](../../coda/backends/train_worker.py) / [TeacherWorker](../../coda/backends/teacher_worker.py) constructors | advantage, policy loss, KL method |
+| Driver (training entry point) | `main()` in [trainer.py](../../coda/controller/trainer.py) | agent, reward, sandbox, data filter, sliding window strategy, micro-batch packer |
+| Train / teacher Ray actors | [TrainWorker](../../coda/backends/train_worker.py) / [TeacherWorker](../../coda/backends/teacher_worker.py) constructors | advantage, policy loss, KL method, micro-batch packer |
+
+Micro-batch packers are a special case: the driver only needs `dp_loads` (DP balancing), while the model-side hooks (`plan` / `pack` / `setup`) run in the training actors only. Teacher and critic passes always use row packing.
 
 ## 2. Error Handling
 

@@ -2,7 +2,7 @@
 
 LoongSage 的扩展点都是"注册表 + 配置驱动"：实现里加一个 `@register_*` 装饰器，配置里按注册名引用。装饰器只在模块被 import 时才执行，所以框架必须先发现你的模块。
 
-[coda/custom/](../../coda/custom/) 就是统一的扩展目录：放进去的每个模块（含子包）都会被自动 import，无论注册的是 agent、reward、sandbox、advantage、policy loss、KL 方法、data filter 还是滑动窗口策略。
+[coda/custom/](../../coda/custom/) 就是统一的扩展目录：放进去的每个模块（含子包）都会被自动 import，无论注册的是 agent、reward、sandbox、advantage、policy loss、KL 方法、data filter、滑动窗口策略还是 micro-batch packer。
 
 ```
 coda/custom/
@@ -22,8 +22,10 @@ coda/custom/
 
 | 进程 | 加载位置 | 覆盖的扩展点 |
 | --- | --- | --- |
-| driver（训练入口） | [trainer.py](../../coda/controller/trainer.py) 的 `main()` | agent、reward、sandbox、data filter、滑动窗口策略 |
-| 训练 / teacher Ray actor | [TrainWorker](../../coda/backends/train_worker.py) / [TeacherWorker](../../coda/backends/teacher_worker.py) 的构造函数 | advantage、policy loss、KL 方法 |
+| driver（训练入口） | [trainer.py](../../coda/controller/trainer.py) 的 `main()` | agent、reward、sandbox、data filter、滑动窗口策略、micro-batch packer |
+| 训练 / teacher Ray actor | [TrainWorker](../../coda/backends/train_worker.py) / [TeacherWorker](../../coda/backends/teacher_worker.py) 的构造函数 | advantage、policy loss、KL 方法、micro-batch packer |
+
+micro-batch packer 特殊一点：driver 侧只需要 `dp_loads`（DP 均衡），模型侧的钩子（`plan` / `pack` / `setup`）只在训练 actor 里调用，teacher 和 critic 始终走逐行打包。
 
 ## 2. 错误处理
 
