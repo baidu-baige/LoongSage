@@ -413,6 +413,43 @@ def _patch_auto_attention_backend_inherits():
         module.set_attention_backend = _patched_set_attention_backend
 
 
+def _patch_dsv4_builder_pipeline_layout():
+    """Auto-set the DeepSeek-V4 pipeline layout at PP > 1 on the builder path.
+
+    Symptom: building DeepSeek-V4 with ``bridge.get_model_config()`` / ``bridge.get_model()``
+    at PP > 1 asserts "pipeline_model_parallel_layout must be set when using hash MoE layers
+    with pipeline parallelism (PP > 1)".
+
+    Root cause:
+      The hash-routed MoE layers must sit on the embedding stage, which needs an explicit
+      layout. The provider path sets one in ``ModelProvider.apply_overrides_and_finalize``
+      (gated on ``experimental_attention_variant == "dsv4_hybrid"``); the builder path's
+      ``finalize`` does not.
+
+    Fix: run ``set_deepseek_v4_pipeline_model_parallel_layout`` before
+      ``DeepSeekV4ModelConfig.finalize``, which ``get_model`` calls after the yaml overrides
+      are applied, so the PP size is final. Scoped to the class rather than the attention
+      variant: ERNIE 5.5 is also ``dsv4_hybrid``, but its pattern has dense layers, so the
+      DSv4 helper rejects it; ``Ernie55ModelConfig.finalize`` splits its own stages. A layout
+      set by the user is never overridden.
+    """
+    from megatron.bridge.models.deepseek.deepseek_v4_bridge import set_deepseek_v4_pipeline_model_parallel_layout
+    from megatron.bridge.models.deepseek.deepseek_v4_config import DeepSeekV4ModelConfig
+
+    _original_finalize = DeepSeekV4ModelConfig.finalize
+    if getattr(_original_finalize, "_coda_dsv4_pp_layout", False):
+        return
+
+    def _patched_finalize(self):
+        transformer = self.transformer
+        if (transformer.pipeline_model_parallel_size or 1) > 1 and transformer.pipeline_model_parallel_layout is None:
+            set_deepseek_v4_pipeline_model_parallel_layout(self)
+        _original_finalize(self)
+
+    _patched_finalize._coda_dsv4_pp_layout = True
+    DeepSeekV4ModelConfig.finalize = _patched_finalize
+
+
 _patch_distributed_optimizer_init()
 _patch_fp32_shard_leaf()
 _patch_fused_adam_fp32_master_remainder()
@@ -420,4 +457,5 @@ _patch_csa_cute_launch_cache()
 _patch_fa4_causal_unbounded_window()
 _patch_ernie55_drop_mtp()
 _patch_auto_attention_backend_inherits()
+_patch_dsv4_builder_pipeline_layout()
 

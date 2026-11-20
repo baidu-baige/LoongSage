@@ -50,10 +50,9 @@ from coda.utils.checkpoint_utils import (
     DIST_CKPT_DIR_NAME, find_latest_ckpt_path, update_latest, get_ckpt_dir,
 )
 from coda.backends.megatron.checkpoint import load_checkpoint, load_model_weights, save_checkpoint
-from coda.utils.types import to_torch_dtype
+from coda.utils.types import convert_overrides, to_torch_dtype
 from coda.utils.tracking import configure_tracking
 from coda.backends.megatron.mixed_precision import KeepFP32Module
-from coda.backends.megatron.model_builder import apply_model_overrides
 
 logger = logging.getLogger(__name__)
 
@@ -227,7 +226,11 @@ class MegatronTrainWorker(TrainWorker):
             **OmegaConf.to_container(config.megatron.ddp_config)
         )
         model_config = self.bridge.get_model_config()
-        apply_model_overrides(model_config, OmegaConf.to_container(config.megatron.model))
+        # Flat setattr routes each field to the outer config or its nested transformer config and
+        # raises on names neither declares; outer-config hints win on shared names.
+        hints = {**get_type_hints(type(model_config.transformer)), **get_type_hints(type(model_config))}
+        for k, v in convert_overrides(OmegaConf.to_container(config.megatron.model), hints).items():
+            setattr(model_config, k, v)
         self._configure_provider(model_config)
         self.model = self.bridge.get_model(
             model_config,
@@ -262,7 +265,7 @@ class MegatronTrainWorker(TrainWorker):
         """Hook to adjust the model config before the model is built.
 
         Receives the overridden (not yet finalized) builder-backed ``ModelConfig``,
-        between ``apply_model_overrides`` and ``bridge.get_model`` in :meth:`init`.
+        between applying the ``megatron.model`` overrides and ``bridge.get_model`` in :meth:`init`.
         Runs before the DDP grad buffers and the optimizer are built from the
         model's parameters. No-op by default.
         """

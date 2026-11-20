@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import random
 from functools import partial
+from typing import get_type_hints
 
 import numpy as np
 import ray
@@ -34,10 +35,9 @@ from coda.utils.multimodal_config import (
 from coda.backends.megatron.checkpoint import load_model_weights
 import coda.backends.megatron.monkey_patch  # noqa: F401  # apply patches before any Megatron usage
 from coda.backends.megatron.mixed_precision import KeepFP32Module
-from coda.backends.megatron.model_builder import apply_model_overrides
 from coda.utils.checkpoint_utils import resolve_dist_ckpt_dir
 from coda.utils.tracking import configure_tracking
-from coda.utils.types import RolloutBatch
+from coda.utils.types import RolloutBatch, convert_overrides
 from coda.utils.tensor_backuper import TensorBackuper
 
 logger = logging.getLogger(__name__)
@@ -181,7 +181,11 @@ class MegatronTeacherWorker(BaseTeacherWorker):
         self.bridge = AutoBridge.from_hf_pretrained(hf_path)
         drop_dsv41_vision_if_text_only(self.bridge.hf_pretrained.config, multimodal_enabled(self.config))
         model_config = self.bridge.get_model_config()
-        apply_model_overrides(model_config, OmegaConf.to_container(self.config.opd.model))
+        # Flat setattr routes each field to the outer config or its nested transformer config and
+        # raises on names neither declares; outer-config hints win on shared names.
+        hints = {**get_type_hints(type(model_config.transformer)), **get_type_hints(type(model_config))}
+        for k, v in convert_overrides(OmegaConf.to_container(self.config.opd.model), hints).items():
+            setattr(model_config, k, v)
         self.model = self.bridge.get_model(
             model_config,
             load_weights=ckpt_dir is None,
