@@ -82,9 +82,16 @@ def is_main_rank(last_pp=True):
         and is_pp_stage
     )
 
-# Metrics reported as the ``loss_agg_mode``-aggregated loss (policy loss, PPO
-# value loss); normalized by num_sequences in seq-mean modes.
-_AGGREGATED_LOSS_KEYS = ("train/loss", "train/value_loss")
+# Metrics reported as a ``loss_agg_mode``-aggregated loss (total loss, its policy /
+# reference-KL / on-policy-distillation parts, PPO value loss); normalized by
+# num_sequences in seq-mean modes.
+_AGGREGATED_LOSS_KEYS = (
+    "train/loss",
+    "train/pg_loss",
+    "train/ref_loss",
+    "train/opd_loss",
+    "train/value_loss",
+)
 
 
 def _collect_loss_metrics(
