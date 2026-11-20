@@ -1,0 +1,125 @@
+# @package _global_
+# GSM8K (single-turn) RL on the full 43-layer ERNIE-5.5-Flash-Base (bf16), 6-node H20
+# (6 x 8 = 48 GPUs), colocated rollout + training.
+#
+# The raw Base checkpoint has no SFT, so GSM8K is the easiest bootstrap: direct Q -> A, no agent,
+# no tool-call format, thinking off, no length penalty. The base model then has reward variance
+# and GRPO gets a real gradient.
+#
+# 1. Download the model and dataset:
+#      hf download baidu/ERNIE-5.5-Flash-Base-BF16 --local-dir /root/ERNIE-5.5-Flash-Base-BF16
+#      hf download openai/gsm8k --repo-type=dataset --local-dir /root/gsm8k
+#
+# 2. Launch on every node (head first), then run on the head node only.
+#    prompt_data_path must name one .jsonl/.parquet file :
+#      bash examples/start_ray_cluster.sh <master-ip>
+#      bash examples/start.sh ernie55_flash/gsm8k_h20_6node \
+#        hf_model_path=/root/ERNIE-5.5-Flash-Base-BF16 \
+#        data_source.dataset.prompt_data_path=/root/gsm8k/main/train-00000-of-00001.parquet
+defaults:
+  - /default
+  - _self_
+
+checkpoint_path: "./checkpoints"
+hf_model_path: ???
+colocate: true
+total_steps: 300
+
+data_source:
+  dataset:
+    prompt_data_path: ???
+    data_pre_processor: "gsm8k"   
+    input_key: question
+    label_key: answer
+  reward:
+    name: gsm8k               
+  num_prompts_per_step: 16
+  num_trajectories_per_prompt: 8
+  max_response_len_per_trajectory: 4096
+
+rollout:
+  env_vars:
+    # The input-RMSNorm / VHA-postmix fusions are not bit-exact; keep rollout close to training.
+    SGLANG_OPT_ERNIE5_5_FUSE_INEXACT: "0"
+    NCCL_CUMEM_ENABLE: "1"
+  num_gpus_per_node: 8
+  sglang_args:
+    # attention_backend=ernie55 and page_size=256 are forced by sglang's ERNIE override.
+    mem_fraction_static: 0.6
+    disable_cuda_graph: false
+    # attn_tp=1: with attn_tp>1 the HCA layers cache a sharded attn_sink that the
+    # ERNIE weight loader does not refresh after an online weight update.
+    attn_dp_size: 8
+    max_running_requests: 128
+  sglang_replicas:
+    regular:
+      num_nodes: 6
+      num_gpus_per_replica: 8
+
+agentflow:
+  dump_trajectory_path: "log/trajectories"
+  tokenizer:
+    # The checkpoint ships no chat template; this is Megatron-Bridge's ERNIE 5.5 SFT template.
+    custom_chat_template_path: ernie55_flash/ernie55_chat_template.jinja
+    think_tags: ["<ernie:think>", "</ernie:think>"]
+    generation_prompt_kwargs:
+      enable_thinking: false  # base model cannot manage the <ernie:think> block; answer directly
+  router:
+    middleware:
+      parser:
+        reasoning_parser: ernie55
+        tool_call_parser: ernie55
+
+trainer:
+  num_gpus_per_node: 8
+  num_nodes: 6
+  mini_batch_size: 128
+  max_tokens_per_gpu: 4096           # x CP4 = 16384 tokens per micro-batch, above prompt + 4096
+  use_dynamic_batch_size: true
+  use_rollout_routing_replay: false  # ERNIE router has no replay hook
+  use_fp32_lm_head: false
+  deterministic_mode: false
+  save_freq: 10                      # dist ckpt incl. fp32 optimizer state is ~3.5 TB per save
+  save_hf: false
+  async_save: true
+  nccl_timeout_minutes: 60
+  gloo_timeout_minutes: 60
+  env_vars:
+    PYTORCH_ALLOC_CONF: "expandable_segments:True,pinned_max_cached_size_mb:32"
+
+megatron:
+  model:
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 6
+    virtual_pipeline_model_parallel_size: null
+    context_parallel_size: 4
+    sequence_packing_scheduler: "default_dynamic_cp"
+    # Global THD layout with cu_seqlens_*_padded set; the H layers need it at CP>1.
+    cp_partition_mode: contiguous
+    # ERNIE 5.5 hyper-connections exchange fp32 residual streams across PP stages;
+    # a narrower pipeline dtype would round them at every boundary (Bridge enforces this).
+    pipeline_dtype: torch.float32
+    expert_model_parallel_size: 8
+    expert_tensor_parallel_size: 1
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 1
+    # Train the D layers' DSA indexer with its KL loss, as Bridge's ERNIE 5.5 recipe does.
+    dsa_indexer_loss_coeff: 0.01
+    dsa_indexer_use_sparse_loss: true
+  optimizer:
+    lr: 1.0e-6
+    chunked_optimizer_state_offload: true
+    optimizer_state_offload_fraction: 1.0
+
+algorithm:
+  advantage_estimator: grpo
+  advantage_norm_mode: group_zscore
+  policy_loss: grpo
+  loss_agg_mode: token-mean
+  is_correction:
+    enable: true
+    action: mask
+    level: token
+    lower_bound: 0.5
+    upper_bound: 2
