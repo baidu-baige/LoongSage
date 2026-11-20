@@ -274,7 +274,7 @@ bash examples/start.sh qwen3_vl_30b_a3b/mmrb_h20_1node \
 
 Both presets use TP4 x PP2, EP4 and freeze the vision tower while training the language model (`megatron.model.freeze_vision_model: true`, `freeze_language_model: false`). Megatron-Bridge defaults both flags to `True` for Qwen3-VL-MoE, so keep them explicit in your own configs. Field details are in [Config Reference §1.1](config-reference.md#11-multimodal-image-modality). For how images flow through the Router and the trainer, see `coda/agentflow/multimodal.py` and `put_dp_shards_to_ray` in `coda/data_factory/data_processor.py` (the AgentFlow and Controller docs are not published yet).
 
-**DeepSeek-V4.1 (geo3k).** [`dsv41_flash/geo3k_h20_6node`](../../conf/dsv41_flash/geo3k_h20_6node.yaml) runs GRPO on geo3k with `boxed_math` reward on 6 nodes x 8 H20, using QAT against a quantized rollout (the same setup as the other `dsv41_flash/` presets). It uses the same data format as above. DeepSeek-V4.1 plans each image with its own image processor, driven by the `vision_*` fields of the checkpoint's `config.json`, so it does not need `qwen-vl-utils` and `multimodal.image.min_pixels/max_pixels` do not apply. Download the model and dataset:
+**DeepSeek-V4.1 (geo3k).** [`dsv41_flash/geo3k_h20_6node`](../../conf/dsv41_flash/geo3k_h20_6node.yaml) runs GRPO on geo3k with `boxed_math` reward on 6 nodes x 8 H20, using QAT against a quantized rollout (the same setup as the other `dsv41_flash/` presets). It uses the same data format as above. DeepSeek-V4.1 plans each image with its own image processor, driven by the `vision_*` fields of the checkpoint's `config.json`. Download the model and dataset:
 
 ```bash
 hf download deepseek-ai/DeepSeek-V4.1-Flash-1017 --local-dir /root/DeepSeek-V4.1-Flash-1017
@@ -291,7 +291,7 @@ bash examples/start.sh dsv41_flash/geo3k_h20_6node \
   data_source.dataset.eval_prompt_data_path=/root/geometry3k/data/validation-00000-of-00001.parquet
 ```
 
-The preset uses TP4 x PP6, EP8, CP1 with `cp_partition_mode: contiguous`. With `multimodal.enable: true` on DeepSeek-V4.1, startup validation rejects settings that break rollout/training consistency, for example `image_processor_backend` other than `pil`, `vision_n_layers: 0` in the rollout override, rollout `pp_size` or `attn_cp_size` above 1, and `freeze_vision_model: false`. The full list is in [Config Reference §1.1](config-reference.md#11-multimodal-image-modality).
+The preset uses TP4 x PP6, EP8, CP1 with `cp_partition_mode: contiguous`. Field details are in [Config Reference §1.1](config-reference.md#11-multimodal-image-modality).
 
 Tip: Each preset inherits from [`conf/default.yaml`](../../conf/default.yaml), and subdirectories such as [`conf/qwen3_30b_a3b/`](../../conf/qwen3_30b_a3b/) hold presets for a specific model and machine type. For more available configurations, see [`conf/`](../../conf/).
 

@@ -33,17 +33,7 @@ Switches on image input for VLM training. Everything is off by default, and text
 | `multimodal.enable` | `false` | Enable image-modality training. The Router then loads the HF processor of `hf_model_path`, expands each image into the image-pad tokens the model sees, and the trainer feeds the image tensors to the model. DeepSeek-V4.1 (`model_type: deepseek_v41`) instead uses its own image processor, which plans each image from the checkpoint's `vision_*` config fields. | Models other than DeepSeek-V4.1 require `qwen-vl-utils` (checked at startup). When `false`, no data source may set `dataset.multimodal_keys` or `dataset.max_image_tokens`. |
 | `multimodal.modalities` | `[image]` | Modalities to enable. | Must be non-empty when `enable=true`. Only `image` is implemented; `video` and `audio` are reserved and rejected. |
 
-`rollout.sglang_args.enable_multimodal` is set to `true` automatically when `multimodal.enable=true`. Setting it to `false` explicitly in the same run is a configuration error.
-
-**DeepSeek-V4.1 constraints.** When `hf_model_path` is a DeepSeek-V4.1 checkpoint and `multimodal.enable=true`, startup validation (`validate_multimodal_config`, `validate_vlm_parallel_config`) rejects:
-
-- `vision_n_layers: 0` in `rollout.sglang_args.json_model_override_args` (the text-only recipes set it; the vision tower must stay on).
-- `rollout.sglang_args.pp_size`, `pipeline_parallel_size` or `attn_cp_size` other than 1.
-- `rollout.sglang_args.moe_a2a_backend` other than `none` or `megamoe`.
-- `rollout.sglang_args.image_processor_backend` other than `pil`, so that rollout and training patchify identically.
-- `megatron.model.moe_router_fusion: true`.
-- `megatron.model.freeze_vision_model: false`. The vision tower stays frozen so that trainer and rollout see the same image features.
-- `context_parallel_size > 1` with a `cp_partition_mode` other than `contiguous`. Other models with CP > 1 reject `contiguous`.
+The SGLang engine takes its default `enable_multimodal` from `multimodal.enable` at launch, so you normally do not set it. A value in `rollout.sglang_args.enable_multimodal` takes precedence, and it is not checked: with `multimodal.enable=true`, an explicit `false` starts SGLang without multimodal support. The config itself is not modified.
 
 ## 2. Fully-async (`fully_async`)
 
@@ -214,9 +204,9 @@ The `megatron` node controls parallelism, optimizer and LR scheduling for the ac
 | `megatron.model.tensor_model_parallel_size` | `1` | Tensor parallel size (TP). | Total trainer GPUs must be divisible by `TP × PP × CP`; validated at startup — see [11.9](#119-dp-and-batch-sizes). |
 | `megatron.model.pipeline_model_parallel_size` | `1` | Pipeline parallel size (PP). | Same as above; participates in `TP × PP × CP`. |
 | `megatron.model.virtual_pipeline_model_parallel_size` | `null` | Virtual PP (VPP) size, used to shrink PP bubbles. | Requires PP > 1. |
-| `megatron.model.context_parallel_size` | `1` | Context parallel size (CP, sequence sharding). | Paired with `cp_partition_mode`; participates in `TP × PP × CP`. |
-| `megatron.model.cp_partition_mode` | `zigzag` | CP partitioning strategy (e.g. `zigzag`). | Only used when CP > 1. With `multimodal.enable=true` and CP > 1, DeepSeek-V4.1 accepts only `contiguous` and other models accept only `zigzag`. |
-| `megatron.model.freeze_vision_model` | unset | Freeze the vision tower (Qwen3-VL, DeepSeek-V4.1). | Megatron-Bridge defaults it to `True` for Qwen3-VL-MoE, so set it explicitly; a warning is logged when it is unset. On DeepSeek-V4.1 with `multimodal.enable=true`, `false` is rejected at startup. |
+| `megatron.model.context_parallel_size` | `1` | Context parallel size (CP, sequence sharding). | Paired with `cp_partition_mode`; participates in `TP × PP × CP`. With `multimodal.enable=true`, Qwen2.5-VL requires CP=1 (checked at startup). |
+| `megatron.model.cp_partition_mode` | `zigzag` | CP partitioning strategy (e.g. `zigzag`). | Only used when CP > 1. |
+| `megatron.model.freeze_vision_model` | unset | Freeze the vision tower (Qwen3-VL, DeepSeek-V4.1). | Megatron-Bridge defaults it to `True` for Qwen3-VL-MoE, so set it explicitly. |
 | `megatron.model.freeze_language_model` | unset | Freeze the language model (Qwen3-VL). | Same as above. Set `false` to train the language model. |
 | `megatron.model.expert_model_parallel_size` | `1` | Expert parallel size (EP) for MoE. | Keep at 1 for non-MoE models. Total trainer GPUs must be divisible by `ETP × EP × PP`. |
 | `megatron.model.expert_tensor_parallel_size` | `null` | TP size for the MoE experts. | `null` means "same as `tensor_model_parallel_size`"; that value is the `ETP` in the formula above. |

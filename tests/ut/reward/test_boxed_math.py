@@ -108,5 +108,107 @@ class TestBoxedMathReward(unittest.TestCase):
         self.assertEqual(r.final_reward, 0.0)
 
 
+class TestBoxedMathUnits(unittest.TestCase):
+    """A numeric label should match an answer that only adds a trailing unit.
+
+    Seen in geo3k rollouts: the value is right but the box carries a unit that
+    ``normalize_final_answer`` has no entry for (e.g. ``ft``), so the reward was 0.
+    The relaxation applies only when the label is a plain number.
+    """
+
+    def test_trailing_unit_is_ignored(self):
+        for pred, label in (
+            ("16.76\\text{ ft}", "16.76"),
+            ("16.76 \\text{ ft}", "16.76"),
+            ("100\\text{ ft}^2", "100"),
+            ("100\\text{ ft}^{2}", "100"),
+            ("100 \\text{ square feet}", "100"),
+            ("8\\mathrm{ft}", "8"),
+            ("8\\text{ in}", "8"),
+            ("12\\text{ cm}", "12"),  # already handled by normalize_final_answer
+            ("30^\\circ", "30"),  # already handled by normalize_final_answer
+        ):
+            with self.subTest(pred=pred, label=label):
+                self.assertEqual(_score(f"\\boxed{{{pred}}}", label).final_reward, 1.0)
+
+    def test_unit_with_wrong_number_is_still_zero(self):
+        for pred, label in (
+            ("16.7\\text{ ft}", "16.76"),
+            ("50\\text{ ft}", "5"),
+            ("100\\text{ ft}^2", "10"),
+        ):
+            with self.subTest(pred=pred, label=label):
+                self.assertEqual(_score(f"\\boxed{{{pred}}}", label).final_reward, 0.0)
+
+    def test_variable_or_expression_is_not_a_unit(self):
+        # Only a `\text{..}` / `\mathrm{..}` suffix is a unit; a bare letter or radical changes the value.
+        for pred, label in (
+            ("5x", "5"),
+            ("5\\sqrt{2}", "5"),
+            ("5\\pi", "5"),
+            ("\\frac{5}{2}", "5"),
+        ):
+            with self.subTest(pred=pred, label=label):
+                self.assertEqual(_score(f"\\boxed{{{pred}}}", label).final_reward, 0.0)
+
+    def test_non_numeric_label_is_not_relaxed(self):
+        self.assertEqual(_score("\\boxed{6\\sqrt{3}\\text{ ft}}", "6\\sqrt{3}").final_reward, 0.0)
+
+
+class TestBoxedMathVariableApprox(unittest.TestCase):
+    """`x \\approx N` is correct when N is exactly the numeric label.
+
+    Seen in geo3k rollouts: the model boxes ``x\\approx 5.7`` for the label ``5.7``. The value is
+    right, but the ``x \\approx`` prefix made the strings differ. Only an exact match of the number
+    is accepted; a different rounding, an exact-vs-approximate form, or extra text stays wrong.
+    """
+
+    def test_variable_approx_with_exact_number_is_correct(self):
+        for pred, label in (
+            ("x\\approx 5.7", "5.7"),
+            ("x \\approx 53.2", "53.2"),
+            ("x \\approx 3.2", "3.2"),
+            ("b \\approx 4.6", "4.6"),
+            ("x\\approx 53.2 \\text{ units}", "53.2"),
+        ):
+            with self.subTest(pred=pred, label=label):
+                self.assertEqual(_score(f"\\boxed{{{pred}}}", label).final_reward, 1.0)
+
+    def test_different_rounding_is_still_zero(self):
+        for pred, label in (
+            ("x \\approx 53.17", "53.2"),
+            ("b \\approx 4.62", "4.6"),
+            ("x\\approx 5.4", "5.42"),
+            ("x \\approx 38.12", "38.1"),
+        ):
+            with self.subTest(pred=pred, label=label):
+                self.assertEqual(_score(f"\\boxed{{{pred}}}", label).final_reward, 0.0)
+
+    def test_approximation_of_an_exact_label_is_still_zero(self):
+        for pred, label in (
+            ("x\\approx 27.71", "16 \\sqrt { 3 }"),
+            ("x\\approx 7.5", "\\frac { 15 } { 2 }"),
+        ):
+            with self.subTest(pred=pred, label=label):
+                self.assertEqual(_score(f"\\boxed{{{pred}}}", label).final_reward, 0.0)
+
+    def test_extra_text_after_the_number_is_still_zero(self):
+        for pred, label in (
+            ("x \\approx 53.2 \\text{ (or } \\frac{32}{\\cos 53^\\circ}\\text{ exactly)}", "53.2"),
+            ("x\\approx 5.4\\text{ (more precisely }5.42\\text{)}", "5.42"),
+            ("x\\approx 5.42 \\text{ (or about }5.4\\text{)}", "5.42"),
+        ):
+            with self.subTest(pred=pred, label=label):
+                self.assertEqual(_score(f"\\boxed{{{pred}}}", label).final_reward, 0.0)
+
+    def test_two_alternative_answers_after_equals_is_still_zero(self):
+        for pred, label in (
+            ("x=\\frac{91}{8}\\ \\text{(or }11.375\\text{)}", "11.375"),
+            ("x=\\frac{40}{3}\\text{ or }13\\frac{1}{3}", "\\frac { 40 } { 3 }"),
+        ):
+            with self.subTest(pred=pred, label=label):
+                self.assertEqual(_score(f"\\boxed{{{pred}}}", label).final_reward, 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()

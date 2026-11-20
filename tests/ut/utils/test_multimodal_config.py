@@ -11,7 +11,6 @@ from omegaconf import OmegaConf
 from coda.utils.hf_config import read_image_pixel_bounds
 from coda.utils.multimodal_config import (
     drop_dsv41_vision_if_text_only,
-    multimodal_enabled,
     validate_multimodal_config,
     validate_vlm_parallel_config,
 )
@@ -27,20 +26,10 @@ def _config(*, enable=True, modalities=("image",), keys=None, sglang_args=None):
     )
 
 
-class TestMultimodalEnabled(unittest.TestCase):
-    def test_missing_block(self):
-        self.assertFalse(multimodal_enabled(OmegaConf.create({})))
-
-    def test_flags(self):
-        self.assertTrue(multimodal_enabled(_config(enable=True)))
-        self.assertFalse(multimodal_enabled(_config(enable=False)))
-
-
 class TestValidateDisabled(unittest.TestCase):
     def test_disabled_without_keys_ok(self):
         cfg = _config(enable=False)
         self.assertIs(validate_multimodal_config(cfg), cfg)
-        self.assertNotIn("enable_multimodal", cfg.rollout.sglang_args)
 
     def test_disabled_with_keys_raises(self):
         with self.assertRaisesRegex(ValueError, "multimodal.enable is false"):
@@ -59,19 +48,14 @@ class TestValidateDisabled(unittest.TestCase):
 
 
 class TestValidateEnabled(unittest.TestCase):
-    def test_links_sglang_enable_multimodal(self):
-        cfg = _config(keys={"image": "images"})
-        validate_multimodal_config(cfg)
-        self.assertTrue(cfg.rollout.sglang_args.enable_multimodal)
-
-    def test_explicit_true_is_kept(self):
+    def test_explicit_true_ok(self):
         cfg = _config(sglang_args={"enable_multimodal": True})
-        validate_multimodal_config(cfg)
-        self.assertTrue(cfg.rollout.sglang_args.enable_multimodal)
+        self.assertIs(validate_multimodal_config(cfg), cfg)
 
-    def test_explicit_false_raises(self):
-        with self.assertRaisesRegex(ValueError, "explicitly false"):
-            validate_multimodal_config(_config(sglang_args={"enable_multimodal": False}))
+    def test_validate_does_not_write_sglang_args(self):
+        cfg = _config()
+        validate_multimodal_config(cfg)
+        self.assertNotIn("enable_multimodal", cfg.rollout.sglang_args)
 
     def test_empty_modalities_raises(self):
         with self.assertRaisesRegex(ValueError, "non-empty"):
@@ -137,24 +121,6 @@ class TestImagePixelBoundsFromModel(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "size.longest_edge"):
                 read_image_pixel_bounds(tmp)
 
-    def test_startup_validation_passes_with_bounds(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            validate_multimodal_config(self._cfg(tmp, size={"shortest_edge": 65536, "longest_edge": 16777216}))
-
-    def test_startup_validation_fails_without_bounds(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            with self.assertRaisesRegex(ValueError, "preprocessor_config.json"):
-                validate_multimodal_config(self._cfg(tmp))
-
-    def test_dsv41_does_not_need_bounds(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            cfg = self._cfg(tmp, model_type="deepseek_v41")
-            cfg.rollout.sglang_args = {"enable_multimodal": True}
-            try:
-                validate_multimodal_config(cfg)
-            except ValueError as e:
-                self.assertNotIn("preprocessor_config", str(e))
-
 
 class TestVlmParallelConfig(unittest.TestCase):
     def _hf_dir(self, model_type):
@@ -169,11 +135,6 @@ class TestVlmParallelConfig(unittest.TestCase):
         model = OmegaConf.create({"context_parallel_size": 2, "cp_partition_mode": "contiguous"})
         validate_vlm_parallel_config(cfg, model, self._hf_dir("qwen2_5_vl"))
 
-    def test_contiguous_cp_rejected(self):
-        model = OmegaConf.create({"context_parallel_size": 2, "cp_partition_mode": "contiguous"})
-        with self.assertRaisesRegex(ValueError, "zigzag"):
-            validate_vlm_parallel_config(_config(), model, self._hf_dir("qwen3_vl"))
-
     def test_contiguous_with_cp1_allowed(self):
         model = OmegaConf.create({"context_parallel_size": 1, "cp_partition_mode": "contiguous"})
         validate_vlm_parallel_config(_config(), model, self._hf_dir("qwen3_vl"))
@@ -181,16 +142,6 @@ class TestVlmParallelConfig(unittest.TestCase):
     def test_dsv41_contiguous_cp_allowed(self):
         model = OmegaConf.create({"context_parallel_size": 2, "cp_partition_mode": "contiguous"})
         validate_vlm_parallel_config(_config(), model, self._hf_dir("deepseek_v41"))
-
-    def test_dsv41_zigzag_cp_rejected(self):
-        model = OmegaConf.create({"context_parallel_size": 2, "cp_partition_mode": "zigzag"})
-        with self.assertRaisesRegex(ValueError, "contiguous"):
-            validate_vlm_parallel_config(_config(), model, self._hf_dir("deepseek_v41"))
-
-    def test_dsv41_default_mode_cp_rejected(self):
-        model = OmegaConf.create({"context_parallel_size": 2})
-        with self.assertRaisesRegex(ValueError, "contiguous"):
-            validate_vlm_parallel_config(_config(), model, self._hf_dir("deepseek_v41"))
 
     def test_dsv41_cp1_allowed(self):
         model = OmegaConf.create({"context_parallel_size": 1, "cp_partition_mode": "zigzag"})
@@ -214,19 +165,6 @@ class TestVlmParallelConfig(unittest.TestCase):
         validate_vlm_parallel_config(_config(), model, self._hf_dir(None))
         validate_vlm_parallel_config(_config(), model, None)
 
-    def test_qwen3_vl_moe_warns_when_freeze_unset(self):
-        model = OmegaConf.create({"context_parallel_size": 1})
-        with self.assertLogs("coda.utils.multimodal_config", level="WARNING") as cm:
-            validate_vlm_parallel_config(_config(), model, self._hf_dir("qwen3_vl_moe"))
-        self.assertEqual(len(cm.records), 2)
-
-    def test_qwen3_vl_moe_no_warning_when_freeze_explicit(self):
-        model = OmegaConf.create(
-            {"context_parallel_size": 1, "freeze_language_model": False, "freeze_vision_model": True}
-        )
-        with self.assertNoLogs("coda.utils.multimodal_config", level="WARNING"):
-            validate_vlm_parallel_config(_config(), model, self._hf_dir("qwen3_vl_moe"))
-
 
 class TestDropDsv41VisionIfTextOnly(unittest.TestCase):
     def test_disabled_clears_vision_config(self):
@@ -247,66 +185,3 @@ class TestDropDsv41VisionIfTextOnly(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-
-class TestValidateDsv41(unittest.TestCase):
-    def _cfg(self, tmp, *, sglang_args=None, model=None, vision_config=None):
-        hf_config = {"model_type": "deepseek_v41"}
-        hf_config["vision_config"] = {"patch_size": 14} if vision_config is None else vision_config
-        (Path(tmp) / "config.json").write_text(json.dumps(hf_config))
-        cfg = _config(
-            keys={"image": "images"},
-            sglang_args={"image_processor_backend": "pil", **(sglang_args or {})},
-        )
-        cfg.hf_model_path = tmp
-        cfg.megatron = {"model": dict(model or {})}
-        return cfg
-
-    def _raises(self, pattern, **kwargs):
-        with tempfile.TemporaryDirectory() as tmp:
-            with self.assertRaisesRegex(ValueError, pattern):
-                validate_multimodal_config(self._cfg(tmp, **kwargs))
-
-    def test_valid_config_passes(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            validate_multimodal_config(self._cfg(tmp, sglang_args={"moe_a2a_backend": "none"}))
-
-    def test_missing_vision_config_raises(self):
-        self._raises("no vision_config", vision_config={})
-
-    def test_vision_disabled_override_raises(self):
-        self._raises("vision_n_layers", sglang_args={"json_model_override_args": '{"vision_n_layers": 0}'})
-
-    def test_other_vision_override_passes(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            validate_multimodal_config(
-                self._cfg(tmp, sglang_args={"json_model_override_args": '{"vision_max_n_token": 512}'})
-            )
-
-    def test_rollout_parallelism_raises(self):
-        self._raises("pp_size", sglang_args={"pp_size": 2})
-        self._raises("attn_cp_size", sglang_args={"attn_cp_size": 2})
-        self._raises("moe_a2a_backend", sglang_args={"moe_a2a_backend": "deepep"})
-
-    def test_image_processor_backend_must_be_pil(self):
-        self._raises("image_processor_backend", sglang_args={"image_processor_backend": "auto"})
-
-    def test_router_fusion_raises(self):
-        self._raises("moe_router_fusion", model={"moe_router_fusion": True})
-
-    def test_frozen_vision_false_raises(self):
-        self._raises("freeze_vision_model", model={"freeze_vision_model": False})
-
-    def test_frozen_vision_true_passes(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            validate_multimodal_config(self._cfg(tmp, model={"freeze_vision_model": True}))
-
-    def test_non_dsv41_model_is_not_checked(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            (Path(tmp) / "config.json").write_text(json.dumps({"model_type": "qwen3_vl"}))
-            (Path(tmp) / "preprocessor_config.json").write_text(
-                json.dumps({"size": {"shortest_edge": 65536, "longest_edge": 16777216}})
-            )
-            cfg = _config(keys={"image": "images"}, sglang_args={"pp_size": 2})
-            cfg.hf_model_path = tmp
-            validate_multimodal_config(cfg)
