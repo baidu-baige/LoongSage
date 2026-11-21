@@ -43,7 +43,6 @@ from coda.backends.train_worker import TrainWorker
 from coda.utils.memory_utils import print_memory, clear_memory
 from coda.utils.multimodal_config import (
     drop_dsv41_vision_if_text_only,
-    multimodal_enabled,
     validate_vlm_parallel_config,
 )
 from coda.utils.checkpoint_utils import (
@@ -221,7 +220,7 @@ class MegatronTrainWorker(TrainWorker):
         # If checkpoint exists: structure only (weights restored from ckpt later)
         # Otherwise: load HF weights into model
         self.bridge = AutoBridge.from_hf_pretrained(config.hf_model_path)
-        drop_dsv41_vision_if_text_only(self.bridge.hf_pretrained.config, multimodal_enabled(config))
+        drop_dsv41_vision_if_text_only(self.bridge.hf_pretrained.config, config.multimodal.enable)
         megatron_ddp_config = DistributedDataParallelConfig(
             **OmegaConf.to_container(config.megatron.ddp_config)
         )
