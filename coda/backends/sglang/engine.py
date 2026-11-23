@@ -342,6 +342,7 @@ def _compute_server_args(
         "enable_return_routed_experts": config.trainer.use_rollout_routing_replay,
         "enable_fp32_lm_head": config.trainer.use_fp32_lm_head,
         "dtype": "auto",
+        "enable_multimodal": config.multimodal.enable,
     }
     if config.colocate:
         # Breakable CUDA graph is not compatible with memory saver mode

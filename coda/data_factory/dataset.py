@@ -282,13 +282,18 @@ def _expand_multimodal_placeholders(messages: list, data: dict, multimodal_keys:
         if segments is None:
             expanded.append(message)
             continue
-        parts = [
-            {"type": "image_url", "image_url": {"url": next(item_iters[segment])}}
-            if segment in item_iters
-            else {"type": "text", "text": segment}
-            for segment in segments
-            if segment
-        ]
+        parts = []
+        for segment in segments:
+            if not segment:
+                continue
+            if segment in item_iters:
+                # Images with no token between them merge into one pad span downstream (V4.1 has no
+                # per-image start/end tokens), so keep a newline between adjacent images.
+                if parts and parts[-1]["type"] == "image_url":
+                    parts.append({"type": "text", "text": "\n"})
+                parts.append({"type": "image_url", "image_url": {"url": next(item_iters[segment])}})
+            else:
+                parts.append({"type": "text", "text": segment})
         expanded.append({**message, "content": parts})
     return expanded
 

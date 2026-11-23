@@ -97,7 +97,7 @@ ______________________________________________________________________
 
 | 模型 | 配方 | 硬件（节点数 × 8 卡） |
 | :--- | :--- | :--- |
-| DeepSeek-V4.1-Flash（原始 FP8/MXFP4 权重，QAT） | [`dsv41_flash/`](conf/dsv41_flash/)：DAPO、SWE、SFT、GRPO（geo3k 单图） | H20 × 6 |
+| DeepSeek-V4.1-Flash（原始 FP8/MXFP4 权重，QAT） | [`dsv41_flash/`](conf/dsv41_flash/)：DAPO、SWE、SFT、GRPO（geo3k 单图、MMRB 多图） | H20 × 6 |
 | DeepSeek-V4.1-Flash（BF16） | [`dsv41_flash_bf16/`](conf/dsv41_flash_bf16/)：DAPO、SWE | B200 × 5–6，H20 × 6 |
 | DeepSeek-V4-Flash（BF16） | [`dsv4_flash_bf16/`](conf/dsv4_flash_bf16/)：DAPO、SWE | H20 × 6–8，GB200 × 8 |
 | Qwen3-30B-A3B | [`qwen3_30b_a3b/`](conf/qwen3_30b_a3b/)：DAPO、GSM8K、BCP、MOPD | H20 × 1 |
