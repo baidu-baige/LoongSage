@@ -121,8 +121,7 @@ class Router:
         self.rollout_worker_load_threshold = config.rollout_worker_load_threshold
         self.accumulate_reasoning = config.accumulate_reasoning
 
-        # WorkerSlot -> in-flight request count (worker + attention-DP group).
-        # Its keys are the routing pool: a removed worker has no slots here.
+        # WorkerSlot -> in-flight request count (worker + attention-DP group)
         self.slot_request_counts: dict[WorkerSlot, int] = {}
         # request_id (trajectory_id#attempt_id) -> pinned WorkerSlot (sticky routing)
         self.session_id_to_slot: dict[str, WorkerSlot] = {}
@@ -268,8 +267,7 @@ class Router:
     def _finish_slot(self, slot: WorkerSlot) -> None:
         """Decrement a slot's in-flight count after request completion."""
         if slot not in self.slot_request_counts:
-            # Expected for requests still in flight when their worker was removed.
-            logger.debug("[worker] _finish_slot: slot %s no longer registered, skipping decrement", slot)
+            logger.error("[worker] _finish_slot: unknown slot %s — skipping decrement", slot)
             return
         self.slot_request_counts[slot] = max(0, self.slot_request_counts[slot] - 1)
 
