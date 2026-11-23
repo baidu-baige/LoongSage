@@ -1,8 +1,10 @@
 """Replica group."""
 
 import logging
+import threading
  
 import ray
+import requests
 from typing import Any
 from omegaconf import DictConfig
  
@@ -31,6 +33,12 @@ class ReplicaGroup:
         # Bundle index (into scheduler.reorder_bundle_list) each engine slot was placed on.
         # Recorded on first allocation so a recovered engine lands back on the same GPUs.
         self.engine_bundle_indices: list[int | None] = num_engines * [None]
+        # Worker URL each engine slot registered with the router (None for non-leader nodes).
+        # kill_engine uses it to remove the worker from the router without asking the actor.
+        self.worker_urls: list[str | None] = num_engines * [None]
+        # Serializes kill_engine (health monitor thread) with recovery (trainer thread): recovery
+        # never sees a half-killed engine, nor rebuilds on GPUs an old engine still holds.
+        self.lock = threading.Lock()
  
     @property
     def _nodes_per_engine(self):
@@ -49,11 +57,15 @@ class ReplicaGroup:
     def start_engines(
         self,
         recover: bool = False,
-    ) -> list:
-        """Create Ray actors, allocate ports, and fire ``engine.init()`` without waiting.
+    ) -> tuple[list[tuple[int, Any]], list]:
+        """Create Ray actors for the empty slots, allocate ports, and fire ``engine.init()`` without waiting.
 
-        Returns a list of Ray ObjectRefs. The caller should ``ray.get()`` on them
-        to block until the engines are healthy.
+        The new actors are not written into ``all_engines``: the health monitor must not see an
+        engine before its ``init()`` has returned. The caller ``ray.get()``s the init handles and
+        then calls ``publish_engines``.
+
+        Returns:
+            ``(new_engines, init_handles)``: ``new_engines`` is a list of ``(slot, actor)``.
         """
 
         num_gpu_per_engine = min(self.replica_config.num_gpus_per_replica, self.config.rollout.num_gpus_per_node)
@@ -96,13 +108,11 @@ class ReplicaGroup:
             )
  
             rollout_engines.append((global_rank, rollout_engine))
-            self.all_engines[i] = rollout_engine
- 
-        self.num_new_engines = len(rollout_engines)
- 
-        if self.num_new_engines == 0:
-            return []
- 
+
+        new_engines = [(rank - self.rank_offset, engine) for rank, engine in rollout_engines]
+        if not rollout_engines:
+            return new_engines, []
+
         addr_and_ports = _allocate_rollout_engine_addr_and_ports(
             rollout_engines=rollout_engines,
             num_gpus_per_node=self.config.rollout.num_gpus_per_node,
@@ -119,31 +129,74 @@ class ReplicaGroup:
             )
             for rank, engine in rollout_engines
         ]
-        return init_handles
+        return new_engines, init_handles
 
-    def kill_engine(self, rollout_engine_id: int):
+    def publish_engines(self, new_engines: list[tuple[int, Any]], worker_urls: list[str | None]) -> None:
+        """Write engines returned by ``start_engines`` into their slots, after their init() returned.
+
+        Args:
+            new_engines: ``(slot, actor)`` pairs returned by ``start_engines``.
+            worker_urls: The init() results for ``new_engines``, in the same order.
+        """
+        for (slot, engine), worker_url in zip(new_engines, worker_urls, strict=True):
+            self.all_engines[slot] = engine
+            self.worker_urls[slot] = worker_url
+        self.num_new_engines = len(new_engines)
+
+    def _remove_worker_from_router(self, worker_url: str, timeout: float = 30.0) -> None:
+        """Ask the router to stop routing to ``worker_url``. Failures are logged, not raised."""
+        router = self.config.agentflow.router
+        try:
+            response = requests.post(
+                f"http://{router.ip}:{router.port}/remove_worker",
+                json={"worker_url": worker_url},
+                timeout=timeout,
+            )
+            if response.status_code == 404:
+                logger.info(f"Worker {worker_url} already removed from router (404).")
+            else:
+                response.raise_for_status()
+                logger.info(f"Removed worker {worker_url} from router")
+        except Exception as e:
+            logger.warning(f"Failed to remove worker {worker_url} from router (e: {e})")
+
+    def kill_engine(self, rollout_engine_id: int, shutdown_timeout: float = 180.0):
         """Kill an engine and all its replicas in the replica group.
+
+        Holds ``self.lock`` for the whole kill, so recovery only sees the engine
+        fully alive or fully gone. The worker is removed from the router first, so no new
+        request reaches it, and so the removal does not depend on a possibly hung actor.
 
         Args:
             rollout_engine_id: The ID of the engine to kill.
+            shutdown_timeout: Seconds to wait for each actor's ``shutdown()`` before killing it anyway.
         """
-        logger.info(f"Killing replica group {rollout_engine_id}...")
-        for i in range(
+        slots = range(
             rollout_engine_id * self._nodes_per_engine,
             (rollout_engine_id + 1) * self._nodes_per_engine,
-        ):
-            engine = self.all_engines[i]
-            if engine:
-                logger.info(f"Shutting down and killing engine at index {i}")
-                try:
-                    ray.get(engine.shutdown.remote())
-                    ray.kill(engine)
-                    logger.info(f"Successfully killed engine at index {i}")
-                except Exception as e:
-                    logger.warning(f"Fail to kill engine at index {i} (e: {e})")
-            else:
-                logger.info(f"Engine at index {i} is already None")
-            self.all_engines[i] = None
+        )
+        with self.lock:
+            logger.info(f"Killing replica group {rollout_engine_id}...")
+            for i in slots:
+                if self.worker_urls[i] is not None:
+                    self._remove_worker_from_router(self.worker_urls[i])
+                    self.worker_urls[i] = None
+            for i in slots:
+                engine = self.all_engines[i]
+                if engine:
+                    logger.info(f"Shutting down and killing engine at index {i}")
+                    try:
+                        ray.get(engine.shutdown.remote(), timeout=shutdown_timeout)
+                    except Exception as e:
+                        logger.warning(f"Shutdown of engine at index {i} failed, killing it anyway (e: {e})")
+                    try:
+                        ray.kill(engine)
+                        logger.info(f"Successfully killed engine at index {i}")
+                    except Exception as e:
+                        logger.warning(f"Fail to kill engine at index {i} (e: {e})")
+                else:
+                    logger.info(f"Engine at index {i} is already None")
+                self.all_engines[i] = None
 
     def offload(self, tags: list[str] | None = None):
         """Fire release_memory_occupation on all engines (non-blocking).

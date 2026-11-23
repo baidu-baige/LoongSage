@@ -121,10 +121,9 @@ class Router:
         self.rollout_worker_load_threshold = config.rollout_worker_load_threshold
         self.accumulate_reasoning = config.accumulate_reasoning
 
-        # WorkerSlot -> in-flight request count (worker + attention-DP group)
+        # WorkerSlot -> in-flight request count (worker + attention-DP group).
+        # Its keys are the routing pool: a removed worker has no slots here.
         self.slot_request_counts: dict[WorkerSlot, int] = {}
-        # Worker URLs quarantined from the routing pool (URL granularity)
-        self.dead_workers: set[str] = set()
         # request_id (trajectory_id#attempt_id) -> pinned WorkerSlot (sticky routing)
         self.session_id_to_slot: dict[str, WorkerSlot] = {}
         # URL -> attention-DP group count reported by the worker
@@ -165,8 +164,7 @@ class Router:
         management_router = APIRouter()
         management_router.post("/add_worker", response_model=None)(self.add_worker)
         management_router.get("/list_workers", response_model=None)(self.list_workers)
-        management_router.put("/exclude_worker", response_model=None)(self.exclude_worker)
-        management_router.put("/include_worker", response_model=None)(self.include_worker)
+        management_router.post("/remove_worker", response_model=None)(self.remove_worker)
         management_router.delete(
             "/release_session/{trajectory_id}/{attempt_id}",
             response_model=None,
@@ -246,22 +244,21 @@ class Router:
 
         Sticky per session first — the same slot for every turn of a trajectory
         attempt, which keeps SGLang's prefix cache on one DP group — else the
-        least-loaded healthy slot.
+        least-loaded slot. A pinned slot that is no longer registered (its worker was
+        removed, or re-added with fewer DP groups) is not reused.
         """
         pinned = self.session_id_to_slot.get(request_id)
         if (
-            pinned is not None
-            and pinned.worker_url not in self.dead_workers
-            and self.slot_request_counts.get(pinned, 0) <= self.rollout_worker_load_threshold
+            pinned in self.slot_request_counts
+            and self.slot_request_counts[pinned] <= self.rollout_worker_load_threshold
         ):
-            self.slot_request_counts[pinned] = self.slot_request_counts.get(pinned, 0) + 1
+            self.slot_request_counts[pinned] += 1
             logger.info("[route] sticky %s -> %s", request_id, pinned)
             return pinned
 
-        available = [s for s in self.slot_request_counts if s.worker_url not in self.dead_workers]
-        if not available:
-            raise RuntimeError("No healthy workers available")
-        slot = min(available, key=self.slot_request_counts.__getitem__)
+        if not self.slot_request_counts:
+            raise RuntimeError("No workers registered")
+        slot = min(self.slot_request_counts, key=self.slot_request_counts.__getitem__)
 
         self.session_id_to_slot[request_id] = slot
         self.slot_request_counts[slot] += 1
@@ -271,7 +268,8 @@ class Router:
     def _finish_slot(self, slot: WorkerSlot) -> None:
         """Decrement a slot's in-flight count after request completion."""
         if slot not in self.slot_request_counts:
-            logger.error("[worker] _finish_slot: unknown slot %s — skipping decrement", slot)
+            # Expected for requests still in flight when their worker was removed.
+            logger.debug("[worker] _finish_slot: slot %s no longer registered, skipping decrement", slot)
             return
         self.slot_request_counts[slot] = max(0, self.slot_request_counts[slot] - 1)
 
@@ -280,13 +278,16 @@ class Router:
     # -------------------------------------------------------------------------
 
     async def add_worker(self, payload: WorkerPayload) -> JSONResponse:
-        """Register a worker URL (and its attention-DP group count) for routing."""
+        """Register a worker URL (and its attention-DP group count) for routing.
+
+        Re-adding a known URL replaces the old registration. A host:port can only be
+        registered again once the old server has released the port, so this is a restarted
+        engine that got the port of a dead one, whether or not the dead one was removed.
+        """
         worker_url = payload.worker_url
         if worker_url in self.worker_dp_size:
-            return JSONResponse(
-                status_code=status.HTTP_409_CONFLICT,
-                content={"error": "Worker already exists", "worker": worker_url},
-            )
+            self._unregister_worker(worker_url)
+            logger.info("[worker] replacing %s", worker_url)
         dp_size = max(1, int(payload.dp_size or 1))
         self.worker_dp_size[worker_url] = dp_size
         for slot in self._slots_of(worker_url):
@@ -298,58 +299,40 @@ class Router:
         )
 
     async def list_workers(self) -> JSONResponse:
-        """Return active, dead, and per-slot load state."""
-        urls = list(dict.fromkeys(s.worker_url for s in self.slot_request_counts))
-        active_workers = [w for w in urls if w not in self.dead_workers]
+        """Return registered workers and their per-slot load."""
         slot_load = {
-            url: [self.slot_request_counts[WorkerSlot(url, dp)] for dp in range(self.worker_dp_size.get(url, 1))]
-            for url in urls
+            url: [self.slot_request_counts[slot] for slot in self._slots_of(url)]
+            for url in self.worker_dp_size
         }
         return JSONResponse(
             status_code=status.HTTP_200_OK,
             content={
-                "active_workers": active_workers,
-                "dead_workers": list(self.dead_workers),
+                "workers": list(self.worker_dp_size),
                 "load_stats": {url: sum(counts) for url, counts in slot_load.items()},
                 "slot_load_stats": slot_load,
             },
         )
 
-    async def exclude_worker(self, payload: WorkerPayload) -> JSONResponse:
-        """Remove a worker from the active routing pool."""
+    def _unregister_worker(self, worker_url: str) -> None:
+        """Drop a worker and all its slots from the routing pool.
+
+        Sticky sessions pinned to it are left in place; ``_select_slot`` re-pins them
+        on their next request because the slot is no longer registered.
+        """
+        for slot in self._slots_of(worker_url):
+            self.slot_request_counts.pop(slot, None)
+        self.worker_dp_size.pop(worker_url, None)
+
+    async def remove_worker(self, payload: WorkerPayload) -> JSONResponse:
+        """Remove a worker from routing. A restarted engine comes back via ``/add_worker``."""
         worker_url = payload.worker_url
         if worker_url not in self.worker_dp_size:
             return JSONResponse(
                 status_code=status.HTTP_404_NOT_FOUND,
                 content={"error": "Worker not found"},
             )
-        if worker_url in self.dead_workers:
-            return JSONResponse(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                content={"error": "Worker is already excluded"},
-            )
-        self.dead_workers.add(worker_url)
-        logger.info("[worker] excluded %s", worker_url)
-        return JSONResponse(
-            status_code=status.HTTP_200_OK,
-            content={"status": "success", "worker": worker_url},
-        )
-
-    async def include_worker(self, payload: WorkerPayload) -> JSONResponse:
-        """Restore an excluded worker to the active pool."""
-        worker_url = payload.worker_url
-        if worker_url not in self.worker_dp_size:
-            return JSONResponse(
-                status_code=status.HTTP_404_NOT_FOUND,
-                content={"error": "Worker not found (never registered)"},
-            )
-        if worker_url not in self.dead_workers:
-            return JSONResponse(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                content={"error": "Worker is already active"},
-            )
-        self.dead_workers.discard(worker_url)
-        logger.info("[worker] included %s", worker_url)
+        self._unregister_worker(worker_url)
+        logger.info("[worker] removed %s", worker_url)
         return JSONResponse(
             status_code=status.HTTP_200_OK,
             content={"status": "success", "worker": worker_url},
@@ -469,14 +452,10 @@ class Router:
         )
 
     async def abort_all_workers(self) -> JSONResponse:
-        """Abort all active workers and clear sticky session state."""
-        active_workers = [
-            w
-            for w in dict.fromkeys(s.worker_url for s in self.slot_request_counts)
-            if w not in self.dead_workers
-        ]
-        if not active_workers:
-            logger.info("[abort] no active workers")
+        """Abort all registered workers and clear sticky session state."""
+        workers = list(self.worker_dp_size)
+        if not workers:
+            logger.info("[abort] no workers registered")
             return JSONResponse(
                 status_code=status.HTTP_200_OK,
                 content={"status": "success", "workers_aborted": 0, "sessions_cleared": 0},
@@ -485,17 +464,17 @@ class Router:
         results = await asyncio.gather(
             *(
                 self._send_worker_abort_request(w, {"abort_all": True})
-                for w in active_workers
+                for w in workers
             ),
         )
         failed_workers = [r for r in results if r is not None]
-        success_count = len(active_workers) - len(failed_workers)
+        success_count = len(workers) - len(failed_workers)
 
         if failed_workers:
             logger.warning(
                 "[abort] workers=%d/%d failed=%s",
                 success_count,
-                len(active_workers),
+                len(workers),
                 failed_workers,
             )
             return JSONResponse(
@@ -517,7 +496,7 @@ class Router:
         logger.info(
             "[abort] workers=%d/%d sessions_cleared=%d",
             success_count,
-            len(active_workers),
+            len(workers),
             sessions_cleared,
         )
         return JSONResponse(

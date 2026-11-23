@@ -46,8 +46,8 @@ AgentFlow 由一个编排器（`AgentFlow`）和若干协作组件组成。编�
 | 类别 | 方法 | 路径 | 作用 |
 | --- | --- | --- | --- |
 | Worker 管理 | POST | `/add_worker` | 注册一个 SGLang worker |
-| | GET | `/list_workers` | 列出活跃/隔离 worker 及负载 |
-| | PUT | `/exclude_worker` / `/include_worker` | 隔离 / 恢复 worker |
+| | POST | `/remove_worker` | 移除 worker（引擎重启后通过 `/add_worker` 重新注册） |
+| | GET | `/list_workers` | 列出已注册 worker 及负载 |
 | Session 管理 | DELETE | `/release_session/{trajectory_id}/{attempt_id}` | 释放该 attempt 的 sticky 映射 |
 | | POST | `/abort_session/{trajectory_id}/{attempt_id}` | 中止失败 attempt 绑定 worker 上的请求 |
 | | POST | `/abort_all_workers` | 中止所有 worker 并清空 sticky 状态 |
