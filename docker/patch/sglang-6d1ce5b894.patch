@@ -796,3 +796,18 @@ index 57cdbcc58f..e9bbc017ac 100644
          self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
  
          if not is_nextn:
+diff --git a/python/sglang/srt/models/ernie55.py b/python/sglang/srt/models/ernie55.py
+index d36bb2cb81..aa100b3783 100644
+--- a/python/sglang/srt/models/ernie55.py
++++ b/python/sglang/srt/models/ernie55.py
+@@ -1046,6 +1046,10 @@ class Ernie5_5_MoeForCausalLM(nn.Module):
+         DeepseekV2WeightLoaderMixin.post_load_weights(self)
+         for layer in self.model.layers[self.start_layer : self.end_layer]:
+             layer.self_attn.postmix.fold()
++            # With attn_tp > 1 the HCA layers cache their rank's slice of attn_sink on the
++            # first forward; re-copy it in place so online weight updates reach it.
++            if isinstance(layer.self_attn, Ernie5_5HcaAttention):
++                layer.self_attn.refresh_attn_sink_cache()
+ 
+ 
+ # wo_a's fp8 block edge, as fp8_einsum's recipe=(1, 128, 128) reads it.
