@@ -4,21 +4,25 @@
 #
 # Single-turn math (no agent / sandbox) as a bootstrap trial for the raw Base checkpoint.
 #
-# 1. Download the model and dataset:
-#      hf download baidu/ERNIE-5.5-Flash-Base-BF16 --local-dir /root/ERNIE-5.5-Flash-Base-BF16
-#      hf download Haitao999/DAPO-Math-17k-unique --repo-type=dataset \
-#        --local-dir /root/DAPO-Math-17k-unique
+#   hf download baidu/ERNIE-5.5-Flash-Base-BF16 --local-dir /root/ERNIE-5.5-Flash-Base-BF16
+#   hf download Haitao999/DAPO-Math-17k-unique --repo-type=dataset --local-dir /root/dapo-math
 #
-# 2. Launch on every node (head first), then run on the head node only:
-#      bash examples/start_ray_cluster.sh <master-ip>
-#      bash examples/start.sh ernie55_flash/dapo_h20_6node \
-#        hf_model_path=/root/ERNIE-5.5-Flash-Base-BF16 \
-#        data_source.dataset.prompt_data_path=/root/DAPO-Math-17k-unique
+#   # Run the same command on every machine
+#   bash examples/start_ray_cluster.sh <master-ip>
+#
+#   # Once the cluster is ready, run this on the head node only
+#   bash examples/start.sh ernie55_flash/dapo_h20_6node \
+#     checkpoint_path=/root/ckpt/ernie55_dapo \
+#     hf_model_path=/root/ERNIE-5.5-Flash-Base-BF16 \
+#     data_source.dataset.prompt_data_path=/root/dapo-math
+#
+# checkpoint_path and hf_model_path must live on storage that every node can reach
+# through the same path.
 defaults:
   - /default
   - _self_
 
-checkpoint_path: "./checkpoints"
+checkpoint_path: ???
 hf_model_path: ???
 colocate: true
 total_steps: 300
@@ -45,9 +49,7 @@ rollout:
     # attention_backend=ernie55 and page_size=256 are forced by sglang's ERNIE override.
     mem_fraction_static: 0.6
     disable_cuda_graph: false
-    # attn_tp=1: with attn_tp>1 the HCA layers cache a sharded attn_sink that the
-    # ERNIE weight loader does not refresh after an online weight update.
-    attn_dp_size: 8
+    ep_size: 8
     max_running_requests: 128
   sglang_replicas:
     regular:
