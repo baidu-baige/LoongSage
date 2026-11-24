@@ -48,3 +48,6 @@ RUN git clone https://github.com/baidu-baige/LoongSage.git && cd LoongSage && pi
 RUN cd /sgl-workspace/sglang && git apply ../LoongSage/docker/patch/sglang-6d1ce5b894.patch
 RUN cd /sgl-workspace/Megatron-LM && git apply ../LoongSage/docker/patch/dsv41/megatron-core.patch
 RUN cd /sgl-workspace/Megatron-Bridge && git apply ../LoongSage/docker/patch/dsv41/megatron-bridge.patch
+
+# for sglang 6d1ce5b894
+pip install sgl-deep-gemm==0.2.6 sgl-flash-mla==1.0.2
