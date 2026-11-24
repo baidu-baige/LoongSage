@@ -46,8 +46,8 @@ The exposed HTTP interfaces fall into two categories:
 | Category | Method | Path | Purpose |
 | --- | --- | --- | --- |
 | Worker management | POST | `/add_worker` | Register a SGLang worker |
-| | GET | `/list_workers` | List active/excluded workers and their load |
-| | PUT | `/exclude_worker` / `/include_worker` | Exclude / restore a worker |
+| | POST | `/remove_worker` | Remove a worker (a restarted engine re-registers via `/add_worker`) |
+| | GET | `/list_workers` | List registered workers and their load |
 | Session management | DELETE | `/release_session/{trajectory_id}/{attempt_id}` | Release the sticky mapping of that attempt |
 | | POST | `/abort_session/{trajectory_id}/{attempt_id}` | Abort the requests bound to the worker of a failed attempt |
 | | POST | `/abort_all_workers` | Abort all workers and clear sticky state |

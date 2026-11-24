@@ -79,6 +79,10 @@ class RolloutWorker(ABC):
             disaggregation_bootstrap_port: Port for prefill-decode disaggregation.
             router_ip: Router IP address.
             router_port: Router port.
+
+        Returns:
+            The worker URL this engine registered with the router, or None if it did not
+            register (non-leader node, or no router configured).
         """
 
     @abstractmethod
@@ -96,7 +100,7 @@ class RolloutWorker(ABC):
         """
 
     @abstractmethod
-    def shutdown(self, timeout: float = 30.0):
+    def shutdown(self):
         """Shutdown the inference engine and clean up resources."""
 
     @abstractmethod
