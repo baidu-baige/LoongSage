@@ -5,6 +5,7 @@ import ray
 import hydra
 import os
 import logging
+import signal
 import torch
 from enum import Enum
 from omegaconf import DictConfig, OmegaConf
@@ -653,6 +654,43 @@ class Trainer:
             return
         ray.get(self.train_manager.async_save_model(None))
 
+    def delete_all_sandboxes(self) -> None:
+        """Delete every live sandbox before the process exits; a no-op without AgentFlow."""
+        sampler = getattr(self, "rollout_sampler", None)
+        agentflow = getattr(sampler, "agentflow", None)
+        if agentflow is None:
+            return
+        try:
+            agentflow.delete_all_sandboxes(float(self.config.agentflow.sandbox_cleanup_timeout_seconds))
+        except Exception:
+            logger.exception("[shutdown] sandbox cleanup failed")
+
+
+def install_shutdown_handler(trainer: "Trainer") -> None:
+    """On SIGTERM/SIGINT delete live sandboxes, then exit; a second signal exits at once.
+
+    Replaces the handler ray.init() installs (``sys.exit``), so call it after ray.init().
+    Cleanup runs before SystemExit because asyncio.run joins the default executor on the
+    way out, and threads still waiting for a sandbox to start only return once their
+    client is closed.
+    """
+    received = []
+
+    def _handler(signum, frame):
+        if received:
+            os._exit(128 + signum)
+        received.append(signum)
+        logger.warning(
+            "[shutdown] received %s; deleting sandboxes before exit (send again to exit now)",
+            signal.Signals(signum).name,
+        )
+        trainer.delete_all_sandboxes()
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, _handler)
+    signal.signal(signal.SIGINT, _handler)
+
+
 @hydra.main(config_path="../../conf", config_name=None, version_base=None)
 def main(config: Optional[DictConfig] = None) -> None:
     """main entry point."""
@@ -678,17 +716,22 @@ def main(config: Optional[DictConfig] = None) -> None:
         ray.init(log_to_driver=True)
 
     trainer = Trainer(config)
+    install_shutdown_handler(trainer)
 
     mode_str = config.run_mode
     mode = Mode(mode_str)
-    if mode == Mode.TRAIN_ONLY:
-        asyncio.run(trainer.train_only_loop())
-    elif mode == Mode.ROLLOUT_ONLY:
-        asyncio.run(trainer.rollout_only_loop())
-    elif mode == Mode.SFT:
-        asyncio.run(trainer.sft_loop())
-    else:
-        asyncio.run(trainer.train_loop())
+    try:
+        if mode == Mode.TRAIN_ONLY:
+            asyncio.run(trainer.train_only_loop())
+        elif mode == Mode.ROLLOUT_ONLY:
+            asyncio.run(trainer.rollout_only_loop())
+        elif mode == Mode.SFT:
+            asyncio.run(trainer.sft_loop())
+        else:
+            asyncio.run(trainer.train_loop())
+    finally:
+        # Normal end or a crash; after a signal the handler already cleaned up.
+        trainer.delete_all_sandboxes()
 
 if __name__ == "__main__":
     main()
