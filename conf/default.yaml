@@ -104,7 +104,9 @@ rollout:
   retry_limit: 3
   backend: sglang
   num_gpus_per_node: 8
-  env_vars: {}
+  env_vars:
+    # Idle keep-alive (s) of SGLang's HTTP server; checked against upstream_keepalive_seconds.
+    SGLANG_TIMEOUT_KEEP_ALIVE: "30"
   sglang_args:                # Dict of SGLang ``ServerArgs`` fields.
     mem_fraction_static: 0.8
     disable_cuda_graph: true
@@ -152,6 +154,12 @@ agentflow:
     # R3 only. Processes that parse /generate bodies and decode routed experts off the
     # router event loop; 0 decodes inline.
     r3_decode_workers: 0
+    # Forward /generate over one pooled aiohttp session instead of a new httpx client per request.
+    use_aiohttp: false
+    # Idle keep-alive (s). Each client value must be >= 10s below its server's (checked at startup).
+    keepalive_seconds: 30            # router server (agent -> router)
+    agent_keepalive_seconds: 10      # agent client (agent -> router)
+    upstream_keepalive_seconds: 10   # router client (router -> SGLang), server: SGLANG_TIMEOUT_KEEP_ALIVE
     middleware:
       parser:
 

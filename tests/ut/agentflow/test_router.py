@@ -3,6 +3,8 @@
 import asyncio
 import importlib.util
 import json
+import threading
+from collections import Counter
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -66,6 +68,9 @@ ROUTER_BASE_CONFIG = {
     "accumulate_reasoning": False,
     "rollout_worker_load_threshold": 4,
     "max_connections": 512,
+    "use_aiohttp": False,
+    "keepalive_seconds": 30,
+    "upstream_keepalive_seconds": 10,
     "middleware": {},
 }
 
@@ -1294,3 +1299,155 @@ class TestDpAttentionRouting:
         forwarded = json.loads(request_mock.await_args.kwargs["content"])
         assert forwarded["routed_dp_rank"] == 0
         assert request_mock.await_args.kwargs["url"] == "http://w1:8888/generate"
+
+
+# ---------------------------------------------------------------------------
+# aiohttp upstream client (use_aiohttp=True)
+# ---------------------------------------------------------------------------
+
+
+@asynccontextmanager
+async def fake_worker(mode: str = "ok"):
+    """Run a raw HTTP/1.1 worker on 127.0.0.1 and yield ``(url, stats)``.
+
+    mode: ``ok`` answers and keeps the connection alive, ``drop`` closes without answering,
+    ``status500`` answers HTTP 500. ``stats`` counts ``connections`` and ``requests``.
+    """
+    stats: Counter[str] = Counter()
+    writers: set[asyncio.StreamWriter] = set()
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        stats["connections"] += 1
+        writers.add(writer)
+        try:
+            while True:
+                head = await reader.readuntil(b"\r\n\r\n")
+                length = next(
+                    (int(line.split(b":", 1)[1]) for line in head.split(b"\r\n")
+                     if line.lower().startswith(b"content-length:")),
+                    0,
+                )
+                body = await reader.readexactly(length) if length else b""
+                stats["requests"] += 1
+                if mode == "drop":
+                    break
+                code, reason = (500, "Internal Server Error") if mode == "status500" else (200, "OK")
+                payload = json.dumps({"text": "ok", "echo": json.loads(body or b"{}")}).encode()
+                writer.write(
+                    f"HTTP/1.1 {code} {reason}\r\nContent-Type: application/json\r\n"
+                    f"Content-Length: {len(payload)}\r\n\r\n".encode() + payload
+                )
+                await writer.drain()
+        except (asyncio.IncompleteReadError, ConnectionError):
+            pass
+        finally:
+            writers.discard(writer)
+            writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    try:
+        yield f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}", stats
+    finally:
+        for writer in list(writers):
+            writer.close()
+        server.close()
+        await server.wait_closed()
+
+
+def make_aiohttp_router(worker_url: str) -> Router:
+    """Router using the pooled aiohttp upstream client, with one routable worker."""
+    router = make_router(use_aiohttp=True)
+    router.slot_request_counts[slot(worker_url)] = 0
+    return router
+
+
+AIOHTTP_UPSTREAM_BODY = {"input_ids": [1, 2, 3], "rid": build_request_id("req-001", 0)}
+
+class TestAiohttpUpstream:
+    """Forwarding over one pooled aiohttp session instead of a client per request."""
+
+    @pytest.mark.asyncio
+    async def test_forwards_and_reuses_pooled_connection(self):
+        """Body, status and JSON pass through; sequential forwards share one connection."""
+        async with fake_worker("ok") as (url, stats):
+            router = make_aiohttp_router(url)
+            try:
+                async with make_client(router, upstream_body=AIOHTTP_UPSTREAM_BODY) as client:
+                    responses = [
+                        await client.post("/req-001/0/v1/chat/completions", json={"messages": []})
+                        for _ in range(3)
+                    ]
+            finally:
+                await router.shutdown()
+
+        assert [r.status_code for r in responses] == [status.HTTP_200_OK] * 3
+        assert responses[0].json() == {"text": "ok", "echo": AIOHTTP_UPSTREAM_BODY}
+        assert responses[0].headers["content-type"] == "application/json"
+        assert stats == Counter(connections=1, requests=3)
+        assert router.slot_request_counts[slot(url)] == 0
+
+    @pytest.mark.asyncio
+    async def test_dropped_connection_returns_502_without_resend(self):
+        """The worker may already be generating, so a dropped request is never resent."""
+        async with fake_worker("drop") as (url, stats):
+            router = make_aiohttp_router(url)
+            try:
+                async with make_client(router, upstream_body=AIOHTTP_UPSTREAM_BODY) as client:
+                    response = await client.post("/req-001/0/v1/chat/completions", json={"messages": []})
+            finally:
+                await router.shutdown()
+
+        assert response.status_code == status.HTTP_502_BAD_GATEWAY
+        assert stats["requests"] == 1
+        assert router.slot_request_counts[slot(url)] == 0
+
+    @pytest.mark.asyncio
+    async def test_worker_5xx_forwarded_without_resend(self):
+        """An HTTP 5xx is a real worker answer: forwarded unchanged, not retried."""
+        async with fake_worker("status500") as (url, stats):
+            router = make_aiohttp_router(url)
+            try:
+                async with make_client(router, upstream_body=AIOHTTP_UPSTREAM_BODY) as client:
+                    response = await client.post("/req-001/0/v1/chat/completions", json={"messages": []})
+            finally:
+                await router.shutdown()
+
+        assert response.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
+        assert response.json()["text"] == "ok"
+        assert stats["requests"] == 1
+
+    @pytest.mark.asyncio
+    async def test_unreachable_worker_returns_502(self):
+        """Connection refused maps to 502 like the httpx path and releases the slot."""
+        url = "http://127.0.0.1:1"  # privileged port, nothing listens: connection refused
+        router = make_aiohttp_router(url)
+        try:
+            async with make_client(router, upstream_body=AIOHTTP_UPSTREAM_BODY) as client:
+                response = await client.post("/req-001/0/v1/chat/completions", json={"messages": []})
+        finally:
+            await router.shutdown()
+
+        assert response.status_code == status.HTTP_502_BAD_GATEWAY
+        assert "Upstream request failed" in response.json()["error"]
+        assert router.slot_request_counts[slot(url)] == 0
+
+    @pytest.mark.asyncio
+    async def test_shutdown_closes_session_owned_by_another_loop(self):
+        """In production the session lives on the router thread's loop; shutdown runs elsewhere."""
+        router = make_aiohttp_router("http://w1:8888")
+        loop = asyncio.new_event_loop()
+        thread = threading.Thread(target=loop.run_forever, daemon=True)
+        thread.start()
+        try:
+            async def _create():
+                return router._get_generate_session()
+
+            session = await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(_create(), loop))
+            assert not session.closed
+            await router.shutdown()
+            assert session.closed
+            assert router._generate_session is None
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=5)
+            loop.close()

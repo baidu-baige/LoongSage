@@ -38,6 +38,26 @@ logger = logging.getLogger(__name__)
 
 _ROLLOUT_SINGLE_TURN = "single_turn"
 _ROLLOUT_MULTI_TURN = "multi_turn"
+# Min gap between a client's keep-alive and its server's: a client stalled longer than this
+# would reuse a connection the server already closed.
+_MIN_KEEPALIVE_MARGIN_SECONDS = 10
+
+
+def check_keepalive_config(config) -> None:
+    """Fail fast unless each client keep-alive is well below its server's keep-alive."""
+    router_cfg = config.agentflow.router
+    pairs = (
+        ("agentflow.router.agent_keepalive_seconds", router_cfg.agent_keepalive_seconds,
+         "agentflow.router.keepalive_seconds", router_cfg.keepalive_seconds),
+        ("agentflow.router.upstream_keepalive_seconds", router_cfg.upstream_keepalive_seconds,
+         "rollout.env_vars.SGLANG_TIMEOUT_KEEP_ALIVE", config.rollout.env_vars["SGLANG_TIMEOUT_KEEP_ALIVE"]),
+    )
+    for client_key, client_value, server_key, server_value in pairs:
+        if float(server_value) - float(client_value) < _MIN_KEEPALIVE_MARGIN_SECONDS:
+            raise ValueError(
+                f"{client_key}={client_value} must be at least {_MIN_KEEPALIVE_MARGIN_SECONDS}s below "
+                f"{server_key}={server_value}, so the client closes idle connections before the server does"
+            )
 
 
 def get_rollout_mode(ds_unit) -> str:
@@ -108,6 +128,8 @@ class AgentFlow:
         self._resources = contextlib.AsyncExitStack()
 
         self._max_connections = int(self.config.agentflow.router.max_connections)
+        check_keepalive_config(self.config)
+        self._agent_keepalive_seconds = float(self.config.agentflow.router.agent_keepalive_seconds)
         # Per-request generation + shared bounded control client, both gated by a
         # semaphore -> each pool's C~=1 so httpcore's O(C^2) _assign stays cheap.
         self._generate_sem = asyncio.Semaphore(self._max_connections)
@@ -512,6 +534,7 @@ class AgentFlow:
             agent = agent_class(
                 router_url=f"{self.router_url}/{traj.trajectory_id}/{attempt_id}",
                 max_response_len_per_trajectory=max_response_len_per_trajectory,
+                http_keepalive_seconds=self._agent_keepalive_seconds,
                 **agent_cfg,
                 reward_fn=reward_fn,
                 sandbox_client=sandbox_client,
