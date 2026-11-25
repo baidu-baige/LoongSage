@@ -63,6 +63,7 @@ ______________________________________________________________________
 
 ## 📰 最新动态 (News)
 
+- **[2026-11]** 发布 [v0.2.1](https://github.com/baidu-baige/LoongSage/releases/tag/v0.2.1)：DeepSeek-V4.1 视觉训练、ERNIE-5.5-Flash-Base、组级别奖励（group reward）以及单卡 Countdown 示例！
 - **[2026-11]** 发布首个正式版本 [v0.2.0](https://github.com/baidu-baige/LoongSage/releases/tag/v0.2.0)：DeepSeek-V4.1 训练、PPO 与 SFT、Qwen3-VL 图像模态 RL、SGLang 0.5.23！
 - **[2026-10]** 支持 DeepSeek-V4.1-Flash [QAT 训练](conf/dsv41_flash/)，并新增 [RLCD2 训练配方](conf/rlcd2/)！
 - **[2026-10]** 技术报告 [*LoongSage: A Production-Grade, High-Efficiency Agentic RL Framework for Frontier LLMs with Validated Recipes*](https://arxiv.org/abs/2610.16352) 已在 arXiv 发布！
@@ -106,6 +107,7 @@ ______________________________________________________________________
 | Qwen3-VL-30B-A3B-Instruct | [`qwen3_vl_30b_a3b/`](conf/qwen3_vl_30b_a3b/)：GRPO（geo3k 单图、MMRB 多图） | H20 × 1 |
 | Qwen3.8-27B | [`qwen3.8_27b/`](conf/qwen3.8_27b/)：DAPO | H20 × 1 |
 | Qwen3-4B | [`qwen3_4b/`](conf/qwen3_4b/)：DAPO、SFT | H800 × 1，H20 × 1 |
+| Qwen3-0.6B | [`qwen3_0_6b/`](conf/qwen3_0_6b/)：Countdown | 1 卡 |
 | StartLux-Decision-v1.1-4B-AutoThink | [`rlcd2/`](conf/rlcd2/)：RLCD2 | H20 × 1 |
 
 QAT（`trainer.qat`）目前仅支持 DeepSeek-V4.1，其他模型均以 BF16 训练。
