@@ -110,7 +110,10 @@ class MegatronActorWorker(MegatronTrainWorker):
         if self._quant.qat:
             n = self._quant.snap_()
             n_act = self._quant.register_activation_hooks()
-            logger.info(f"[Rank {self.rank}] QAT: snapped {n} params, {n_act} activation hooks")
+            n_fq = len(self._quant.fake_quant_params)
+            logger.info(
+                f"[Rank {self.rank}] QAT: snapped {n} params, {n_fq} forward fake-quant params, {n_act} activation hooks"
+            )
         elif self._quant.quantized:
             logger.info(f"[Rank {self.rank}] Quantized checkpoint without QAT: bridge exports the checkpoint format, no snapping")
 

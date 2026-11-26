@@ -101,7 +101,8 @@ The following models have been validated with the recipes under [`conf/`](conf/)
 | DeepSeek-V4.1-Flash (original FP8/MXFP4 weights, QAT) | [`dsv41_flash/`](conf/dsv41_flash/): DAPO, SWE, SFT, GRPO on geo3k (single image) and MMRB (multi-image) | H20 × 6 |
 | DeepSeek-V4.1-Flash (BF16) | [`dsv41_flash_bf16/`](conf/dsv41_flash_bf16/): DAPO, SWE | NVIDIA SM100 GPUs × 5–6, H20 × 6 |
 | DeepSeek-V4-Flash (BF16) | [`dsv4_flash_bf16/`](conf/dsv4_flash_bf16/): DAPO, SWE | H20 × 6–8, NVIDIA SM100 GPUs × 4 |
-| ERNIE-5.5-Flash-Base (BF16) | [`ernie55_flash/`](conf/ernie55_flash/): DAPO, GSM8K | H20 × 6 |
+| ERNIE-5.5-Flash (original FP8/MXFP4 weights, weight QAT) | [`ernie55_flash/`](conf/ernie55_flash/): DAPO | H20 × 6 |
+| ERNIE-5.5-Flash (BF16) | [`ernie55_flash_bf16/`](conf/ernie55_flash_bf16/): DAPO, GSM8K | H20 × 6 |
 | Qwen3-30B-A3B | [`qwen3_30b_a3b/`](conf/qwen3_30b_a3b/): DAPO, GSM8K, BCP, MOPD | H20 × 1 |
 | Qwen3-Coder-30B-A3B-Instruct | [`qwen3_coder_30b_a3b/`](conf/qwen3_coder_30b_a3b/): Claude Code, Codex, OpenCode, mini-SWE | H20 × 2–4 |
 | Qwen3-VL-30B-A3B-Instruct | [`qwen3_vl_30b_a3b/`](conf/qwen3_vl_30b_a3b/): GRPO on geo3k (single image) and MMRB (multi-image) | H20 × 1 |
@@ -110,7 +111,7 @@ The following models have been validated with the recipes under [`conf/`](conf/)
 | Qwen3-0.6B | [`qwen3_0_6b/`](conf/qwen3_0_6b/): Countdown | 1 GPU |
 | StartLux-Decision-v1.1-4B-AutoThink | [`rlcd2/`](conf/rlcd2/): RLCD2 | H20 × 1 |
 
-QAT (`trainer.qat`) currently supports only DeepSeek-V4.1. Other models train in BF16.
+QAT (`trainer.qat`) currently supports DeepSeek-V4.1 (weight and activation QAT) and ERNIE-5.5-Flash (weight QAT only). Other models train in BF16.
 
 ______________________________________________________________________
 

@@ -1,0 +1,124 @@
+# @package _global_
+# DAPO math (single-turn) RL on the full 43-layer ERNIE-5.5-Flash-Preview with bf16 weights, 6-node
+# H20 (6 x 8 = 48 GPUs), colocated rollout + training. For the released FP8/MXFP4 weights with
+# weight QAT, see ernie55_flash/dapo_h20_6node.
+#
+#   hf download baidu/ERNIE-5.5-Flash-Preview-BF16 --local-dir /root/ERNIE-5.5-Flash-Preview-BF16
+#   hf download Haitao999/DAPO-Math-17k-unique --repo-type=dataset --local-dir /root/dapo-math
+#
+#   # Run the same command on every machine
+#   bash examples/start_ray_cluster.sh <master-ip>
+#
+#   # Once the cluster is ready, run this on the head node only (the defaults below point at
+#   # the shared copies; override them for other locations)
+#   bash examples/start.sh ernie55_flash_bf16/dapo_h20_6node \
+#     checkpoint_path=/root/ckpt/ernie55_dapo \
+#     hf_model_path=/root/ERNIE-5.5-Flash-Preview-BF16 \
+#     data_source.dataset.prompt_data_path=/root/dapo-math
+#
+# checkpoint_path and hf_model_path must live on storage that every node can reach
+# through the same path.
+defaults:
+  - /default
+  - _self_
+
+checkpoint_path: ???
+hf_model_path: ???
+colocate: true
+total_steps: 300
+
+data_source:
+  dataset:
+    prompt_data_path: ???
+    input_key: prompt
+    label_key: reward_model
+  reward:
+    name: dapo_math
+    #overlong_penalty_length: 2048
+  num_prompts_per_step: 16
+  num_trajectories_per_prompt: 8
+  max_response_len_per_trajectory: 20480
+
+rollout:
+  env_vars:
+    # The input-RMSNorm / VHA-postmix fusions are not bit-exact; keep rollout close to training.
+    SGLANG_OPT_ERNIE5_5_FUSE_INEXACT: "0"
+    NCCL_CUMEM_ENABLE: "1"
+  num_gpus_per_node: 8
+  sglang_args:
+    # attention_backend=ernie55 and page_size=256 are forced by sglang's ERNIE override.
+    mem_fraction_static: 0.6
+    disable_cuda_graph: false
+    ep_size: 8
+    max_running_requests: 128
+  sglang_replicas:
+    regular:
+      num_nodes: 6
+      # The full model does not fit in a 4-GPU replica.
+      num_gpus_per_replica: 8
+
+agentflow:
+  dump_trajectory_path: "log/trajectories"
+  tokenizer:
+    think_tags: ["<ernie:think>", "</ernie:think>"]
+    generation_prompt_kwargs:
+      enable_thinking: false
+  router:
+    middleware:
+      parser:
+        reasoning_parser: ernie55
+        tool_call_parser: ernie55
+
+trainer:
+  num_gpus_per_node: 8
+  num_nodes: 6
+  mini_batch_size: 128
+  max_tokens_per_gpu: 8192           # x CP4 = 32768 tokens per micro-batch, above prompt + 20480
+  use_dynamic_batch_size: true
+  use_rollout_routing_replay: false  # ERNIE router has no replay hook
+  use_fp32_lm_head: false
+  deterministic_mode: false
+  save_freq: 10                      # dist ckpt incl. fp32 optimizer state is ~3.5 TB per save
+  save_hf: false
+  async_save: true
+  nccl_timeout_minutes: 60
+  gloo_timeout_minutes: 60
+  env_vars:
+    PYTORCH_ALLOC_CONF: "expandable_segments:True,pinned_max_cached_size_mb:32"
+
+megatron:
+  model:
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 6
+    virtual_pipeline_model_parallel_size: null
+    context_parallel_size: 4
+    sequence_packing_scheduler: "default_dynamic_cp"
+    # Global THD layout with cu_seqlens_*_padded set; the H layers need it at CP>1.
+    cp_partition_mode: contiguous
+    # ERNIE 5.5 hyper-connections exchange fp32 residual streams across PP stages;
+    # a narrower pipeline dtype would round them at every boundary (Bridge enforces this).
+    pipeline_dtype: torch.float32
+    expert_model_parallel_size: 8
+    expert_tensor_parallel_size: 1
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 1
+    # Train the D layers' DSA indexer with its KL loss, as Bridge's ERNIE 5.5 recipe does.
+    dsa_indexer_loss_coeff: 0.01
+    dsa_indexer_use_sparse_loss: true
+  optimizer:
+    lr: 1.0e-6
+    chunked_optimizer_state_offload: true
+    optimizer_state_offload_fraction: 1.0
+
+algorithm:
+  advantage_estimator: grpo
+  advantage_norm_mode: group_zscore
+  policy_loss: grpo
+  loss_agg_mode: token-mean
+  is_correction:
+    enable: true
+    action: mask
+    level: token
+    lower_bound: 0.5
+    upper_bound: 2

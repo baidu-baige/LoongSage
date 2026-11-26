@@ -240,3 +240,105 @@ def test_activation_fake_quant_matches_sglang_and_is_ste(monkeypatch):
     torch.testing.assert_close(m.wq_b(inp), torch.nn.functional.linear(qat._FakeQuantActFP8.apply(inp, 32), m.wq_b.weight),
                                rtol=0, atol=0)
     assert torch.equal(m.wo_a(inp), torch.nn.functional.linear(inp, m.wo_a.weight))
+
+
+# ---------------------------------------------------------------- ERNIE 5.5
+
+
+class Ernie55LatentProjection(torch.nn.Module):
+    """Stand-in with the forward of the bridge's ``Ernie55LatentProjection`` (fp32 weight, cast at use)."""
+
+    def __init__(self, o, i):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.randn(o, i) * 0.02)
+
+    def forward(self, x):
+        return torch.nn.functional.linear(x, self.weight.to(x.dtype)), None
+
+
+ERNIE_ROLLOUT = {"backend": "sglang", "env_vars": {},
+                 "sglang_args": {"moe_runner_backend": "flashinfer_mxfp4", "flashinfer_mxfp4_moe_precision": "bf16",
+                                 "disable_shared_experts_fusion": True}}
+
+
+def _ernie(monkeypatch, rounding="threshold", rollout=ERNIE_ROLLOUT):
+    em = pytest.importorskip("megatron.bridge.models.ernie.ernie55_mappings")
+    # 2 heads of nope 24 + v 32 = 56 rows: heads and the k/v split are not 32-row aligned.
+    dims = em.Ernie55DLayerDims(num_heads=2, kv_lora_rank=64, qk_nope_head_dim=24, qk_rope_head_dim=8, v_head_dim=32)
+    m = torch.nn.Module()
+    m.attn = torch.nn.Module()
+    m.attn.k_b_proj = torch.nn.Parameter(torch.randn(2 * 64, 24).bfloat16())
+    m.attn.v_b_proj = torch.nn.Parameter(torch.randn(2 * 32, 64).bfloat16())
+    m.wq = torch.nn.Linear(64, 64, bias=False).bfloat16()
+    m.latent = Ernie55LatentProjection(64, 96)
+    kv = "model.layers.7.self_attn.kv_b_proj.weight"
+
+    def task(name, module, param, mapping):
+        return SimpleNamespace(param_name=name, megatron_module=module, param_weight=param, mapping=mapping)
+
+    tasks = [
+        task("attn.k_b_proj", m.attn, m.attn.k_b_proj,
+             em._Ernie55KVUpMapping("attn.k_b_proj", kv, hf_dtype=torch.bfloat16, part="k", dims=dims)),
+        task("attn.v_b_proj", m.attn, m.attn.v_b_proj,
+             em._Ernie55KVUpMapping("attn.v_b_proj", kv, hf_dtype=torch.bfloat16, part="v", dims=dims)),
+        task("wq.weight", m.wq, m.wq.weight, ReplicatedMapping("wq.weight", "model.layers.7.self_attn.q_a_proj.weight")),
+        task("latent.weight", m.latent, m.latent.weight,
+             ReplicatedMapping("latent.weight", "model.layers.7.block_sparse_moe.fc1_latent_proj.weight")),
+    ]
+    bridge = SimpleNamespace(get_conversion_tasks=lambda chunks: tasks,
+                             hf_pretrained=SimpleNamespace(config=SimpleNamespace(architectures=["Ernie5_5_MoeForCausalLM"])))
+    ckpt = {
+        kv: CkptQuant(FP8, kv + "_scale_inv", (112, 64)),
+        "model.layers.7.self_attn.q_a_proj.weight": CkptQuant(FP8, "q_scale_inv", (64, 64)),
+        "model.layers.7.block_sparse_moe.fc1_latent_proj.weight": CkptQuant(FP8, "l_scale_inv", (64, 96)),
+    }
+    monkeypatch.setattr(qat, "scan_ckpt_quant", lambda path: (ckpt, {}))
+    monkeypatch.setattr(qat.os.path, "isdir", lambda path: True)
+    monkeypatch.setattr(qat.torch.distributed, "get_rank", lambda: 0)
+    plan = qat.QuantPlan(bridge, [m], "/ckpt", _cfg(True, rollout, rounding))
+    return plan, m, dims, kv, em
+
+
+@pytest.mark.parametrize("rounding", ["threshold", "nearest"])
+def test_ernie_kv_b_proj_joint_snap(monkeypatch, rounding):
+    plan, m, dims, kv, em = _ernie(monkeypatch, rounding)
+    assert [n for n, _, _ in plan.snap_params] == ["wq.weight"] and len(plan.joint_snaps) == 1
+    assert not plan.act_modules  # weight QAT only
+    full = em.join_kv_b_proj(m.attn.k_b_proj.data, m.attn.v_b_proj.data, dims)
+    thr = None
+    if rounding == "threshold":
+        thr = qat._thresholds_fn(SimpleNamespace(tp_rank=0), [kv], full.shape, tuple(full.shape))
+    expect = FP8.snap_(full.clone(), thr)
+    assert plan.snap_() == 2
+    got = em.join_kv_b_proj(m.attn.k_b_proj.data, m.attn.v_b_proj.data, dims)
+    assert torch.equal(got, expect) and not torch.equal(got, full)
+    assert torch.equal(FP8.snap_(got.clone()), got)  # on the checkpoint tensor's grid
+
+
+def test_ernie_fp32_latent_forward_fake_quant(monkeypatch):
+    plan, m, *_ = _ernie(monkeypatch)
+    assert [n for n, _, _ in plan.fake_quant_params] == ["latent.weight"]
+    master = m.latent.weight.data.clone()
+    plan.snap_()
+    assert torch.equal(m.latent.weight.data, master)  # never snapped in place
+    x = torch.randn(5, 96).bfloat16()
+    y, _ = m.latent(x)
+    q = FP8.snap_(master.clone())
+    assert torch.equal(y, torch.nn.functional.linear(x, q.bfloat16()))
+    assert torch.equal(m.latent.weight.data, master)  # restored after the forward
+    y.float().sum().backward()  # straight-through: dL/dW = g^T x, independent of W
+    ref = torch.ones(5, 64).bfloat16().t().float() @ x.float()
+    torch.testing.assert_close(m.latent.weight.grad, ref, rtol=1e-2, atol=1e-2)
+
+
+def test_ernie_adapter_rejects_unmodeled_rollout(monkeypatch):
+    bad = {"backend": "sglang", "env_vars": {}, "sglang_args": {}}
+    with pytest.raises(ValueError, match="moe_runner_backend.*flashinfer_mxfp4_moe_precision.*shared_experts"):
+        _ernie(monkeypatch, rollout=bad)
+
+
+def test_fp32_quantized_param_needs_adapter(monkeypatch):
+    m = _toy()
+    m.wq_b.weight.data = m.wq_b.weight.data.float()
+    with pytest.raises(NotImplementedError, match="fp32 quantized param"):
+        _plan(monkeypatch, m, enable=True)

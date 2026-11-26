@@ -64,10 +64,22 @@ trainer:
   qat: true
 ```
 
+ERNIE-5.5-Flash 的发布权重为 dense FP8（128x128 块，F32 存储的 2 的幂 scale）+ MXFP4 experts，只做权重 QAT，不做激活 fake-quant。配方见 [ernie55_flash/dapo_h20_6node.yaml](../../conf/ernie55_flash/dapo_h20_6node.yaml)，启动时校验的 rollout 设置：
+
+```yaml
+rollout:
+  sglang_args:
+    # config 未声明 MXFP4 experts，需补 routed_experts_quant_method（覆盖整个 quantization_config）
+    json_model_override_args: '{"quantization_config": {..., "routed_experts_quant_method": "mxfp4"}}'
+    moe_runner_backend: flashinfer_mxfp4                # 唯一支持 MXFP4 原地热更新和 SiTU 的后端
+    flashinfer_mxfp4_moe_precision: bf16
+    disable_shared_experts_fusion: true
+```
+
 注意事项：
 
 - `hf_model_path` 不是量化 checkpoint 时，开启 `trainer.qat` 会直接报错；
-- 目前只在 DeepSeek-V4.1 + SGLang rollout 上验证过，暂不训练 MTP，也不支持 vision；
+- 目前在 DeepSeek-V4.1 和 ERNIE-5.5-Flash + SGLang rollout 上验证过，暂不训练 MTP，也不支持 vision；
 - 开启 `save_hf` 时每次都会写出一整份 checkpoint（含未训练的 vision / MTP 权重），完整模型需预留数百 GB 磁盘；
 - 激活对齐的是量化函数，两侧 GEMM 的实现与累加顺序仍不同，残余偏差仍需第 5 节的算法层修正处理；
 - 想评估 QAT 的收益，可以设 `trainer.qat: false` 跑一组对照：推理侧同样跑量化权重，训练侧不做 QAT，对比两者的 `train/is_approx_k3_kl`。

@@ -1,23 +1,31 @@
 # @package _global_
-# DAPO math (single-turn) RL on the full 43-layer ERNIE-5.5-Flash-Base (bf16), 6-node H20
-# (6 x 8 = 48 GPUs), colocated rollout + training.
+# DAPO math RL on the full 43-layer ERNIE-5.5-Flash-Preview in its released FP8/MXFP4 format,
+# 6-node H20 (6 x 8 = 48 GPUs), colocated, with weight QAT. The same model with bf16 weights is
+# in ernie55_flash_bf16/dapo_h20_6node.
 #
-# Single-turn math (no agent / sandbox) as a bootstrap trial for the raw Base checkpoint.
+# The rollout serves the checkpoint's own format: dense linears FP8 e4m3 with 128x128 power-of-two
+# scales (W8A8), routed experts MXFP4 (W4A16). The trainer loads the same directory, dequantized
+# to bf16 by the bridge (coda/backends/megatron/monkey_patch.py). Each weight sync re-quantizes
+# into that format, and trainer.qat snaps the quantized weights onto the grid after every
+# optimizer step, so the rollout runs exactly the training weights. Activation QAT is not
+# modeled for ERNIE (the QAT adapter registers no activation hooks). See
+# coda/backends/megatron/qat.py (Ernie55Adapter) for kv_b_proj and the fp32 latent projections.
 #
-#   hf download baidu/ERNIE-5.5-Flash-Base-BF16 --local-dir /root/ERNIE-5.5-Flash-Base-BF16
+#   hf download baidu/ERNIE-5.5-Flash-Preview --local-dir /root/ERNIE-5.5-Flash-Preview
 #   hf download Haitao999/DAPO-Math-17k-unique --repo-type=dataset --local-dir /root/dapo-math
 #
 #   # Run the same command on every machine
 #   bash examples/start_ray_cluster.sh <master-ip>
 #
-#   # Once the cluster is ready, run this on the head node only
+#   # Once the cluster is ready, run this on the head node only (the defaults below point at
+#   # the shared copies; override them for other locations)
 #   bash examples/start.sh ernie55_flash/dapo_h20_6node \
-#     checkpoint_path=/root/ckpt/ernie55_dapo \
-#     hf_model_path=/root/ERNIE-5.5-Flash-Base-BF16 \
+#     checkpoint_path=/root/ckpt/ernie55_dapo_qat \
+#     hf_model_path=/root/ERNIE-5.5-Flash-Preview \
 #     data_source.dataset.prompt_data_path=/root/dapo-math
 #
-# checkpoint_path and hf_model_path must live on storage that every node can reach
-# through the same path.
+# checkpoint_path and hf_model_path must live on storage that every node can reach through the
+# same path.
 defaults:
   - /default
   - _self_
@@ -34,7 +42,6 @@ data_source:
     label_key: reward_model
   reward:
     name: dapo_math
-    #overlong_penalty_length: 2048
   num_prompts_per_step: 16
   num_trajectories_per_prompt: 8
   max_response_len_per_trajectory: 20480
@@ -51,20 +58,29 @@ rollout:
     disable_cuda_graph: false
     ep_size: 8
     max_running_requests: 128
+    # The Preview config marks its MXFP4 experts only with `expert_dtype`, which sglang does not
+    # read; without routed_experts_quant_method it loads them as FP8 and fails. The override
+    # replaces the whole quantization_config, so every field is repeated.
+    json_model_override_args: >-
+      {"quantization_config": {"activation_scheme": "dynamic", "fmt": "e4m3", "quant_method": "fp8",
+      "expert_dtype": "mxfp4", "routed_experts_quant_method": "mxfp4", "scale_fmt": "ue8m0",
+      "weight_block_size": [128, 128]}}
+    # The only MoE backend with the in-place MXFP4 weight update (and SiTU) in the sglang patch;
+    # `auto` picks the triton FP8 MoE, which fails on the MXFP4 experts.
+    moe_runner_backend: flashinfer_mxfp4
+    flashinfer_mxfp4_moe_precision: bf16   # W4A16 experts
+    disable_shared_experts_fusion: true    # shared experts as dense FP8 linears
   sglang_replicas:
     regular:
       num_nodes: 6
-      # The full model does not fit in a 4-GPU replica.
       num_gpus_per_replica: 8
 
 agentflow:
   dump_trajectory_path: "log/trajectories"
   tokenizer:
-    # The checkpoint ships no chat template; this is Megatron-Bridge's ERNIE 5.5 SFT template.
-    custom_chat_template_path: ernie55_flash/ernie55_chat_template.jinja
     think_tags: ["<ernie:think>", "</ernie:think>"]
     generation_prompt_kwargs:
-      enable_thinking: false
+      enable_thinking: true
   router:
     middleware:
       parser:
@@ -80,8 +96,9 @@ trainer:
   use_rollout_routing_replay: false  # ERNIE router has no replay hook
   use_fp32_lm_head: false
   deterministic_mode: false
+  qat: true                          # weight QAT; set false for the FP8/FP4-rollout baseline
   save_freq: 10                      # dist ckpt incl. fp32 optimizer state is ~3.5 TB per save
-  save_hf: false
+  save_hf: false                     # true writes the checkpoint's own format (~155 GB per save)
   async_save: true
   nccl_timeout_minutes: 60
   gloo_timeout_minutes: 60

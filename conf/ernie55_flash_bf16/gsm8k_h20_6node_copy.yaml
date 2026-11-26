@@ -1,0 +1,147 @@
+# @package _global_
+#
+# GSM8K (single-turn) RL on the full 43-layer ERNIE-5.5-Flash-Base (bf16), 6-node H20
+# (6 x 8 = 48 GPUs), colocated rollout + training. Same full-model layout as dapo_h20_6node.yaml,
+# but the easiest bootstrap for the base checkpoint: grade-school math, direct Q -> A, no agent,
+# no tool-call format, thinking off, no length penalty.
+#
+# Why this shape (see the base-model analysis): the raw Base checkpoint has no SFT, so it cannot
+# follow the <ernie:think> / <ernie:tool_call> format and collapses under a length penalty. GSM8K
+# is easy enough that the base model sometimes answers correctly -> reward has variance -> GRPO
+# gets a real gradient. Thinking off removes the think-tag burden; agent=null removes the
+# multi-turn tool format; the gsm8k reward has no overlong penalty, so there is no "emit EOS to
+# dodge the penalty" reward hack.
+#
+# Launch (ERNIE-capable checkouts via examples/start_ernie55.sh, see that script):
+#   bash examples/start_ernie55.sh ray <head-ip>     # on every node, head first
+#   bash examples/start_ernie55.sh run ernie55_flash_bf16/gsm8k_h20_6node   # on the head node only
+#
+# ERNIE 5.5 constraints this config follows (see dapo_h20_6node.yaml / swe_h20_6node.yaml):
+#   * Trainer TP=1 (multimax head, H and D layers); experts use EP.
+#   * No routing replay (R3); deterministic_mode off (D-layer deterministic backward is SM100-only).
+#   * bf16 checkpoint on both sides; sglang attn_tp=1 (attn_dp_size = replica size).
+#   * With PP>1 the ERNIE hyper-connections exchange fp32 residual streams -> pipeline_dtype fp32.
+#
+# Trainer layout: TP1 x PP6 x CP4 x DP2, EP8 within each PP stage (one node per stage).
+defaults:
+  - /default
+  - _self_
+
+checkpoint_path: "/mnt/cfs-ainf/zhuminghan/checkpoint/ernie55-gsm8k"
+hf_model_path: "/mnt/cfs-ainf/workspace/coda-data/models/ERNIE-5.5-Flash-Base-BF16"
+colocate: true
+total_steps: 300
+
+data_source:
+  dataset:
+    prompt_data_path: "/mnt/cfs-ainf/workspace/coda-data/datasets/gsm8k/main/train-00000-of-00001.parquet"
+    data_pre_processor: "gsm8k"   # appends "#### <answer>" format instruction; the reward extracts #### N
+    input_key: question
+    label_key: answer
+  # Single-turn Q -> A: leave data_source.agent at its default (name: null) so no agent/tool-call
+  # format is required (the base model cannot emit it). Do NOT set `agent: null` here -- that
+  # replaces the default {name: null} dict with None and get_rollout_mode() crashes on .get().
+  reward:
+    name: gsm8k               # binary-ish answer match, no overlong penalty (no length reward hack)
+  num_prompts_per_step: 16
+  num_trajectories_per_prompt: 8
+  max_response_len_per_trajectory: 4096
+
+rollout:
+  env_vars:
+    # Ray workers take their environment from `ray start`; forward the driver's PYTHONPATH so
+    # every node imports the ERNIE-capable Megatron-LM / Bridge / sglang.
+    PYTHONPATH: ${oc.env:PYTHONPATH}
+    # The input-RMSNorm / VHA-postmix fusions are not bit-exact; keep rollout close to training.
+    SGLANG_OPT_ERNIE5_5_FUSE_INEXACT: "0"
+    NCCL_CUMEM_ENABLE: "1"
+  num_gpus_per_node: 8
+  sglang_args:
+    # attention_backend=ernie55 and page_size=256 are forced by sglang's ERNIE override.
+    mem_fraction_static: 0.6
+    disable_cuda_graph: false
+    # attn_tp=1: with attn_tp>1 the HCA layers cache a sharded attn_sink that the
+    # ERNIE weight loader does not refresh after an online weight update.
+    #attn_dp_size: 8
+    ep_size: 8
+    max_running_requests: 128
+  sglang_replicas:
+    regular:
+      num_nodes: 6
+      # The full model does not fit in a 4-GPU replica.
+      num_gpus_per_replica: 8
+
+agentflow:
+  dump_trajectory_path: "log/trajectories"
+  tokenizer:
+    # The checkpoint ships no chat template; this is Megatron-Bridge's ERNIE 5.5 SFT template.
+    custom_chat_template_path: ernie55_flash_bf16/ernie55_chat_template.jinja
+    think_tags: ["<ernie:think>", "</ernie:think>"]
+    generation_prompt_kwargs:
+      enable_thinking: false  # base model cannot manage the <ernie:think> block; answer directly
+  router:
+    middleware:
+      parser:
+        reasoning_parser: ernie55
+        tool_call_parser: ernie55
+
+tracking:
+  project_name: eb-test
+  experiment_name: gsm8k
+  tracking_backend: mlflow
+  mlflow_tracking_uri: http://10.41.51.215:8500/
+
+trainer:
+  num_gpus_per_node: 8
+  num_nodes: 6
+  mini_batch_size: 128
+  max_tokens_per_gpu: 4096           # x CP4 = 16384 tokens per micro-batch, above prompt + 4096
+  use_dynamic_batch_size: true
+  use_rollout_routing_replay: false  # ERNIE router has no replay hook
+  use_fp32_lm_head: false
+  deterministic_mode: false
+  save_freq: 10                      # dist ckpt incl. fp32 optimizer state is ~3.5 TB per save
+  save_hf: false
+  async_save: true
+  nccl_timeout_minutes: 60
+  gloo_timeout_minutes: 60
+  env_vars:
+    PYTHONPATH: ${oc.env:PYTHONPATH}
+    PYTORCH_ALLOC_CONF: "expandable_segments:True,pinned_max_cached_size_mb:32"
+
+megatron:
+  model:
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 6
+    virtual_pipeline_model_parallel_size: null
+    context_parallel_size: 4
+    sequence_packing_scheduler: "default_dynamic_cp"
+    # Global THD layout with cu_seqlens_*_padded set; the H layers need it at CP>1.
+    cp_partition_mode: contiguous
+    # ERNIE 5.5 hyper-connections exchange fp32 residual streams across PP stages;
+    # a narrower pipeline dtype would round them at every boundary (Bridge enforces this).
+    pipeline_dtype: torch.float32
+    expert_model_parallel_size: 8
+    expert_tensor_parallel_size: 1
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 1
+    # Train the D layers' DSA indexer with its KL loss, as Bridge's ERNIE 5.5 recipe does.
+    dsa_indexer_loss_coeff: 0.01
+    dsa_indexer_use_sparse_loss: true
+  optimizer:
+    lr: 1.0e-6
+    chunked_optimizer_state_offload: true
+    optimizer_state_offload_fraction: 1.0
+
+algorithm:
+  advantage_estimator: grpo
+  advantage_norm_mode: group_zscore
+  policy_loss: grpo
+  loss_agg_mode: token-mean
+  is_correction:
+    enable: true
+    action: mask
+    level: token
+    lower_bound: 0.5
+    upper_bound: 2
