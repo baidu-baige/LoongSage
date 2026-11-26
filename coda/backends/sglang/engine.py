@@ -15,6 +15,7 @@ from omegaconf import OmegaConf
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
 from coda.backends.rollout_worker import RolloutWorker
+from coda.algorithms.score_centering import validate_rollout_config as validate_score_centering_rollout_config
 from coda.utils.logging_utils import redact_secrets
 logger = logging.getLogger(__name__)
 
@@ -57,6 +58,9 @@ class SglangEngine(RolloutWorker):
         if config.rollout.sglang_replicas.regular.num_nodes == 0:
             assert config.rollout.sglang_replicas.prefill.num_nodes > 0
             assert config.rollout.sglang_replicas.decode.num_nodes > 0
+
+        if config.algorithm.score_centering.enable:
+            validate_score_centering_rollout_config(config)
 
         return config
     

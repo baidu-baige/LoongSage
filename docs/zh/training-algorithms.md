@@ -24,13 +24,14 @@
 
 ### 1.2.Policy loss
 
-`algorithm.policy_loss` 内置两种类 GRPO 的 clipped surrogate loss：
+`algorithm.policy_loss` 内置类 GRPO 的 clipped surrogate loss 和不裁剪的 REINFORCE loss：
 
 | 取值 | 重要性比率 | 说明 |
 | --- | --- | --- |
 | `grpo`（默认） | token 级 `exp(logπ - logπ_old)` | 非对称裁剪（`clip_ratio_low` / `clip_ratio_high`，默认 0.2 / 0.28，即 DAPO 的 clip-higher）；对负 advantage 额外做 dual-clip（`clip_ratio_c`，默认 10.0） |
 | `gspo` | 序列级 `exp(mean(Δlogp))` | 序列级比率、token 级梯度路由，见 [GSPO](https://arxiv.org/pdf/2507.18071)；仅使用 `clip_ratio_low` / `clip_ratio_high` |
 | `ppo` | token 级，同 `grpo` | 与 `grpo` 是同一个 clipped surrogate（PPO 和 GRPO 只在 advantage 上不同）；标准 PPO 设置为 `clip_ratio_low = clip_ratio_high = 0.2`、`clip_ratio_c = 3.0` |
+| `reinforce` | 无 | 逐 token `-A·logπ`，不裁剪；score centering 要求使用它 |
 
 行为策略 `logπ_old` 默认由训练引擎在每个 step 开始时重算；设置 `trainer.use_rollout_log_probs: true` 可改用推理引擎返回的 `rollout_log_probs`（此时不能启用 IS correction 和 M2PO，见下节）。
 
@@ -43,6 +44,7 @@
 | IS correction | `algorithm.is_correction.enable` | 按 `π_old / π_rollout` 对逐 token loss 加权，权重越界时裁剪或屏蔽 | 与 `trainer.use_rollout_log_probs: true` 互斥 |
 | M2PO | `algorithm.m2po.enable` | 在整批范围内屏蔽 `(log(π_old/π_rollout))²` 最大的 token，直至剩余 token 的平均二阶矩降到 `threshold`（默认 0.04）以下 | 同上 |
 | OPSM | `algorithm.opsm.enable` | 当序列满足 `advantage < 0` 且序列级 KL 超过 `delta`（默认 0.1）时，丢弃该序列的梯度（分母保持不变） | 无 |
+| Score centering | `algorithm.score_centering.enable` | 从被采样 token 的 score 中减去它在推理分布下的期望，抵消训推失配带来的漂移（[arXiv:2609.20807](https://arxiv.org/abs/2609.20807)） | 需 `policy_loss: reinforce`；不能与 M2PO、OPSM、OPD 同时开；与 IS correction 组合时只支持 `level: token`；采样只允许不超过 `topk` 的 `top_k` 截断（见[配置参考 §9.5](./config-reference.md)） |
 
 IS correction 的行为由两个维度组合而成：
 

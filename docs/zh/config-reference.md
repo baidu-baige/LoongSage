@@ -301,7 +301,7 @@ OPD（On-Policy Distillation）在 RL 流程中额外挂载若干 teacher 模型
 | `algorithm.advantage_estimator` | `grpo` | advantage 估计方法名。 | 通过 registry 注册；当前内置 `grpo`、`gae`（PPO：advantage 由 critic 计算，需要 `critic.enable`）。 |
 | `algorithm.advantage_norm_mode` | `group_zscore` | `grpo` 的组内 reward 归一化方式。 | `none` / `group_mean` / `group_zscore`；`group_*` 要求同组 trajectory 数一致；`gae` 忽略此项。 |
 | `algorithm.use_masked_whiten` | `false` | 对任意 estimator 的 advantage，在整个 step 的全部 response token 上做白化（DP 内 all-reduce）。 | 在 estimator 之后执行；PPO 的 returns 不做白化。 |
-| `algorithm.policy_loss` | `grpo` | policy loss 名。 | 内置 `grpo` / `ppo`（与 `grpo` 同一个 clipped surrogate）/ `gspo`；GSPO 见 [论文](https://arxiv.org/pdf/2507.18071)。 |
+| `algorithm.policy_loss` | `grpo` | policy loss 名。 | 内置 `grpo` / `ppo`（与 `grpo` 同一个 clipped surrogate）/ `gspo` / `reinforce`（`-A·logπ`，不裁剪）；GSPO 见 [论文](https://arxiv.org/pdf/2507.18071)。 |
 | `algorithm.ppo.value_clip` | `0.2` | critic value loss 围绕 old values 的裁剪范围。 | 仅 `advantage_estimator: gae` 时使用。 |
 | `algorithm.ppo.gamma` | `1.0` | GAE 折扣因子。 | 仅 `advantage_estimator: gae` 时使用。 |
 | `algorithm.ppo.lam` | `0.95` | GAE lambda。 | 仅 `advantage_estimator: gae` 时使用。 |
@@ -339,6 +339,26 @@ OPD（On-Policy Distillation）在 RL 流程中额外挂载若干 teacher 模型
 | `algorithm.ref_kl.kl_type` | `k3` | KL 估计器：`k1` / `k2` / `k3`。 | — |
 | `algorithm.ref_kl.use_unbiased_kl` | `false` | 逐 token KL 乘以 `exp(log_probs - old_log_probs)`（DeepSeek-V3.2 做法）。 | — |
 | `algorithm.ref_kl.update_interval` | `-1` | `<=0` 表示 ref 保持冻结；`>0` 表示每 N 步用当前 actor 覆盖 ref。 | 需要 `enable: true`。 |
+
+### 9.5 score_centering
+
+从被采样 token 的 score 中减去它在推理分布下的期望，抵消训推失配带来的漂移，见 [arXiv:2609.20807](https://arxiv.org/abs/2609.20807)。推理端为每个响应 token 记录 top-k logprob，top-k 之外的尾部用训练端分布按尾部质量缩放来近似。
+
+| 参数 | 默认 | 说明 | 约束 |
+| --- | --- | --- | --- |
+| `algorithm.score_centering.enable` | `false` | 是否开启 score centering。 | 见下方约束。 |
+| `algorithm.score_centering.topk` | `128` | 每个响应 token 记录的推理端 top-k logprob 数。 | 必须 > 0。论文 Figure 5 中 `32` 在多数设置下与全词表接近，但在 MIS + SC（staleness 64）和 30B INT8 W/A + INT4 KV 两个设置里有阶段性落后，且 30B 的 `32` 只跑了单 seed；除非载荷成为瓶颈，建议保持 `128`。 |
+
+开启后启动时校验：
+
+- `algorithm.policy_loss` 必须是 `reinforce`；clipped surrogate 是分段目标，无法用加性项修正。
+- 不能同时开启 `algorithm.m2po`、`algorithm.opsm`、`opd`。
+- 开启 `algorithm.is_correction` 时只支持 `level: token`；它与 `trainer.use_rollout_log_probs: true` 的互斥保持不变。
+- `rollout.partial` 或 `fully_async.enable` 建议打开 `is_correction` ：论文中严重陈旧性下单独使用 score centering 效果差，建议组合 TIS 或 MIS。
+- 每个 data source 的 `completion_params` 不能截断或改写采样分布：`top_p < 1`、`min_p > 0`、repetition / frequency / presence penalty、`min_new_tokens`、`logit_bias`、`json_schema` / `regex` / `ebnf` / `structural_tag` 均会报错；`stop` 不受影响。
+- 采样 `top_k` 只能是 `-1` 或 `2 ≤ top_k ≤ algorithm.score_centering.topk`：记录的 top-k 需覆盖全部可采样 token，训练端才能在其上重新归一化得到实际采样分布；`top_k = 1` 是贪心，中心化后梯度为 0。
+- `trainer.temperature ≠ 1` 时不能设置 `SGLANG_RETURN_ORIGINAL_LOGPROB=1`。
+- 不支持投机解码（`sglang_args.speculative_algorithm`）。
 
 ## 10. Trainer
 
@@ -384,6 +404,7 @@ OPD（On-Policy Distillation）在 RL 流程中额外挂载若干 teacher 模型
   - `algorithm.is_correction.enable: true`
   - `algorithm.m2po.enable: true`
 - `algorithm.opsm.*` 与上述三者可自由组合。
+- `algorithm.score_centering.enable: true` 要求 `policy_loss: reinforce`，且不能与 M2PO、OPSM 同时开启，见 §9.5。
 
 ### 11.3 全异步模式
 

@@ -299,7 +299,7 @@ algorithm:
   advantage_estimator: grpo # grpo|gae (gae = PPO, requires critic.enable)
   advantage_norm_mode: group_zscore # none|group_mean|group_zscore (grpo only; ignored by gae)
   use_masked_whiten: false # whiten advantages over all response tokens of the step (any estimator)
-  policy_loss: grpo # grpo|gspo|ppo (ppo = the grpo clipped surrogate)
+  policy_loss: grpo # grpo|gspo|ppo|reinforce (ppo = the grpo clipped surrogate; reinforce = -A*log p, unclipped)
   ppo:                     # used when advantage_estimator=gae
     value_clip: 0.2        # clip range of the critic value loss around old values
     gamma: 1.0             # GAE discount
@@ -311,6 +311,9 @@ algorithm:
     level: token # token|sequence|geometric
     lower_bound: ??? # 0.5 for token-level clipping, 0.9999 for geometric-level clipping
     upper_bound: ??? # 2 for token-level clipping, 1.0001 for geometric-level clipping
+  score_centering: # requires policy_loss=reinforce; composes with is_correction at level=token
+    enable: false           
+    topk: 128 # sampler top-k log-probs recorded per response token; the paper's default (32 lags in some settings); sampling top_k must be ≤ this
 
   opsm:
     enable: false
