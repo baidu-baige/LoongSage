@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import json
 import logging
+import os
 import threading
 import time
 from collections import Counter
@@ -15,10 +16,18 @@ import uvicorn
 from fastapi import APIRouter, FastAPI, Request, status
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel as PydanticModel
-from sglang.srt.utils.auth import admin_auth_headers
 
 from coda.agentflow.router import resolve_middleware_chain
 from coda.agentflow.utils import build_request_id
+
+
+def admin_auth_headers() -> dict[str, str]:
+    """Bearer header for SGLang admin routes, from the key SglangEngine puts in SGLANG_ADMIN_API_KEY.
+
+    Same as sglang.srt.utils.auth.admin_auth_headers, without importing sglang into the router.
+    """
+    key = os.environ.get("SGLANG_ADMIN_API_KEY")
+    return {"Authorization": f"Bearer {key}"} if key else {}
 
 
 class WorkerPayload(PydanticModel):
