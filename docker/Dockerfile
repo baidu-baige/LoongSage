@@ -20,12 +20,11 @@ RUN pip install nvidia-resiliency-ext==0.6.0
 RUN git clone https://github.com/NVIDIA-NeMo/Megatron-Bridge.git && cd Megatron-Bridge && git checkout 17530a274 && pip install --no-deps --no-build-isolation -e .
 RUN git clone https://github.com/NVIDIA/Megatron-LM.git && cd Megatron-LM && git checkout 2ab6361e4 && pip install --no-deps --no-build-isolation -e .
 
-# sglang main 28053272d9 + sgl-project/sglang#51926 (Inkling-2-Mini, head 7ee83cfebc)
-RUN rm -rf sglang && git clone https://github.com/sgl-project/sglang.git && cd sglang && git checkout 28053272d9 \
-    && git fetch origin pull/51926/head && git -c user.name=loongsage -c user.email=loongsage@localhost merge --no-ff --no-edit 7ee83cfebc \
+# sglang main 4817721258
+RUN rm -rf sglang && git clone https://github.com/sgl-project/sglang.git && cd sglang && git checkout 4817721258 \
     && cd python && pip install --no-deps --no-build-isolation -e .
 
-# kernels and deps pinned by sglang 28053272d9 + #51926 (python/pyproject.toml)
+# kernels and deps pinned by sglang 4817721258 (python/pyproject.toml)
 RUN pip install sglang-kernel==0.4.11 sgl-deep-gemm==0.2.9 sgl-flash-mla==1.0.5 sgl-deep-ep==0.1.3 sgl-fa3==0.1.0 \
     tml-renderers==0.4.2 humming-kernels==0.1.18 "flashinfer_python[cu13]==0.7.4"
 RUN pip install flashinfer-cubin==0.7.4 --index-url https://flashinfer.ai/whl \
@@ -56,7 +55,7 @@ RUN pip install qwen-vl-utils==0.0.14
 RUN git clone https://github.com/baidu-baige/LoongSage.git && cd LoongSage && pip install --no-deps --no-build-isolation -e .
 
 # patch
-RUN cd /sgl-workspace/sglang && git apply ../LoongSage/docker/patch/sglang-28053272d9-pr51926.patch
+RUN cd /sgl-workspace/sglang && git apply ../LoongSage/docker/patch/sglang-4817721258.patch
 RUN cd /sgl-workspace/Megatron-LM && git apply ../LoongSage/docker/patch/dsv41/megatron-core.patch
 RUN cd /sgl-workspace/Megatron-Bridge && git apply ../LoongSage/docker/patch/dsv41/megatron-bridge.patch
 RUN cd /sgl-workspace/Megatron-Bridge && git apply ../LoongSage/docker/patch/inkling2/megatron-bridge.patch

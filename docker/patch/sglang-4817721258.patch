@@ -59,10 +59,10 @@ index d3382c7610..19e3def991 100644
  async def update_weights_from_tensor(
      obj: Annotated[UpdateWeightsFromTensorReqInput, Body()], request: Request
 diff --git a/python/sglang/srt/layers/engram.py b/python/sglang/srt/layers/engram.py
-index d072641866..a428bba272 100644
+index aa59ce4f22..5a17d71905 100644
 --- a/python/sglang/srt/layers/engram.py
 +++ b/python/sglang/srt/layers/engram.py
-@@ -1845,3 +1845,63 @@ def _bcg_engram_embed(
+@@ -1908,3 +1908,63 @@ def _bcg_engram_embed(
      # A replay builds a fresh batch; the capture-time one stages no rows.
      forward_batch = get_tc_piecewise_forward_context().forward_batch
      out.copy_(engram.embed_rows(hash_ids, forward_batch, cp_all_tokens))
@@ -127,10 +127,10 @@ index d072641866..a428bba272 100644
 +                param.weight_loader(param, f.get_slice(name))
 +        emb.finish_load(label=f"dummy engram layer {i}")
 diff --git a/python/sglang/srt/layers/quantization/fp8.py b/python/sglang/srt/layers/quantization/fp8.py
-index 0083af59ec..319b612599 100644
+index 64643b2b93..957cd76877 100644
 --- a/python/sglang/srt/layers/quantization/fp8.py
 +++ b/python/sglang/srt/layers/quantization/fp8.py
-@@ -1050,6 +1050,33 @@ class Fp8LinearMethod(LinearMethodBase):
+@@ -1031,6 +1031,33 @@ class Fp8LinearMethod(LinearMethodBase):
          self._process_mxfp8_linear_weight_scale(layer, scale_u8=scale_u8)
          layer.block_fp8_mxfp8_ready = True
  
@@ -565,7 +565,7 @@ index 50aeeef220..b68f69a3d6 100644
      # The new weight version
      new_version: str
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index aa3a580d08..69a4a87319 100644
+index 2660d3f85b..360f5ab5e0 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
 @@ -214,6 +214,7 @@ from sglang.srt.managers.io_struct import (
@@ -746,10 +746,10 @@ index c05551108f..2fed7669c1 100644
                  quant_method = getattr(module, "quant_method", None)
                  if quant_method is not None:
 diff --git a/python/sglang/srt/model_loader/weight_utils.py b/python/sglang/srt/model_loader/weight_utils.py
-index 2ff1aa32fc..1c7d290f18 100644
+index bf6f566840..7a74836f7c 100644
 --- a/python/sglang/srt/model_loader/weight_utils.py
 +++ b/python/sglang/srt/model_loader/weight_utils.py
-@@ -2012,6 +2012,13 @@ def initialize_dummy_weights(
+@@ -2014,6 +2014,13 @@ def initialize_dummy_weights(
      the parameter's number of elements and its data type.
      """
      for name, param in model.state_dict().items():
@@ -764,10 +764,10 @@ index 2ff1aa32fc..1c7d290f18 100644
          # MXFP8 weight scales to 2**-127.
          if name.endswith("weight_scale_inv") and param.dtype == torch.uint8:
 diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
-index af3608ce74..73e18f6f32 100644
+index e6504b7a48..783539b368 100644
 --- a/python/sglang/srt/models/deepseek_v4.py
 +++ b/python/sglang/srt/models/deepseek_v4.py
-@@ -5316,6 +5316,15 @@ class DeepseekV4ForCausalLM(
+@@ -5414,6 +5414,15 @@ class DeepseekV4ForCausalLM(
          if self.wo_a_fp8:
              self._setup_fp8_wo_a_scales(is_nextn)
  
@@ -783,7 +783,7 @@ index af3608ce74..73e18f6f32 100644
          for module in self.modules():
              if isinstance(module, MQALayer):
                  module.setup_mega_attention()
-@@ -5888,6 +5897,16 @@ class DeepseekV4ForCausalLM(
+@@ -5989,6 +5998,16 @@ class DeepseekV4ForCausalLM(
                  f"Some weights are not initialized from checkpoints: {unloaded_params}"
              )
  
