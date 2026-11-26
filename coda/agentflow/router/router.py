@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import json
 import logging
+import os
 import threading
 import time
 from collections import Counter
@@ -18,6 +19,15 @@ from pydantic import BaseModel as PydanticModel
 
 from coda.agentflow.router import resolve_middleware_chain
 from coda.agentflow.utils import build_request_id
+
+
+def admin_auth_headers() -> dict[str, str]:
+    """Bearer header for SGLang admin routes, from the key SglangEngine puts in SGLANG_ADMIN_API_KEY.
+
+    Same as sglang.srt.utils.auth.admin_auth_headers, without importing sglang into the router.
+    """
+    key = os.environ.get("SGLANG_ADMIN_API_KEY")
+    return {"Authorization": f"Bearer {key}"} if key else {}
 
 
 class WorkerPayload(PydanticModel):
@@ -367,7 +377,10 @@ class Router:
         for attempt in range(1, max_attempts + 1):
             try:
                 async with self._control_sem:
-                    response = await self._control_client.post(target_url, json=payload)
+                    # /abort_request is an SGLang admin route; SglangEngine sets the run's admin key.
+                    response = await self._control_client.post(
+                        target_url, json=payload, headers=admin_auth_headers()
+                    )
                 if 200 <= response.status_code < 300:
                     return None
                 failure = {

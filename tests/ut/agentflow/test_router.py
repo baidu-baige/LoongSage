@@ -366,8 +366,9 @@ class TestWorkerManagement:
         assert body["attempt_id"] == 7
 
     @pytest.mark.asyncio
-    async def test_abort_session_aborts_worker_request_and_clears_session(self):
+    async def test_abort_session_aborts_worker_request_and_clears_session(self, monkeypatch):
         """Aborting one attempt sends its rid to the pinned worker and clears sticky routing."""
+        monkeypatch.setenv("SGLANG_ADMIN_API_KEY", "test-admin-key")
         router = make_router()
         request_id = build_request_id("traj-001", 0)
         router.session_id_to_slot[request_id] = slot("http://w1:8888")
@@ -385,6 +386,7 @@ class TestWorkerManagement:
         router._control_client.post.assert_awaited_once_with(
             "http://w1:8888/abort_request",
             json={"rid": request_id, "abort_all": False},
+            headers={"Authorization": "Bearer test-admin-key"},
         )
         assert request_id not in router.session_id_to_slot
 

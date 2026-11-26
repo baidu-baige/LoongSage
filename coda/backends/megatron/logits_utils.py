@@ -127,6 +127,13 @@ def _mul_reduce(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return (a * b).sum(dim=-1, keepdim=True)
 
 
+def _masked_mul_reduce(softmax: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
+    """``sum(p * logits)`` treating ``0 * -inf`` as 0: models such as Inkling2 mask padded vocab rows with -inf."""
+    product = softmax * logits
+    product.masked_fill_(torch.isneginf(logits), 0.0)
+    return product.sum(dim=-1, keepdim=True)
+
+
 # from https://github.com/volcengine/verl/blob/
 #   0bdf7f469854815177e73dcfe9e420836c952e6e/verl/utils/megatron/tensor_parallel.py#L99
 class _VocabParallelEntropy(torch.autograd.Function):
@@ -141,7 +148,7 @@ class _VocabParallelEntropy(torch.autograd.Function):
         normalized_sum_exp_logits = normalized_exp_logits.sum(dim=-1, keepdim=True)
         dist.all_reduce(normalized_sum_exp_logits, group=process_group)
         softmax_logits = normalized_exp_logits.div_(normalized_sum_exp_logits)
-        sum_softmax_times_logits = _mul_reduce(softmax_logits, vocab_parallel_logits)
+        sum_softmax_times_logits = _masked_mul_reduce(softmax_logits, vocab_parallel_logits)
         dist.all_reduce(sum_softmax_times_logits, group=process_group)
         entropy = logits_max + normalized_sum_exp_logits.log() - sum_softmax_times_logits
         ctx.save_for_backward(vocab_parallel_logits, softmax_logits, sum_softmax_times_logits)
@@ -154,6 +161,8 @@ class _VocabParallelEntropy(torch.autograd.Function):
         # reuse softmax_logits as grad
         vocab_parallel_logits.sub_(sum_softmax_times_logits)
         softmax_logits.mul_(vocab_parallel_logits)
+        # p = 0 on -inf (masked) rows, whose gradient is 0 rather than 0 * -inf.
+        softmax_logits.masked_fill_(torch.isneginf(vocab_parallel_logits), 0.0)
         softmax_logits.mul_(grad_output.unsqueeze(dim=-1))
         # recover vocab_parallel_logits
         vocab_parallel_logits.add_(sum_softmax_times_logits)
