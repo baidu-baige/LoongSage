@@ -7,6 +7,7 @@ supporting distributed deployment, weight updates, and fault tolerance.
 import logging
 import multiprocessing
 import os
+import secrets
 import time
 from typing import override
 
@@ -14,6 +15,7 @@ import requests
 from omegaconf import OmegaConf
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils.auth import admin_auth_headers
 from coda.backends.rollout_worker import RolloutWorker
 from coda.utils.logging_utils import redact_secrets
 logger = logging.getLogger(__name__)
@@ -27,7 +29,7 @@ class SglangEngine(RolloutWorker):
     @classmethod
     def runtime_env_vars(cls) -> dict:
         """Return runtime environment variables for the SGLang engine."""
-        return  {
+        env_vars = {
             key: os.environ.get(key, default_val)
             for key, default_val in {
                 "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "false",
@@ -43,6 +45,12 @@ class SglangEngine(RolloutWorker):
                 "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
             }.items()
         }
+        # SGLang refuses its admin routes (weight update, memory release) unless the server has an
+        # admin key. One key per run: it is set in the driver's own environment, where the router
+        # reads it, so every call and every engine (server and client side) gets the same key.
+        os.environ.setdefault("SGLANG_ADMIN_API_KEY", secrets.token_urlsafe(32))
+        env_vars["SGLANG_ADMIN_API_KEY"] = os.environ["SGLANG_ADMIN_API_KEY"]
+        return env_vars
 
     @classmethod
     def validate_config(cls, config):
@@ -158,7 +166,7 @@ class SglangEngine(RolloutWorker):
             return
 
         url = f"http://{self.server_host}:{self.server_port}/{endpoint}"
-        response = requests.post(url, json=payload or {}, timeout=timeout or 30.0)
+        response = requests.post(url, json=payload or {}, headers=admin_auth_headers(), timeout=timeout or 30.0)
         try:
             response.raise_for_status()
         except requests.exceptions.HTTPError as e:
@@ -198,6 +206,7 @@ class SglangEngine(RolloutWorker):
             try:
                 response = requests.get(
                     f"http://{self.server_host}:{self.server_port}/flush_cache",
+                    headers=admin_auth_headers(),
                     timeout=timeout,
                 )
                 if response.status_code == 200:
@@ -410,6 +419,8 @@ def _wait_server_healthy(base_url, api_key, is_process_alive):
         "Content-Type": "application/json; charset=utf-8",
         "Authorization": f"Bearer {api_key}",
     }
+    # /flush_cache and /freeze_gc are admin routes: with an admin key set they accept only that key.
+    admin_headers = {**headers, **admin_auth_headers()}
 
     with requests.Session() as session:
         while True:
@@ -429,7 +440,7 @@ def _wait_server_healthy(base_url, api_key, is_process_alive):
         # use flush_cache to make sure the working queue is empty, so that we can do offload
         while True:
             try:
-                response = session.get(f"{base_url}/flush_cache", headers=headers)
+                response = session.get(f"{base_url}/flush_cache", headers=admin_headers)
                 if response.status_code == 200:
                     break
 
@@ -445,7 +456,7 @@ def _wait_server_healthy(base_url, api_key, is_process_alive):
         # SGLang's own post-warmup freeze_gc is disabled in _run_server; do it here,
         # where the server is known to be serving.
         try:
-            response = session.post(f"{base_url}/freeze_gc", headers=headers, timeout=30)
+            response = session.post(f"{base_url}/freeze_gc", headers=admin_headers, timeout=30)
             response.raise_for_status()
         except requests.RequestException as e:
             logger.warning("freeze_gc failed, GC stays unfrozen: %s", e)

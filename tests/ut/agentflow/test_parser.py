@@ -393,7 +393,7 @@ def make_parser(r3_enabled: bool = True) -> TrajectoryParser:
 
 
 @pytest.mark.parametrize(("model_family", "expected_skip_special_tokens"), [(None, True), ("deepseek_v4", False)])
-def test_parser_sampling_params_keep_special_tokens_only_for_deepseek_v4(
+def test_parser_sampling_params_keep_special_tokens_for_deepseek_v4(
     model_family, expected_skip_special_tokens
 ) -> None:
     tokenizer_manager = SimpleNamespace(
@@ -422,6 +422,38 @@ def test_parser_sampling_params_keep_special_tokens_only_for_deepseek_v4(
     assert sampling_params.get("skip_special_tokens") is expected_skip_special_tokens
     # SGLang must keep trimming the matched EOS: the parsers work on EOS-free text.
     assert sampling_params.get("no_stop_trim") is None
+
+
+def _tokenizer_with_special(*special: str, plain: tuple[str, ...] = ()) -> SimpleNamespace:
+    """Tokenizer stub exposing only what the special-token check reads."""
+    added = {i: SimpleNamespace(content=t, special=True) for i, t in enumerate(special)}
+    added.update({len(special) + i: SimpleNamespace(content=t, special=False) for i, t in enumerate(plain)})
+    return SimpleNamespace(all_special_tokens=[], added_tokens_decoder=added)
+
+
+@pytest.mark.parametrize(
+    ("tokenizer", "reasoning_parser", "tool_call_parser", "expected"),
+    [
+        # Inkling frames thinking and text in special content-block tokens.
+        (_tokenizer_with_special("<|content_thinking|>", "<|end_message|>"), "inkling", "inkling2", True),
+        # Qwen's <think> / <tool_call> are plain added tokens and survive skip_special_tokens.
+        (_tokenizer_with_special("<|im_end|>", plain=("<think>", "</think>", "<tool_call>")), "qwen3", "qwen", False),
+        (_tokenizer_with_special("<|content_thinking|>"), None, None, False),
+        # ERNIE's tool detector names its markers tool_call_start_token / tool_call_end_token.
+        (_tokenizer_with_special("<ernie:tool_call>"), None, "ernie55", True),
+        (_tokenizer_with_special(plain=("<ernie:tool_call>", "</ernie:tool_call>")), None, "ernie55", False),
+    ],
+)
+def test_parser_keeps_special_tokens_when_parser_markers_are_special(
+    tokenizer, reasoning_parser, tool_call_parser, expected
+) -> None:
+    parser = TrajectoryParser(
+        trajectory_store=TrajectoryStore(),
+        tokenizer_manager=SimpleNamespace(tokenizer=tokenizer),
+        reasoning_parser=reasoning_parser if reasoning_parser else False,
+        tool_call_parser=tool_call_parser if tool_call_parser else False,
+    )
+    assert parser.keep_special_tokens is expected
 
 
 @pytest.mark.parametrize(
@@ -845,9 +877,9 @@ BASH_TOOLS = [{
     ("config", "expected_reasoning", "expected_tool_call"),
     [
         # Config values are SGLang keys verbatim, and the two key spaces differ:
-        # "qwen3" only exists as a reasoning key, "qwen25" only as a tool-call key.
+        # "qwen3" only exists as a reasoning key, "qwen" only as a tool-call key.
         ("qwen3", "qwen3", None),
-        ("qwen25", None, "qwen25"),
+        ("qwen", None, "qwen"),
         ("qwen3_coder", None, "qwen3_coder"),
         (True, None, None),          # no chat template to auto-detect from
         (False, None, None),
@@ -912,7 +944,7 @@ def test_parse_reasoning_disabled_returns_text_unchanged() -> None:
 @pytest.mark.parametrize("tools", [BASH_TOOLS, None])
 def test_parse_tool_calls_extracts_qwen_markup_with_or_without_schema(tools) -> None:
     """Calls are forwarded even when the request omitted the tools field."""
-    parser = make_sglang_parser(tool_call_parser="qwen25")
+    parser = make_sglang_parser(tool_call_parser="qwen")
     text = 'ok\n<tool_call>\n{"name": "bash", "arguments": {"command": "ls"}}\n</tool_call>'
 
     content, tool_calls = parser._parse_tool_calls(text, tools)
@@ -972,7 +1004,7 @@ def test_parse_tool_calls_extracts_qwen3_coder_apply_patch_string() -> None:
 
 
 def test_parse_tool_calls_assigns_unique_ids_across_turns() -> None:
-    parser = make_sglang_parser(tool_call_parser="qwen25")
+    parser = make_sglang_parser(tool_call_parser="qwen")
     text = '<tool_call>\n{"name": "bash", "arguments": {"command": "ls"}}\n</tool_call>'
 
     _, first = parser._parse_tool_calls(text, BASH_TOOLS)
@@ -983,7 +1015,7 @@ def test_parse_tool_calls_assigns_unique_ids_across_turns() -> None:
 
 
 def test_parse_tool_calls_without_markup_returns_original_text() -> None:
-    parser = make_sglang_parser(tool_call_parser="qwen25")
+    parser = make_sglang_parser(tool_call_parser="qwen")
     assert parser._parse_tool_calls("plain answer", BASH_TOOLS) == ("plain answer", None)
 
 
@@ -1014,7 +1046,7 @@ def test_build_turn_input_caches_tools_for_follow_up_turns() -> None:
 
 
 def test_build_assistant_message_splits_reasoning_and_tool_calls() -> None:
-    parser = make_sglang_parser(reasoning_parser="qwen3", tool_call_parser="qwen25")
+    parser = make_sglang_parser(reasoning_parser="qwen3", tool_call_parser="qwen")
     generated_text = (
         "<think>plan</think>"
         '<tool_call>\n{"name": "bash", "arguments": {"command": "ls"}}\n</tool_call>'

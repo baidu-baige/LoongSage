@@ -15,6 +15,7 @@ import uvicorn
 from fastapi import APIRouter, FastAPI, Request, status
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel as PydanticModel
+from sglang.srt.utils.auth import admin_auth_headers
 
 from coda.agentflow.router import resolve_middleware_chain
 from coda.agentflow.utils import build_request_id
@@ -367,7 +368,10 @@ class Router:
         for attempt in range(1, max_attempts + 1):
             try:
                 async with self._control_sem:
-                    response = await self._control_client.post(target_url, json=payload)
+                    # /abort_request is an SGLang admin route; SglangEngine sets the run's admin key.
+                    response = await self._control_client.post(
+                        target_url, json=payload, headers=admin_auth_headers()
+                    )
                 if 200 <= response.status_code < 300:
                     return None
                 failure = {
