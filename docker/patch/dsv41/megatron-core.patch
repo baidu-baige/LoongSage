@@ -164,10 +164,10 @@ index 11c42045f..7946d543b 100644
      if padded_num_heads != actual_num_heads:
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/deepseek_v41.py b/megatron/core/transformer/experimental_attention_variant/dsv41/deepseek_v41.py
 new file mode 100644
-index 000000000..0520cd8b0
+index 000000000..08ecd27c1
 --- /dev/null
 +++ b/megatron/core/transformer/experimental_attention_variant/dsv41/deepseek_v41.py
-@@ -0,0 +1,732 @@
+@@ -0,0 +1,746 @@
 +import copy
 +
 +import einops
@@ -467,8 +467,10 @@ index 000000000..0520cd8b0
 +        super().__init__(config, layer_number)
 +        self.norm_eps = config.layernorm_epsilon
 +
-+    def forward(self, hidden_states, mhc_recompute_manager=None, output_slot=None, return_residual=False):
-+        if mhc_recompute_manager is not None or output_slot is not None:
++    def forward(
++        self, hidden_states, mhc_recompute_manager=None, output_slot=None, return_residual=False, *, checkpoint_fn=None
++    ):
++        if mhc_recompute_manager is not None or output_slot is not None or checkpoint_fn is not None:
 +            raise NotImplementedError("mHC recompute is not supported for the DeepSeek-V4.1 plugin")
 +        result = self._forward_normal(hidden_states)
 +        return result if return_residual else result[:3]
@@ -487,8 +489,20 @@ index 000000000..0520cd8b0
 +        return aggregated, h_res, h_post, hs_for_residual
 +
 +    def fused_h_res_h_post_bda(
-+        self, h_res, original_residual, h_post, layer_output_with_bias, dropout_prob, training, fused, manager=None
++        self,
++        h_res,
++        original_residual,
++        h_post,
++        layer_output_with_bias,
++        dropout_prob,
++        training,
++        fused,
++        manager=None,
++        *,
++        checkpoint_fn=None,
 +    ):
++        if checkpoint_fn is not None:
++            raise NotImplementedError("mHC recompute is not supported for the DeepSeek-V4.1 plugin")
 +        x, bias = layer_output_with_bias
 +        assert bias is None
 +        if hc_mix.FUSED:

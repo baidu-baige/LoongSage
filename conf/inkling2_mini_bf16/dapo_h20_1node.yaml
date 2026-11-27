@@ -33,7 +33,7 @@ data_source:
   reward:
     name: dapo_math
     overlong_penalty_length: 4096
-  num_prompts_per_step: 32
+  num_prompts_per_step: 64
   num_trajectories_per_prompt: 8
   max_response_len_per_trajectory: 20480
 
