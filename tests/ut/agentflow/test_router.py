@@ -40,6 +40,12 @@ def slot(worker_url: str, dp_rank: int = 0) -> WorkerSlot:
     return WorkerSlot(worker_url, dp_rank)
 
 
+def register(router: Router, worker_url: str, in_flight: int = 0) -> None:
+    """Register a single-DP-group worker with ``in_flight`` requests, as /add_worker would."""
+    router.worker_dp_size[worker_url] = 1
+    router.slot_request_counts[slot(worker_url)] = in_flight
+
+
 def make_store(*specs: tuple[str, int]) -> TrajectoryStore:
     """Create a TrajectoryStore pre-populated with minimal trajectories."""
     store = TrajectoryStore()
@@ -160,7 +166,7 @@ async def proxy_client(router: Router, *, upstream_body: dict, **request_kwargs)
 
 
 class TestWorkerManagement:
-    """Tests for add/exclude/include worker management endpoints."""
+    """Tests for add/remove/list worker management endpoints."""
 
     @pytest.mark.asyncio
     async def test_add_worker(self):
@@ -177,7 +183,7 @@ class TestWorkerManagement:
             "worker": "http://worker1:8888",
         }
         assert workers.status_code == status.HTTP_200_OK
-        assert "http://worker1:8888" in workers.json()["active_workers"]
+        assert "http://worker1:8888" in workers.json()["workers"]
 
     @pytest.mark.asyncio
     async def test_add_worker_missing_url_returns_422(self):
@@ -204,8 +210,8 @@ class TestWorkerManagement:
         assert result.status_code == 422
 
     @pytest.mark.asyncio
-    async def test_add_worker_duplicate_returns_409(self):
-        """Add worker returns 409 when worker already exists, and deduplicates."""
+    async def test_add_worker_duplicate_replaces(self):
+        """Re-adding a known URL replaces it instead of duplicating it."""
         router = make_router()
         async with make_client(router) as client:
             first = await client.post(
@@ -217,8 +223,23 @@ class TestWorkerManagement:
             workers = await client.get("/list_workers")
 
         assert first.status_code == status.HTTP_200_OK
-        assert second.status_code == status.HTTP_409_CONFLICT
-        assert workers.json()["active_workers"].count("http://worker1:8888") == 1
+        assert second.status_code == status.HTTP_200_OK
+        assert workers.json()["workers"].count("http://worker1:8888") == 1
+
+    @pytest.mark.asyncio
+    async def test_add_worker_after_remove_registers_again(self):
+        """A restarted engine on a removed engine's host:port is routable again."""
+        router = make_router()
+        async with make_client(router) as client:
+            await client.post("/add_worker", json={"worker_url": "http://w1:8888", "dp_size": 2})
+            await client.post("/remove_worker", json={"worker_url": "http://w1:8888"})
+            result = await client.post("/add_worker", json={"worker_url": "http://w1:8888"})
+            workers = await client.get("/list_workers")
+
+        assert result.status_code == status.HTTP_200_OK
+        body = workers.json()
+        assert body["workers"] == ["http://w1:8888"]
+        assert body["slot_load_stats"] == {"http://w1:8888": [0]}
 
     @pytest.mark.asyncio
     async def test_list_workers_empty_on_new_router(self):
@@ -229,126 +250,85 @@ class TestWorkerManagement:
 
         assert workers.status_code == status.HTTP_200_OK
         body = workers.json()
-        assert body["active_workers"] == []
-        assert body["dead_workers"] == []
+        assert body["workers"] == []
+        assert body["load_stats"] == {}
 
     @pytest.mark.asyncio
-    async def test_exclude_worker_moves_to_dead(self):
-        """Exclude worker removes it from active list and adds it to dead list."""
+    async def test_remove_worker_drops_it(self):
+        """Remove worker drops the worker and all its slots from the routing pool."""
         router = make_router()
         async with make_client(router) as client:
-            await client.post("/add_worker", json={"worker_url": "http://worker1:8888"})
-            result = await client.put(
-                "/exclude_worker", json={"worker_url": "http://worker1:8888"}
+            await client.post("/add_worker", json={"worker_url": "http://worker1:8888", "dp_size": 2})
+            await client.post("/add_worker", json={"worker_url": "http://worker2:8888"})
+            result = await client.post(
+                "/remove_worker", json={"worker_url": "http://worker1:8888"}
             )
             workers = await client.get("/list_workers")
 
         assert result.status_code == status.HTTP_200_OK
         assert result.json()["status"] == "success"
-        body = workers.json()
-        assert "http://worker1:8888" not in body["active_workers"]
-        assert "http://worker1:8888" in body["dead_workers"]
+        assert workers.json()["workers"] == ["http://worker2:8888"]
+        assert "http://worker1:8888" not in router.worker_dp_size
+        assert list(router.slot_request_counts) == [slot("http://worker2:8888")]
 
     @pytest.mark.asyncio
-    async def test_exclude_worker_missing_url_returns_422(self):
-        """Exclude worker returns 422 when worker_url is missing (Pydantic validation)."""
+    async def test_remove_worker_missing_url_returns_422(self):
+        """Remove worker returns 422 when worker_url is missing (Pydantic validation)."""
         router = make_router()
         async with make_client(router) as client:
-            result = await client.put("/exclude_worker", json={})
+            result = await client.post("/remove_worker", json={})
 
         assert result.status_code == 422
 
     @pytest.mark.asyncio
-    async def test_exclude_nonexistent_returns_404(self):
-        """Exclude a worker that was never registered returns 404."""
+    async def test_remove_nonexistent_returns_404(self):
+        """Removing a worker that was never registered returns 404."""
         router = make_router()
         async with make_client(router) as client:
-            result = await client.put(
-                "/exclude_worker", json={"worker_url": "http://notexist:8888"}
+            result = await client.post(
+                "/remove_worker", json={"worker_url": "http://notexist:8888"}
             )
 
         assert result.status_code == status.HTTP_404_NOT_FOUND
         assert result.json()["error"] == "Worker not found"
 
     @pytest.mark.asyncio
-    async def test_exclude_already_dead_returns_400(self):
-        """Exclude a worker that is already in the dead pool returns 400."""
+    async def test_remove_twice_returns_404(self):
+        """Removing an already removed worker returns 404, which the callers treat as done."""
         router = make_router()
         async with make_client(router) as client:
             await client.post("/add_worker", json={"worker_url": "http://w1:8888"})
-            _ = await client.put("/exclude_worker", json={"worker_url": "http://w1:8888"})
-            result = await client.put(
-                "/exclude_worker", json={"worker_url": "http://w1:8888"}
-            )
-
-        assert result.status_code == status.HTTP_400_BAD_REQUEST
-        assert result.json()["error"] == "Worker is already excluded"
-
-    @pytest.mark.asyncio
-    async def test_include_never_registered_returns_404(self):
-        """Include a worker that was never registered returns 404 with 'never registered'."""
-        router = make_router()
-        async with make_client(router) as client:
-            result = await client.put(
-                "/include_worker", json={"worker_url": "http://notexist:8888"}
+            _ = await client.post("/remove_worker", json={"worker_url": "http://w1:8888"})
+            result = await client.post(
+                "/remove_worker", json={"worker_url": "http://w1:8888"}
             )
 
         assert result.status_code == status.HTTP_404_NOT_FOUND
-        assert "never registered" in result.json()["error"]
+        assert result.json()["error"] == "Worker not found"
 
     @pytest.mark.asyncio
-    async def test_include_already_active_returns_400(self):
-        """Include a registered but non-excluded worker returns 400."""
-        router = make_router()
-        async with make_client(router) as client:
-            await client.post("/add_worker", json={"worker_url": "http://w1:8888"})
-            result = await client.put(
-                "/include_worker", json={"worker_url": "http://w1:8888"}
-            )
-
-        assert result.status_code == status.HTTP_400_BAD_REQUEST
-        assert result.json()["error"] == "Worker is already active"
-
-    @pytest.mark.asyncio
-    async def test_include_dead_worker_restores_to_active(self):
-        """Include a dead worker moves it back to the active pool."""
-        router = make_router()
-        async with make_client(router) as client:
-            await client.post("/add_worker", json={"worker_url": "http://w1:8888"})
-            await client.put("/exclude_worker", json={"worker_url": "http://w1:8888"})
-            result = await client.put(
-                "/include_worker", json={"worker_url": "http://w1:8888"}
-            )
-            workers = await client.get("/list_workers")
-
-        assert result.status_code == status.HTTP_200_OK
-        body = workers.json()
-        assert "http://w1:8888" in body["active_workers"]
-        assert "http://w1:8888" not in body["dead_workers"]
-
-    @pytest.mark.asyncio
-    async def test_exclude_keeps_session_routing(self):
-        """Excluding a worker does not proactively delete existing sticky sessions."""
+    async def test_remove_keeps_session_routing(self):
+        """Removing a worker does not proactively delete existing sticky sessions."""
         router = make_router()
         async with make_client(router) as client:
             await client.post("/add_worker", json={"worker_url": "http://w1:8888"})
             router.session_id_to_slot[build_request_id("traj-001", 0)] = slot("http://w1:8888")
             router.session_id_to_slot[build_request_id("traj-002", 0)] = slot("http://w1:8888")
-            await client.put("/exclude_worker", json={"worker_url": "http://w1:8888"})
+            await client.post("/remove_worker", json={"worker_url": "http://w1:8888"})
 
         assert router.session_id_to_slot[build_request_id("traj-001", 0)] == slot("http://w1:8888")
         assert router.session_id_to_slot[build_request_id("traj-002", 0)] == slot("http://w1:8888")
 
     @pytest.mark.asyncio
-    async def test_exclude_preserves_other_sessions(self):
-        """Excluding worker A does not affect sticky sessions bound to worker B."""
+    async def test_remove_preserves_other_sessions(self):
+        """Removing worker A does not affect sticky sessions bound to worker B."""
         router = make_router()
         async with make_client(router) as client:
             await client.post("/add_worker", json={"worker_url": "http://w1:8888"})
             await client.post("/add_worker", json={"worker_url": "http://w2:8888"})
             router.session_id_to_slot[build_request_id("traj-001", 0)] = slot("http://w1:8888")
             router.session_id_to_slot[build_request_id("traj-002", 0)] = slot("http://w2:8888")
-            await client.put("/exclude_worker", json={"worker_url": "http://w1:8888"})
+            await client.post("/remove_worker", json={"worker_url": "http://w1:8888"})
 
         assert router.session_id_to_slot[build_request_id("traj-001", 0)] == slot("http://w1:8888")
         assert router.session_id_to_slot[build_request_id("traj-002", 0)] == slot("http://w2:8888")
@@ -432,8 +412,8 @@ class TestAbortAllWorkers:
     async def test_abort_all_success_clears_sessions_and_counts(self):
         """Successful abort-all clears sticky sessions and in-flight counts."""
         router = make_router()
-        router.slot_request_counts[slot("http://w1:8888")] = 2
-        router.slot_request_counts[slot("http://w2:8888")] = 1
+        register(router, "http://w1:8888", in_flight=2)
+        register(router, "http://w2:8888", in_flight=1)
         router.session_id_to_slot[build_request_id("traj-001", 0)] = slot("http://w1:8888")
         router.session_id_to_slot[build_request_id("traj-002", 0)] = slot("http://w2:8888")
         router._control_client.post = AsyncMock(
@@ -456,8 +436,8 @@ class TestAbortAllWorkers:
     async def test_abort_all_http_failure_preserves_sessions_and_counts(self):
         """A non-2xx worker response fails abort-all without clearing router state."""
         router = make_router()
-        router.slot_request_counts[slot("http://w1:8888")] = 2
-        router.slot_request_counts[slot("http://w2:8888")] = 1
+        register(router, "http://w1:8888", in_flight=2)
+        register(router, "http://w2:8888", in_flight=1)
         router.session_id_to_slot[build_request_id("traj-001", 0)] = slot("http://w1:8888")
         router._control_client.post = AsyncMock(
             side_effect=[
@@ -488,7 +468,7 @@ class TestAbortAllWorkers:
     async def test_abort_all_request_exception_preserves_sessions_and_counts(self):
         """A worker request exception fails abort-all without clearing router state."""
         router = make_router()
-        router.slot_request_counts[slot("http://w1:8888")] = 2
+        register(router, "http://w1:8888", in_flight=2)
         router.session_id_to_slot[build_request_id("traj-001", 0)] = slot("http://w1:8888")
         router._control_client.post = AsyncMock(side_effect=httpx.ConnectError("unreachable"))
 
@@ -583,16 +563,32 @@ class TestRoutingLogic:
         assert router.slot_request_counts[slot("http://w1:8888")] == 1
         assert router.slot_request_counts[slot("http://w2:8888")] == 0
 
-    def test_sticky_routing_skipped_when_worker_dead(self):
-        """Sticky routing falls back to least-loaded when pinned worker is dead."""
+    def test_sticky_routing_skipped_when_worker_removed(self):
+        """Sticky routing falls back to least-loaded when the pinned worker was removed."""
         router = self._make_router_with_workers(["http://w1:8888", "http://w2:8888"])
         router.session_id_to_slot[build_request_id("traj-001", 0)] = slot("http://w1:8888")
-        router.dead_workers.add("http://w1:8888")
+        router._unregister_worker("http://w1:8888")
 
         selected = router._select_slot(build_request_id("traj-001", 0))
 
         assert selected == slot("http://w2:8888")
         assert router.session_id_to_slot[build_request_id("traj-001", 0)] == slot("http://w2:8888")
+        assert slot("http://w1:8888") not in router.slot_request_counts
+
+    def test_sticky_routing_skipped_when_pinned_dp_group_gone(self):
+        """A worker re-added with fewer DP groups does not get its vanished slot back."""
+        router = make_router()
+        router.worker_dp_size["http://w1:8888"] = 2
+        router.slot_request_counts.update({slot("http://w1:8888", 0): 0, slot("http://w1:8888", 1): 0})
+        router.session_id_to_slot[build_request_id("traj-001", 0)] = slot("http://w1:8888", 1)
+        router._unregister_worker("http://w1:8888")
+        router.worker_dp_size["http://w1:8888"] = 1
+        router.slot_request_counts[slot("http://w1:8888", 0)] = 0
+
+        selected = router._select_slot(build_request_id("traj-001", 0))
+
+        assert selected == slot("http://w1:8888", 0)
+        assert list(router.slot_request_counts) == [slot("http://w1:8888", 0)]
 
     def test_sticky_routing_skipped_when_overloaded(self):
         """Sticky routing falls back when pinned worker exceeds the load threshold."""
@@ -630,14 +626,14 @@ class TestRoutingLogic:
     def test_no_workers_raises_runtime_error(self):
         """_select_slot raises RuntimeError when no workers are registered."""
         router = make_router()
-        with pytest.raises(RuntimeError, match="No healthy workers available"):
+        with pytest.raises(RuntimeError, match="No workers registered"):
             router._select_slot(build_request_id("traj-001", 0))
 
-    def test_all_workers_dead_raises_runtime_error(self):
-        """_select_slot raises RuntimeError when all workers are in the dead pool."""
+    def test_all_workers_removed_raises_runtime_error(self):
+        """_select_slot raises RuntimeError once every worker has been removed."""
         router = self._make_router_with_workers(["http://w1:8888"])
-        router.dead_workers.add("http://w1:8888")
-        with pytest.raises(RuntimeError, match="No healthy workers available"):
+        router._unregister_worker("http://w1:8888")
+        with pytest.raises(RuntimeError, match="No workers registered"):
             router._select_slot(build_request_id("traj-001", 0))
 
     def test_accumulate_reasoning_default_false(self):
@@ -720,7 +716,7 @@ class TestProxyForwarding:
 
     @pytest.mark.asyncio
     async def test_proxy_no_available_workers_returns_503(self):
-        """Proxy returns 503 when no healthy workers are registered."""
+        """Proxy returns 503 when no workers are registered."""
         router = make_proxy_router(make_store(("req-001", 0)))
         async with make_client(router, upstream_body={"messages": [{"role": "user", "content": "hi"}]}) as client:
             response = await client.post(
@@ -729,7 +725,7 @@ class TestProxyForwarding:
             )
 
         assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
-        assert response.json() == {"error": "No healthy workers available"}
+        assert response.json() == {"error": "No workers registered"}
 
     @pytest.mark.asyncio
     async def test_proxy_forwards_worker_4xx_unchanged(self):
@@ -1217,7 +1213,7 @@ class TestDpAttentionRouting:
             slot("http://w1:8888", 1),
         }
         body = workers.json()
-        assert body["active_workers"] == ["http://w1:8888"]
+        assert body["workers"] == ["http://w1:8888"]
         assert body["slot_load_stats"] == {"http://w1:8888": [0, 0]}
 
     @pytest.mark.asyncio

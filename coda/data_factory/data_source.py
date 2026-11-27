@@ -31,7 +31,7 @@ from coda.data_factory import (
 )
 from coda.data_factory.dataset import Dataset
 from coda.utils.checkpoint_utils import get_data_source_dir
-from coda.utils.multimodal_config import multimodal_enabled
+from coda.utils.hf_config import DEEPSEEK_V41_MODEL_TYPE, read_hf_model_type, read_image_pixel_bounds
 
 logger = logging.getLogger(__name__)
 
@@ -117,8 +117,8 @@ class RolloutDataSource(DataSource):
     - `prompt_data_path` (str):         Path to the dataset file, or to a directory of dataset files.
     - `eval_prompt_data_path` (str):    Path to the eval split, used when `is_eval` is set.
     - `max_prompt_len` (int | None):    Max prompt character length (text only; images are not counted).
-    - `max_image_tokens` (int | None):  Max estimated image tokens summed over one prompt's images; uses the
-                                        `multimodal.image` pixel bounds.  null = disabled.
+    - `max_image_tokens` (int | None):  Max estimated image tokens summed over one prompt's images; uses
+                                        the model's `preprocessor_config.json` pixel bounds.  null = disabled.
     - `input_key` (str):                Dataset column for the prompt text.
     - `label_key` (str | None):         Dataset column for ground-truth labels.
     - `metadata_key` (str):             Dataset column for per-row metadata dicts.
@@ -143,6 +143,9 @@ class RolloutDataSource(DataSource):
 
         pre_processor_name = self.dataset_config.data_pre_processor
         max_image_tokens = getattr(self.dataset_config, "max_image_tokens", None)
+        # An estimator (DeepSeek-V4.1) takes precedence over the pixel bounds, which that model does not use.
+        image_token_estimator = self._image_token_estimator() if max_image_tokens is not None else None
+        use_pixel_bounds = max_image_tokens is not None and image_token_estimator is None
         self.dataset = Dataset(
             self.dataset_config.eval_prompt_data_path if is_eval else self.dataset_config.prompt_data_path,
             max_length=self.dataset_config.max_prompt_len,
@@ -153,21 +156,34 @@ class RolloutDataSource(DataSource):
             data_pre_processor=get_data_pre_processor(pre_processor_name) if pre_processor_name else None,
             multimodal_keys=self._multimodal_keys(),
             max_image_tokens=max_image_tokens,
-            image_pixel_bounds=self._image_pixel_bounds() if max_image_tokens is not None else None,
+            image_pixel_bounds=self._image_pixel_bounds() if use_pixel_bounds else None,
+            image_token_estimator=image_token_estimator,
         )
 
         if self.dataset_config.shuffle:
             self.dataset.shuffle(self.epoch_id)
 
+    def _image_token_estimator(self):
+        """`data_uri -> tokens` for models whose image token count is not set by the pixel bounds, else None.
+
+        DeepSeek-V4.1 plans each image from the checkpoint's `vision_*` config, so the Qwen-style estimate
+        from the `preprocessor_config.json` pixel bounds does not apply.
+        """
+        if read_hf_model_type(getattr(self.config, "hf_model_path", None)) != DEEPSEEK_V41_MODEL_TYPE:
+            return None
+        from coda.agentflow.multimodal import dsv41_image_token_estimator, load_dsv41_vision_args
+
+        vision_args = load_dsv41_vision_args(self.config.hf_model_path)
+        return dsv41_image_token_estimator(vision_args)
+
     def _image_pixel_bounds(self) -> tuple[int, int]:
-        """Return `(min_pixels, max_pixels)` from `multimodal.image`, the bounds the router resizes images into."""
-        image_config = self.config.multimodal.image
-        return int(image_config.min_pixels), int(image_config.max_pixels)
+        """Return `(min_pixels, max_pixels)`, the bounds of the model's own processor config the router resizes into."""
+        return read_image_pixel_bounds(self.config.hf_model_path)
 
     def _multimodal_keys(self) -> dict | None:
         """Return this source's `{modality: column}` mapping as a plain dict, or None when multimodal is off."""
         keys = getattr(self.dataset_config, "multimodal_keys", None)
-        if not keys or not multimodal_enabled(self.config):
+        if not keys or not self.config.multimodal.enable:
             return None
         return {str(modality): str(column) for modality, column in keys.items()}
 

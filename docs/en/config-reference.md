@@ -26,16 +26,14 @@ Global run mode, randomness, checkpoint paths and logging.
 
 ### 1.1 multimodal (image modality)
 
-Switches on image input for VLM training. Everything is off by default, and text-only runs do not read this block. For the data format and a launch example see [Run Guide](run-guide.md#task-8-train-a-vision-language-model-qwen3-vl-with-images).
+Switches on image input for VLM training. Everything is off by default, and text-only runs do not read this block. For the data format and a launch example see [Run Guide](run-guide.md#task-8-train-a-vision-language-model-qwen3-vl-deepseek-v41-with-images).
 
 | Field | Default | Description | Constraints |
 | --- | --- | --- | --- |
-| `multimodal.enable` | `false` | Enable image-modality training. The Router then loads the HF processor of `hf_model_path`, expands each image into the image-pad tokens the model sees, and the trainer feeds the image tensors to the model. | Requires `qwen-vl-utils` (checked at startup). When `false`, no data source may set `dataset.multimodal_keys`. |
+| `multimodal.enable` | `false` | Enable image-modality training. The Router then loads the HF processor of `hf_model_path`, expands each image into the image-pad tokens the model sees, and the trainer feeds the image tensors to the model. DeepSeek-V4.1 (`model_type: deepseek_v41`) instead uses its own image processor, which plans each image from the checkpoint's `vision_*` config fields. | Models other than DeepSeek-V4.1 require `qwen-vl-utils` (checked at startup). When `false`, no data source may set `dataset.multimodal_keys` or `dataset.max_image_tokens`. |
 | `multimodal.modalities` | `[image]` | Modalities to enable. | Must be non-empty when `enable=true`. Only `image` is implemented; `video` and `audio` are reserved and rejected. |
-| `multimodal.image.min_pixels` | `65536` | Lower bound on an image's pixel count. The Router resizes smaller images up to it before the HF processor runs. Global, applies to every data source. | `> 0` and `<= max_pixels`; must be `>=` the processor's `shortest_edge`, checked when the processor loads. |
-| `multimodal.image.max_pixels` | `16777216` | Upper bound on an image's pixel count (4096x4096). Larger images are resized down to it. With Qwen3-VL (one token per 32x32 pixels) this allows at most 16384 image tokens per image. | `> 0`; must be `<=` the processor's `longest_edge`, checked when the processor loads. |
 
-`rollout.sglang_args.enable_multimodal` is set to `true` automatically when `multimodal.enable=true`. Setting it to `false` explicitly in the same run is a configuration error.
+The SGLang engine takes its default `enable_multimodal` from `multimodal.enable` at launch, so you normally do not set it. A value in `rollout.sglang_args.enable_multimodal` takes precedence, and it is not checked: with `multimodal.enable=true`, an explicit `false` starts SGLang without multimodal support. The config itself is not modified.
 
 ## 2. Fully-async (`fully_async`)
 
@@ -58,7 +56,7 @@ Switches that turn on the "rollout runs concurrently with training" pipeline. Se
 | `dataset.prompt_data_path` | `???` | Prompt dataset path. Supports `.jsonl` / `.parquet`, plus an optional row-slice suffix like `data.jsonl@[0:1000]`. | Required. |
 | `dataset.eval_prompt_data_path` | `null` | Eval split path, same format as above. | `null` disables eval; also requires `rollout.eval.interval > 0` for eval to actually run. |
 | `dataset.max_prompt_len` | `null` | Maximum characters allowed per prompt. Rows exceeding this are dropped at load time. | `null` disables the filter. This is a **character** length, not tokens. |
-| `dataset.max_image_tokens` | `null` | Maximum estimated image tokens summed over all images of one prompt. Rows exceeding this are dropped at load time. | `null` disables the filter. Estimated from image headers and `multimodal.image.{min_pixels,max_pixels}`, assuming Qwen3-VL's 32x32 pixels per token; independent of `max_prompt_len`. |
+| `dataset.max_image_tokens` | `null` | Maximum estimated image tokens summed over all images of one prompt. Rows exceeding this are dropped at load time. | `null` disables the filter. For models other than DeepSeek-V4.1 the estimate comes from image headers and the model's `preprocessor_config.json` (`size.shortest_edge` / `size.longest_edge`), assuming Qwen3-VL's 32x32 pixels per token; for DeepSeek-V4.1 it comes from the checkpoint's `vision_*` config. Independent of `max_prompt_len`. |
 | `dataset.multimodal_keys` | `null` | Maps a modality to its dataset column, e.g. `{image: images}`. The `images` column holds one base64 data URI (`data:image/...;base64,...`) per `<image>` placeholder in the prompt text, in order. | `null` means a text-only dataset. Requires `multimodal.enable=true`; each key must be listed in `multimodal.modalities`; only `image` is implemented. The placeholder count must equal the number of items in the column. |
 | `dataset.input_key` | `???` | Column holding the prompt text or message list. | Required. |
 | `dataset.label_key` | `???` | Column holding the ground-truth label. | Required; set to `null` explicitly if unused. |
@@ -206,9 +204,9 @@ The `megatron` node controls parallelism, optimizer and LR scheduling for the ac
 | `megatron.model.tensor_model_parallel_size` | `1` | Tensor parallel size (TP). | Total trainer GPUs must be divisible by `TP × PP × CP`; validated at startup — see [11.9](#119-dp-and-batch-sizes). |
 | `megatron.model.pipeline_model_parallel_size` | `1` | Pipeline parallel size (PP). | Same as above; participates in `TP × PP × CP`. |
 | `megatron.model.virtual_pipeline_model_parallel_size` | `null` | Virtual PP (VPP) size, used to shrink PP bubbles. | Requires PP > 1. |
-| `megatron.model.context_parallel_size` | `1` | Context parallel size (CP, sequence sharding). | Paired with `cp_partition_mode`; participates in `TP × PP × CP`. |
-| `megatron.model.cp_partition_mode` | `zigzag` | CP partitioning strategy (e.g. `zigzag`). | Only used when CP > 1. With `multimodal.enable=true` and CP > 1 only `zigzag` is accepted. |
-| `megatron.model.freeze_vision_model` | unset | Freeze the vision tower (Qwen3-VL). | Megatron-Bridge defaults it to `True` for Qwen3-VL-MoE, so set it explicitly; a warning is logged when it is unset. |
+| `megatron.model.context_parallel_size` | `1` | Context parallel size (CP, sequence sharding). | Paired with `cp_partition_mode`; participates in `TP × PP × CP`. With `multimodal.enable=true`, Qwen2.5-VL requires CP=1 (checked at startup). |
+| `megatron.model.cp_partition_mode` | `zigzag` | CP partitioning strategy (e.g. `zigzag`). | Only used when CP > 1. |
+| `megatron.model.freeze_vision_model` | unset | Freeze the vision tower (Qwen3-VL, DeepSeek-V4.1). | Megatron-Bridge defaults it to `True` for Qwen3-VL-MoE, so set it explicitly. |
 | `megatron.model.freeze_language_model` | unset | Freeze the language model (Qwen3-VL). | Same as above. Set `false` to train the language model. |
 | `megatron.model.expert_model_parallel_size` | `1` | Expert parallel size (EP) for MoE. | Keep at 1 for non-MoE models. Total trainer GPUs must be divisible by `ETP × EP × PP`. |
 | `megatron.model.expert_tensor_parallel_size` | `null` | TP size for the MoE experts. | `null` means "same as `tensor_model_parallel_size`"; that value is the `ETP` in the formula above. |

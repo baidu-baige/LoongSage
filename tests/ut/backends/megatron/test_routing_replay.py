@@ -26,10 +26,11 @@ TOPK = 2
 
 
 class _FakeMoELayer(torch.nn.Module):
-    def __init__(self, with_replay: bool = True):
+    def __init__(self, with_replay: bool = True, is_hash_layer: bool = False):
         super().__init__()
         self.router = torch.nn.Module()
         self.router.router_replay = RouterReplay() if with_replay else None
+        self.router.is_hash_layer = is_hash_layer
 
 
 class _FakeLayer(TransformerLayer):
@@ -158,6 +159,32 @@ def test_collect_ignores_orphans_outside_the_module_tree():
     assert sorted(routers) == [0, 1]
     assert len(RouterReplay.global_router_replay_instances) == 5
     assert all(o.router.router_replay not in routers.values() for o in orphans)
+
+
+def test_hash_layers_are_detached_from_replay():
+    # DeepSeek-V4: the first layers route by tid2eid. SGLang does not capture them (rows are zeros),
+    # so they must keep routing by table and never see a global replay action.
+    hash_layers = [_FakeLayer(n, mlp=_FakeMoELayer(is_hash_layer=True)) for n in (1, 2)]
+    learned = [_FakeLayer(n) for n in (3, 4)]
+    chunk = _Chunk(hash_layers + learned)
+    hash_replays = [layer.mlp.router.router_replay for layer in hash_layers]
+
+    packed = torch.arange(5 * 4 * TOPK).reshape(5, 4, TOPK)
+    batch = {"rollout_routed_experts": [torch.zeros(5, 4 * TOPK)]}
+    cfg = SimpleNamespace(num_layers=4, moe_router_topk=TOPK)
+
+    with patch.object(model_mod, "get_model_config", return_value=cfg), \
+         patch.object(model_mod, "prepare_routing_replay_data", return_value=packed):
+        model_mod.setup_routing_replay(None, batch, chunk)
+
+    assert sorted(model_mod.collect_replay_routers(chunk)) == [2, 3]
+    for layer in hash_layers:
+        assert layer.mlp.router.router_replay is None
+    assert all(r not in RouterReplay.global_router_replay_instances for r in hash_replays)
+    for layer_id, layer in zip((2, 3), learned):
+        replay = layer.mlp.router.router_replay
+        assert torch.equal(replay.target_topk_idx, packed[:, layer_id])
+        assert replay.router_replay_action == RouterReplayAction.REPLAY_FORWARD
 
 
 def test_setup_fails_loudly_when_no_router_found():

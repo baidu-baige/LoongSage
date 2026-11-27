@@ -11,6 +11,7 @@ from typing import Callable, Literal
 from megatron.core import parallel_state as mpu
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.context_parallel_layout.routes import prebuild_thd_cp_partition_routes
 
 
 CPPartitionMode = Literal["zigzag", "contiguous"]
@@ -211,6 +212,15 @@ def prepare_packed_seq_params(
             qkv_format="thd",
             cp_partition_mode="contiguous",
         )
+        if cp_size > 1:
+            # DSv4-hybrid D layers (ERNIE 5.5 latent-MQA, DeepSeek V4.1 DSA) convert these
+            # contiguous rows to zigzag per layer; prebuild the conversion route and the host
+            # cu_seqlens copies so that runs on the host. ERNIE's D layer hard-rejects a
+            # micro-batch without the route; DSA would otherwise rebuild it with a
+            # device-to-host sync in every layer. 
+            prebuild_thd_cp_partition_routes(
+                packed_seq_params, mpu.get_context_parallel_group()
+            )
         return packed, packed_seq_params
 
     raise ValueError(f"Unsupported cp_partition_mode: {cp_partition_mode!r}")

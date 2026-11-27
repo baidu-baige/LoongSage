@@ -46,8 +46,8 @@ AgentFlow 由一个编排器（`AgentFlow`）和若干协作组件组成。编�
 | 类别 | 方法 | 路径 | 作用 |
 | --- | --- | --- | --- |
 | Worker 管理 | POST | `/add_worker` | 注册一个 SGLang worker |
-| | GET | `/list_workers` | 列出活跃/隔离 worker 及负载 |
-| | PUT | `/exclude_worker` / `/include_worker` | 隔离 / 恢复 worker |
+| | POST | `/remove_worker` | 移除 worker（引擎重启后通过 `/add_worker` 重新注册） |
+| | GET | `/list_workers` | 列出已注册 worker 及负载 |
 | Session 管理 | DELETE | `/release_session/{trajectory_id}/{attempt_id}` | 释放该 attempt 的 sticky 映射 |
 | | POST | `/abort_session/{trajectory_id}/{attempt_id}` | 中止失败 attempt 绑定 worker 上的请求 |
 | | POST | `/abort_all_workers` | 中止所有 worker 并清空 sticky 状态 |
@@ -108,8 +108,8 @@ get_trajectory()        # 取出当前 attempt 的 Trajectory
 
 开启图像模态后，`TrajectoryParser`（[parser.py](../../coda/agentflow/router/parser.py) 中的 `_expand_multimodal`）在同一套 token in / token out 流程里处理图片；纯文本请求不会进入这些逻辑。图像相关的辅助代码在 [multimodal.py](../../coda/agentflow/multimodal.py)。
 
-- **输入。** 图片以 OpenAI `image_url` content part 的形式出现在 `user` 或 `tool` 消息中，内容为 base64 data URI。其他角色里的图片会被拒绝，因为 chat template 会静默丢弃它们。图片无法处理、或占位符数量与图片数量不符时，返回 HTTP 400。
-- **处理。** `MultimodalProcessor` 先把每张图缩放到 `multimodal.image.{min_pixels,max_pixels}` 范围内，再运行 `hf_model_path` 的 HF processor，得到 `pixel_values` 与 `image_grid_thw`。结果缓存在 `ImageCache` 中，这是一个 4 GiB 的 LRU，key 为图片字节的 sha256 加像素上下界，因此跨轮次、或同一 prompt 的多条 trajectory 里重复出现的图片只处理一次。启动时 `verify_expansion()` 会校验 Router 的 pad 展开结果与 HF processor 一致。
+- **输入。** 图片以 OpenAI `image_url` content part 的形式出现在 `user` 或 `tool` 消息中，内容为 base64 data URI。其他角色里的图片会被拒绝。
+- **处理。** `MultimodalProcessor` 先把每张图缩放到模型自身 `preprocessor_config.json` 的像素范围内（`size.shortest_edge` 到 `size.longest_edge`），再运行 `hf_model_path` 的 HF processor，得到 `pixel_values` 与 `image_grid_thw`。结果缓存在 `ImageCache` 中，这是一个 4 GiB 的 LRU，key 为图片字节的 sha256 加像素上下界，因此跨轮次、或同一 prompt 的多条 trajectory 里重复出现的图片只处理一次。启动时 `verify_expansion()` 会校验 Router 的 pad 展开结果与 HF processor 一致。
 - **两种 token 形式。** tokenizer 对每张图只输出一个 image pad token。SGLang 接收这种折叠形式和 PNG data URI（`image_data`），自行展开 pad。trajectory 中保存的是展开形式，每张图的 pad 段长度由 `image_grid_thw` 决定，因此训练回放的序列与模型实际看到的一致。后续轮次发送前会先把已保存的前缀折叠回去。
 - **训练输入。** 每出现一张新图，Router 就向 `Trajectory.multimodal_train_inputs` 追加一项（见 §2.5）。
 

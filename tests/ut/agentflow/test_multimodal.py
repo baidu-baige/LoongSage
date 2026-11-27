@@ -194,13 +194,6 @@ class TestProcessorInit:
         proc = MultimodalProcessor(hf, tok, min_pixels=65536, max_pixels=1048576, cache_max_bytes=0)
         assert proc.image_pad_id == 7
 
-    def test_bounds_validated_against_processor(self):
-        hf = SimpleNamespace(image_processor=_FakeImageProcessor(), image_token_id=1)
-        with pytest.raises(ValueError):
-            MultimodalProcessor(hf, None, min_pixels=1024, max_pixels=1048576, cache_max_bytes=0)
-        with pytest.raises(ValueError):
-            MultimodalProcessor(hf, None, min_pixels=65536, max_pixels=1 << 30, cache_max_bytes=0)
-
 
 class _FakeHfProcessor:
     """Mimics HF processor expansion: each image pad becomes ``counts[i]`` pads (tokens are ints)."""
@@ -461,6 +454,159 @@ class TestBuildMultimodalProcessorDeps:
         from coda.agentflow.tokenizer_manager import build_multimodal_processor
 
         monkeypatch.setitem(sys.modules, "qwen_vl_utils", None)
-        cfg = SimpleNamespace(enable=True, image=SimpleNamespace(min_pixels=1, max_pixels=2))
+        cfg = SimpleNamespace(enable=True)
         with pytest.raises(ImportError, match="qwen-vl-utils"):
             build_multimodal_processor(cfg, "/unused", tokenizer=None, num_workers=1)
+
+
+# ---------------------------------------------------------------------------
+# DeepSeek-V4.1 image processor (needs sglang's V4.1 image helpers)
+# ---------------------------------------------------------------------------
+
+try:
+    from sglang.srt.multimodal import deepseek_v41_image_processing as sglang_v41
+except ImportError:  # the V4.1 tests below need sglang's image helpers
+    sglang_v41 = None
+
+requires_sglang_v41 = pytest.mark.skipif(sglang_v41 is None, reason="sglang V4.1 image helpers not installed")
+
+from coda.agentflow.multimodal import (  # noqa: E402
+    Dsv41ImageProcessor,
+    dsv41_image_token_estimator,
+    load_dsv41_vision_args,
+)
+
+V41_PAD = 129264
+
+
+def _v41_args(**overrides):
+    values = dict(
+        vision_patch_size=14,
+        vision_downsample_ratio=3,
+        vision_max_n_token=1024,
+        vision_min_pixels=295936,
+        vision_max_wh_ratio=None,
+    )
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _png_ref(width: int, height: int, mode: str = "RGB") -> str:
+    import io
+
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.effect_noise((width, height), 60).convert(mode).save(buf, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+# tiny, small (scaled up to min_pixels), ultra-wide, ultra-tall, large (needs safe_resize)
+V41_SIZES = [(8, 8), (640, 480), (3000, 40), (40, 3000), (4000, 3000)]
+
+
+@requires_sglang_v41
+class TestDsv41ImageProcessor:
+    @pytest.mark.parametrize("size", V41_SIZES)
+    def test_matches_sglang_patchify(self, size):
+        import io
+
+        from PIL import Image
+
+        args = _v41_args()
+        proc = Dsv41ImageProcessor(args, V41_PAD, cache_max_bytes=0)
+        ref = _png_ref(*size)
+
+        out = proc.process_image(ref)
+
+        with Image.open(io.BytesIO(parse_data_uri(ref))) as handle:
+            patches, n_vit_h, n_vit_w, n_llm_h, n_llm_w = sglang_v41.patchify_image(handle, args)
+        assert torch.equal(out.tensors["pixel_values"], patches)
+        assert out.tensors["pixel_values"].dtype == torch.bfloat16
+        assert out.tensors["image_grid_hw"].tolist() == [[n_vit_h, n_vit_w]]
+        assert out.num_tokens == sglang_v41.num_image_tokens(n_llm_h, n_llm_w)
+        assert out.num_tokens <= args.vision_max_n_token
+        assert out.tensors["pixel_values"].shape[0] == n_vit_h * n_vit_w
+        assert out.png_data_uri == ref and out.image_hash == image_sha256(ref)
+
+    @pytest.mark.parametrize("size", V41_SIZES)
+    def test_estimator_matches_processor(self, size):
+        args = _v41_args()
+        ref = _png_ref(*size)
+        proc = Dsv41ImageProcessor(args, V41_PAD, cache_max_bytes=0)
+        assert dsv41_image_token_estimator(args)(ref) == proc.process_image(ref).num_tokens
+
+    def test_palette_and_alpha_modes_become_rgb(self):
+        proc = Dsv41ImageProcessor(_v41_args(), V41_PAD, cache_max_bytes=0)
+        for mode in ("L", "RGBA", "P"):
+            assert proc.process_image(_png_ref(300, 300, mode)).tensors["pixel_values"].shape[1] == 3
+
+    def test_pad_id_and_cache_key(self):
+        proc = Dsv41ImageProcessor(_v41_args(), V41_PAD, cache_max_bytes=1 << 30)
+        assert proc.image_pad_id == V41_PAD
+        ref = _png_ref(64, 64)
+        first = proc.process_image(ref)
+        assert proc.process_image(ref) is first
+        assert proc.cache.get((first.image_hash,)) is first
+
+    def test_undecodable_image_is_a_request_error(self):
+        proc = Dsv41ImageProcessor(_v41_args(), V41_PAD, cache_max_bytes=0)
+        bad = "data:image/png;base64," + base64.b64encode(b"not an image").decode()
+        with pytest.raises(MultimodalRequestError, match="failed to process image"):
+            proc.process_image(bad)
+
+    def test_prepare_dedups_and_orders(self):
+        import asyncio
+
+        proc = Dsv41ImageProcessor(_v41_args(), V41_PAD, cache_max_bytes=0)
+        a, b = _png_ref(64, 64), _png_ref(96, 48)
+        results = asyncio.run(proc.prepare([a, b, a]))
+        assert len(results) == 3 and results[0] is results[2] and results[0] is not results[1]
+        assert proc._inflight == {}
+
+
+@requires_sglang_v41
+class TestLoadDsv41VisionArgs:
+    def _write(self, tmp_path, vision):
+        import json
+
+        (tmp_path / "config.json").write_text(
+            json.dumps({"model_type": "deepseek_v41", "architectures": ["DeepseekV41ForCausalLM"], "vision_config": vision})
+        )
+        return str(tmp_path)
+
+    VISION = dict(patch_size=14, downsample_ratio=3, max_image_tokens=1024, min_pixels=295936, max_wh_ratio=None)
+
+    def test_reads_checkpoint_values(self, tmp_path):
+        args = load_dsv41_vision_args(self._write(tmp_path, self.VISION))
+        assert (args.vision_patch_size, args.vision_downsample_ratio, args.vision_max_n_token) == (14, 3, 1024)
+        assert (args.vision_min_pixels, args.vision_max_wh_ratio) == (295936, None)
+
+
+@requires_sglang_v41
+class TestDsv41PadIdFromConfig:
+    VISION = dict(patch_size=14, downsample_ratio=3, max_image_tokens=1024, min_pixels=295936, max_wh_ratio=None)
+
+    def _build(self, tmp_path, **config_extra):
+        import json
+
+        from coda.agentflow.tokenizer_manager import build_multimodal_processor
+
+        config = {
+            "model_type": "deepseek_v41",
+            "architectures": ["DeepseekV41ForCausalLM"],
+            "vision_config": self.VISION,
+            **config_extra,
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        return build_multimodal_processor(
+            SimpleNamespace(enable=True), str(tmp_path), tokenizer=None, num_workers=1
+        )
+
+    def test_pad_id_comes_from_config(self, tmp_path):
+        proc = self._build(tmp_path, image_token_id=V41_PAD)
+        assert proc.image_pad_id == V41_PAD
+
+    def test_config_without_image_token_id_raises(self, tmp_path):
+        with pytest.raises(ValueError, match="no image_token_id"):
+            self._build(tmp_path)

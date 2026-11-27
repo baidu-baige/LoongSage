@@ -186,6 +186,34 @@ _V4_EFFORT = (
             False,
             _DS_BOS + "<｜User｜>a\n\nb<｜Assistant｜></think>",
         ),
+        # V4.1 renders each image as the image token, abutting its neighbours.
+        (
+            DEEPSEEK_V41_MODEL_FAMILY,
+            [
+                {
+                    "role": "user",
+                    "content": [{"type": "image_url", "image_url": {"url": "x"}}, {"type": "text", "text": "Find x."}],
+                }
+            ],
+            False,
+            _DS_BOS + "<｜User｜><｜deepseek_image｜>Find x.<｜Assistant｜></think>",
+        ),
+        (
+            DEEPSEEK_V41_MODEL_FAMILY,
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "a"},
+                        {"type": "image_url", "image_url": {"url": "x"}},
+                        {"type": "image_url", "image_url": {"url": "y"}},
+                        {"type": "text", "text": "b"},
+                    ],
+                }
+            ],
+            False,
+            _DS_BOS + "<｜User｜>a<｜deepseek_image｜><｜deepseek_image｜>b<｜Assistant｜></think>",
+        ),
     ],
 )
 def test_deepseek_recipe_wrapper_matches_official_encoder(
@@ -198,13 +226,20 @@ def test_deepseek_recipe_wrapper_matches_official_encoder(
     assert prompt == expected
 
 
-def test_deepseek_recipe_wrapper_rejects_non_text_content() -> None:
-    tokenizer = _wrap_deepseek_v4_tokenizer(FakeDeepSeekV4Tokenizer(), DEEPSEEK_V41_MODEL_FAMILY)
+def test_deepseek_v4_recipe_wrapper_rejects_image_content() -> None:
+    tokenizer = _wrap_deepseek_v4_tokenizer(FakeDeepSeekV4Tokenizer(), DEEPSEEK_V4_MODEL_FAMILY)
 
     with pytest.raises(ValueError, match="text content only"):
         tokenizer.apply_chat_template(
             [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}], tokenize=False
         )
+
+
+def test_deepseek_v41_recipe_wrapper_rejects_other_non_text_parts() -> None:
+    tokenizer = _wrap_deepseek_v4_tokenizer(FakeDeepSeekV4Tokenizer(), DEEPSEEK_V41_MODEL_FAMILY)
+
+    with pytest.raises(ValueError, match="text content only"):
+        tokenizer.apply_chat_template([{"role": "user", "content": [{"type": "video_url"}]}], tokenize=False)
 
 
 def test_deepseek_v4_empty_system_is_only_bos() -> None:

@@ -7,59 +7,53 @@ from pathlib import Path
 
 from omegaconf import OmegaConf
 
+from coda.utils.hf_config import read_image_pixel_bounds
 from coda.utils.multimodal_config import (
-    multimodal_enabled,
     validate_multimodal_config,
-    validate_pixel_bounds,
     validate_vlm_parallel_config,
 )
 
 
-def _config(*, enable=True, modalities=("image",), image=None, keys=None, sglang_args=None):
-    image = {"min_pixels": 65536, "max_pixels": 1048576} if image is None else image
+def _config(*, enable=True, modalities=("image",), keys=None, sglang_args=None):
     return OmegaConf.create(
         {
-            "multimodal": {"enable": enable, "modalities": list(modalities), "image": image},
+            "multimodal": {"enable": enable, "modalities": list(modalities)},
             "data_sources": [{"dataset": {"multimodal_keys": keys}}],
             "rollout": {"sglang_args": dict(sglang_args or {})},
         }
     )
 
 
-class TestMultimodalEnabled(unittest.TestCase):
-    def test_missing_block(self):
-        self.assertFalse(multimodal_enabled(OmegaConf.create({})))
-
-    def test_flags(self):
-        self.assertTrue(multimodal_enabled(_config(enable=True)))
-        self.assertFalse(multimodal_enabled(_config(enable=False)))
-
-
 class TestValidateDisabled(unittest.TestCase):
     def test_disabled_without_keys_ok(self):
         cfg = _config(enable=False)
         self.assertIs(validate_multimodal_config(cfg), cfg)
-        self.assertNotIn("enable_multimodal", cfg.rollout.sglang_args)
 
     def test_disabled_with_keys_raises(self):
         with self.assertRaisesRegex(ValueError, "multimodal.enable is false"):
             validate_multimodal_config(_config(enable=False, keys={"image": "images"}))
 
+    def test_disabled_with_max_image_tokens_raises(self):
+        cfg = _config(enable=False)
+        cfg.data_sources[0].dataset.max_image_tokens = 15000
+        with self.assertRaisesRegex(ValueError, "max_image_tokens is set but multimodal.enable is false"):
+            validate_multimodal_config(cfg)
+
+    def test_disabled_with_null_max_image_tokens_ok(self):
+        cfg = _config(enable=False)
+        cfg.data_sources[0].dataset.max_image_tokens = None
+        self.assertIs(validate_multimodal_config(cfg), cfg)
+
 
 class TestValidateEnabled(unittest.TestCase):
-    def test_links_sglang_enable_multimodal(self):
-        cfg = _config(keys={"image": "images"})
-        validate_multimodal_config(cfg)
-        self.assertTrue(cfg.rollout.sglang_args.enable_multimodal)
-
-    def test_explicit_true_is_kept(self):
+    def test_explicit_true_ok(self):
         cfg = _config(sglang_args={"enable_multimodal": True})
-        validate_multimodal_config(cfg)
-        self.assertTrue(cfg.rollout.sglang_args.enable_multimodal)
+        self.assertIs(validate_multimodal_config(cfg), cfg)
 
-    def test_explicit_false_raises(self):
-        with self.assertRaisesRegex(ValueError, "explicitly false"):
-            validate_multimodal_config(_config(sglang_args={"enable_multimodal": False}))
+    def test_validate_does_not_write_sglang_args(self):
+        cfg = _config()
+        validate_multimodal_config(cfg)
+        self.assertNotIn("enable_multimodal", cfg.rollout.sglang_args)
 
     def test_empty_modalities_raises(self):
         with self.assertRaisesRegex(ValueError, "non-empty"):
@@ -74,21 +68,6 @@ class TestValidateEnabled(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "not implemented"):
                 validate_multimodal_config(_config(modalities=(name,)))
 
-    def test_image_block_required(self):
-        cfg = _config()
-        cfg.multimodal.image = None
-        with self.assertRaisesRegex(ValueError, "multimodal.image is required"):
-            validate_multimodal_config(cfg)
-
-    def test_pixel_values_validated(self):
-        bad = [
-            {"min_pixels": 0, "max_pixels": 100},
-            {"min_pixels": 200, "max_pixels": 100},
-        ]
-        for image in bad:
-            with self.assertRaises(ValueError):
-                validate_multimodal_config(_config(image=image))
-
     def test_keys_must_name_known_declared_modality(self):
         with self.assertRaisesRegex(ValueError, "unknown modality"):
             validate_multimodal_config(_config(keys={"hologram": "col"}))
@@ -99,18 +78,46 @@ class TestValidateEnabled(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "must be a column name"):
             validate_multimodal_config(_config(keys={"image": ""}))
 
+    def test_max_image_tokens_needs_image_column(self):
+        for keys in (None, {}):
+            cfg = _config(keys=keys)
+            cfg.data_sources[0].dataset.max_image_tokens = 15000
+            with self.assertRaisesRegex(ValueError, "declares no 'image' column"):
+                validate_multimodal_config(cfg)
 
-class TestPixelBounds(unittest.TestCase):
-    def test_ok(self):
-        validate_pixel_bounds(65536, 1048576, 65536, 16777216)
+    def test_max_image_tokens_with_image_column_ok(self):
+        cfg = _config(keys={"image": "images"})
+        cfg.data_sources[0].dataset.max_image_tokens = 15000
+        validate_multimodal_config(cfg)
 
-    def test_min_below_shortest_edge(self):
-        with self.assertRaisesRegex(ValueError, "shortest_edge"):
-            validate_pixel_bounds(1000, 1048576, 65536, 16777216)
 
-    def test_max_above_longest_edge(self):
-        with self.assertRaisesRegex(ValueError, "longest_edge"):
-            validate_pixel_bounds(65536, 20000000, 65536, 16777216)
+class TestImagePixelBoundsFromModel(unittest.TestCase):
+    """Image pixel bounds come from the model's own `preprocessor_config.json`."""
+
+    @staticmethod
+    def _cfg(tmp, *, model_type="qwen3_vl", size=None):
+        (Path(tmp) / "config.json").write_text(json.dumps({"model_type": model_type}))
+        if size is not None:
+            (Path(tmp) / "preprocessor_config.json").write_text(json.dumps({"size": size}))
+        cfg = _config()
+        cfg.hf_model_path = tmp
+        return cfg
+
+    def test_reads_size_edges(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._cfg(tmp, size={"shortest_edge": 65536, "longest_edge": 16777216})
+            self.assertEqual(read_image_pixel_bounds(tmp), (65536, 16777216))
+
+    def test_missing_file_raises(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(ValueError, "preprocessor_config.json"):
+                read_image_pixel_bounds(tmp)
+
+    def test_missing_edge_raises(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._cfg(tmp, size={"shortest_edge": 65536})
+            with self.assertRaisesRegex(ValueError, "size.longest_edge"):
+                read_image_pixel_bounds(tmp)
 
 
 class TestVlmParallelConfig(unittest.TestCase):
@@ -126,14 +133,17 @@ class TestVlmParallelConfig(unittest.TestCase):
         model = OmegaConf.create({"context_parallel_size": 2, "cp_partition_mode": "contiguous"})
         validate_vlm_parallel_config(cfg, model, self._hf_dir("qwen2_5_vl"))
 
-    def test_contiguous_cp_rejected(self):
-        model = OmegaConf.create({"context_parallel_size": 2, "cp_partition_mode": "contiguous"})
-        with self.assertRaisesRegex(ValueError, "zigzag"):
-            validate_vlm_parallel_config(_config(), model, self._hf_dir("qwen3_vl"))
-
     def test_contiguous_with_cp1_allowed(self):
         model = OmegaConf.create({"context_parallel_size": 1, "cp_partition_mode": "contiguous"})
         validate_vlm_parallel_config(_config(), model, self._hf_dir("qwen3_vl"))
+
+    def test_dsv41_contiguous_cp_allowed(self):
+        model = OmegaConf.create({"context_parallel_size": 2, "cp_partition_mode": "contiguous"})
+        validate_vlm_parallel_config(_config(), model, self._hf_dir("deepseek_v41"))
+
+    def test_dsv41_cp1_allowed(self):
+        model = OmegaConf.create({"context_parallel_size": 1, "cp_partition_mode": "zigzag"})
+        validate_vlm_parallel_config(_config(), model, self._hf_dir("deepseek_v41"))
 
     def test_qwen25_vl_cp_rejected(self):
         model = OmegaConf.create({"context_parallel_size": 2, "cp_partition_mode": "zigzag"})
@@ -152,19 +162,6 @@ class TestVlmParallelConfig(unittest.TestCase):
         model = OmegaConf.create({"context_parallel_size": 2, "cp_partition_mode": "zigzag"})
         validate_vlm_parallel_config(_config(), model, self._hf_dir(None))
         validate_vlm_parallel_config(_config(), model, None)
-
-    def test_qwen3_vl_moe_warns_when_freeze_unset(self):
-        model = OmegaConf.create({"context_parallel_size": 1})
-        with self.assertLogs("coda.utils.multimodal_config", level="WARNING") as cm:
-            validate_vlm_parallel_config(_config(), model, self._hf_dir("qwen3_vl_moe"))
-        self.assertEqual(len(cm.records), 2)
-
-    def test_qwen3_vl_moe_no_warning_when_freeze_explicit(self):
-        model = OmegaConf.create(
-            {"context_parallel_size": 1, "freeze_language_model": False, "freeze_vision_model": True}
-        )
-        with self.assertNoLogs("coda.utils.multimodal_config", level="WARNING"):
-            validate_vlm_parallel_config(_config(), model, self._hf_dir("qwen3_vl_moe"))
 
 
 if __name__ == "__main__":

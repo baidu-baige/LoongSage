@@ -63,6 +63,7 @@ ______________________________________________________________________
 
 ## 📰 News
 
+- **[2026-11]** Released [v0.2.1](https://github.com/baidu-baige/LoongSage/releases/tag/v0.2.1): DeepSeek-V4.1 vision RL, ERNIE-5.5-Flash-Base, group-level reward, and a single-GPU Countdown example!
 - **[2026-11]** Released our first official version [v0.2.0](https://github.com/baidu-baige/LoongSage/releases/tag/v0.2.0): DeepSeek-V4.1 training, PPO and SFT, image-modality RL for Qwen3-VL, and SGLang 0.5.23!
 - **[2026-10]** Added [QAT](conf/dsv41_flash/) support for DeepSeek-V4.1-Flash and a new [RLCD2 recipe](conf/rlcd2/)!
 - **[2026-10]** Our technical report [*LoongSage: A Production-Grade, High-Efficiency Agentic RL Framework for Frontier LLMs with Validated Recipes*](https://arxiv.org/abs/2610.16352) is now available on arXiv!
@@ -97,14 +98,16 @@ The following models have been validated with the recipes under [`conf/`](conf/)
 
 | Model | Recipes | Hardware (nodes × 8 GPUs) |
 | :--- | :--- | :--- |
-| DeepSeek-V4.1-Flash (original FP8/MXFP4 weights, QAT) | [`dsv41_flash/`](conf/dsv41_flash/): DAPO, SWE, SFT | H20 × 6 |
-| DeepSeek-V4.1-Flash (BF16) | [`dsv41_flash_bf16/`](conf/dsv41_flash_bf16/): DAPO, SWE | B200 × 5–6, H20 × 6 |
-| DeepSeek-V4-Flash (BF16) | [`dsv4_flash_bf16/`](conf/dsv4_flash_bf16/): DAPO, SWE | H20 × 6–8, GB200 × 8 |
+| DeepSeek-V4.1-Flash (original FP8/MXFP4 weights, QAT) | [`dsv41_flash/`](conf/dsv41_flash/): DAPO, SWE, SFT, GRPO on geo3k (single image) and MMRB (multi-image) | H20 × 6 |
+| DeepSeek-V4.1-Flash (BF16) | [`dsv41_flash_bf16/`](conf/dsv41_flash_bf16/): DAPO, SWE | NVIDIA SM100 GPUs × 5–6, H20 × 6 |
+| DeepSeek-V4-Flash (BF16) | [`dsv4_flash_bf16/`](conf/dsv4_flash_bf16/): DAPO, SWE | H20 × 6–8, NVIDIA SM100 GPUs × 4 |
+| ERNIE-5.5-Flash-Base (BF16) | [`ernie55_flash/`](conf/ernie55_flash/): DAPO, GSM8K | H20 × 6 |
 | Qwen3-30B-A3B | [`qwen3_30b_a3b/`](conf/qwen3_30b_a3b/): DAPO, GSM8K, BCP, MOPD | H20 × 1 |
 | Qwen3-Coder-30B-A3B-Instruct | [`qwen3_coder_30b_a3b/`](conf/qwen3_coder_30b_a3b/): Claude Code, Codex, OpenCode, mini-SWE | H20 × 2–4 |
 | Qwen3-VL-30B-A3B-Instruct | [`qwen3_vl_30b_a3b/`](conf/qwen3_vl_30b_a3b/): GRPO on geo3k (single image) and MMRB (multi-image) | H20 × 1 |
 | Qwen3.8-27B | [`qwen3.8_27b/`](conf/qwen3.8_27b/): DAPO | H20 × 1 |
 | Qwen3-4B | [`qwen3_4b/`](conf/qwen3_4b/): DAPO, SFT | H800 × 1, H20 × 1 |
+| Qwen3-0.6B | [`qwen3_0_6b/`](conf/qwen3_0_6b/): Countdown | 1 GPU |
 | StartLux-Decision-v1.1-4B-AutoThink | [`rlcd2/`](conf/rlcd2/): RLCD2 | H20 × 1 |
 
 QAT (`trainer.qat`) currently supports only DeepSeek-V4.1. Other models train in BF16.
@@ -190,7 +193,8 @@ Below are our main plans for upcoming work. Discussions and contributions via Is
 - [x] SFT support (`run_mode: sft`, see `conf/qwen3_4b/sft_h20_1node.yaml`)
 - [ ] LORA support
 - [ ] Distributed storage for multi-teacher weights
-- [ ] Omni-modal support
+- [x] Image modality support
+- [ ] Video and audio modality support
 
 ______________________________________________________________________
 

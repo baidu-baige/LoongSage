@@ -4,6 +4,7 @@ This module provides classes for managing inference engines,
 including replicas and health monitoring.
 """
  
+import contextlib
 import dataclasses
 import logging
  
@@ -59,6 +60,7 @@ class RolloutManager:
         """
         rank_offset = 0
         replica_groups: list[ReplicaGroup] = []
+        new_engines_per_group: list = []
         all_init_handles: list = []
 
         num_gpus_per_node = self.config.rollout.num_gpus_per_node
@@ -78,14 +80,15 @@ class RolloutManager:
                 worker_type=worker_type,
                 rank_offset=rank_offset,
             )
-            handles = replica_group.start_engines()
+            new_engines, handles = replica_group.start_engines()
+            new_engines_per_group.append(new_engines)
             all_init_handles.extend(handles)
             replica_groups.append(replica_group)
 
             rank_offset += num_engines
 
-        if all_init_handles:
-            ray.get(all_init_handles)
+        init_results = ray.get(all_init_handles) if all_init_handles else []
+        _publish_engines(replica_groups, new_engines_per_group, init_results)
  
         return replica_groups
 
@@ -154,30 +157,51 @@ class RolloutManager:
         self.onload(tags=[GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH])
  
     def recover_faulty_engines(self):
-        """Restart any dead rollout engines and update num_new_engines for update_weights detection."""
-        # Record dead indices per replica before starting.
-        dead_per_replica = [[i for i, engine in enumerate(r.all_engines) if engine is None] for r in
-                            self.replica_groups]
- 
-        # Start all replicas concurrently.
-        all_handles = []
-        for r in self.replica_groups:
-            handles = r.start_engines(True)
-            all_handles.extend(handles)
-        if all_handles:
-            ray.get(all_handles)
- 
-        # Post-recovery: offload then onload weights for newly created engines.
+        """Restart any dead rollout engines and update num_new_engines for update_weights detection.
+
+        Holds every replica group's lock, so a kill the health monitor has in progress finishes
+        before the dead slots are read, and no kill starts until the new engines are published.
+        New engines are published only after their init() returned, so the monitor never probes
+        an engine that is still starting.
+        """
+        with contextlib.ExitStack() as stack:
+            for r in self.replica_groups:
+                stack.enter_context(r.lock)
+
+            # Start all replicas concurrently.
+            new_engines_per_replica = []
+            all_handles = []
+            try:
+                for r in self.replica_groups:
+                    new_engines, handles = r.start_engines(True)
+                    new_engines_per_replica.append(new_engines)
+                    all_handles.extend(handles)
+                init_results = ray.get(all_handles) if all_handles else []
+                self._restore_colocated_memory(new_engines_per_replica)
+            except BaseException:
+                # Unpublished actors are invisible to the health monitor, so nobody else would kill
+                # them; they would keep the pinned GPUs and the next recovery would fail on them too.
+                for new_engines in new_engines_per_replica:
+                    for _, engine in new_engines:
+                        try:
+                            ray.kill(engine)
+                        except Exception:
+                            logger.exception("Failed to kill a rollout engine whose recovery failed")
+                raise
+
+            _publish_engines(self.replica_groups, new_engines_per_replica, init_results)
+
+    def _restore_colocated_memory(self, new_engines_per_replica):
+        """Post-recovery: offload then onload weights for newly created engines in colocate mode."""
         release_handles = []
         new_engines_all = []
-        for r, dead_indices in zip(self.replica_groups, dead_per_replica, strict=True):
-            logger.info(f"Recovered {r.num_new_engines} dead rollout engines (worker_type={r.worker_type})")
-            assert r.num_new_engines == len(dead_indices), "num_new_engines does not match dead_indices length"
-            if r.config.colocate and dead_indices:
-                new_engines = [r.all_engines[i] for i in dead_indices]
-                release_handles.extend(engine.release_memory_occupation.remote() for engine in new_engines)
-                new_engines_all.extend(new_engines)
- 
+        for r, new_engines in zip(self.replica_groups, new_engines_per_replica, strict=True):
+            logger.info(f"Recovered {len(new_engines)} dead rollout engines (worker_type={r.worker_type})")
+            if r.config.colocate and new_engines:
+                engines = [engine for _, engine in new_engines]
+                release_handles.extend(engine.release_memory_occupation.remote() for engine in engines)
+                new_engines_all.extend(engines)
+
         if release_handles:
             ray.get(release_handles)
             ray.get(
@@ -200,3 +224,15 @@ class RolloutManager:
             meta_dict["weight_version"] = str(weight_version)
             handles.append(engines[i].update_weights_from_channel.remote(meta_dict))
         return handles
+
+
+def _publish_engines(replica_groups, new_engines_per_group, init_results) -> None:
+    """Publish each group's new engines with their init() results (the registered worker URLs).
+
+    ``init_results`` is the flattened ``ray.get`` of every group's init handles, in group order;
+    each group has one handle per new engine.
+    """
+    offset = 0
+    for group, new_engines in zip(replica_groups, new_engines_per_group, strict=True):
+        group.publish_engines(new_engines, init_results[offset:offset + len(new_engines)])
+        offset += len(new_engines)

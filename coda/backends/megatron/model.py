@@ -148,6 +148,11 @@ def collect_replay_routers(model_chunk: torch.nn.Module) -> dict[int, RouterRepl
     MTP layers are skipped because their `layer_number` restarts at 1 and would collide with decoder layer 1.
     They get no replay data (MTP is disabled in replay-enabled recipes).
 
+    Hash-routing layers (DeepSeek-V4's first `num_hash_layers`) get their replay detached: their experts are
+    `tid2eid[token_id]`, the same table rollout uses, so replay adds nothing. SGLang's `HashTopK` also never
+    captures routed experts, so the rollout rows for these layers are all zeros. Replaying them would leave
+    one expert per token instead of top-k and break the EP all-to-all split sizes.
+
     Raises if the chunk holds a RouterReplay that is neither mapped nor in an MTP layer (e.g. an MoE layer
     that is not a `TransformerLayer`). Otherwise it would reach the forward pass with no target indices and
     fail there with an opaque AttributeError. The result is cached on the chunk (its structure is fixed).
@@ -164,8 +169,15 @@ def collect_replay_routers(model_chunk: torch.nn.Module) -> dict[int, RouterRepl
         if module.is_mtp_layer:
             accounted.update(_live_replays(module))
             continue
-        router_replay = getattr(getattr(module.mlp, "router", None), "router_replay", None)
+        router = getattr(module.mlp, "router", None)
+        router_replay = getattr(router, "router_replay", None)
         if router_replay is None:
+            continue
+        if getattr(router, "is_hash_layer", False):
+            # Detach so the global replay actions never reach it; `_hash_routing` then uses `tid2eid`.
+            router.router_replay = None
+            if router_replay in RouterReplay.global_router_replay_instances:
+                RouterReplay.global_router_replay_instances.remove(router_replay)
             continue
         layer_id = module.layer_number - 1  # layer_number is 1-based and includes the PP/VP offset
         assert layer_id not in routers, f"Duplicate RouterReplay for decoder layer {layer_id}"
@@ -183,13 +195,50 @@ def collect_replay_routers(model_chunk: torch.nn.Module) -> dict[int, RouterRepl
     return routers
 
 
+def _routing_replay_layer_map(model_config, model_chunk: torch.nn.Module):
+    """Replay layer-dim size and physical->logical router-index map for ``model_chunk``.
+
+    The rollout engine emits routing per decoder MoE layer, in global decoder order. A GPTModel
+    has one decoder layer per physical layer, so that count equals ``model_config.num_layers`` and
+    a router is indexed by its physical (global) layer id — no remap needed. A HybridModel (e.g.
+    DeepSeek-V4) splits each logical layer into separate attention and MoE physical layers, so
+    ``num_layers`` (physical) overcounts; map each MoE physical layer id to its logical MoE index
+    (its rank among the ``E`` layers of ``hybrid_layer_pattern``).
+
+    Returns ``(num_layer_dim, None)`` for GPTModel, else ``(num_moe_layers, {physical_id: logical})``.
+    """
+    pattern = getattr(model_config, "hybrid_layer_pattern", None)
+    if not pattern:
+        # The running config may be the transformer config; read the pattern off the HybridModel.
+        for module in model_chunk.modules():
+            pattern = getattr(module, "hybrid_layer_pattern", None)
+            if pattern:
+                break
+    if not pattern:
+        return model_config.num_layers, None
+
+    from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+
+    # Pattern is global (one symbol per physical decoder layer); drop PP pipes and MTP depths.
+    pattern = pattern.replace(Symbols.PIPE, "").partition(Symbols.MTP_SEPARATOR)[0]
+    physical_to_logical: dict[int, int] = {}
+    logical = 0
+    for physical_id, symbol in enumerate(pattern):
+        if symbol == Symbols.MOE:
+            physical_to_logical[physical_id] = logical
+            logical += 1
+    return logical, physical_to_logical
+
+
 def _r3_rows(batch: dict, model_chunk: torch.nn.Module) -> list[torch.Tensor]:
-    """Per-row routed experts reshaped to ``[seq, num_layers, topk]``.
+    """Per-row routed experts reshaped to ``[seq, num_layer_dim, topk]`` (see
+    ``_routing_replay_layer_map``).
 
     Rows arrive as read-only numpy views of the Ray object store (see put_dp_shards_to_ray).
     """
     mc = get_model_config(model_chunk)
-    return [torch.as_tensor(seq).reshape(len(seq), mc.num_layers, mc.moe_router_topk)
+    num_layer_dim, _ = _routing_replay_layer_map(mc, model_chunk)
+    return [torch.as_tensor(seq).reshape(len(seq), num_layer_dim, mc.moe_router_topk)
             for seq in batch["rollout_routed_experts"]]
 
 
@@ -199,12 +248,16 @@ def setup_routing_replay(config: DictConfig, batch: dict, model_chunk: torch.nn.
     Only sets replay data for the routers that live in `model_chunk` (its PP/VP stage).
     """
     model_config = get_model_config(model_chunk)
+    _, physical_to_logical = _routing_replay_layer_map(model_config, model_chunk)
     packed_experts = prepare_routing_replay_data(_r3_rows(batch, model_chunk), model_config)
 
     routers = collect_replay_routers(model_chunk)
     assert routers, "Routing replay is enabled but no live RouterReplay was found in the model chunk"
     for layer_id, router_replay in routers.items():
-        router_replay.set_target_indices(packed_experts[:, layer_id])
+        # GPTModel: index by physical layer id. HybridModel: remap to the logical MoE index the
+        # rollout used, since only the `E` physical layers carry a router.
+        column = layer_id if physical_to_logical is None else physical_to_logical[layer_id]
+        router_replay.set_target_indices(packed_experts[:, column])
 
     RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
 

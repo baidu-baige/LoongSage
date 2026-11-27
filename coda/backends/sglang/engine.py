@@ -31,7 +31,7 @@ class SglangEngine(RolloutWorker):
             key: os.environ.get(key, default_val)
             for key, default_val in {
                 "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "false",
-                "SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK": "true",
+                "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK": "false",
                 "SGLANG_MEMORY_SAVER_CUDA_GRAPH": "true",
                 "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT": "true",
                 "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "false",
@@ -82,6 +82,9 @@ class SglangEngine(RolloutWorker):
             disaggregation_bootstrap_port: Port for prefill-decode disaggregation.
             router_ip: Router IP address.
             router_port: Router port.
+
+        Returns:
+            The worker URL registered with the router, or None if this node did not register.
         """
         self.router_ip = router_ip
         self.router_port = router_port
@@ -104,21 +107,25 @@ class SglangEngine(RolloutWorker):
         self.server_host = server_args_dict["host"]
         self.server_port = server_args_dict["port"]
 
-        self._init_server(server_args_dict)
+        return self._init_server(server_args_dict)
 
-    def _init_server(self, server_args_dict, timeout: float = 30.0):
+    def _init_server(self, server_args_dict, timeout: float = 30.0) -> str | None:
         """Initialize the SGLang server.
 
         Args:
             server_args_dict: Dictionary containing server configuration arguments.
+
+        Returns:
+            The worker URL registered with the router, or None if this node did not register.
         """
         logger.info(f"Launch HttpServerEngineAdapter at: {self.server_host}:{self.server_port}")
         server_args = ServerArgs(**server_args_dict)
         self.process = launch_server_process(server_args)
 
         if self.node_rank == 0 and self.router_ip and self.router_port:
+            worker_url = f"http://{self.server_host}:{self.server_port}"
             payload = {
-                "worker_url": f"http://{self.server_host}:{self.server_port}",
+                "worker_url": worker_url,
             }
             if self.worker_type == "prefill":
                 payload["bootstrap_port"] = server_args_dict["disaggregation_bootstrap_port"]
@@ -133,6 +140,8 @@ class SglangEngine(RolloutWorker):
                 timeout=timeout,
             )
             response.raise_for_status()
+            return worker_url
+        return None
 
     def _make_request(self, endpoint: str, payload: dict | None = None, timeout: float | None = None):
         """Make a POST request to the specified endpoint with the given payload.
@@ -202,35 +211,13 @@ class SglangEngine(RolloutWorker):
             raise TimeoutError("Timeout while flushing cache.")
 
     @override
-    def shutdown(self, timeout: float = 30.0):
-        """Shutdown the SGLang engine and clean up resources."""
-        logger.info(f"Shutdown engine {self.server_host}:{self.server_port}...")
-        if self.node_rank == 0:
-            worker_url = f"http://{self.server_host}:{self.server_port}"
-            try:
-                response = requests.get(
-                    f"http://{self.router_ip}:{self.router_port}/list_workers",
-                    timeout=timeout,
-                )
-                response.raise_for_status()
-                all_workers = response.json()["active_workers"]
-                for worker in all_workers:
-                    if worker == worker_url:
-                        response = requests.put(
-                            f"http://{self.router_ip}:{self.router_port}/exclude_worker",
-                            json={"worker_url": worker},
-                            timeout=timeout,
-                        )
-                        if response.status_code == 404:
-                            logger.info(f"Worker {worker} already removed from router (404).")
-                        else:
-                            response.raise_for_status()
-                        break
-                else:
-                    logger.warning(f"Worker {worker_url} not found in router during shutdown.")
-            except Exception as e:
-                logger.warning(f"Failed to fetch workers list or remove worker: {e}")
+    def shutdown(self):
+        """Shutdown the SGLang engine and clean up resources.
 
+        Removing the worker from the router is not done here: ReplicaGroup.kill_engine does it
+        before calling this, so it does not depend on this actor still responding.
+        """
+        logger.info(f"Shutdown engine {self.server_host}:{self.server_port}...")
         if self.process is not None:
             kill_process_tree(self.process.pid)
 
@@ -342,6 +329,7 @@ def _compute_server_args(
         "enable_return_routed_experts": config.trainer.use_rollout_routing_replay,
         "enable_fp32_lm_head": config.trainer.use_fp32_lm_head,
         "dtype": "auto",
+        "enable_multimodal": config.multimodal.enable,
     }
     if config.colocate:
         # Breakable CUDA graph is not compatible with memory saver mode

@@ -4,15 +4,13 @@ from __future__ import annotations
 
 import logging
 import random
-from enum import Enum
 from functools import partial
-from typing import Optional, get_type_hints
+from typing import get_type_hints
 
 import numpy as np
 import ray
 import torch
 from megatron.bridge import AutoBridge
-from megatron.bridge.models import GPTModelProvider
 from megatron.core import parallel_state as mpu
 from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
 from omegaconf import DictConfig, OmegaConf
@@ -31,10 +29,11 @@ from coda.utils.memory_utils import clear_memory
 from coda.utils.multimodal_tensors import move_image_table_to_device
 from coda.utils.multimodal_config import validate_vlm_parallel_config
 from coda.backends.megatron.checkpoint import load_model_weights
+import coda.backends.megatron.monkey_patch  # noqa: F401  # apply patches before any Megatron usage
 from coda.backends.megatron.mixed_precision import KeepFP32Module
 from coda.utils.checkpoint_utils import resolve_dist_ckpt_dir
 from coda.utils.tracking import configure_tracking
-from coda.utils.types import RolloutBatch, to_torch_dtype
+from coda.utils.types import RolloutBatch, convert_overrides
 from coda.utils.tensor_backuper import TensorBackuper
 
 logger = logging.getLogger(__name__)
@@ -176,13 +175,15 @@ class MegatronTeacherWorker(BaseTeacherWorker):
         )
 
         self.bridge = AutoBridge.from_hf_pretrained(hf_path)
-        provider = self.bridge.to_megatron_provider(load_weights=ckpt_dir is None)
-        # Apply overrides and finalize via the bridge helper so provider paths
-        # that need post-override setup (e.g. DeepSeek-V4 hash MoE auto-setting
-        # pipeline_model_parallel_layout when PP > 1) run before finalize().
-        provider.apply_overrides_and_finalize(overrides=self._build_model_overrides())
-
-        self.model = provider.provide_distributed_model(
+        model_config = self.bridge.get_model_config()
+        # Flat setattr routes each field to the outer config or its nested transformer config and
+        # raises on names neither declares; outer-config hints win on shared names.
+        hints = {**get_type_hints(type(model_config.transformer)), **get_type_hints(type(model_config))}
+        for k, v in convert_overrides(OmegaConf.to_container(self.config.opd.model), hints).items():
+            setattr(model_config, k, v)
+        self.model = self.bridge.get_model(
+            model_config,
+            load_weights=ckpt_dir is None,
             wrap_with_ddp=False,
             mixed_precision_wrapper=partial(KeepFP32Module, self.config.megatron.keep_fp32_weights),
         )
@@ -211,24 +212,6 @@ class MegatronTeacherWorker(BaseTeacherWorker):
             self.rank, teacher_idx,
             f"ckpt:{ckpt_dir}" if ckpt_dir else f"hf:{teacher.hf_path}",
         )
-
-    def _build_model_overrides(self) -> dict:
-        """Convert ``opd.model`` into provider attribute overrides."""
-        model_config_dict = OmegaConf.to_container(self.config.opd.model)
-        hints = get_type_hints(GPTModelProvider)
-        overrides = {}
-        for k, v in model_config_dict.items():
-            # Convert string dtype like "torch.bfloat16" to actual torch.dtype
-            hint = hints.get(k)
-            if hint is torch.dtype or hint is Optional[torch.dtype]:
-                v = to_torch_dtype(v)
-            elif isinstance(hint, type) and issubclass(hint, Enum) and isinstance(v, str):
-                # e.g. attention_backend: flash -> AttnBackend.flash. Megatron's enums
-                # are plain Enum (no str mixin), so a raw string silently compares
-                # unequal to every member instead of failing loudly.
-                v = hint[v]
-            overrides[k] = v
-        return overrides
 
     @torch.no_grad()
     def switch(self, teacher_idx):

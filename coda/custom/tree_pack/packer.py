@@ -52,7 +52,6 @@ import numpy as np
 import torch
 from omegaconf import DictConfig
 
-from coda.utils.multimodal_config import multimodal_enabled
 from coda.utils.packing import MicroBatchPacker, PackedInputs, PackPlan, register_packer
 
 from coda.custom.tree_pack.index.cost import chain_cost
@@ -142,7 +141,7 @@ class TreePacker(MicroBatchPacker):
             return f"attention_backend={m.get('attention_backend')!r} (needs 'flash')"
         if not config.trainer.use_dynamic_batch_size:
             return "use_dynamic_batch_size=False (node budgets need dynamic batching)"
-        if multimodal_enabled(config):
+        if config.get("multimodal", {}).get("enable", False):
             return "multimodal.enable=True (image inputs are not supported by tree packing)"
         return None
 

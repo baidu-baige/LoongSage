@@ -26,16 +26,14 @@
 
 ### 1.1 multimodal（图像模态）
 
-用于开启 VLM 训练的图像输入。默认全部关闭，纯文本训练不读取该节。数据格式与启动示例见 [运行指南](run-guide.md#任务八使用图像训练视觉语言模型qwen3-vl)。
+用于开启 VLM 训练的图像输入。默认全部关闭，纯文本训练不读取该节。数据格式与启动示例见 [运行指南](run-guide.md#任务八使用图像训练视觉语言模型qwen3-vldeepseek-v41)。
 
 | 参数 | 默认 | 说明 | 约束 |
 | --- | --- | --- | --- |
-| `multimodal.enable` | `false` | 是否开启图像模态训练。开启后 Router 会加载 `hf_model_path` 的 HF processor，把每张图片展开成模型实际看到的 image pad token，训练侧再把图像张量送入模型。 | 需安装 `qwen-vl-utils`（启动时校验）。为 `false` 时任何数据源都不能设置 `dataset.multimodal_keys`。 |
+| `multimodal.enable` | `false` | 是否开启图像模态训练。开启后 Router 会加载 `hf_model_path` 的 HF processor，把每张图片展开成模型实际看到的 image pad token，训练侧再把图像张量送入模型。DeepSeek-V4.1（`model_type: deepseek_v41`）改用自带的图像处理器，按检查点 `config.json` 中的 `vision_*` 字段规划每张图。 | 除 DeepSeek-V4.1 外的模型需安装 `qwen-vl-utils`（启动时校验）。为 `false` 时任何数据源都不能设置 `dataset.multimodal_keys` 或 `dataset.max_image_tokens`。 |
 | `multimodal.modalities` | `[image]` | 启用的模态列表。 | `enable=true` 时不能为空。目前只实现 `image`，`video` / `audio` 为预留项，填写会报错。 |
-| `multimodal.image.min_pixels` | `65536` | 单张图片像素数下限。像素数更小的图片会在 HF processor 之前被 Router 放大到该值。全局生效，对所有数据源一致。 | `> 0` 且 `<= max_pixels`；须 `>=` processor 的 `shortest_edge`，在 processor 加载时校验。 |
-| `multimodal.image.max_pixels` | `16777216` | 单张图片像素数上限（4096x4096），更大的图片会被缩小到该值。Qwen3-VL 每 32x32 像素 1 个 token，因此单张图最多 16384 个 image token。 | `> 0`；须 `<=` processor 的 `longest_edge`，在 processor 加载时校验。 |
 
-`multimodal.enable=true` 时 `rollout.sglang_args.enable_multimodal` 会被自动置为 `true`；若同时显式写成 `false`，会报配置错误。
+SGLang 引擎在启动时用 `multimodal.enable` 作为 `enable_multimodal` 的默认值，通常无需自己设置。`rollout.sglang_args.enable_multimodal` 里写的值优先，且不做校验：`multimodal.enable=true` 时显式写成 `false`，SGLang 会在不支持多模态的情况下启动。配置本身不会被修改。
 
 ## 2. 全异步（fully_async）
 
@@ -58,7 +56,7 @@
 | `dataset.prompt_data_path` | `???` | prompt 数据集路径，支持 `.jsonl` / `.parquet`；可加行切片后缀 `data.jsonl@[0:1000]`。 | 必填。 |
 | `dataset.eval_prompt_data_path` | `null` | 评测集路径，格式同上。 | `null` 表示禁用 eval；同时需 `rollout.eval.interval > 0` 才会真正运行 eval。 |
 | `dataset.max_prompt_len` | `null` | 单个 prompt 允许的最大字符数，超长样本会在加载时丢弃。 | `null` 关闭过滤；这里是**字符**长度，不是 token 长度。 |
-| `dataset.max_image_tokens` | `null` | 单个 prompt 全部图片的估算 token 数之和上限，超限样本会在加载时丢弃。 | `null` 关闭过滤；按图片头部尺寸和 `multimodal.image.{min_pixels,max_pixels}` 估算，假设 Qwen3-VL 每 32x32 像素 1 个 token；与 `max_prompt_len` 相互独立。 |
+| `dataset.max_image_tokens` | `null` | 单个 prompt 全部图片的估算 token 数之和上限，超限样本会在加载时丢弃。 | `null` 关闭过滤；除 DeepSeek-V4.1 外的模型按图片头部尺寸和模型 `preprocessor_config.json` 的 `size.shortest_edge` / `size.longest_edge` 估算，假设 Qwen3-VL 每 32x32 像素 1 个 token，DeepSeek-V4.1 则按检查点的 `vision_*` 配置估算；与 `max_prompt_len` 相互独立。 |
 | `dataset.multimodal_keys` | `null` | 模态到数据列的映射，如 `{image: images}`。`images` 列按顺序存放 prompt 文本中每个 `<image>` 占位符对应的一个 base64 data URI（`data:image/...;base64,...`）。 | `null` 表示纯文本数据集。需 `multimodal.enable=true`；key 必须在 `multimodal.modalities` 中；目前只实现 `image`。占位符数量必须等于该列的元素个数。 |
 | `dataset.input_key` | `???` | prompt 文本或 message 列的列名。 | 必填。 |
 | `dataset.label_key` | `???` | 参考答案 / label 列的列名。 | 必填；不需要时可显式设为 `null`。 |
@@ -206,9 +204,9 @@ Agent 侧的 Router 与 tokenizer，以及 trajectory dump 等框架级能力。
 | `megatron.model.tensor_model_parallel_size` | `1` | Tensor Parallel 大小（TP）。 | 训练总卡数需能被 `TP × PP × CP` 整除，启动即校验，详见 [11.9](#119-dp-与-batch-尺寸)。 |
 | `megatron.model.pipeline_model_parallel_size` | `1` | Pipeline Parallel 大小（PP）。 | 同上，参与 `TP × PP × CP`。 |
 | `megatron.model.virtual_pipeline_model_parallel_size` | `null` | Virtual PP（VPP）大小，用于减小 PP bubble。 | 需 PP > 1。 |
-| `megatron.model.context_parallel_size` | `1` | Context Parallel 大小（CP，序列切分）。 | 与 `cp_partition_mode` 配套；参与 `TP × PP × CP`。 |
-| `megatron.model.cp_partition_mode` | `zigzag` | CP 切分方式，`zigzag` 等。 | 仅 CP > 1 时生效。`multimodal.enable=true` 且 CP > 1 时只接受 `zigzag`。 |
-| `megatron.model.freeze_vision_model` | 未设置 | 冻结视觉塔（Qwen3-VL）。 | Megatron-Bridge 对 Qwen3-VL-MoE 默认取 `True`，请显式设置；未设置时会打印 warning。 |
+| `megatron.model.context_parallel_size` | `1` | Context Parallel 大小（CP，序列切分）。 | 与 `cp_partition_mode` 配套；参与 `TP × PP × CP`。`multimodal.enable=true` 时，Qwen2.5-VL 要求 CP=1（启动时校验）。 |
+| `megatron.model.cp_partition_mode` | `zigzag` | CP 切分方式，`zigzag` 等。 | 仅 CP > 1 时生效。 |
+| `megatron.model.freeze_vision_model` | 未设置 | 冻结视觉塔（Qwen3-VL、DeepSeek-V4.1）。 | Megatron-Bridge 对 Qwen3-VL-MoE 默认取 `True`，请显式设置。 |
 | `megatron.model.freeze_language_model` | 未设置 | 冻结语言模型（Qwen3-VL）。 | 同上。要训练语言模型须设为 `false`。 |
 | `megatron.model.expert_model_parallel_size` | `1` | MoE 的 Expert Parallel（EP）。 | 非 MoE 模型保持 1。要求训练总卡数能被 `ETP × EP × PP` 整除。 |
 | `megatron.model.expert_tensor_parallel_size` | `null` | MoE 专家部分的 TP 大小。 | `null` 表示与 `tensor_model_parallel_size` 相同，该值即上式中的 `ETP`。 |

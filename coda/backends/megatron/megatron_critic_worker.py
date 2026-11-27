@@ -108,21 +108,22 @@ class MegatronCriticWorker(MegatronTrainWorker):
         logger.info(f"[Rank {self.rank}] MegatronCriticWorker initialization complete")
 
     @override
-    def _configure_provider(self, provider) -> None:
+    def _configure_provider(self, model_config) -> None:
         """Replace the LM head with a hidden->1 value head before DDP wrapping.
 
         * Untie embedding and output weights: with tied weights and PP > 1 the
           last stage's ``output_layer.weight`` is all-reduced with the first
           stage's embedding gradient and checkpointed as the embedding, which
           breaks once it is a ``[1, H]`` head.
-        * The swap is a pre-wrap hook *appended* after the one that loads the
-          HF weights (``provider.register_pre_wrap_hook``; the
-          ``pre_wrap_hook=`` argument would replace that hook), so the HF load
-          never sees the value head. Hooks are chained, so it returns the model.
+        * The swap runs as a pre-wrap hook *appended* to the builder config's
+          ``pre_wrap_hooks``. ``AutoBridge.get_model`` prepends the HF-weight-load
+          hook before the existing hooks, so the HF load still runs first (on the
+          model with its LM head) and never sees the value head. Hooks are chained,
+          so it returns the model.
         """
-        provider.share_embeddings_and_output_weights = False
-        hidden_size = provider.hidden_size
-        sequence_parallel = bool(provider.sequence_parallel)
+        model_config.share_embeddings_and_output_weights = False
+        hidden_size = model_config.transformer.hidden_size
+        sequence_parallel = bool(model_config.transformer.sequence_parallel)
         init_std = float(self.config.critic.value_head_init_std)
         seed = int(self.config.seed)
 
@@ -137,7 +138,7 @@ class MegatronCriticWorker(MegatronTrainWorker):
                     )
             return model_chunks
 
-        provider.register_pre_wrap_hook(install_value_head)
+        model_config.pre_wrap_hooks.append(install_value_head)
 
     @override
     @torch.no_grad()

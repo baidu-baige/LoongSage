@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from enum import Enum
+from typing import Any, Optional
 
 import torch
 
@@ -99,3 +100,19 @@ def to_torch_dtype(v: torch.dtype | str) -> torch.dtype:
             raise ValueError(f"Unsupported dtype string: {v}")
         v = getattr(torch, dtype_name)
     return v
+
+
+def convert_overrides(overrides: dict[str, Any], hints: dict[str, Any]) -> dict[str, Any]:
+    """Turn yaml strings into the dtypes / Enums the config fields declare."""
+    converted = {}
+    for k, v in overrides.items():
+        hint = hints.get(k)
+        if hint is torch.dtype or hint is Optional[torch.dtype]:
+            v = to_torch_dtype(v)
+        elif isinstance(hint, type) and issubclass(hint, Enum) and isinstance(v, str):
+            # e.g. attention_backend: flash -> AttnBackend.flash. Megatron's enums
+            # are plain Enum (no str mixin), so a raw string silently compares
+            # unequal to every member instead of failing loudly.
+            v = hint[v]
+        converted[k] = v
+    return converted

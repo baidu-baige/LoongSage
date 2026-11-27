@@ -15,7 +15,8 @@ logger = logging.getLogger(__name__)
 
 _ANSWER_PATTERN = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.DOTALL | re.IGNORECASE)
 _NUMBER_PATTERN = re.compile(r"\d+")
-_ALLOWED_CHARS = set("0123456789+-*/(). ")
+# No ".": the task's numbers are integers, and "1.5" would read the given 1 and 5 as one number.
+_ALLOWED_CHARS = set("0123456789+-*/() ")
 
 
 def extract_equation(text: str) -> str | None:
@@ -54,10 +55,11 @@ def _parse_label(label) -> tuple[float | None, list[int]]:
 
 def evaluate_equation(equation: str) -> float | None:
     # Safe eval: char allowlist blocks identifiers/strings/calls; "**" banned to
-    # avoid exponent blow-ups.
+    # avoid exponent blow-ups, and "//" because floor division is not one of the
+    # task's four operations (7 // 2 reaches 3, which + - * / cannot).
     if not equation or not all(c in _ALLOWED_CHARS for c in equation):
         return None
-    if "**" in equation:
+    if "**" in equation or "//" in equation:
         return None
     try:
         return float(eval(equation, {"__builtins__": {}}, {}))  # noqa: S307 - inputs char-allowlisted above

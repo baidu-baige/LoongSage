@@ -4,8 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import ctypes
+import multiprocessing
+import os
 import shlex
+import signal
+import sys
 from collections.abc import Callable, Mapping
+from concurrent.futures import ProcessPoolExecutor
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -90,6 +96,39 @@ def kill_process_tree_command(pattern: str, grace_seconds: int = 10) -> str:
     # prefixes commands with `timeout N`.
     return shlex.join(
         ["bash", "-c", _KILL_PROCESS_TREE_SH.strip(), "coda-kill", pattern, str(int(grace_seconds * 10))]
+    )
+
+
+_PR_SET_PDEATHSIG = 1
+
+
+def _init_pool_worker(parent_pid: int, initializer: Callable[..., None] | None, initargs: tuple) -> None:
+    """Make a pool worker die with the process that spawned it, then run *initializer*."""
+    if sys.platform.startswith("linux"):
+        # The parent fires on SIGTERM/SIGKILL without shutting the pool down, and
+        # idle workers block on the call queue forever, so let the kernel kill them.
+        ctypes.CDLL(None, use_errno=True).prctl(_PR_SET_PDEATHSIG, signal.SIGKILL)
+        # The parent may have died before prctl took effect.
+        if os.getppid() != parent_pid:
+            os._exit(1)
+    if initializer is not None:
+        initializer(*initargs)
+
+
+def spawn_process_pool(
+    max_workers: int, initializer: Callable[..., None] | None = None, initargs: tuple = ()
+) -> ProcessPoolExecutor:
+    """ProcessPoolExecutor whose workers are spawned and exit when this process dies.
+
+    spawn, not fork: workers are created lazily while sandbox threads have kubectl
+    subprocesses in flight; forked workers inherit those pipe fds (and the router's
+    listening socket), so the subprocess calls never see EOF and hang.
+    """
+    return ProcessPoolExecutor(
+        max_workers=max_workers,
+        mp_context=multiprocessing.get_context("spawn"),
+        initializer=_init_pool_worker,
+        initargs=(os.getpid(), initializer, initargs),
     )
 
 
