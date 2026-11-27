@@ -240,16 +240,23 @@ class LLMGenerateResponse:
     logprobs: list[float]
     weight_version: int
     routed_experts: torch.Tensor | None = None
+    # Top-k log-probs of the rollout distribution per response token, sorted by log-prob:
+    # [n, k] int32 ids / float32 log-probs.
+    topk_ids: torch.Tensor | None = None
+    topk_log_probs: torch.Tensor | None = None
 
 
 # Wire dtypes SGLang may report in meta_info["routed_experts_dtype"]; absent means int32.
 _R3_WIRE_DTYPES = {"int32": torch.int32, "int16": torch.int16, "uint8": torch.uint8}
 
-# Spare rows (fraction of the needed rows) added when the routing buffer grows.
-_R3_GROWTH = 0.125
+# Spare rows (fraction of the needed rows) added when a growable row buffer (R3, rollout top-k) grows.
+_BUFFER_GROWTH = 0.125
 
 # meta_info key for output_token_logprobs already split by parse_generate_json.
 _SPLIT_LOGPROBS_KEY = "_split_output_token_logprobs"
+
+# meta_info key for the flat output top log-probs already decoded by parse_generate_json.
+_DECODED_TOP_LOGPROBS_KEY = "_decoded_output_top_logprobs"
 
 
 def _compact_expert_ids(t: torch.Tensor) -> torch.Tensor:
@@ -294,7 +301,7 @@ def deserialize_routed_experts(b64_str: str, num_entries: int, dtype: str = "int
     return _compact_expert_ids(flat.reshape(num_entries, -1))
 
 
-def _r3_append_rows(base: torch.Tensor, keep: int, *parts: torch.Tensor) -> torch.Tensor:
+def _append_rows_in_place(base: torch.Tensor, keep: int, *parts: torch.Tensor) -> torch.Tensor:
     """``torch.cat([base[:keep], *parts])`` that writes into spare capacity of base's buffer.
 
     The returned tensor is a prefix view of a larger buffer, so a turn costs O(new rows)
@@ -310,7 +317,7 @@ def _r3_append_rows(base: torch.Tensor, keep: int, *parts: torch.Tensor) -> torc
     if base.storage_offset() == 0 and base.is_contiguous() and capacity >= need:
         buf = base.new_empty(0).set_(storage, 0, (capacity, *base.shape[1:]))
     else:
-        capacity = need + int(need * _R3_GROWTH)
+        capacity = need + int(need * _BUFFER_GROWTH)
         buf = base.new_empty((capacity, *base.shape[1:]))
         buf[:keep].copy_(base[:keep])
     pos = keep
@@ -332,11 +339,43 @@ def _gc_paused():
             gc.enable()
 
 
+def _decode_flat_top_logprobs(meta: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Pop SGLang's flat base64 output top log-probs into ``[n, k]`` int32 ids / float32 log-probs.
+
+    Requested with ``return_flat_raw_output_top_logprobs`` + ``return_flat_raw_top_logprobs_b64``.
+    """
+    keys = ("val_flat_b64", "idx_flat_b64", "val_flat_b64_dtype", "idx_flat_b64_dtype", "shape", "null_prefix")
+    fields = {key: meta.pop(f"output_top_logprobs_{key}", None) for key in keys}
+    if fields["val_flat_b64"] is None:
+        return None
+    if (fields["val_flat_b64_dtype"], fields["idx_flat_b64_dtype"]) != ("float32", "int32"):
+        raise ValueError(
+            f"unsupported flat top logprob dtypes {fields['val_flat_b64_dtype']!r} / {fields['idx_flat_b64_dtype']!r}"
+        )
+    num_rows, k = fields["shape"]
+    # Every generated token has a top-k row; a null prefix only arises on the prompt side.
+    if fields["null_prefix"]:
+        raise ValueError(f"output top logprobs have {fields['null_prefix']} leading positions without a row")
+    if not num_rows:
+        return torch.empty((0, k), dtype=torch.int32), torch.empty((0, k), dtype=torch.float32)
+    return (
+        _flat_b64_tensor(fields["idx_flat_b64"], torch.int32, num_rows, k),
+        _flat_b64_tensor(fields["val_flat_b64"], torch.float32, num_rows, k),
+    )
+
+
+def _flat_b64_tensor(b64: str, dtype: torch.dtype, num_rows: int, k: int) -> torch.Tensor:
+    """``[num_rows, k]`` tensor over the decoded bytes, without another copy."""
+    # bytearray: frombuffer over read-only bytes would give a read-only tensor.
+    return torch.frombuffer(pybase64.b64decode_as_bytearray(b64), dtype=dtype).view(num_rows, k)
+
+
 def parse_generate_json(body: bytes) -> dict[str, Any]:
     """Parse an SGLang /generate body and split output_token_logprobs into two flat lists.
 
     The per-token ``[logprob, id, None]`` lists are freed with GC paused, before any young
-    collection can promote them into the generations that full collections walk.
+    collection can promote them into the generations that full collections walk. Flat
+    base64 output top log-probs, when present, are decoded into ``[n, k]`` tensors.
     """
     with _gc_paused():
         response_json = orjson.loads(body)
@@ -349,6 +388,9 @@ def parse_generate_json(body: bytes) -> dict[str, Any]:
                     [int(item[1]) for item in items],
                 )
             del items
+            top_logprobs = _decode_flat_top_logprobs(meta)
+            if top_logprobs is not None:
+                meta[_DECODED_TOP_LOGPROBS_KEY] = top_logprobs
     return response_json
 
 
@@ -447,11 +489,13 @@ class TrajectoryParser:
         r3_enabled: bool = False,
         reasoning_parser: str | bool | dict[str, Any] | None = None,
         tool_call_parser: str | bool | dict[str, Any] | None = None,
+        rollout_top_logprobs_num: int = 0,
     ):
         self.trajectory_store = trajectory_store
         self.tokenizer_manager = tokenizer_manager
         self.accumulate_reasoning = accumulate_reasoning
         self.r3_enabled = r3_enabled
+        self.rollout_top_logprobs_num = rollout_top_logprobs_num
         self.model_family = getattr(tokenizer_manager, "model_family", None)
         self.think_tags = getattr(tokenizer_manager, "think_tags", DEFAULT_THINK_TAGS)
         self.think_end_ids: list[int] = list(getattr(tokenizer_manager, "think_end_ids", []))
@@ -799,6 +843,11 @@ class TrajectoryParser:
 
         weight_version = _parse_weight_version(meta.get("weight_version"))
         generated_text: str = response_json.get("text") or ""
+        topk_ids, topk_log_probs = meta.pop(_DECODED_TOP_LOGPROBS_KEY, (None, None))
+        if topk_ids is not None and topk_ids.size(0) != len(response_ids):
+            raise ValueError(
+                f"output top logprobs have {topk_ids.size(0)} rows for {len(response_ids)} response tokens"
+            )
 
         payload = LLMGenerateResponse(
             generated_text=generated_text,
@@ -806,6 +855,8 @@ class TrajectoryParser:
             logprobs=logprobs,
             weight_version=weight_version,
             routed_experts=routed_experts,
+            topk_ids=topk_ids,
+            topk_log_probs=topk_log_probs,
         )
 
         reasoning_content, visible_text = self._parse_reasoning(generated_text)
@@ -902,6 +953,15 @@ class TrajectoryParser:
             return
         trajectory = active
 
+        # Checked before any write: a turn appended without its top-k rows would leave trainable
+        # response rows that the next turn fills with id -1.
+        if (self.rollout_top_logprobs_num and not trajectory.is_eval
+                and not turn_ctx.is_subagent_placeholder and payload.topk_ids is None):
+            raise ValueError(
+                f"no output top logprobs for {trajectory.trajectory_id}#{trajectory.attempt_id} "
+                f"(requested top_logprobs_num={self.rollout_top_logprobs_num})"
+            )
+
         base = len(trajectory.tokens)
         self._append_triplet(
             trajectory,
@@ -934,6 +994,8 @@ class TrajectoryParser:
             self._append_routed_experts(
                 trajectory, payload.routed_experts, turn_ctx.start_new_segment
             )
+        if self.rollout_top_logprobs_num and not trajectory.is_eval:
+            self._append_rollout_topk(trajectory, payload)
         segment_messages = copy.deepcopy(turn_ctx.raw_new_messages + [assistant_message])
         active_id = trajectory.active_segment_id
         if turn_ctx.start_new_segment or active_id not in trajectory.chat_completions:
@@ -1317,6 +1379,15 @@ class TrajectoryParser:
                     trajectory.rollout_routed_experts[response_start + delta:],
                 ], dim=0)
 
+        # Sync the rollout top-k rows (response space): keep only the answer slice of the response.
+        if trajectory.rollout_topk_ids is not None:
+            keep = slice(logprob_s + keep_start, logprob_s + keep_end)
+            for name in ("rollout_topk_ids", "rollout_topk_log_probs"):
+                rows = getattr(trajectory, name)
+                setattr(trajectory, name, _append_rows_in_place(
+                    rows, logprob_s, rows[keep].clone(), rows[logprob_e:].clone()
+                ))
+
     def _append_triplet(
         self,
         trajectory: Trajectory,
@@ -1431,9 +1502,9 @@ class TrajectoryParser:
         if base is None:
             merged = routed_experts_chunk.clone()
         elif start_new_segment:
-            merged = _r3_append_rows(base, base.size(0), routed_experts_chunk)
+            merged = _append_rows_in_place(base, base.size(0), routed_experts_chunk)
         else:
-            merged = _r3_append_rows(base, base.size(0) - 1, routed_experts_chunk)
+            merged = _append_rows_in_place(base, base.size(0) - 1, routed_experts_chunk)
         if merged.size(0) > 1:
             merged[-1].copy_(merged[-2])
         trajectory.rollout_routed_experts = merged
@@ -1444,3 +1515,30 @@ class TrajectoryParser:
         )
         logger.debug("[append_r3] %s#%d: total=%s",
                      trajectory.trajectory_id, trajectory.attempt_id, list(merged.shape))
+
+    def _append_rollout_topk(self, trajectory: Trajectory, payload: LLMGenerateResponse) -> None:
+        """Extend the rollout top-k rows (response space) with a new turn's top-k log-probs.
+
+        The rows this turn added before its response (tool outputs, rebuilt prompts) are
+        filled with id -1 and log-prob 0.0, so the rows stay aligned with rollout_log_probs.
+        update_trajectory has already checked that the payload carries the top-k rows.
+        """
+        ids, log_probs = trajectory.rollout_topk_ids, trajectory.rollout_topk_log_probs
+        num_total_rows = len(trajectory.rollout_log_probs)
+        num_existing_rows = 0 if ids is None else ids.size(0)
+        num_response_rows = payload.topk_ids.size(0)
+        num_fill_rows = num_total_rows - num_existing_rows - num_response_rows
+        if num_fill_rows < 0:
+            raise ValueError(
+                f"rollout top-k rows {num_existing_rows} + {num_response_rows} exceed response length {num_total_rows}"
+            )
+        k = payload.topk_ids.size(1)
+        fill_ids = payload.topk_ids.new_full((num_fill_rows, k), -1)
+        fill_log_probs = payload.topk_log_probs.new_zeros((num_fill_rows, k))
+        if ids is None:
+            ids = torch.cat([fill_ids, payload.topk_ids], dim=0)
+            log_probs = torch.cat([fill_log_probs, payload.topk_log_probs], dim=0)
+        else:
+            ids = _append_rows_in_place(ids, num_existing_rows, fill_ids, payload.topk_ids)
+            log_probs = _append_rows_in_place(log_probs, num_existing_rows, fill_log_probs, payload.topk_log_probs)
+        trajectory.rollout_topk_ids, trajectory.rollout_topk_log_probs = ids, log_probs

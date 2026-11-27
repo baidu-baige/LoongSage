@@ -77,7 +77,8 @@ trainer:
 源头对齐无法完全消除偏差（精度与算子实现的差异仍在），也不覆盖异步 / partial rollout 引入的权重版本差；残余部分由算法层处理，详见[训练算法](./training-algorithms.md)第 1.3 节：
 
 - **IS correction**：按 `π_old / π_rollout` 对逐 token loss 加权，将残余偏差显式折算进梯度，权重越界时裁剪或屏蔽；
-- **M2PO / OPSM**：不加权，而是屏蔽偏差最严重的 token / 序列，防止极端样本主导更新。
+- **M2PO / OPSM**：不加权，而是屏蔽偏差最严重的 token / 序列，防止极端样本主导更新；
+- **Score centering**：从被采样 token 的 score 中减去它在推理分布下的期望，抵消训推失配带来的漂移（[arXiv:2609.20807](https://arxiv.org/abs/2609.20807)）。开启后训练请求带 `top_logprobs_num = algorithm.score_centering.topk`（eval 请求不带），router 把每个响应 token 的推理端 top-k id 与 logprob 存进 trajectory 的 `rollout_topk_ids`（int32）/ `rollout_topk_log_probs`（float32），工具输出等非 LLM 位置填 id `-1`、logprob `0.0`，再按 Segment 切片随 rollout batch 下发到训练端。
 
 另一条路线是 `trainer.use_rollout_log_probs: true`：直接以 `π_rollout` 作为行为策略参与 policy loss，让比率 `π_θ / π_rollout` 隐式吸收训推差，省去 `old_log_probs` 重算；该开关与 IS correction、M2PO 互斥。
 

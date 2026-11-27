@@ -38,6 +38,8 @@ logger = logging.getLogger(__name__)
 
 _ROLLOUT_SINGLE_TURN = "single_turn"
 _ROLLOUT_MULTI_TURN = "multi_turn"
+# Trajectory tensors the parser grows in place (prefix views of a larger buffer).
+_GROWABLE_BUFFERS = ("rollout_routed_experts", "rollout_topk_ids", "rollout_topk_log_probs")
 
 
 def get_rollout_mode(ds_unit) -> str:
@@ -724,22 +726,25 @@ class AgentFlow:
         """Push a terminal trajectory to the queue and remove it from the store.
         Eval trajectories share this queue; RolloutSampler splits them out by is_eval.
         """
-        # R3 rows are a view of a growable buffer: clone them rather than deep-copy the
-        # spare capacity along with the rest of the trajectory.
-        routed_experts = trajectory.rollout_routed_experts
-        trajectory.rollout_routed_experts = None
+        # R3 and rollout top-k rows are views of a growable buffer: clone them rather than
+        # deep-copy the spare capacity along with the rest of the trajectory.
+        buffers = {name: getattr(trajectory, name) for name in _GROWABLE_BUFFERS}
+        for name in _GROWABLE_BUFFERS:
+            setattr(trajectory, name, None)
         trajectory_id = trajectory.trajectory_id
         prompt_id, ds_index = trajectory.prompt_id, trajectory.ds_index
         try:
             snapshot = self._copy_for_queue(trajectory)
-            if routed_experts is not None:
-                snapshot.rollout_routed_experts = routed_experts.clone()
+            for name, rows in buffers.items():
+                if rows is not None:
+                    setattr(snapshot, name, rows.clone())
         finally:
-            trajectory.rollout_routed_experts = routed_experts
+            for name, rows in buffers.items():
+                setattr(trajectory, name, rows)
             # Delete before the queue write so the original is freed now, not after every
             # concurrent emit (abort, step end) has finished.
             self.trajectory_store.delete([trajectory_id])
-        del trajectory, routed_experts
+        del trajectory, buffers
         write_task = asyncio.create_task(asyncio.to_thread(self.traj_queue.add, snapshot))
         del snapshot
         self._inflight_queue_write_futures.add(write_task)

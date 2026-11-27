@@ -295,7 +295,7 @@ The `algorithm` node bundles advantage estimation, policy loss, off-policy safeg
 | `algorithm.advantage_estimator` | `grpo` | Advantage estimator name. | Registered via the registry; built-in: `grpo`, `gae` (PPO: advantages computed by the critic, requires `critic.enable`). |
 | `algorithm.advantage_norm_mode` | `group_zscore` | Group-level reward normalization of `grpo`. | `none` / `group_mean` / `group_zscore`; `group_*` requires equal group sizes; ignored by `gae`. |
 | `algorithm.use_masked_whiten` | `false` | Whiten the advantages of any estimator over all response tokens of the step (DP all-reduced). | Applied after the estimator; PPO returns are not whitened. |
-| `algorithm.policy_loss` | `grpo` | Policy loss name. | Built-in: `grpo` / `ppo` (same clipped surrogate as `grpo`) / `gspo`; see [GSPO paper](https://arxiv.org/pdf/2507.18071). |
+| `algorithm.policy_loss` | `grpo` | Policy loss name. | Built-in: `grpo` / `ppo` (same clipped surrogate as `grpo`) / `gspo` / `reinforce` (`-A·logπ`, unclipped); see [GSPO paper](https://arxiv.org/pdf/2507.18071). |
 | `algorithm.ppo.value_clip` | `0.2` | Clip range of the critic value loss around the old values. | Only with `advantage_estimator: gae`. |
 | `algorithm.ppo.gamma` | `1.0` | GAE discount factor. | Only with `advantage_estimator: gae`. |
 | `algorithm.ppo.lam` | `0.95` | GAE lambda. | Only with `advantage_estimator: gae`. |
@@ -333,6 +333,26 @@ The `algorithm` node bundles advantage estimation, policy loss, off-policy safeg
 | `algorithm.ref_kl.kl_type` | `k3` | KL estimator: `k1` / `k2` / `k3`. | — |
 | `algorithm.ref_kl.use_unbiased_kl` | `false` | Multiply per-token KL by `exp(log_probs - old_log_probs)` (DeepSeek-V3.2 style). | — |
 | `algorithm.ref_kl.update_interval` | `-1` | `<=0` keeps ref frozen; `>0` refreshes ref from the current actor every N steps. | Requires `enable: true`. |
+
+### 9.5 `score_centering`
+
+Subtracts the expected score under the inference distribution from the sampled token's score, canceling the drift that train-inference mismatch adds; see [arXiv:2609.20807](https://arxiv.org/abs/2609.20807). The inference engine records the top-k log-probs of every response token, and the tail beyond the top-k is modeled with the training distribution rescaled to the tail mass.
+
+| Field | Default | Description | Constraints |
+| --- | --- | --- | --- |
+| `algorithm.score_centering.enable` | `false` | Enable score centering. | See the checks below. |
+| `algorithm.score_centering.topk` | `128` | Number of inference-side top-k log-probs recorded per response token. | Must be > 0. In the paper's Figure 5, `32` tracks full-vocabulary centering in most settings but falls behind for stretches in MIS + SC at staleness 64 and in 30B INT8 W/A + INT4 KV, and its 30B runs are single-seed; keep `128` unless the payload is a problem. |
+
+When enabled, startup checks that:
+
+- `algorithm.policy_loss` is `reinforce`; a clipped surrogate is piecewise and cannot be corrected by an additive term.
+- `algorithm.m2po`, `algorithm.opsm` and `opd` are disabled.
+- `algorithm.is_correction`, if enabled, uses `level: token`; its exclusion with `trainer.use_rollout_log_probs: true` still holds.
+- With `rollout.partial` or `fully_async.enable`, enabling `is_correction` is recommended: the paper finds score centering alone performs poorly under heavy staleness and recommends combining it with TIS or MIS.
+- No data source's `completion_params` truncates or rewrites the sampling distribution: `top_p < 1`, `min_p > 0`, repetition / frequency / presence penalty, `min_new_tokens`, `logit_bias`, `json_schema` / `regex` / `ebnf` / `structural_tag` are rejected; `stop` is fine.
+- Sampling `top_k` is `-1` or `2 ≤ top_k ≤ algorithm.score_centering.topk`: the recorded top-k must cover every token that can be sampled, so the trainer can renormalize it into the actual sampling distribution; `top_k = 1` is greedy and centering zeroes its gradient.
+- `SGLANG_RETURN_ORIGINAL_LOGPROB=1` is not set when `trainer.temperature ≠ 1`.
+- Speculative decoding (`sglang_args.speculative_algorithm`) is not enabled.
 
 ## 10. Trainer
 
@@ -378,6 +398,7 @@ The dependencies below span multiple sections and are the most common pitfalls w
   - `algorithm.is_correction.enable: true`
   - `algorithm.m2po.enable: true`
 - `algorithm.opsm.*` is compatible with all of the above.
+- `algorithm.score_centering.enable: true` requires `policy_loss: reinforce` and cannot be combined with M2PO or OPSM; see §9.5.
 
 ### 11.3 Fully-async mode
 

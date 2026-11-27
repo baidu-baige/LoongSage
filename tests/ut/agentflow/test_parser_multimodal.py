@@ -258,6 +258,7 @@ def _middleware(parser):
         MagicMock(),
         config=SimpleNamespace(
             trainer=SimpleNamespace(temperature=1.0),
+            algorithm=SimpleNamespace(score_centering=SimpleNamespace(enable=False, topk=128)),
             rollout=SimpleNamespace(eval=SimpleNamespace(temperature=None)),
         ),
         trajectory_store=TrajectoryStore(),

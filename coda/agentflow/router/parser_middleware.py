@@ -55,11 +55,11 @@ class ParserMiddleware(BaseHTTPMiddleware):
         self.train_temperature = config.trainer.temperature
         self.eval_temperature = config.rollout.eval.temperature
         self.r3_enabled = r3_enabled
+        self.rollout_top_logprobs_num = self._required_rollout_top_logprobs_num(config)
         self.inflight_requests = inflight_requests
         self.ds_configs = ds_configs
         self._trajectory_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._trajectory_lock_refs: Counter[str] = Counter()
-        # Body parse + R3 decode off the router event loop (0 = decode inline).
         self._decode_pool = (
             spawn_process_pool(r3_decode_workers)
             if r3_enabled and r3_decode_workers > 0 else None
@@ -73,7 +73,20 @@ class ParserMiddleware(BaseHTTPMiddleware):
             r3_enabled=r3_enabled,
             reasoning_parser=reasoning_parser,
             tool_call_parser=tool_call_parser,
+            rollout_top_logprobs_num=self.rollout_top_logprobs_num,
         )
+
+    @staticmethod
+    def _required_rollout_top_logprobs_num(config: Any) -> int:
+        """Top log-probs each training turn must record per response token; 0 = none.
+
+        The maximum over every enabled feature that reads the rollout top-k log-probs, so one
+        request serves all of them; each reads its own leading columns (SGLang sorts them).
+        """
+        needs = [0]
+        if config.algorithm.score_centering.enable:
+            needs.append(int(config.algorithm.score_centering.topk))
+        return max(needs)
 
     async def dispatch(self, request: Request, call_next):
         """Intercept a recognized-protocol request; pass all others through."""
@@ -331,6 +344,12 @@ class ParserMiddleware(BaseHTTPMiddleware):
         if self.r3_enabled:
             payload["return_routed_experts"] = True
             payload["routed_experts_start_len"] = routed_experts_start_len
+
+        if self.rollout_top_logprobs_num and not is_eval:
+            # Flat base64 arrays decode with frombuffer instead of millions of nested JSON lists.
+            payload["top_logprobs_num"] = self.rollout_top_logprobs_num
+            payload["return_flat_raw_output_top_logprobs"] = True
+            payload["return_flat_raw_top_logprobs_b64"] = True
 
         return json.dumps(payload)
 

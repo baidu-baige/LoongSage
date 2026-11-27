@@ -1,6 +1,7 @@
 """Built-in policy-loss implementations.
 
-Registers the GRPO / PPO and GSPO clipped surrogate losses into the policy-loss registry.
+Registers the GRPO / PPO and GSPO clipped surrogate losses and the unclipped
+REINFORCE loss into the policy-loss registry.
 """
 
 from __future__ import annotations
@@ -83,6 +84,29 @@ def ppo_loss(
     the advantages are estimated.
     """
     return grpo_loss(config, old_log_prob, log_prob, advantages, loss_masks, **kwargs)
+
+
+@register_policy_loss("reinforce")
+def reinforce_loss(
+    config: DictConfig,
+    old_log_prob: list[torch.Tensor],
+    log_prob: list[torch.Tensor],
+    advantages: list[torch.Tensor],
+    loss_masks: list[torch.Tensor],
+    **kwargs,
+) -> tuple[list[torch.Tensor], dict[str, float]]:
+    """REINFORCE loss (per-token): ``-A * log p``, no ratio and no clipping.
+
+    Required by score centering, whose correction is additive in log p and
+    cannot be applied through a clipped surrogate. ``old_log_prob`` only feeds
+    the ``approx_kl`` metric.
+    """
+    per_token_loss = [-adv * lp for adv, lp in zip(advantages, log_prob)]
+
+    with torch.no_grad():
+        approx_kl = ((torch.cat(old_log_prob) - torch.cat(log_prob)) * torch.cat(loss_masks)).sum().item()
+
+    return per_token_loss, {"train/approx_kl": approx_kl}
 
 
 @register_policy_loss("gspo")

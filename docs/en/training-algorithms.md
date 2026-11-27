@@ -24,13 +24,14 @@ Every estimator reports `train/adv_zero_ratio`: the fraction of Segment rows who
 
 ### 1.2. Policy Loss
 
-`algorithm.policy_loss` provides two built-in GRPO-like clipped surrogate losses:
+`algorithm.policy_loss` provides built-in GRPO-like clipped surrogate losses and an unclipped REINFORCE loss:
 
 | Value | Importance Ratio | Description |
 | --- | --- | --- |
 | `grpo` (default) | token-level `exp(logπ - logπ_old)` | Asymmetric clipping (`clip_ratio_low` / `clip_ratio_high`, default 0.2 / 0.28, i.e. DAPO's clip-higher); additionally applies dual-clip for negative advantages (`clip_ratio_c`, default 10.0) |
 | `gspo` | sequence-level `exp(mean(Δlogp))` | Sequence-level ratio with token-level gradient routing, see [GSPO](https://arxiv.org/pdf/2507.18071); only uses `clip_ratio_low` / `clip_ratio_high` |
 | `ppo` | token-level, same as `grpo` | The same clipped surrogate (PPO and GRPO differ only in the advantage); the standard PPO setting is `clip_ratio_low = clip_ratio_high = 0.2`, `clip_ratio_c = 3.0` |
+| `reinforce` | none | Per-token `-A·logπ`, no clipping; required by score centering |
 
 The behavior policy `logπ_old` is by default recomputed by the training engine at the beginning of every step; setting `trainer.use_rollout_log_probs: true` switches to the `rollout_log_probs` returned by the inference engine (in which case IS correction and M2PO cannot be enabled, see the next section).
 
@@ -43,6 +44,7 @@ The following mechanisms all target train-inference inconsistency (the deviation
 | IS correction | `algorithm.is_correction.enable` | Weights the per-token loss by `π_old / π_rollout`, clipping or masking when the weight goes out of bounds | Mutually exclusive with `trainer.use_rollout_log_probs: true` |
 | M2PO | `algorithm.m2po.enable` | Masks the tokens with the largest `(log(π_old/π_rollout))²` across the whole batch until the average second moment of the remaining tokens drops below `threshold` (default 0.04) | Same as above |
 | OPSM | `algorithm.opsm.enable` | When a sequence satisfies `advantage < 0` and its sequence-level KL exceeds `delta` (default 0.1), the gradient of that sequence is discarded (the denominator stays unchanged) | None |
+| Score centering | `algorithm.score_centering.enable` | Subtracts the expected score under the inference distribution from the sampled token's score, canceling the drift that train-inference mismatch adds ([arXiv:2609.20807](https://arxiv.org/abs/2609.20807)) | Requires `policy_loss: reinforce`; cannot be combined with M2PO, OPSM or OPD; with IS correction only `level: token`; sampling may only be truncated by a `top_k` no larger than `topk` (see [Config reference §9.5](./config-reference.md)) |
 
 The behavior of IS correction is composed of two dimensions:
 

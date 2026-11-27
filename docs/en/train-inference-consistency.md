@@ -77,7 +77,8 @@ Notes:
 Source alignment cannot fully eliminate the deviation (differences in precision and operator implementation remain), and it does not cover the weight version differences introduced by async / partial rollout; the residual part is handled at the algorithm level, see Section 1.3 of [Training Algorithms](./training-algorithms.md):
 
 - **IS correction**: weights the per-token loss by `π_old / π_rollout`, explicitly folding the residual deviation into the gradient, and clipping or masking when the weight goes out of bounds;
-- **M2PO / OPSM**: instead of weighting, they mask out the tokens / sequences with the worst deviation, preventing extreme samples from dominating the update.
+- **M2PO / OPSM**: instead of weighting, they mask out the tokens / sequences with the worst deviation, preventing extreme samples from dominating the update;
+- **Score centering**: subtracts the expected score under the inference distribution from the sampled token's score, canceling the drift that train-inference mismatch adds ([arXiv:2609.20807](https://arxiv.org/abs/2609.20807)). When enabled, training requests carry `top_logprobs_num = algorithm.score_centering.topk` (eval requests do not), and the router stores each response token's inference-side top-k ids and log-probs in the trajectory's `rollout_topk_ids` (int32) / `rollout_topk_log_probs` (float32); non-LLM positions such as tool outputs get id `-1` and log-prob `0.0`. The rows are sliced per Segment and shipped to the trainer with the rollout batch.
 
 Another route is `trainer.use_rollout_log_probs: true`: use `π_rollout` directly as the behavior policy in the policy loss, letting the ratio `π_θ / π_rollout` implicitly absorb the train-inference difference and saving the recomputation of `old_log_probs`; this switch is mutually exclusive with IS correction and M2PO.
 

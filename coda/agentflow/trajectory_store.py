@@ -365,6 +365,13 @@ class Trajectory(PydanticModel):
 
     rollout_routed_experts: Any = None
 
+    # Top-k log-probs of the rollout distribution per response-space token, sorted by log-prob
+    # ([response_len, k] int32 ids / float32 log-probs), recorded on training turns when a feature
+    # requests it (score centering).
+    # Non-LLM positions: id -1, log-prob 0.0. None when not requested.
+    rollout_topk_ids: Any = None
+    rollout_topk_log_probs: Any = None
+
     # --- Rewards ---
     # Final ORM scalar reward returned by the Agent.
     reward: float = 0.0

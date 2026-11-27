@@ -255,6 +255,32 @@ class TestPutDpShardsToRay(unittest.TestCase):
         self.assertEqual(d["tokens"][1].untyped_storage().nbytes(), 3 * 8)
         self.assertEqual(d["tokens"][1].tolist(), [3, 4, 5])
 
+    def test_rollout_topk_ships_per_segment_as_numpy(self):
+        import numpy as np
+        import torch
+
+        traj = _make_trajectory(n_tokens=6, pid="p0")
+        traj.rollout_topk_ids = torch.arange(12, dtype=torch.int32).reshape(6, 2)
+        traj.rollout_topk_log_probs = -torch.arange(12, dtype=torch.float32).reshape(6, 2)
+        traj.segments = [
+            Segment(token_start=0, token_end=3, logprob_start=0, logprob_end=3),
+            Segment(token_start=3, token_end=6, logprob_start=3, logprob_end=6),
+        ]
+        mock_ray, captured = _fake_ray_put()
+        with patch("coda.data_factory.data_processor.ray", mock_ray):
+            put_dp_shards_to_ray([[TrajectoryGroup(prompt_id="p0", trajectories=[traj])]], dp_size=1)
+        d = captured[0]
+        self.assertTrue(all(isinstance(r, np.ndarray) for r in d["rollout_topk_ids"]))
+        self.assertEqual(d["rollout_topk_ids"][1].tolist(), [[6, 7], [8, 9], [10, 11]])
+        self.assertEqual(d["rollout_topk_log_probs"][0].dtype, np.float32)
+
+    def test_rollout_topk_omitted_without_data(self):
+        mock_ray, captured = _fake_ray_put()
+        with patch("coda.data_factory.data_processor.ray", mock_ray):
+            put_dp_shards_to_ray([[_make_group("p0", [4])]], dp_size=1)
+        self.assertNotIn("rollout_topk_ids", captured[0])
+        self.assertNotIn("rollout_topk_log_probs", captured[0])
+
     # --- multimodal_train_inputs ---
 
     MM_PAD = 999
@@ -444,6 +470,19 @@ class TestGetDpShardFromRay(unittest.TestCase):
         del data["rollout_routed_experts"]
         result = self._get_result(data)
         self.assertNotIn("rollout_routed_experts", result)
+
+    def test_rollout_topk_passthrough(self):
+        data = self._make_rollout_data()
+        data["rollout_topk_ids"] = [object()]
+        data["rollout_topk_log_probs"] = [object()]
+        result = self._get_result(data)
+        self.assertIs(result["rollout_topk_ids"], data["rollout_topk_ids"])
+        self.assertIs(result["rollout_topk_log_probs"], data["rollout_topk_log_probs"])
+
+    def test_missing_rollout_topk_omits_keys(self):
+        result = self._get_result(self._make_rollout_data())
+        self.assertNotIn("rollout_topk_ids", result)
+        self.assertNotIn("rollout_topk_log_probs", result)
 
     def test_missing_rollout_weight_versions_raises(self):
         data = self._make_rollout_data()

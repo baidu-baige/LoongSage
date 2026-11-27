@@ -24,6 +24,12 @@ def make_minimal_config(**overrides):
         "fully_async": {
             "enable": False,
         },
+        "rollout": {
+            "partial": False,
+        },
+        "opd": {
+            "enable": False,
+        },
         "trainer": {
             "num_nodes": 1,
             "num_gpus_per_node": 1,
@@ -77,6 +83,13 @@ def make_minimal_config(**overrides):
             "m2po": {
                 "enable": False,
                 "threshold": 0.0,
+            },
+            "opsm": {
+                "enable": False,
+            },
+            "score_centering": {
+                "enable": False,
+                "topk": 128,
             },
             "ref_kl": {
                 "enable": False,
@@ -152,6 +165,33 @@ class TestMegatronValidateConfigM2PO:
                 fully_async={"enable": True},
                 trainer={"use_rollout_log_probs": True},
                 algorithm={"m2po": {"enable": True, "threshold": 0.05}},
+            )
+
+
+class TestMegatronValidateConfigScoreCentering:
+    def _run(self, **overrides):
+        return MegatronActorWorker.validate_config(make_minimal_config(**overrides))
+
+    def test_disabled_does_not_require_reinforce(self):
+        self._run(algorithm={"policy_loss": "grpo"})
+
+    def test_enabled_accepts_reinforce(self):
+        result = self._run(algorithm={"policy_loss": "reinforce", "score_centering": {"enable": True}})
+        assert result.algorithm.score_centering.topk == 128
+
+    def test_enabled_rejects_clipped_policy_loss(self):
+        with pytest.raises(ValueError, match="policy_loss=reinforce"):
+            self._run(algorithm={"policy_loss": "grpo", "score_centering": {"enable": True}})
+
+    def test_is_correction_and_rollout_log_probs_stay_exclusive(self):
+        with pytest.raises(ValueError, match="is_correction.enable and trainer.use_rollout_log_probs"):
+            self._run(
+                trainer={"use_rollout_log_probs": True},
+                algorithm={
+                    "policy_loss": "reinforce",
+                    "score_centering": {"enable": True},
+                    "is_correction": {"enable": True, "level": "token"},
+                },
             )
 
 

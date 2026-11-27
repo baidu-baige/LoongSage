@@ -22,6 +22,7 @@ from coda.utils.checkpoint_utils import resolve_dist_ckpt_dir, get_hf_dir
 from coda.utils.types import RolloutBatch
 from coda.algorithms.advantage import compute_advantages_and_returns
 from coda.algorithms.is_correction import apply_is_correction
+from coda.algorithms.score_centering import validate_train_config as validate_score_centering_train_config
 from coda.algorithms.second_moment_trust_policy_optimization import apply_m2po_masking
 from coda.backends.megatron.data import (
     get_rollout_data,
@@ -75,6 +76,9 @@ class MegatronActorWorker(MegatronTrainWorker):
             )
 
         assert config.algorithm.clip_ratio_c > 1.0, "clip_ratio_c must be greater than 1.0"
+
+        if config.algorithm.score_centering.enable:
+            validate_score_centering_train_config(config)
 
         if config.algorithm.ref_kl.enable:
             if config.algorithm.ref_kl.kl_type not in {"k1", "k2", "k3"}:
