@@ -205,6 +205,56 @@ class TestLossFunction:
         assert metrics["train/approx_kl"] == pytest.approx(0.25)
         assert metrics["train/opsm_clipfrac"] == pytest.approx(1.0)
 
+    def test_packer_row_outputs_replace_the_row_layout(self, monkeypatch):
+        """``packed_seq_params.row_outputs`` supplies entropy and log-probs; the row helpers are not called."""
+        log_probs = [torch.tensor([0.2, 0.4])]
+        entropy = [torch.tensor([0.5, 0.5])]
+        calls = []
+
+        class RowOutputs:
+            def entropy(self, logits, temperature, with_grad):
+                calls.append(("entropy", with_grad))
+                return entropy
+
+            def log_probs(self, logits, temperature):
+                calls.append(("log_probs", temperature))
+                return log_probs
+
+        def unexpected(*args, **kwargs):
+            raise AssertionError("row path used")
+
+        for name in ("prepare_packed_seq_params", "compute_entropy", "compute_log_probs"):
+            monkeypatch.setattr(_loss_mod, name, unexpected)
+
+        def fake_compute_policy_loss(**kwargs):
+            assert kwargs["log_prob"] is log_probs
+            return [torch.tensor([2.0, 3.0], requires_grad=True)], {}
+
+        monkeypatch.setattr(_loss_mod, "compute_policy_loss", fake_compute_policy_loss)
+        config = OmegaConf.create({
+            "trainer": {"temperature": 0.7, "use_rollout_log_probs": False},
+            "algorithm": {"loss_agg_mode": "token-mean", "entropy_coef": 0.0,
+                          "opsm": {"enable": False}, "ref_kl": {"enable": False}},
+            "opd": {"enable": False},
+            "megatron": {"model": {"cp_partition_mode": "zigzag"}},
+        })
+        batch = {
+            "tokens": [torch.tensor([10, 11, 12])],
+            "total_lengths": [3],
+            "response_lengths": [2],
+            "loss_masks": [torch.ones(2)],
+            "raw_loss_masks": [torch.ones(2)],
+            "old_log_probs": [torch.zeros(2)],
+            "advantages": [torch.ones(2)],
+        }
+        psp = MagicMock(row_outputs=RowOutputs())
+
+        _, _, metrics = _loss_mod.loss_function(config, batch, psp, None, torch.zeros(1))
+
+        assert calls == [("entropy", False), ("log_probs", 0.7)]
+        assert metrics["train/entropy"] == pytest.approx(1.0)
+        assert metrics["train/pg_loss"] == pytest.approx(5.0)
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # PPO critic: response_values / value_loss_function

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 from array import array
-from typing import Any
+from typing import Any, Callable
 from collections import defaultdict
 
 import ray
@@ -65,8 +65,12 @@ def split_traj_group_by_dp(
     traj_groups: list[TrajectoryGroup],
     dp_size: int,
     num_mini_batch: int,
+    load_fn: Callable[[list[TrajectoryGroup]], list[int]] | None = None,
 ) -> list[list[TrajectoryGroup]]:
     """Split traj_groups by DP rank with ds_index-stratified balancing.
+
+    Load per group = ``load_fn`` (e.g. a packer's ``dp_loads``), by default Segment
+    count then tokens.
 
     Guarantees:
     1. Each DP rank receives the same ds_index proportion
@@ -78,6 +82,7 @@ def split_traj_group_by_dp(
     3. Within each DP shard, further partition each ds group into num_mini_batch parts and interleave
     """
 
+    load_fn = load_fn or _get_group_partition_loads
     ds_groups = defaultdict(list)
     for group in traj_groups:
         ds_idx = group.trajectories[0].ds_index
@@ -87,7 +92,7 @@ def split_traj_group_by_dp(
     dp_shards = [[] for _ in range(dp_size)]
     for ds_idx in sorted(ds_groups.keys()):
         groups = ds_groups[ds_idx]
-        seqlen_list = _get_group_partition_loads(groups)
+        seqlen_list = load_fn(groups)
         index_parts = get_seqlen_balanced_partitions(seqlen_list, dp_size, equal_size=True)
         for rank, part in enumerate(index_parts):
             dp_shards[rank].extend([groups[i] for i in part])
@@ -101,7 +106,7 @@ def split_traj_group_by_dp(
         partitions_by_ds = {}
         for ds_idx in sorted(rank_ds_groups.keys()):
             groups = rank_ds_groups[ds_idx]
-            seqlen_list = _get_group_partition_loads(groups)
+            seqlen_list = load_fn(groups)
             index_parts = get_seqlen_balanced_partitions(seqlen_list, num_mini_batch, equal_size=True)
             partitions_by_ds[ds_idx] = [[groups[i] for i in part] for part in index_parts]
 
