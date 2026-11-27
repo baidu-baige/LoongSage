@@ -69,8 +69,6 @@ data_source:
 
 rollout:
   env_vars:
-    SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE: "1"
-    SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT: "per_rank"
     SGLANG_DSV4_FP4_EXPERTS: "0"
     SGLANG_OPT_FP8_WO_A_GEMM: "0"
     SGLANG_OPT_FUSE_WQA_WKV: "0"
@@ -84,6 +82,8 @@ rollout:
   retry_limit: 3
   num_gpus_per_node: 8
   sglang_args:
+    # Engram tables in pinned host memory, one shard per rank (the old ENGRAM_HOST_TABLE=1, LAYOUT=per_rank).
+    engram_config: {placement: cpu}
     mem_fraction_static: 0.85
     # Hard cap on the KV pool (final KV tokens = min(mem_fraction-profiled, this)).
     # Also sizes the R3 routing-replay host capture buffer at ~960 B/token
