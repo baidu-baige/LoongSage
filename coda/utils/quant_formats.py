@@ -284,17 +284,6 @@ class UnsupportedQuant:
     shape: tuple[int, ...]
 
 
-def weight_of_scale(scale_name: str) -> str | None:
-    """Companion weight name of a scale tensor: DeepSeek ``X.scale`` -> ``X.weight``; the
-    ``*_scale_inv`` convention (ERNIE 5.5, DeepSeek-V3) -> ``X`` (``X.weight_scale_inv`` ->
-    ``X.weight``, and ``self_attn.linear_o_group_proj_scale_inv`` -> ``...linear_o_group_proj``)."""
-    if scale_name.endswith(".scale"):
-        return scale_name[: -len(".scale")] + ".weight"
-    if scale_name.endswith("_scale_inv"):
-        return scale_name[: -len("_scale_inv")]
-    return None
-
-
 def ckpt_quant_config(path: str) -> dict:
     """``quantization_config`` of the checkpoint's config.json ({} if absent)."""
     cfg_path = os.path.join(path, "config.json")
@@ -348,8 +337,13 @@ def scan_ckpt_quant(path: str) -> tuple[dict[str, CkptQuant], dict[str, Unsuppor
     out: dict[str, CkptQuant] = {}
     unsupported: dict[str, UnsupportedQuant] = {}
     for scale_name, sh in layout.items():
-        name = weight_of_scale(scale_name)
-        wh = layout.get(name) if name is not None else None
+        if scale_name.endswith(".scale"):  # DeepSeek: X.scale -> X.weight
+            name = scale_name[: -len(".scale")] + ".weight"
+        elif scale_name.endswith("_scale_inv"):  # ERNIE 5.5 / DeepSeek-V3: X_scale_inv -> X
+            name = scale_name[: -len("_scale_inv")]
+        else:
+            continue
+        wh = layout.get(name)
         if wh is None:
             continue
         scheme = infer_scheme(wh.dtype, wh.shape, sh.dtype, sh.shape, qcfg)

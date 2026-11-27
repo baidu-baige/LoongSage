@@ -1,0 +1,86 @@
+# @package _global_
+#
+# SFT on the full 43-layer ERNIE-5.5-Flash-Preview in its released FP8/MXFP4 format, 6-node H20
+# (6 x 8 = 48 GPUs), with weight QAT.
+#
+#   hf download baidu/ERNIE-5.5-Flash-Preview --local-dir /root/ERNIE-5.5-Flash-Preview
+#   hf download fxmeng/UltraData-SFT-2605-no-think-8k-32k --repo-type=dataset --local-dir /root/ultradata-no-think-8k-32k
+#
+#   # Run the same command on every machine
+#   bash examples/start_ray_cluster.sh <master-ip>
+#
+#   # Once the cluster is ready, run this on the head node only
+#   bash examples/start.sh ernie55_flash/sft_h20_6node \
+#     checkpoint_path=/root/ckpt/ernie55_sft_qat \
+#     hf_model_path=/root/ERNIE-5.5-Flash-Preview \
+#     data_source.dataset.prompt_data_path=/root/ultradata-no-think-8k-32k
+#
+# checkpoint_path and hf_model_path must live on storage that every node can reach through the
+# same path.
+defaults:
+  - /default
+  - _self_
+
+run_mode: sft
+checkpoint_path: ???
+hf_model_path: ???
+total_steps: 300
+
+data_source:
+  dataset:
+    prompt_data_path: ???
+    input_key: messages
+    label_key: null
+  num_trajectories_per_prompt: 1
+  num_prompts_per_step: 16
+  sft_max_seq_len: 32768
+
+agentflow:
+  tokenizer:
+    think_tags: ["<ernie:think>", "</ernie:think>"]
+    generation_prompt_kwargs:
+      enable_thinking: true
+
+trainer:
+  num_gpus_per_node: 8
+  num_nodes: 6
+  mini_batch_size: ${data_source.num_prompts_per_step}
+  max_tokens_per_gpu: 8192           # x CP4 = 32768 tokens per micro-batch
+  use_dynamic_batch_size: true
+  use_fp32_lm_head: false
+  deterministic_mode: false          # the D layers' deterministic sparse-attention backward is SM100-only
+  qat: true
+  save_freq: 50                      # dist ckpt incl. fp32 optimizer state is ~3.5 TB per save
+  save_hf: true                      # the checkpoint's own format (~155 GB per save)
+  async_save: true
+  nccl_timeout_minutes: 60
+  gloo_timeout_minutes: 60
+  env_vars:
+    PYTORCH_ALLOC_CONF: "expandable_segments:True,pinned_max_cached_size_mb:32"
+
+megatron:
+  model:
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 6
+    virtual_pipeline_model_parallel_size: null
+    context_parallel_size: 4
+    sequence_packing_scheduler: "default_dynamic_cp"
+    cp_partition_mode: contiguous
+    # ERNIE 5.5 hyper-connections exchange fp32 residual streams across PP stages;
+    # a narrower pipeline dtype would round them at every boundary (Bridge enforces this).
+    pipeline_dtype: torch.float32
+    expert_model_parallel_size: 8
+    expert_tensor_parallel_size: 1
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 1
+    dsa_indexer_use_sparse_loss: true
+  optimizer:
+    lr: 1.0e-6
+    chunked_optimizer_state_offload: true
+    optimizer_state_offload_fraction: 1.0
+
+algorithm:
+  advantage_estimator: sft
+  policy_loss: sft
+  loss_agg_mode: token-mean
