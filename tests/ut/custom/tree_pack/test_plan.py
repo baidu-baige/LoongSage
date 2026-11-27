@@ -1,4 +1,4 @@
-"""Unit tests for the tree planner (tree_pack/core/plan.py).
+"""Unit tests for the tree planner (tree_pack/index/plan.py).
 
 CPU-only index math: reconstruction correctness, node de-dup, monotone positions,
 response-node recovery, greedy capping. Uses both synthetic caterpillar chains with known
@@ -12,7 +12,7 @@ import random
 
 import pytest
 
-from coda.custom.tree_pack.core.plan import (
+from coda.custom.tree_pack.index.plan import (
     build_tree_seq,
     plan_sequences,
     row_path_nodes,
@@ -139,7 +139,7 @@ class TestTreePackRealShapes:
 # ---------------------------------------------------------------------------------------
 import itertools  # noqa: E402
 
-from coda.custom.tree_pack.core.plan import (  # noqa: E402
+from coda.custom.tree_pack.index.plan import (  # noqa: E402
     TreeCostWeights, group_cost, group_nodes, plan_sequences, plan_sequences_min_cost,
 )
 

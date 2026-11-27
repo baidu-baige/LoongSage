@@ -30,7 +30,7 @@ def test_build_tree_microbatch_structure():
     from types import SimpleNamespace
 
     from coda.backends.megatron.cp_utils import prepare_packed_seq_params, prepare_routing_replay_data
-    from coda.custom.tree_pack.core.batch import build_tree_microbatch
+    from coda.custom.tree_pack.index.batch import build_tree_microbatch
     from coda.custom.tree_pack.megatron.adapters.attention import build_attn_layout
 
     rows_a, _ = _setup(4)                  # one caterpillar trajectory ...

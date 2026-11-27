@@ -31,7 +31,7 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig  # noqa: E402
 
 from coda.custom.tree_pack.megatron.adapters.gdn import install_gdn_tree_patch  # noqa: E402
-from coda.custom.tree_pack.core.plan import (  # noqa: E402
+from coda.custom.tree_pack.index.plan import (  # noqa: E402
     build_tree_seq, merge_pieces, row_path_nodes,
 )
 

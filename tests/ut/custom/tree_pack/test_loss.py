@@ -25,9 +25,9 @@ from megatron.core import parallel_state  # noqa: E402
 
 from coda.backends.megatron.cp_utils import prepare_packed_seq_params  # noqa: E402
 from coda.backends.megatron.logits_utils import compute_entropy, compute_log_probs  # noqa: E402
-from coda.custom.tree_pack.core.loss_index import build_loss_index, index_to, restrict_to_lm_rows  # noqa: E402
+from coda.custom.tree_pack.index.loss_index import build_loss_index, index_to, restrict_to_lm_rows  # noqa: E402
 from coda.custom.tree_pack.megatron.loss import tree_compute_entropy, tree_compute_log_probs  # noqa: E402
-from coda.custom.tree_pack.core.plan import build_tree_seq, merge_pieces  # noqa: E402
+from coda.custom.tree_pack.index.plan import build_tree_seq, merge_pieces  # noqa: E402
 
 V, HD = 4096, 256
 
@@ -83,7 +83,7 @@ def test_tree_loss_matches_rowwise(seed):
     idx = index_to(build_loss_index([ts], row_t, resp, T), dev)
     assert idx.extra_nodes.numel() == len(rows) - 1, idx.extra_nodes.numel()
 
-    from coda.custom.tree_pack.core.plan import row_path_nodes
+    from coda.custom.tree_pack.index.plan import row_path_nodes
     fidx = torch.tensor([i for r in range(len(rows)) for i in row_path_nodes(ts, r)], device=dev)
 
     torch.manual_seed(seed)

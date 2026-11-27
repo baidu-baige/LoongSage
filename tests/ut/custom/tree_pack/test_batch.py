@@ -1,12 +1,12 @@
-"""CPU tests for tree_pack/core/batch.py: node tokens, R3 routing selection + mismatch stats,
+"""CPU tests for tree_pack/index/batch.py: node tokens, R3 routing selection + mismatch stats,
 branch points."""
 from __future__ import annotations
 
 import pytest
 import torch
 
-from coda.custom.tree_pack.core.batch import chain_branch_points, gather_nodes, tree_routed_experts
-from coda.custom.tree_pack.core.plan import build_tree_seq, plan_sequences, row_path_nodes
+from coda.custom.tree_pack.index.batch import chain_branch_points, gather_nodes, tree_routed_experts
+from coda.custom.tree_pack.index.plan import build_tree_seq, plan_sequences, row_path_nodes
 
 from .tree_test_utils import caterpillar as _caterpillar
 

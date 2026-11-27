@@ -12,7 +12,7 @@ from dataclasses import dataclass
 
 import torch
 
-from coda.custom.tree_pack.core.plan import Piece
+from coda.custom.tree_pack.index.plan import Piece
 from coda.custom.tree_pack.megatron.adapters import LayerAdapter, register_layer_adapter
 
 

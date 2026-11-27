@@ -29,7 +29,7 @@ from megatron.core.transformer import TransformerConfig  # noqa: E402
 from megatron.core.transformer.enums import AttnMaskType  # noqa: E402
 
 from coda.custom.tree_pack.megatron.adapters.attention import install_attention_tree_patch  # noqa: E402
-from coda.custom.tree_pack.core.plan import (  # noqa: E402
+from coda.custom.tree_pack.index.plan import (  # noqa: E402
     build_tree_seq, merge_pieces, row_path_nodes,
 )
 
@@ -164,7 +164,7 @@ def _rowwise_positions_from_bridge(rows, dev):
 
 
 def test_tree_positions_match_bridge_rowwise_positions(attn):
-    from coda.custom.tree_pack.core.plan import merge_positions
+    from coda.custom.tree_pack.index.plan import merge_positions
     dev = "cuda"
     rows, bp, resp = _caterpillar(3, n_rows=5, spine0=1500, grow=(300, 900), thorn=(200, 700))
     lens = [len(r) for r in rows]
@@ -193,7 +193,7 @@ class _RopeCfg:
 def test_rope_attention_tree_matches_rowwise(attn, seed, pad):
     """RoPE + attention, tree positions vs row-wise positions; negative control uses the
     positions the model would derive for the tree buffer if position_ids were not passed."""
-    from coda.custom.tree_pack.core.plan import merge_positions
+    from coda.custom.tree_pack.index.plan import merge_positions
     dev = "cuda"
     rows, bp, resp = _caterpillar(seed, n_rows=5, spine0=1500, grow=(300, 900), thorn=(200, 700))
     lens = [len(r) for r in rows]

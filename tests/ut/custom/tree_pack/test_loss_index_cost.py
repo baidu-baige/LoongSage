@@ -1,13 +1,13 @@
-"""CPU tests for tree_pack/core/loss_index.py and tree_pack/core/cost.py."""
+"""CPU tests for tree_pack/index/loss_index.py and tree_pack/index/cost.py."""
 from __future__ import annotations
 
 import numpy as np
 import pytest
 import torch
 
-from coda.custom.tree_pack.core.batch import chain_branch_points, plan_trees
-from coda.custom.tree_pack.core.cost import TREE_LEVEL_COST, chain_cost
-from coda.custom.tree_pack.core.loss_index import build_loss_index, restrict_to_lm_rows
+from coda.custom.tree_pack.index.batch import chain_branch_points, plan_trees
+from coda.custom.tree_pack.index.cost import TREE_LEVEL_COST, chain_cost
+from coda.custom.tree_pack.index.loss_index import build_loss_index, restrict_to_lm_rows
 
 from .tree_test_utils import caterpillar as _caterpillar
 

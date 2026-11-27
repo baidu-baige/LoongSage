@@ -7,7 +7,7 @@ from __future__ import annotations
 import torch
 import torch.distributed as dist
 
-from coda.custom.tree_pack.core.loss_index import TreeLossIndex
+from coda.custom.tree_pack.index.loss_index import TreeLossIndex
 
 
 # from https://github.com/volcengine/verl/blob/

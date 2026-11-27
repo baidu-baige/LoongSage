@@ -12,7 +12,7 @@ from omegaconf import OmegaConf  # noqa: E402
 
 import coda.backends.megatron.data as data_mod  # noqa: E402
 
-from coda.custom.tree_pack.core.batch import chain_branch_points  # noqa: E402
+from coda.custom.tree_pack.index.batch import chain_branch_points  # noqa: E402
 from coda.custom.tree_pack.packer import TreePacker  # noqa: E402
 
 

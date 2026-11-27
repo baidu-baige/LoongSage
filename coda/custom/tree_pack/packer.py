@@ -7,10 +7,10 @@ micro-batch's rows into one tree-shaped node buffer: every token is computed onc
 forward and backward passes, and per-row log-probs / entropy match the row-wise path.
 
 How it works:
-* ``core/plan.py``: consecutive rows of a trajectory form a chain where row k shares a
+* ``index/plan.py``: consecutive rows of a trajectory form a chain where row k shares a
   prefix of length ``bp_k`` with row k-1. Each chain is cut into trees under a node
   budget, at the cheapest estimated cut points (``cut: min_cost``) or greedily.
-* ``core/batch.py``: every node is stored once; its position id is its root-path depth and
+* ``index/batch.py``: every node is stored once; its position id is its root-path depth and
   it carries the R3 routing of the last row that contains it.
 * ``megatron/adapters/``: only sequence mixers need the tree layout. Attention gathers
   each piece's ancestors as K/V (FlashAttention), GDN chains ``final_state`` into
@@ -55,7 +55,7 @@ from omegaconf import DictConfig
 from coda.utils.multimodal_config import multimodal_enabled
 from coda.utils.packing import MicroBatchPacker, PackedInputs, PackPlan, register_packer
 
-from coda.custom.tree_pack.core.cost import chain_cost
+from coda.custom.tree_pack.index.cost import chain_cost
 
 logger = logging.getLogger(__name__)
 
@@ -188,8 +188,8 @@ class TreePacker(MicroBatchPacker):
         logit-row budget); the trees are the items bin-packed into micro-batches."""
         from coda.backends.megatron.data import _trajectory_row_ranges
 
-        from coda.custom.tree_pack.core.batch import chain_branch_points
-        from coda.custom.tree_pack.core.plan import group_nodes, plan_sequences, plan_sequences_min_cost
+        from coda.custom.tree_pack.index.batch import chain_branch_points
+        from coda.custom.tree_pack.index.plan import group_nodes, plan_sequences, plan_sequences_min_cost
 
         opts = self.options
         if opts["max_nodes_per_gpu"]:
@@ -240,7 +240,7 @@ class TreePacker(MicroBatchPacker):
              routed_rows: Callable[[], list]) -> PackedInputs:
         from coda.backends.megatron.cp_utils import prepare_packed_seq_params
 
-        from coda.custom.tree_pack.core.batch import build_tree_microbatch
+        from coda.custom.tree_pack.index.batch import build_tree_microbatch
         from coda.custom.tree_pack.megatron.lm_head import lm_head_rows
 
         cfg = self.config

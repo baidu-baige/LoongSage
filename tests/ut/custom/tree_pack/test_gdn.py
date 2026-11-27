@@ -21,7 +21,7 @@ fla_conv = pytest.importorskip("fla.modules.convolution").causal_conv1d
 fla_gdr = pytest.importorskip("fla.ops.gated_delta_rule").chunk_gated_delta_rule
 
 from coda.custom.tree_pack.megatron.adapters.gdn import tree_causal_conv1d, tree_gated_delta_rule  # noqa: E402
-from coda.custom.tree_pack.core.plan import build_tree_seq, row_path_nodes  # noqa: E402
+from coda.custom.tree_pack.index.plan import build_tree_seq, row_path_nodes  # noqa: E402
 
 from .tree_test_utils import caterpillar as _caterpillar  # noqa: E402
 from .tree_test_utils import cu_seqlens as _cu  # noqa: E402
