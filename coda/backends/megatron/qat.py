@@ -34,7 +34,8 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Iterable, Iterator, Sequence
+from types import SimpleNamespace
+from typing import Callable, Iterable, Iterator, Sequence
 
 import torch
 from megatron.bridge.models.conversion.param_mapping import (
@@ -85,6 +86,10 @@ class QATAdapter:
     def validate(self, config) -> None:
         """Reject rollout settings whose numerics this QAT does not model."""
 
+    def custom_task(self, plan: "QuantPlan", task, entry: CkptQuant) -> bool:
+        """Weight QAT of a task the generic in-place snap cannot express; True if handled here."""
+        return False
+
 
 class DeepseekV41Adapter(QATAdapter):
     """SGLang DeepSeek-V4.1: wo_a is dequantized to bf16 at load (bf16 activations); routed MXFP4
@@ -111,7 +116,91 @@ class DeepseekV41Adapter(QATAdapter):
             raise ValueError("DeepSeek-V4.1 QAT: " + "; ".join(problems))
 
 
-_ADAPTERS: dict[str, QATAdapter] = {"DeepseekV41ForCausalLM": DeepseekV41Adapter()}
+class Ernie55Adapter(QATAdapter):
+    """SGLang ERNIE 5.5 Flash (Preview: FP8 128x128 dense linears with fp32 power-of-two scales,
+    MXFP4 routed experts). Weight QAT only; activation QAT is not modeled, so no input hooks.
+
+    Two kinds of params need more than the generic in-place snap:
+
+    * ``kv_b_proj`` (D layers): Megatron holds it as ``k_b_proj`` (``W_UK`` transposed per head)
+      and ``v_b_proj``. A head spans 448 rows, 3.5 tiles of 128, so neither param is a tile-aligned
+      slice of the checkpoint tensor. Both are snapped together: join, snap, split.
+    * ``fc1/fc2_latent_proj``: fp32 params (``Ernie55LatentProjection``), which the optimizer
+      updates directly with no separate master. An in-place snap would erase every update smaller
+      than the grid step. Instead the forward uses round-to-nearest Q(W): a pre-hook copies Q(W)
+      into the param, and a post-hook restores the unquantized values. The module casts its weight
+      to the input dtype, so autograd keeps that bf16 copy of Q(W), and the weight gradient (which
+      does not read the weight) is straight-through. The export re-quantizes the fp32 values with
+      round-to-nearest, which is the same Q(W) the forward used.
+    """
+
+    def act_quant(self, hf_name: str, scheme: QuantScheme) -> bool:
+        return False
+
+    def validate(self, config) -> None:
+        if config.run_mode == "sft":
+            return
+        rollout = config.rollout
+        if rollout.backend != "sglang":
+            raise NotImplementedError(f"ERNIE 5.5 QAT is only verified for the SGLang rollout, got {rollout.backend}")
+        args = rollout.sglang_args
+        problems = []
+        if args.get("moe_runner_backend") != "flashinfer_mxfp4":
+            problems.append("sglang_args.moe_runner_backend must be flashinfer_mxfp4 (in-place MXFP4 weight update, SiTU)")
+        if args.get("flashinfer_mxfp4_moe_precision") != "bf16":
+            problems.append("sglang_args.flashinfer_mxfp4_moe_precision must be bf16 (W4A16 experts)")
+        if not args.get("disable_shared_experts_fusion"):
+            problems.append("sglang_args.disable_shared_experts_fusion must be true (shared experts as dense FP8 linears)")
+        if problems:
+            raise ValueError("ERNIE 5.5 QAT: " + "; ".join(problems))
+
+    def custom_task(self, plan: "QuantPlan", task, entry: CkptQuant) -> bool:
+        from megatron.bridge.models.ernie.ernie55_mappings import _Ernie55GatedMLPMapping, _Ernie55KVUpMapping
+
+        if isinstance(task.mapping, _Ernie55KVUpMapping):
+            # Both params live on the attention module: the k task snaps the pair, the v task is skipped.
+            if task.mapping.part == "k":
+                self._add_kv_b_proj_snap(plan, task, entry)
+            return True
+        if isinstance(task.mapping, _Ernie55GatedMLPMapping):
+            # fc1 rows block-interleaved [g_0:k, u_0:k, ...]: snapping the local param is snapping
+            # the checkpoint tensors only if every k-row block is whole tiles.
+            size = task.mapping._interleave_size(task.megatron_module)
+            if size and size % entry.scheme.block[0]:
+                raise NotImplementedError(
+                    f"[QAT] {task.param_name}: GLU interleave size {size} splits {entry.scheme} tiles"
+                )
+        if task.param_weight.dtype == torch.float32:
+            if type(task.megatron_module).__name__ != "Ernie55LatentProjection":
+                raise NotImplementedError(f"[QAT] {task.param_name}: fp32 quantized param of an unverified module")
+            plan.add_forward_fake_quant(task.param_name, task.megatron_module, task.param_weight, entry.scheme)
+            return True
+        return False
+
+    @staticmethod
+    def _add_kv_b_proj_snap(plan: "QuantPlan", task, entry: CkptQuant) -> None:
+        from megatron.bridge.models.ernie.ernie55_mappings import join_kv_b_proj, split_kv_b_proj
+
+        k, v, dims, scheme = task.param_weight, task.megatron_module.v_b_proj, task.mapping.dims, entry.scheme
+        thresholds = None
+        if plan.weight_rounding == "threshold":
+            hf_name = task.mapping.hf_param
+            thresholds = _thresholds_fn(SimpleNamespace(tp_rank=0), [hf_name], torch.Size(entry.shape), entry.shape)
+
+        def snap():
+            w = join_kv_b_proj(k.data, v.data, dims)
+            scheme.snap_(w, thresholds)
+            new_k, new_v = split_kv_b_proj(w, dims)
+            k.data.copy_(new_k)
+            v.data.copy_(new_v)
+
+        plan.custom_snaps.append((f"{task.param_name}+v_b_proj", snap))
+
+
+_ADAPTERS: dict[str, QATAdapter] = {
+    "DeepseekV41ForCausalLM": DeepseekV41Adapter(),
+    "Ernie5_5_MoeForCausalLM": Ernie55Adapter(),
+}
 
 
 def get_adapter(architectures: Sequence[str] | None) -> QATAdapter:
@@ -209,6 +298,8 @@ class QuantPlan:
     ``quantized`` -- the checkpoint stores some trained tensors quantized, i.e. the rollout serves
     that format; the bridge exports it and :meth:`check_export` checks every weight sync.
     ``snap_params`` / ``act_modules`` -- QAT only: params to snap, linears whose input is fake-quantized.
+    ``custom_snaps`` / ``fake_quant_params`` -- QAT only, added by a :class:`QATAdapter`: snaps the
+    generic per-param snap cannot express, and fp32 params whose forward uses Q(W) instead of being snapped.
     """
 
     def __init__(self, bridge, model_chunks: Sequence[torch.nn.Module], hf_model_path: str, config):
@@ -223,6 +314,8 @@ class QuantPlan:
         self.ckpt, self.unsupported = scan_ckpt_quant(hf_model_path) if os.path.isdir(hf_model_path) else ({}, {})
         self.snap_params: list[tuple[str, torch.nn.Parameter, QuantScheme]] = []
         self._snap_thresholds: list = []  # per snap param: thresholds(r0, r1), or None = round-to-nearest
+        self.custom_snaps: list[tuple[str, Callable[[], None]]] = []
+        self.fake_quant_params: list[tuple[str, torch.nn.Parameter, QuantScheme]] = []
         self.act_modules: list[tuple[str, torch.nn.Module, int]] = []
         tasks = self._quantized_tasks(bridge, model_chunks)
         self.quantized = bool(tasks)
@@ -277,6 +370,11 @@ class QuantPlan:
             param = task.param_weight
             if id(param) not in own:
                 raise RuntimeError(f"[QAT] {task.param_name}: bridge task does not hold the live model param")
+            if adapter.custom_task(self, task, entries[0]):
+                continue
+            if param.dtype == torch.float32:
+                # An fp32 param is its own optimizer master: snapping it would erase sub-grid updates.
+                raise NotImplementedError(f"[QAT] {task.param_name}: fp32 quantized param; add a QATAdapter for this model")
             if not _local_layout_ok(task.mapping, len(names), param.shape, full, scheme.block):
                 raise NotImplementedError(
                     f"[QAT] {task.param_name} ({type(task.mapping).__name__}, local {tuple(param.shape)}) is not a "
@@ -294,13 +392,35 @@ class QuantPlan:
                 hooked.add(id(module))
                 self.act_modules.append((task.param_name[: -len(".weight")], module, scheme.block[1]))
 
+    def add_forward_fake_quant(self, name: str, module: torch.nn.Module, param: torch.nn.Parameter,
+                               scheme: QuantScheme) -> None:
+        """Run ``module``'s forward with round-to-nearest Q(param) and restore ``param`` afterwards
+        (adapters; for an fp32 param that is its own optimizer master). Only valid for a module
+        whose forward does not save ``param`` itself for backward (e.g. it casts it first)."""
+
+        def pre_hook(mod, args):
+            stash = param.data.clone()
+            scheme.snap_(param.data)
+            mod._coda_qat_stash = stash
+
+        def post_hook(mod, args, output):
+            param.data.copy_(mod._coda_qat_stash)
+            del mod._coda_qat_stash
+
+        module.register_forward_pre_hook(pre_hook)
+        module.register_forward_hook(post_hook)
+        self.fake_quant_params.append((name, param, scheme))
+
     # -- weight QAT
     @torch.no_grad()
     def snap_(self) -> int:
-        """Snap every quantized param in place onto its checkpoint grid. Returns #params."""
+        """Snap every quantized param in place onto its checkpoint grid. Returns #params (a custom
+        snap counts once)."""
         for (_, p, scheme), thresholds in zip(self.snap_params, self._snap_thresholds):
             scheme.snap_(p.data, thresholds)
-        return len(self.snap_params)
+        for _, snap in self.custom_snaps:
+            snap()
+        return len(self.snap_params) + len(self.custom_snaps)
 
     # -- activation QAT
     def register_activation_hooks(self) -> int:

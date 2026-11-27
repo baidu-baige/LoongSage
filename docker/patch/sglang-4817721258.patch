@@ -1,3 +1,20 @@
+diff --git a/python/sglang/srt/configs/model_config.py b/python/sglang/srt/configs/model_config.py
+index c3111376ff..9e7095be4a 100644
+--- a/python/sglang/srt/configs/model_config.py
++++ b/python/sglang/srt/configs/model_config.py
+@@ -888,7 +888,11 @@ class ModelConfig:
+         routed_experts_quant_method = quantization_config.get(
+             "routed_experts_quant_method"
+         )
+-        self.is_fp4_experts: bool = routed_experts_quant_method == "mxfp4"
++        # ERNIE-5.5-Flash-Preview marks them with `expert_dtype` instead.
++        self.is_fp4_experts: bool = (
++            routed_experts_quant_method == "mxfp4"
++            or quantization_config.get("expert_dtype") == "mxfp4"
++        )
+         if self.is_fp4_experts:
+             logger.info("Detected mixed checkpoint layout: routed experts are MXFP4.")
+ 
 diff --git a/python/sglang/srt/debug_utils/dumper.py b/python/sglang/srt/debug_utils/dumper.py
 index cc807dd421..643bb832f1 100644
 --- a/python/sglang/srt/debug_utils/dumper.py
@@ -126,6 +143,42 @@ index aa59ce4f22..5a17d71905 100644
 +                # colocate host OOM). _load_rows also handles the shared/private layout.
 +                param.weight_loader(param, f.get_slice(name))
 +        emb.finish_load(label=f"dummy engram layer {i}")
+diff --git a/python/sglang/srt/layers/moe/moe_runner/flashinfer_cutlass.py b/python/sglang/srt/layers/moe/moe_runner/flashinfer_cutlass.py
+index 8e11b2a18c..0b7fb8d009 100644
+--- a/python/sglang/srt/layers/moe/moe_runner/flashinfer_cutlass.py
++++ b/python/sglang/srt/layers/moe/moe_runner/flashinfer_cutlass.py
+@@ -150,6 +150,11 @@ class FlashInferCutlassMxfp4MoeQuantInfo(MoeQuantInfo):
+     # SwigluStep variant.
+     use_swiglu_step: bool = False
+ 
++    # SiTU (ERNIE 5.5): per-expert fp32 [E] beta / linear_beta; set iff the
++    # activation is SiTU, in which case the SwiGLU overrides stay None.
++    situ_beta: Optional[torch.Tensor] = None
++    situ_linear_beta: Optional[torch.Tensor] = None
++
+     # GPT-OSS pads its input hidden dim up to the (pre-padded) loaded weight
+     # width and trims the output back. DSv4 leaves this as ``None`` (no pad).
+     padded_hidden: Optional[int] = None
+@@ -597,6 +602,8 @@ def _fused_experts_flashinfer_mxfp4_cutlass(
+         swiglu_alpha=quant_info.swiglu_alpha,
+         swiglu_beta=quant_info.swiglu_beta,
+         swiglu_limit=quant_info.swiglu_limit,
++        situ_beta=quant_info.situ_beta,
++        situ_linear_beta=quant_info.situ_linear_beta,
+         tp_size=runner_config.moe_tp_size,
+         tp_rank=runner_config.moe_tp_rank,
+         ep_size=runner_config.moe_ep_size,
+@@ -604,7 +611,9 @@ def _fused_experts_flashinfer_mxfp4_cutlass(
+         use_w4_group_scaling=not use_mxfp8_act_scaling,
+         use_mxfp8_act_scaling=use_mxfp8_act_scaling,
+         activation_type=(
+-            ActivationType.SwigluStep
++            ActivationType.Situ
++            if quant_info.situ_beta is not None
++            else ActivationType.SwigluStep
+             if quant_info.use_swiglu_step
+             else ActivationType.Swiglu
+         ),
 diff --git a/python/sglang/srt/layers/quantization/fp8.py b/python/sglang/srt/layers/quantization/fp8.py
 index 64643b2b93..957cd76877 100644
 --- a/python/sglang/srt/layers/quantization/fp8.py
@@ -165,7 +218,7 @@ index 64643b2b93..957cd76877 100644
          """Pack the weight scale a FlashInfer layer needs for a DeepGEMM-packed input pair."""
          from sglang.srt.layers import deep_gemm_wrapper
 diff --git a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py b/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py
-index 7a1c5a9512..0c0be3cf22 100644
+index 7a1c5a9512..cb1db7e3c5 100644
 --- a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py
 +++ b/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py
 @@ -6,8 +6,10 @@ TRT-LLM implementation.
@@ -179,21 +232,76 @@ index 7a1c5a9512..0c0be3cf22 100644
  from typing import TYPE_CHECKING
  
  import torch
-@@ -118,6 +120,13 @@ class Mxfp4FlashinferCutlassMoEMethod:
+@@ -48,6 +50,8 @@ class Mxfp4FlashinferCutlassMoEMethod:
+         self.prefix = prefix
+         self._swiglu_limit_tensor: torch.Tensor | None = None
+         self._use_swiglu_step = False
++        self._situ_beta_tensor: torch.Tensor | None = None
++        self._situ_linear_beta_tensor: torch.Tensor | None = None
+         self._mxfp4_weight_global_scale_tensor: torch.Tensor | None = None
+ 
+     @property
+@@ -105,19 +109,48 @@ class Mxfp4FlashinferCutlassMoEMethod:
+         # implements in its SwigluStep variant.
+         swiglu_limit = getattr(moe_runner_config, "swiglu_limit", None)
+         gemm1_clamp_limit = getattr(moe_runner_config, "gemm1_clamp_limit", None)
+-        self._use_swiglu_step = (
+-            gemm1_clamp_limit is not None
+-            and getattr(moe_runner_config, "gemm1_alpha", None) is None
+-        )
+-        clamp_limit = (
+-            gemm1_clamp_limit if gemm1_clamp_limit is not None else swiglu_limit
+-        )
+-        if clamp_limit is not None:
+-            self._swiglu_limit_tensor = torch.full(
+-                (E,), float(clamp_limit), dtype=torch.float32, device=device
++        gemm1_alpha = getattr(moe_runner_config, "gemm1_alpha", None)
++        if moe_runner_config.activation == "situ":
++            # SiTU (ERNIE 5.5) carries beta / linear_beta in gemm1_alpha /
++            # gemm1_clamp_limit; the kernel's Situ activation takes them per expert.
++            # They are not SwiGLU parameters, so no SwiGLU clamp is passed.
++            if gemm1_alpha is None or gemm1_clamp_limit is None:
++                raise ValueError(
++                    "SiTU MoE needs gemm1_alpha (beta) and gemm1_clamp_limit (linear_beta)"
++                )
++            self._situ_beta_tensor = torch.full(
++                (E,), float(gemm1_alpha), dtype=torch.float32, device=device
              )
-         else:
+-        else:
++            self._situ_linear_beta_tensor = torch.full(
++                (E,), float(gemm1_clamp_limit), dtype=torch.float32, device=device
++            )
++            self._use_swiglu_step = False
              self._swiglu_limit_tensor = None
++        else:
++            self._use_swiglu_step = (
++                gemm1_clamp_limit is not None and gemm1_alpha is None
++            )
++            clamp_limit = (
++                gemm1_clamp_limit if gemm1_clamp_limit is not None else swiglu_limit
++            )
++            if clamp_limit is not None:
++                self._swiglu_limit_tensor = torch.full(
++                    (E,), float(clamp_limit), dtype=torch.float32, device=device
++                )
++            else:
++                self._swiglu_limit_tensor = None
 +        # These constants are allocated inside the memory-saver "weights" region but are not
 +        # weight-synced; as (non-persistent) buffers they are stashed/restored in place across
 +        # release/resume_memory_occupation (colocate), otherwise they come back as garbage.
-+        for name in ("_swiglu_limit_tensor", "_mxfp4_weight_global_scale_tensor"):
++        for name in (
++            "_swiglu_limit_tensor",
++            "_situ_beta_tensor",
++            "_situ_linear_beta_tensor",
++            "_mxfp4_weight_global_scale_tensor",
++        ):
 +            t = getattr(self, name)
 +            if t is not None:
 +                layer.register_buffer(f"_mxfp4_cutlass{name}", t, persistent=False)
  
          # Register the fused func at runner construction so the FusedOpPool
          # lookup at `MoeRunner.__init__` finds it.
-@@ -221,6 +230,20 @@ class Mxfp4FlashinferCutlassMoEMethod:
+@@ -221,6 +254,20 @@ class Mxfp4FlashinferCutlassMoEMethod:
              layer.w2_weight = Parameter(w2_il, requires_grad=False)
              layer.w13_weight_scale_inv = Parameter(w13_s_il, requires_grad=False)
              layer.w2_weight_scale_inv = Parameter(w2_s_il, requires_grad=False)
@@ -214,7 +322,7 @@ index 7a1c5a9512..0c0be3cf22 100644
  
          layer._dsv4_mxfp4_backend = (
              "flashinfer_cutlass_sm120"
-@@ -235,6 +258,88 @@ class Mxfp4FlashinferCutlassMoEMethod:
+@@ -235,6 +282,88 @@ class Mxfp4FlashinferCutlassMoEMethod:
          if not self._use_mxfp8_act_scaling:
              torch.cuda.empty_cache()
  
@@ -303,6 +411,15 @@ index 7a1c5a9512..0c0be3cf22 100644
      def apply(
          self,
          layer: Module,
+@@ -261,6 +390,8 @@ class Mxfp4FlashinferCutlassMoEMethod:
+             swiglu_beta=None,
+             swiglu_limit=self._swiglu_limit_tensor,
+             use_swiglu_step=self._use_swiglu_step,
++            situ_beta=self._situ_beta_tensor,
++            situ_linear_beta=self._situ_linear_beta_tensor,
+             padded_hidden=None,
+         )
+         return self.runner.run(dispatch_output, quant_info)
 diff --git a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_trtllm_moe.py b/python/sglang/srt/layers/quantization/mxfp4_flashinfer_trtllm_moe.py
 index ee867f09cd..41bf3add66 100644
 --- a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_trtllm_moe.py

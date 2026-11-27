@@ -193,3 +193,94 @@ def test_dsv4_builder_pipeline_layout_is_applied_once(fake_dsv4):
     patched = config_cls.finalize
     monkey_patch._patch_dsv4_builder_pipeline_layout()
     assert config_cls.finalize is patched
+
+
+# ---------------------------------------------------------------- ERNIE 5.5 quantized checkpoint
+
+
+class _FakeStateDict(dict):
+    def __init__(self, tensors, path):
+        super().__init__(tensors)
+        self.source = types.SimpleNamespace(path=path)
+
+
+@pytest.fixture
+def ernie_quant_ckpt(tmp_path):
+    """A tiny ERNIE-Preview-like checkpoint: fp32 power-of-two ``*_scale_inv`` 128x128 tiles (one
+    with a partial last tile, one on a weight without ``.weight``), an MXFP4 expert, a bf16 tensor."""
+    import json
+
+    import torch
+    from safetensors.torch import save_file
+
+    from coda.utils.quant_formats import QuantScheme, e8m0_to_float
+
+    pytest.importorskip("megatron.bridge.models.ernie.ernie55_bridge")
+    g = torch.Generator().manual_seed(0)
+    blk, fp4 = QuantScheme("fp8_block", (128, 128)), QuantScheme("mxfp4", (1, 32))
+    tensors = {}
+    for name, (o, i) in {"l.kv_a.weight": (576, 256), "l.o_group": (256, 128)}.items():
+        q, s = blk.quant((torch.randn(o, i, generator=g) * 0.05).bfloat16())
+        tensors[name], tensors[name + "_scale_inv"] = q, e8m0_to_float(s)
+    q, s = fp4.quant((torch.randn(64, 128, generator=g) * 0.05).bfloat16())
+    tensors["l.experts.0.w1.weight"], tensors["l.experts.0.w1.weight_scale_inv"] = q, s
+    tensors["l.norm.weight"] = torch.ones(64).bfloat16()
+    save_file(tensors, str(tmp_path / "model.safetensors"))
+    qcfg = {"quant_method": "fp8", "scale_fmt": "ue8m0", "weight_block_size": [128, 128]}
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"quantization_config": qcfg}, f)
+    bridge = types.SimpleNamespace(hf_config=types.SimpleNamespace(quantization_config=qcfg, _name_or_path=str(tmp_path)))
+    schemes = {"l.kv_a.weight": blk, "l.o_group": blk, "l.experts.0.w1.weight": fp4}
+    return bridge, _FakeStateDict(tensors, str(tmp_path)), schemes
+
+
+def test_ernie55_quantized_import_export_round_trip(ernie_quant_ckpt):
+    import torch
+    from megatron.bridge.models.ernie.ernie55_bridge import Ernie55Bridge
+
+    bridge, sd, schemes = ernie_quant_ckpt
+    loaded = Ernie55Bridge.maybe_modify_loaded_hf_weight(bridge, {n: n for n in [*schemes, "l.norm.weight"]}, sd)
+    for name, scheme in schemes.items():
+        assert loaded[name].dtype == torch.bfloat16
+        torch.testing.assert_close(loaded[name].float(), scheme.dequant(sd[name], sd[name + "_scale_inv"], torch.float32),
+                                   rtol=0, atol=0)
+    assert loaded["l.norm.weight"] is sd["l.norm.weight"]
+    assert loaded["l.kv_a.weight"].shape == (576, 256)
+
+    out = Ernie55Bridge.maybe_modify_converted_hf_weight(bridge, None, dict(loaded), sd)
+    assert set(out) == {*loaded, *(n + "_scale_inv" for n in schemes)}
+    for name, scheme in schemes.items():
+        q, s = out[name], out[name + "_scale_inv"]
+        assert q.dtype == sd[name].dtype and q.shape == sd[name].shape
+        assert s.dtype == sd[name + "_scale_inv"].dtype and s.shape == sd[name + "_scale_inv"].shape
+        # the exported values are the imported ones (a snapped weight is a fixed point)
+        torch.testing.assert_close(scheme.dequant(q, s, torch.float32), loaded[name].float(), rtol=0, atol=0)
+    assert out["l.norm.weight"] is loaded["l.norm.weight"]
+    # plain-dtype export requested: untouched
+    task = types.SimpleNamespace(weight_dtype=torch.bfloat16)
+    assert Ernie55Bridge.maybe_modify_converted_hf_weight(bridge, task, dict(loaded), sd) == loaded
+
+
+def test_ernie55_quantized_import_rejects_bad_scales(ernie_quant_ckpt):
+    import torch
+    from megatron.bridge.models.ernie.ernie55_bridge import Ernie55Bridge
+
+    bridge, sd, _ = ernie_quant_ckpt
+    sd["l.o_group_scale_inv"] = sd["l.o_group_scale_inv"] * 1.5
+    with pytest.raises(RuntimeError, match="non-power-of-two"):
+        Ernie55Bridge.maybe_modify_loaded_hf_weight(bridge, "l.o_group", sd)
+    del sd["l.kv_a.weight_scale_inv"]
+    with pytest.raises(RuntimeError, match="without l.kv_a.weight_scale_inv"):
+        Ernie55Bridge.maybe_modify_loaded_hf_weight(bridge, "l.kv_a.weight", sd)
+    assert sd["l.norm.weight"].dtype == torch.bfloat16
+
+
+def test_ernie55_key_check_ignores_scale_companions(monkeypatch):
+    ernie55_mappings = pytest.importorskip("megatron.bridge.models.ernie.ernie55_mappings")
+    captured = []
+    monkeypatch.setattr(ernie55_mappings, "check_ernie55_checkpoint_keys",
+                        lambda hf_config, hf_keys: captured.append(set(hf_keys)))
+    monkey_patch._patch_ernie55_quantized_checkpoint()  # wraps the recorder
+    keys = {"m.a.weight", "m.a.weight_scale_inv", "m.o_group", "m.o_group_scale_inv", "m.orphan_scale_inv"}
+    ernie55_mappings.check_ernie55_checkpoint_keys({}, keys)
+    assert captured == [{"m.a.weight", "m.o_group", "m.orphan_scale_inv"}]

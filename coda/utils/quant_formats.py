@@ -12,11 +12,14 @@ round-to-nearest) reproduces the same values, so what the bridge re-quantizes at
 dequantizes to exactly the snapped training weights (QAT).
 
 :func:`scan_ckpt_quant` recovers the per-tensor scheme of a safetensors checkpoint from its headers
-alone (dtype + shape of every ``X.weight`` / ``X.scale`` pair), without reading tensor data.
+alone (dtype + shape of every weight / scale pair, ``X.scale`` or ``X_scale_inv``), without reading
+tensor data.
 """
 
 from __future__ import annotations
 
+import json
+import os
 import zlib
 from dataclasses import dataclass
 from typing import Callable
@@ -76,7 +79,8 @@ def _round_fp8_block(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """[O, I] -> (e4m3 [O/br, br, I/bc, bc], fp32 scale broadcastable to it, e8m0 [O/br, I/bc]).
     With per-element thresholds ``t`` ([O, I] in (0, 1)) the values are threshold-rounded and
-    returned as fp32 (exactly representable in e4m3) instead of round-to-nearest e4m3."""
+    returned as fp32 (exactly representable in e4m3) instead of round-to-nearest e4m3.
+    Requires tile-aligned dims; see :func:`_pad_to_tiles` for a partial last tile."""
     (O, I), (br, bc) = w.shape, block
     assert O % br == 0 and I % bc == 0, f"fp8 {br}x{bc} blocks need aligned dims, got {tuple(w.shape)}"
     x = w.float().view(O // br, br, I // bc, bc)
@@ -88,18 +92,32 @@ def _round_fp8_block(
     return q, scale, scale_e8m0
 
 
+def _pad_to_tiles(w: torch.Tensor, block: tuple[int, int]) -> torch.Tensor:
+    """Zero-pad [O, I] up to whole ``block`` tiles (a checkpoint's partial last tile, e.g. a
+    576-row weight in 128x128 tiles). Zeros never raise a tile's amax, so the real elements
+    round as in the unpadded tensor."""
+    (O, I), (br, bc) = w.shape, block
+    pad_o, pad_i = -O % br, -I % bc
+    return torch.nn.functional.pad(w, (0, pad_i, 0, pad_o)) if pad_o or pad_i else w
+
+
 def quant_fp8_block(w: torch.Tensor, block: tuple[int, int] = (32, 32)) -> tuple[torch.Tensor, torch.Tensor]:
-    """[O, I] float -> (e4m3 [O, I], e8m0 [O/br, I/bc]); O, I must be multiples of the tile."""
-    q, _, scale_e8m0 = _round_fp8_block(w, block)
-    return q.view(w.shape), scale_e8m0
+    """[O, I] float -> (e4m3 [O, I], e8m0 [ceil(O/br), ceil(I/bc)])."""
+    O, I = w.shape
+    q, _, scale_e8m0 = _round_fp8_block(_pad_to_tiles(w, block), block)
+    return q.reshape(q.shape[0] * q.shape[1], -1)[:O, :I].contiguous(), scale_e8m0
 
 
-def dequant_fp8_block(q: torch.Tensor, scale: torch.Tensor, dtype=torch.bfloat16) -> torch.Tensor:
+def dequant_fp8_block(q: torch.Tensor, scale: torch.Tensor, dtype=torch.bfloat16,
+                      block: tuple[int, int] | None = None) -> torch.Tensor:
+    """``scale`` is e8m0, or fp32 holding powers of two. ``block`` defaults to the exact tiling
+    ``(O/sO, I/sI)``; pass it for a partial last tile."""
     O, I = q.shape
     sO, sI = scale.shape
-    s = e8m0_to_float(scale)
-    x = q.float().view(sO, O // sO, sI, I // sI) * s[:, None, :, None]
-    return x.view(O, I).to(dtype)
+    br, bc = block or (O // sO, I // sI)
+    s = e8m0_to_float(scale) if scale.dtype == torch.float8_e8m0fnu else scale.float()
+    x = _pad_to_tiles(q.float(), (br, bc)).view(sO, br, sI, bc) * s[:, None, :, None]
+    return x.view(sO * br, sI * bc)[:O, :I].to(dtype)
 
 
 # ---------------------------------------------------------------- MXFP4 e2m1, groups of bc along I
@@ -169,7 +187,7 @@ class QuantScheme:
 
     def dequant(self, q: torch.Tensor, scale: torch.Tensor, dtype=torch.bfloat16) -> torch.Tensor:
         if self.kind == "fp8_block":
-            return dequant_fp8_block(q, scale, dtype)
+            return dequant_fp8_block(q, scale, dtype, self.block)
         return dequant_mxfp4(q, scale, dtype)
 
     @torch.no_grad()
@@ -182,8 +200,7 @@ class QuantScheme:
         thresholds for rows ``r0:r1`` (see :func:`element_thresholds`) instead of round-to-nearest.
         Rows are then processed in tile-aligned chunks to bound the temporaries."""
         if thresholds is None:
-            v, scale, _ = self._round(w, None)
-            w.copy_((v.float() * scale).view(w.shape))
+            w.copy_(self._snapped(w, None))
             return w
         O, I = w.shape
         br = self.block[0]
@@ -191,14 +208,20 @@ class QuantScheme:
         for r0 in range(0, O, rows):
             r1 = min(O, r0 + rows)
             part = w[r0:r1]
-            v, scale, _ = self._round(part, thresholds(r0, r1, w.device))
-            part.copy_((v * scale).view(part.shape))
+            part.copy_(self._snapped(part, thresholds(r0, r1, w.device)))
         return w
 
-    def _round(self, w: torch.Tensor, t: torch.Tensor | None):
-        if self.kind == "fp8_block":
-            return _round_fp8_block(w, self.block, t)
-        return _round_mxfp4(w, self.block[1], t)
+    def _snapped(self, w: torch.Tensor, t: torch.Tensor | None) -> torch.Tensor:
+        """fp32 ``dequant(quant(w))`` of [O, I] ``w``; a partial last fp8 tile is zero-padded."""
+        if self.kind != "fp8_block":
+            v, scale, _ = _round_mxfp4(w, self.block[1], t)
+            return (v.float() * scale).view(w.shape)
+        O, I = w.shape
+        if t is not None:
+            t = _pad_to_tiles(t, self.block)
+        v, scale, _ = _round_fp8_block(_pad_to_tiles(w, self.block), self.block, t)
+        out = v.float() * scale
+        return out.view(out.shape[0] * out.shape[1], -1)[:O, :I]
 
 
 # ---------------------------------------------------------------- per-element rounding thresholds
@@ -261,45 +284,78 @@ class UnsupportedQuant:
     shape: tuple[int, ...]
 
 
-_SCALE_SUFFIX = ".scale"
+def weight_of_scale(scale_name: str) -> str | None:
+    """Companion weight name of a scale tensor: DeepSeek ``X.scale`` -> ``X.weight``; the
+    ``*_scale_inv`` convention (ERNIE 5.5, DeepSeek-V3) -> ``X`` (``X.weight_scale_inv`` ->
+    ``X.weight``, and ``self_attn.linear_o_group_proj_scale_inv`` -> ``...linear_o_group_proj``)."""
+    if scale_name.endswith(".scale"):
+        return scale_name[: -len(".scale")] + ".weight"
+    if scale_name.endswith("_scale_inv"):
+        return scale_name[: -len("_scale_inv")]
+    return None
+
+
+def ckpt_quant_config(path: str) -> dict:
+    """``quantization_config`` of the checkpoint's config.json ({} if absent)."""
+    cfg_path = os.path.join(path, "config.json")
+    if not os.path.isfile(cfg_path):
+        return {}
+    with open(cfg_path) as f:
+        cfg = json.load(f)
+    qcfg = cfg.get("quantization_config") or (cfg.get("text_config") or {}).get("quantization_config") or {}
+    return qcfg if isinstance(qcfg, dict) else {}
+
+
+def infer_scheme(weight_dtype: str, weight_shape, scale_dtype: str, scale_shape, qcfg: dict) -> QuantScheme | str:
+    """:class:`QuantScheme` of a stored (weight, scale) pair from safetensors dtype names and shapes,
+    or the reason it is unsupported. ``qcfg`` is the checkpoint's ``quantization_config``.
+
+    e4m3 weight -> ``fp8_block`` with tile ``(O/sO, I/sI)``, or the config's ``weight_block_size``
+    when the last tile is partial (``ceil(O/br) == sO``, e.g. a 576-row weight in 128x128 tiles);
+    int8/uint8 (packed e2m1) weight with one scale row per weight row -> ``mxfp4`` groups of
+    ``2*Ip/sI``. Only power-of-two scales make the snapped bf16 weights exact: e8m0 scales, or fp32
+    scales of a checkpoint whose ``quantization_config.scale_fmt`` is ``ue8m0``.
+    """
+    pow2_scale = scale_dtype == "F8_E8M0" or (scale_dtype == "F32" and qcfg.get("scale_fmt") == "ue8m0")
+    if not pow2_scale or len(scale_shape) != 2 or len(weight_shape) != 2:
+        return f"unsupported quantized layout weight={weight_dtype}{list(weight_shape)} scale={scale_dtype}{list(scale_shape)}"
+    (O, I), (sO, sI) = weight_shape, scale_shape
+    if weight_dtype == "F8_E4M3":
+        kind, logical_i = "fp8_block", I
+    elif weight_dtype in ("I8", "U8") and sO == O:
+        kind, logical_i = "mxfp4", 2 * I
+    else:
+        return f"unsupported quantized layout weight={weight_dtype}{list(weight_shape)} scale={scale_dtype}{list(scale_shape)}"
+    if O % sO == 0 and logical_i % sI == 0:
+        return QuantScheme(kind, (O // sO, logical_i // sI))
+    cfg_block = qcfg.get("weight_block_size")
+    if kind == "fp8_block" and cfg_block and (-(-O // cfg_block[0]), -(-I // cfg_block[1])) == (sO, sI):
+        return QuantScheme(kind, (int(cfg_block[0]), int(cfg_block[1])))
+    return f"scale {list(scale_shape)} does not tile weight [{O}, {logical_i}]"
 
 
 def scan_ckpt_quant(path: str) -> tuple[dict[str, CkptQuant], dict[str, UnsupportedQuant]]:
-    """Every ``X.weight`` stored with an ``X.scale`` companion, split into
-    (name -> :class:`CkptQuant` for supported layouts, name -> :class:`UnsupportedQuant`).
+    """Every weight stored with a scale companion (``X.weight`` + ``X.scale``, or ``X`` +
+    ``X_scale_inv``), split into (name -> :class:`CkptQuant` for supported layouts,
+    name -> :class:`UnsupportedQuant`); the scheme comes from :func:`infer_scheme`.
 
-    The scheme is inferred from dtypes and the weight/scale geometry: e4m3 weight -> ``fp8_block``
-    with tile ``(O/sO, I/sI)``; int8/uint8 (packed e2m1) weight with one scale row per weight row ->
-    ``mxfp4`` groups of ``2*Ip/sI``. Only e8m0 scales are supported, since only power-of-two scales
-    make the snapped bf16 weights exact. Whether an unsupported layout is an error depends on
-    whether the trainer maps the tensor and on QAT (e.g. the BF16 DeepSeek-V4 conversion keeps the
-    unused MTP e_proj/h_proj in FP8 with fp32 scales), so the caller decides.
+    Whether an unsupported layout is an error depends on whether the trainer maps the tensor and on
+    QAT (e.g. the BF16 DeepSeek-V4 conversion keeps the unused MTP e_proj/h_proj in FP8 with fp32
+    scales), so the caller decides.
     """
     layout = read_source_layout(path)
+    qcfg = ckpt_quant_config(path)
     out: dict[str, CkptQuant] = {}
     unsupported: dict[str, UnsupportedQuant] = {}
     for scale_name, sh in layout.items():
-        if not scale_name.endswith(_SCALE_SUFFIX):
-            continue
-        name = scale_name[: -len(_SCALE_SUFFIX)] + ".weight"
-        wh = layout.get(name)
+        name = weight_of_scale(scale_name)
+        wh = layout.get(name) if name is not None else None
         if wh is None:
             continue
-        stored = scale_name, wh.dtype, tuple(wh.shape)
-        if sh.dtype != "F8_E8M0" or len(sh.shape) != 2 or len(wh.shape) != 2:
-            unsupported[name] = UnsupportedQuant(f"unsupported quantized layout weight={wh} scale={sh}", *stored)
+        scheme = infer_scheme(wh.dtype, wh.shape, sh.dtype, sh.shape, qcfg)
+        if isinstance(scheme, str):
+            unsupported[name] = UnsupportedQuant(scheme, scale_name, wh.dtype, tuple(wh.shape))
             continue
-        (O, I), (sO, sI) = wh.shape, sh.shape
-        if wh.dtype == "F8_E4M3":
-            kind, logical_i = "fp8_block", I
-        elif wh.dtype in ("I8", "U8") and sO == O:
-            kind, logical_i = "mxfp4", 2 * I
-        else:
-            unsupported[name] = UnsupportedQuant(f"unsupported quantized layout weight={wh} scale={sh}", *stored)
-            continue
-        if O % sO or logical_i % sI:
-            unsupported[name] = UnsupportedQuant(f"scale {list(sh.shape)} does not tile weight [{O}, {logical_i}]", *stored)
-            continue
-        scheme = QuantScheme(kind, (O // sO, logical_i // sI))
-        out[name] = CkptQuant(scheme, scale_name, (O, logical_i))
+        O, I = wh.shape
+        out[name] = CkptQuant(scheme, scale_name, (O, 2 * I if scheme.kind == "mxfp4" else I))
     return out, unsupported

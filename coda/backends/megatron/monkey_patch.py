@@ -353,6 +353,9 @@ def _patch_ernie55_drop_mtp():
         _hf_get = ernie55_mappings._hf_get
 
         def _patched_check(hf_config, hf_keys):
+            # The Preview checkpoints store DSpark draft weights under ``model.mtp.`` even with
+            # ``num_nextn_predict_layers: 0``; the decoder-only model never reads them.
+            hf_keys = {k for k in hf_keys if not k.startswith("model.mtp.")}
             if not int(_hf_get(hf_config, "num_nextn_predict_layers", 0) or 0):
                 num_hidden_layers = int(_hf_get(hf_config, "num_hidden_layers", 0))
                 hf_keys = {
@@ -364,6 +367,127 @@ def _patch_ernie55_drop_mtp():
 
         _patched_check._coda_drop_mtp = True
         ernie55_mappings.check_ernie55_checkpoint_keys = _patched_check
+
+
+def _patch_ernie55_quantized_checkpoint():
+    """Load and export an ERNIE 5.5 checkpoint stored in FP8 / MXFP4 (ERNIE-5.5-Flash).
+
+    Upstream ``Ernie55Bridge`` only converts bf16 checkpoints. The quantized release stores every
+    dense linear as e4m3 with an fp32 power-of-two ``X_scale_inv`` per 128x128 tile (the last
+    tile may be partial: ``kv_a_proj_with_mqa`` has 576 rows), and every routed expert as packed
+    e2m1 with an e8m0 scale per 32 inputs. Three edits, all no-ops on a bf16 checkpoint:
+
+    * ``check_ernie55_checkpoint_keys`` ignores the ``*_scale_inv`` companions, which no mapping
+      reads (the import hook below consumes them).
+    * ``maybe_modify_loaded_hf_weight`` dequantizes to bf16 on import, exactly (an e4m3 / e2m1
+      value times a power of two is a bf16 value). An fp32 scale that is not a power of two is
+      rejected: the export below could not reproduce it.
+    * ``maybe_modify_converted_hf_weight`` re-quantizes the export into the checkpoint's own
+      format (weight, then ``X_scale_inv`` in the stored dtype), with the QAT quantizer
+      (:mod:`coda.utils.quant_formats`). Snapped weights are its fixed points, so the rollout
+      gets exactly the training weights. The bridge's own quantizer is not usable here: for an
+      fp32 scale it uses ``amax / 448``, not a power of two. Formats come from the safetensors
+      headers, read once; a weight sync reads no checkpoint data.
+    """
+    import functools
+
+    from megatron.bridge.models.ernie import ernie55_mappings
+    from megatron.bridge.models.ernie.ernie55_bridge import Ernie55Bridge
+
+    from coda.utils.hf_ckpt import SAFETENSORS_DTYPE, read_source_layout
+    from coda.utils.quant_formats import ckpt_quant_config, e8m0_to_float, infer_scheme, scan_ckpt_quant
+
+    _original_check = ernie55_mappings.check_ernie55_checkpoint_keys
+    if not getattr(_original_check, "_coda_quantized", False):
+
+        def _patched_check(hf_config, hf_keys):
+            hf_keys = set(hf_keys)
+            scales = {k for k in hf_keys if k.endswith("_scale_inv") and k[: -len("_scale_inv")] in hf_keys}
+            return _original_check(hf_config, hf_keys - scales)
+
+        _patched_check._coda_quantized = True
+        ernie55_mappings.check_ernie55_checkpoint_keys = _patched_check
+
+    if getattr(Ernie55Bridge.maybe_modify_loaded_hf_weight, "_coda_quantized", False):
+        return
+
+    def _quant_config(bridge) -> dict:
+        qcfg = getattr(bridge.hf_config, "quantization_config", None) or {}
+        return qcfg if isinstance(qcfg, dict) else qcfg.to_dict()
+
+    def _loaded(self, hf_param, hf_state_dict):
+        if isinstance(hf_param, dict):
+            return {k: _loaded(self, v, hf_state_dict) for k, v in hf_param.items()}
+        weight = hf_state_dict[hf_param]
+        if weight.dtype not in (torch.float8_e4m3fn, torch.int8, torch.uint8):
+            return weight
+        scale_name = hf_param + "_scale_inv"
+        if scale_name not in hf_state_dict:
+            raise RuntimeError(f"ERNIE 5.5: {hf_param} is stored as {weight.dtype} without {scale_name}")
+        scale = hf_state_dict[scale_name]
+        scheme = infer_scheme(
+            SAFETENSORS_DTYPE[weight.dtype], tuple(weight.shape), SAFETENSORS_DTYPE[scale.dtype], tuple(scale.shape),
+            _quant_config(self),
+        )
+        if isinstance(scheme, str):
+            raise RuntimeError(f"ERNIE 5.5: cannot dequantize {hf_param}: {scheme}")
+        if scale.dtype == torch.float32 and not bool((torch.frexp(scale)[0] == 0.5).all()):
+            raise RuntimeError(f"ERNIE 5.5: {scale_name} has non-power-of-two scales")
+        return scheme.dequant(weight, scale, torch.bfloat16)
+
+    @functools.lru_cache(maxsize=None)
+    def _export_layout(ckpt_dir: str):
+        """weight name -> (QuantScheme, scale name, stored scale shape, stored scale dtype)."""
+        quantized, unsupported = scan_ckpt_quant(ckpt_dir)
+        if not quantized and not unsupported:
+            return {}, {}
+        src = read_source_layout(ckpt_dir)
+        torch_dtype = {v: k for k, v in SAFETENSORS_DTYPE.items()}
+        layout = {
+            name: (e.scheme, e.scale_name, tuple(src[e.scale_name].shape), torch_dtype[src[e.scale_name].dtype])
+            for name, e in quantized.items()
+        }
+        return layout, unsupported
+
+    def _checkpoint_dir(self, hf_state_dict) -> str | None:
+        path = getattr(getattr(hf_state_dict, "source", None), "path", None)
+        if path is None:
+            path = getattr(self.hf_config, "_name_or_path", None) or getattr(self.hf_config, "name_or_path", None)
+        return str(path) if path else None
+
+    def _converted(self, task, converted_weights_dict, hf_state_dict):
+        if task is not None and task.weight_dtype is not None:
+            return converted_weights_dict
+        ckpt_dir = _checkpoint_dir(self, hf_state_dict)
+        if not ckpt_dir:
+            return converted_weights_dict
+        layout, unsupported = _export_layout(ckpt_dir)
+        if not layout and not unsupported:
+            return converted_weights_dict
+        result: dict[str, torch.Tensor] = {}
+        for name, weight in converted_weights_dict.items():
+            if name in unsupported:
+                raise RuntimeError(f"ERNIE 5.5: cannot re-quantize {name}: {unsupported[name].reason}")
+            entry = layout.get(name)
+            if entry is None:
+                result[name] = weight
+                continue
+            scheme, scale_name, scale_shape, scale_dtype = entry
+            q, scale = scheme.quant(weight)
+            if scale_dtype == torch.float32:
+                scale = e8m0_to_float(scale)
+            if tuple(scale.shape) != scale_shape or scale.dtype != scale_dtype:
+                raise RuntimeError(
+                    f"ERNIE 5.5: re-quantized {scale_name} is {scale.dtype} {tuple(scale.shape)}, "
+                    f"the checkpoint stores {scale_dtype} {scale_shape}"
+                )
+            result[name] = q
+            result[scale_name] = scale
+        return result
+
+    _loaded._coda_quantized = True
+    Ernie55Bridge.maybe_modify_loaded_hf_weight = _loaded
+    Ernie55Bridge.maybe_modify_converted_hf_weight = _converted
 
 
 def _patch_auto_attention_backend_inherits():
@@ -456,6 +580,7 @@ _patch_fused_adam_fp32_master_remainder()
 _patch_csa_cute_launch_cache()
 _patch_fa4_causal_unbounded_window()
 _patch_ernie55_drop_mtp()
+_patch_ernie55_quantized_checkpoint()
 _patch_auto_attention_backend_inherits()
 _patch_dsv4_builder_pipeline_layout()
 

@@ -63,7 +63,7 @@ ______________________________________________________________________
 
 ## 📰 最新动态 (News)
 
-- **[2026-11]** 发布 [v0.2.1](https://github.com/baidu-baige/LoongSage/releases/tag/v0.2.1)：DeepSeek-V4.1 视觉训练、ERNIE-5.5-Flash-Base、组级别奖励（group reward）以及单卡 Countdown 示例！
+- **[2026-11]** 发布 [v0.2.1](https://github.com/baidu-baige/LoongSage/releases/tag/v0.2.1)：DeepSeek-V4.1 视觉训练、ERNIE-5.5-Flash、组级别奖励（group reward）以及单卡 Countdown 示例！
 - **[2026-11]** 发布首个正式版本 [v0.2.0](https://github.com/baidu-baige/LoongSage/releases/tag/v0.2.0)：DeepSeek-V4.1 训练、PPO 与 SFT、Qwen3-VL 图像模态 RL、SGLang 0.5.23！
 - **[2026-10]** 支持 DeepSeek-V4.1-Flash [QAT 训练](conf/dsv41_flash/)，并新增 [RLCD2 训练配方](conf/rlcd2/)！
 - **[2026-10]** 技术报告 [*LoongSage: A Production-Grade, High-Efficiency Agentic RL Framework for Frontier LLMs with Validated Recipes*](https://arxiv.org/abs/2610.16352) 已在 arXiv 发布！
@@ -101,7 +101,8 @@ ______________________________________________________________________
 | DeepSeek-V4.1-Flash（原始 FP8/MXFP4 权重，QAT） | [`dsv41_flash/`](conf/dsv41_flash/)：DAPO、SWE、SFT、GRPO（geo3k 单图、MMRB 多图） | H20 × 6 |
 | DeepSeek-V4.1-Flash（BF16） | [`dsv41_flash_bf16/`](conf/dsv41_flash_bf16/)：DAPO、SWE | B200 × 5–6，H20 × 6 |
 | DeepSeek-V4-Flash（BF16） | [`dsv4_flash_bf16/`](conf/dsv4_flash_bf16/)：DAPO、SWE | H20 × 6–8，GB200 × 8 |
-| ERNIE-5.5-Flash-Base（BF16） | [`ernie55_flash/`](conf/ernie55_flash/)：DAPO、GSM8K | H20 × 6 |
+| ERNIE-5.5-Flash（原始 FP8/MXFP4 权重，权重 QAT） | [`ernie55_flash/`](conf/ernie55_flash/)：DAPO | H20 × 6 |
+| ERNIE-5.5-Flash（BF16） | [`ernie55_flash_bf16/`](conf/ernie55_flash_bf16/)：DAPO、GSM8K | H20 × 6 |
 | Qwen3-30B-A3B | [`qwen3_30b_a3b/`](conf/qwen3_30b_a3b/)：DAPO、GSM8K、BCP、MOPD | H20 × 1 |
 | Qwen3-Coder-30B-A3B-Instruct | [`qwen3_coder_30b_a3b/`](conf/qwen3_coder_30b_a3b/)：Claude Code、Codex、OpenCode、mini-SWE | H20 × 2–4 |
 | Qwen3-VL-30B-A3B-Instruct | [`qwen3_vl_30b_a3b/`](conf/qwen3_vl_30b_a3b/)：GRPO（geo3k 单图、MMRB 多图） | H20 × 1 |
@@ -110,7 +111,7 @@ ______________________________________________________________________
 | Qwen3-0.6B | [`qwen3_0_6b/`](conf/qwen3_0_6b/)：Countdown | 1 卡 |
 | StartLux-Decision-v1.1-4B-AutoThink | [`rlcd2/`](conf/rlcd2/)：RLCD2 | H20 × 1 |
 
-QAT（`trainer.qat`）目前仅支持 DeepSeek-V4.1，其他模型均以 BF16 训练。
+QAT（`trainer.qat`）目前支持 DeepSeek-V4.1（权重 + 激活 QAT）和 ERNIE-5.5-Flash（仅权重 QAT），其他模型均以 BF16 训练。
 
 ______________________________________________________________________
 

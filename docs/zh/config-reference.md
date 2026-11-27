@@ -365,7 +365,7 @@ OPD（On-Policy Distillation）在 RL 流程中额外挂载若干 teacher 模型
 | `trainer.async_save` | `true` | 异步保存 checkpoint（保存线程与训练主循环并发）。 | 见 [模型加载与保存](model-checkpointing.md)。 |
 | `trainer.save_checkpoint` | `true` | 是否保存 megatron 分布式 checkpoint。 | 关闭后仅在 `save_hf: true` 时能恢复。 |
 | `trainer.save_hf` | `false` | 是否额外导出 HuggingFace 格式权重到 `train_step_{step}/hf_model`。 | 便于下游推理直接加载。 |
-| `trainer.qat` | `false` | 量化感知训练（QAT），让训练前向与按 checkpoint 原始量化格式（块缩放 FP8 / MXFP4，ue8m0 scale）运行的 rollout 对齐。开启后，每次 optimizer step 之后把量化权重原地 snap 到量化网格上，并对 rollout 中做 W8A8 的 linear 的输入做激活 fake-quant。量化格式从 `hf_model_path` 的 safetensors header 读取。 | `hf_model_path` 必须是量化 checkpoint，否则启动报错。只要 checkpoint 是量化格式，无论本项是否开启，权重同步和 `save_hf` 都会编码回原始格式（`save_hf` 输出与源 checkpoint 同 shard、同 dtype）。目前只在 DeepSeek-V4.1 + SGLang rollout 上验证过，该模型的 rollout 设置会在启动时校验。配方见 `conf/dsv41_flash/`。 |
+| `trainer.qat` | `false` | 量化感知训练（QAT），让训练前向与按 checkpoint 原始量化格式（块缩放 FP8 / MXFP4，scale 为 2 的幂）运行的 rollout 对齐。开启后，每次 optimizer step 之后把量化权重原地 snap 到量化网格上，并对 rollout 中做 W8A8 的 linear 的输入做激活 fake-quant。量化格式从 `hf_model_path` 的 safetensors header 读取。 | `hf_model_path` 必须是量化 checkpoint，否则启动报错。只要 checkpoint 是量化格式，无论本项是否开启，权重同步和 `save_hf` 都会编码回原始格式（`save_hf` 输出与源 checkpoint 同 shard、同 dtype）。目前在 DeepSeek-V4.1 和 ERNIE-5.5-Flash（仅权重 QAT，不做激活 fake-quant）+ SGLang rollout 上验证过，rollout 设置会在启动时校验。配方见 `conf/dsv41_flash/`、`conf/ernie55_flash/`。 |
 | `trainer.env_vars` | `{}` | 训练 worker 环境变量。 | — |
 
 ## 11. 常见组合与约束速查

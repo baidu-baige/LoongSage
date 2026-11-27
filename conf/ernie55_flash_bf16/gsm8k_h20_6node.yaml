@@ -1,22 +1,20 @@
 # @package _global_
-# GSM8K (single-turn) RL on the full 43-layer ERNIE-5.5-Flash-Base (bf16), 6-node H20
-# (6 x 8 = 48 GPUs), colocated rollout + training.
+# GSM8K (single-turn) RL on the full 43-layer ERNIE-5.5-Flash-Preview with bf16 weights, 6-node
+# H20 (6 x 8 = 48 GPUs), colocated rollout + training. Direct Q -> A: no agent, no tool-call
+# format, thinking off, no length penalty.
 #
-# The raw Base checkpoint has no SFT, so GSM8K is the easiest bootstrap: direct Q -> A, no agent,
-# no tool-call format, thinking off, no length penalty. The base model then has reward variance
-# and GRPO gets a real gradient.
-#
-#   hf download baidu/ERNIE-5.5-Flash-Base-BF16 --local-dir /root/ERNIE-5.5-Flash-Base-BF16
+#   hf download baidu/ERNIE-5.5-Flash-Preview-BF16 --local-dir /root/ERNIE-5.5-Flash-Preview-BF16
 #   hf download openai/gsm8k --repo-type=dataset --local-dir /root/gsm8k
 #
 #   # Run the same command on every machine
 #   bash examples/start_ray_cluster.sh <master-ip>
 #
-#   # Once the cluster is ready, run this on the head node only
-#   # (prompt_data_path must name a single .jsonl/.parquet file)
-#   bash examples/start.sh ernie55_flash/gsm8k_h20_6node \
+#   # Once the cluster is ready, run this on the head node only (the defaults below point at
+#   # the shared copies; override them for other locations; prompt_data_path must name a single
+#   # .jsonl/.parquet file)
+#   bash examples/start.sh ernie55_flash_bf16/gsm8k_h20_6node \
 #     checkpoint_path=/root/ckpt/ernie55_gsm8k \
-#     hf_model_path=/root/ERNIE-5.5-Flash-Base-BF16 \
+#     hf_model_path=/root/ERNIE-5.5-Flash-Preview-BF16 \
 #     data_source.dataset.prompt_data_path=/root/gsm8k/main/train-00000-of-00001.parquet
 #
 # checkpoint_path and hf_model_path must live on storage that every node can reach
@@ -62,11 +60,9 @@ rollout:
 agentflow:
   dump_trajectory_path: "log/trajectories"
   tokenizer:
-    # The checkpoint ships no chat template; this is Megatron-Bridge's ERNIE 5.5 SFT template.
-    custom_chat_template_path: ernie55_flash/ernie55_chat_template.jinja
     think_tags: ["<ernie:think>", "</ernie:think>"]
     generation_prompt_kwargs:
-      enable_thinking: false  # base model cannot manage the <ernie:think> block; answer directly
+      enable_thinking: false  # answer directly, within the 4096-token response budget
   router:
     middleware:
       parser:
@@ -107,8 +103,7 @@ megatron:
     recompute_granularity: full
     recompute_method: uniform
     recompute_num_layers: 1
-    # Train the D layers' DSA indexer with its KL loss, as Bridge's ERNIE 5.5 recipe does.
-    dsa_indexer_loss_coeff: 0.01
+    dsa_indexer_loss_coeff: 0.0
     dsa_indexer_use_sparse_loss: true
   optimizer:
     lr: 1.0e-6

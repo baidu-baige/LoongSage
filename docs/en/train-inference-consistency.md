@@ -64,10 +64,20 @@ trainer:
   qat: true
 ```
 
+The ERNIE-5.5-Flash release weights are dense FP8 (128x128 tiles, power-of-two scales stored as F32) plus MXFP4 experts; only weight QAT is applied, with no activation fake-quant. The recipe is [ernie55_flash/dapo_h20_6node.yaml](../../conf/ernie55_flash/dapo_h20_6node.yaml); the rollout settings validated at startup:
+
+```yaml
+rollout:
+  sglang_args:
+    moe_runner_backend: flashinfer_mxfp4                # the only backend with in-place MXFP4 weight update and SiTU
+    flashinfer_mxfp4_moe_precision: bf16
+    disable_shared_experts_fusion: true
+```
+
 Notes:
 
 - Enabling `trainer.qat` fails at startup if `hf_model_path` is not a quantized checkpoint;
-- So far it has only been verified on DeepSeek-V4.1 with the SGLang rollout; MTP is not trained and vision is not supported yet;
+- So far it has been verified on DeepSeek-V4.1 and ERNIE-5.5-Flash with the SGLang rollout; MTP is not trained and vision is not supported yet;
 - With `save_hf` on, every save writes a full checkpoint (including the untrained vision / MTP weights); reserve several hundred GB of disk for the full model;
 - Activation alignment covers the quantization function only. The GEMM implementations and accumulation order still differ between the two sides, so the residual deviation is still handled by the algorithm-level correction in Section 5;
 - To measure the benefit of QAT, run a control with `trainer.qat: false`: the inference side still serves the quantized weights while the training side does no QAT, then compare `train/is_approx_k3_kl` between the two runs.
