@@ -62,7 +62,7 @@ agentflow:
   tokenizer:
     think_tags: ["<ernie:think>", "</ernie:think>"]
     generation_prompt_kwargs:
-      enable_thinking: false
+      enable_thinking: ture
   router:
     middleware:
       parser:
@@ -103,8 +103,6 @@ megatron:
     recompute_granularity: full
     recompute_method: uniform
     recompute_num_layers: 1
-    # Train the D layers' DSA indexer with its KL loss, as Bridge's ERNIE 5.5 recipe does.
-    dsa_indexer_loss_coeff: 0.01
     dsa_indexer_use_sparse_loss: true
   optimizer:
     lr: 1.0e-6

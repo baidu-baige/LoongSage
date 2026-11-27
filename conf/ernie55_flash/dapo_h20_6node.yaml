@@ -58,13 +58,6 @@ rollout:
     disable_cuda_graph: false
     ep_size: 8
     max_running_requests: 128
-    # The Preview config marks its MXFP4 experts only with `expert_dtype`, which sglang does not
-    # read; without routed_experts_quant_method it loads them as FP8 and fails. The override
-    # replaces the whole quantization_config, so every field is repeated.
-    json_model_override_args: >-
-      {"quantization_config": {"activation_scheme": "dynamic", "fmt": "e4m3", "quant_method": "fp8",
-      "expert_dtype": "mxfp4", "routed_experts_quant_method": "mxfp4", "scale_fmt": "ue8m0",
-      "weight_block_size": [128, 128]}}
     # The only MoE backend with the in-place MXFP4 weight update (and SiTU) in the sglang patch;
     # `auto` picks the triton FP8 MoE, which fails on the MXFP4 experts.
     moe_runner_backend: flashinfer_mxfp4
@@ -122,8 +115,6 @@ megatron:
     recompute_granularity: full
     recompute_method: uniform
     recompute_num_layers: 1
-    # Train the D layers' DSA indexer with its KL loss, as Bridge's ERNIE 5.5 recipe does.
-    dsa_indexer_loss_coeff: 0.01
     dsa_indexer_use_sparse_loss: true
   optimizer:
     lr: 1.0e-6

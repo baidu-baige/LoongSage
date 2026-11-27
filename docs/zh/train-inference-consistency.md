@@ -69,8 +69,6 @@ ERNIE-5.5-Flash 的发布权重为 dense FP8（128x128 块，F32 存储的 2 的
 ```yaml
 rollout:
   sglang_args:
-    # config 未声明 MXFP4 experts，需补 routed_experts_quant_method（覆盖整个 quantization_config）
-    json_model_override_args: '{"quantization_config": {..., "routed_experts_quant_method": "mxfp4"}}'
     moe_runner_backend: flashinfer_mxfp4                # 唯一支持 MXFP4 原地热更新和 SiTU 的后端
     flashinfer_mxfp4_moe_precision: bf16
     disable_shared_experts_fusion: true

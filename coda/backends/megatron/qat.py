@@ -86,13 +86,9 @@ class QATAdapter:
     def validate(self, config) -> None:
         """Reject rollout settings whose numerics this QAT does not model."""
 
-    def plan_task(self, plan: "QuantPlan", task, entry: CkptQuant, state: dict) -> bool:
-        """Weight QAT of a task the generic in-place snap cannot express; True if handled here.
-        ``state`` is scratch space shared by the calls of one plan."""
+    def custom_task(self, plan: "QuantPlan", task, entry: CkptQuant) -> bool:
+        """Weight QAT of a task the generic in-place snap cannot express; True if handled here."""
         return False
-
-    def finish_plan(self, plan: "QuantPlan", state: dict) -> None:
-        """Called once after every task went through :meth:`plan_task`."""
 
 
 class DeepseekV41Adapter(QATAdapter):
@@ -158,11 +154,13 @@ class Ernie55Adapter(QATAdapter):
         if problems:
             raise ValueError("ERNIE 5.5 QAT: " + "; ".join(problems))
 
-    def plan_task(self, plan: "QuantPlan", task, entry: CkptQuant, state: dict) -> bool:
+    def custom_task(self, plan: "QuantPlan", task, entry: CkptQuant) -> bool:
         from megatron.bridge.models.ernie.ernie55_mappings import _Ernie55GatedMLPMapping, _Ernie55KVUpMapping
 
         if isinstance(task.mapping, _Ernie55KVUpMapping):
-            state.setdefault("kv_b_proj", {}).setdefault(task.mapping.hf_param, {})[task.mapping.part] = (task, entry)
+            # Both params live on the attention module: the k task snaps the pair, the v task is skipped.
+            if task.mapping.part == "k":
+                self._add_kv_b_proj_snap(plan, task, entry)
             return True
         if isinstance(task.mapping, _Ernie55GatedMLPMapping):
             # fc1 rows block-interleaved [g_0:k, u_0:k, ...]: snapping the local param is snapping
@@ -179,26 +177,24 @@ class Ernie55Adapter(QATAdapter):
             return True
         return False
 
-    def finish_plan(self, plan: "QuantPlan", state: dict) -> None:
+    @staticmethod
+    def _add_kv_b_proj_snap(plan: "QuantPlan", task, entry: CkptQuant) -> None:
         from megatron.bridge.models.ernie.ernie55_mappings import join_kv_b_proj, split_kv_b_proj
 
-        for hf_name, parts in state.get("kv_b_proj", {}).items():
-            if set(parts) != {"k", "v"}:
-                raise RuntimeError(f"[QAT] {hf_name}: got only the {sorted(parts)} part of kv_b_proj on this rank")
-            (k_task, entry), (v_task, _) = parts["k"], parts["v"]
-            k, v, dims, scheme = k_task.param_weight, v_task.param_weight, k_task.mapping.dims, entry.scheme
-            thresholds = None
-            if plan.weight_rounding == "threshold":
-                thresholds = _thresholds_fn(SimpleNamespace(tp_rank=0), [hf_name], torch.Size(entry.shape), entry.shape)
+        k, v, dims, scheme = task.param_weight, task.megatron_module.v_b_proj, task.mapping.dims, entry.scheme
+        thresholds = None
+        if plan.weight_rounding == "threshold":
+            hf_name = task.mapping.hf_param
+            thresholds = _thresholds_fn(SimpleNamespace(tp_rank=0), [hf_name], torch.Size(entry.shape), entry.shape)
 
-            def snap(k=k, v=v, dims=dims, scheme=scheme, thresholds=thresholds):
-                w = join_kv_b_proj(k.data, v.data, dims)
-                scheme.snap_(w, thresholds)
-                new_k, new_v = split_kv_b_proj(w, dims)
-                k.data.copy_(new_k)
-                v.data.copy_(new_v)
+        def snap():
+            w = join_kv_b_proj(k.data, v.data, dims)
+            scheme.snap_(w, thresholds)
+            new_k, new_v = split_kv_b_proj(w, dims)
+            k.data.copy_(new_k)
+            v.data.copy_(new_v)
 
-            plan.add_joint_snap(f"{k_task.param_name}+{v_task.param_name.rsplit('.', 1)[-1]}", (k, v), snap)
+        plan.custom_snaps.append((f"{task.param_name}+v_b_proj", snap))
 
 
 _ADAPTERS: dict[str, QATAdapter] = {
@@ -302,8 +298,8 @@ class QuantPlan:
     ``quantized`` -- the checkpoint stores some trained tensors quantized, i.e. the rollout serves
     that format; the bridge exports it and :meth:`check_export` checks every weight sync.
     ``snap_params`` / ``act_modules`` -- QAT only: params to snap, linears whose input is fake-quantized.
-    ``joint_snaps`` / ``fake_quant_params`` -- QAT only, added by a :class:`QATAdapter`: snaps over
-    several params, and fp32 params whose forward uses Q(W) instead of being snapped.
+    ``custom_snaps`` / ``fake_quant_params`` -- QAT only, added by a :class:`QATAdapter`: snaps the
+    generic per-param snap cannot express, and fp32 params whose forward uses Q(W) instead of being snapped.
     """
 
     def __init__(self, bridge, model_chunks: Sequence[torch.nn.Module], hf_model_path: str, config):
@@ -318,7 +314,7 @@ class QuantPlan:
         self.ckpt, self.unsupported = scan_ckpt_quant(hf_model_path) if os.path.isdir(hf_model_path) else ({}, {})
         self.snap_params: list[tuple[str, torch.nn.Parameter, QuantScheme]] = []
         self._snap_thresholds: list = []  # per snap param: thresholds(r0, r1), or None = round-to-nearest
-        self.joint_snaps: list[tuple[str, Callable[[], None]]] = []
+        self.custom_snaps: list[tuple[str, Callable[[], None]]] = []
         self.fake_quant_params: list[tuple[str, torch.nn.Parameter, QuantScheme]] = []
         self.act_modules: list[tuple[str, torch.nn.Module, int]] = []
         tasks = self._quantized_tasks(bridge, model_chunks)
@@ -360,9 +356,7 @@ class QuantPlan:
         adapter = get_adapter(getattr(bridge.hf_pretrained.config, "architectures", None))
         adapter.validate(config)
         own = {id(p) for chunk in model_chunks for p in chunk.parameters()}
-        self._own_params = own
         hooked: set[int] = set()
-        adapter_state: dict = {}
         for task in tasks:
             names = hf_names(task.mapping)
             if bad := [n for n in names if n in self.unsupported]:
@@ -376,7 +370,7 @@ class QuantPlan:
             param = task.param_weight
             if id(param) not in own:
                 raise RuntimeError(f"[QAT] {task.param_name}: bridge task does not hold the live model param")
-            if adapter.plan_task(self, task, entries[0], adapter_state):
+            if adapter.custom_task(self, task, entries[0]):
                 continue
             if param.dtype == torch.float32:
                 # An fp32 param is its own optimizer master: snapping it would erase sub-grid updates.
@@ -397,14 +391,6 @@ class QuantPlan:
                     raise NotImplementedError(f"[QAT] {task.param_name}: input of a fused norm+linear is pre-norm")
                 hooked.add(id(module))
                 self.act_modules.append((task.param_name[: -len(".weight")], module, scheme.block[1]))
-        adapter.finish_plan(self, adapter_state)
-
-    def add_joint_snap(self, name: str, params: Sequence[torch.nn.Parameter], snap: Callable[[], None]) -> None:
-        """Snap several params together with ``snap()`` (adapters; e.g. two params that split one
-        checkpoint tensor across tiles)."""
-        if any(id(p) not in self._own_params for p in params):
-            raise RuntimeError(f"[QAT] {name}: bridge task does not hold the live model param")
-        self.joint_snaps.append((name, snap))
 
     def add_forward_fake_quant(self, name: str, module: torch.nn.Module, param: torch.nn.Parameter,
                                scheme: QuantScheme) -> None:
@@ -428,13 +414,13 @@ class QuantPlan:
     # -- weight QAT
     @torch.no_grad()
     def snap_(self) -> int:
-        """Snap every quantized param in place onto its checkpoint grid. Returns #params (a joint
+        """Snap every quantized param in place onto its checkpoint grid. Returns #params (a custom
         snap counts once)."""
         for (_, p, scheme), thresholds in zip(self.snap_params, self._snap_thresholds):
             scheme.snap_(p.data, thresholds)
-        for _, snap in self.joint_snaps:
+        for _, snap in self.custom_snaps:
             snap()
-        return len(self.snap_params) + len(self.joint_snaps)
+        return len(self.snap_params) + len(self.custom_snaps)
 
     # -- activation QAT
     def register_activation_hooks(self) -> int:

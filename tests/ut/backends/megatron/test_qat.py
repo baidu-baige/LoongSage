@@ -302,7 +302,7 @@ def _ernie(monkeypatch, rounding="threshold", rollout=ERNIE_ROLLOUT):
 @pytest.mark.parametrize("rounding", ["threshold", "nearest"])
 def test_ernie_kv_b_proj_joint_snap(monkeypatch, rounding):
     plan, m, dims, kv, em = _ernie(monkeypatch, rounding)
-    assert [n for n, _, _ in plan.snap_params] == ["wq.weight"] and len(plan.joint_snaps) == 1
+    assert [n for n, _, _ in plan.snap_params] == ["wq.weight"] and len(plan.custom_snaps) == 1
     assert not plan.act_modules  # weight QAT only
     full = em.join_kv_b_proj(m.attn.k_b_proj.data, m.attn.v_b_proj.data, dims)
     thr = None

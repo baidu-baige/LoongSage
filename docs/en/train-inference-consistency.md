@@ -69,8 +69,6 @@ The ERNIE-5.5-Flash release weights are dense FP8 (128x128 tiles, power-of-two s
 ```yaml
 rollout:
   sglang_args:
-    # the config does not declare the MXFP4 experts; add routed_experts_quant_method (replaces the whole quantization_config)
-    json_model_override_args: '{"quantization_config": {..., "routed_experts_quant_method": "mxfp4"}}'
     moe_runner_backend: flashinfer_mxfp4                # the only backend with in-place MXFP4 weight update and SiTU
     flashinfer_mxfp4_moe_precision: bf16
     disable_shared_experts_fusion: true

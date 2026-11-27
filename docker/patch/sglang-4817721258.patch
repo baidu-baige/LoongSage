@@ -1,3 +1,20 @@
+diff --git a/python/sglang/srt/configs/model_config.py b/python/sglang/srt/configs/model_config.py
+index c3111376ff..9e7095be4a 100644
+--- a/python/sglang/srt/configs/model_config.py
++++ b/python/sglang/srt/configs/model_config.py
+@@ -888,7 +888,11 @@ class ModelConfig:
+         routed_experts_quant_method = quantization_config.get(
+             "routed_experts_quant_method"
+         )
+-        self.is_fp4_experts: bool = routed_experts_quant_method == "mxfp4"
++        # ERNIE-5.5-Flash-Preview marks them with `expert_dtype` instead.
++        self.is_fp4_experts: bool = (
++            routed_experts_quant_method == "mxfp4"
++            or quantization_config.get("expert_dtype") == "mxfp4"
++        )
+         if self.is_fp4_experts:
+             logger.info("Detected mixed checkpoint layout: routed experts are MXFP4.")
+ 
 diff --git a/python/sglang/srt/debug_utils/dumper.py b/python/sglang/srt/debug_utils/dumper.py
 index cc807dd421..643bb832f1 100644
 --- a/python/sglang/srt/debug_utils/dumper.py
