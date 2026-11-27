@@ -1,0 +1,590 @@
+diff --git a/src/megatron/bridge/models/inkling/__init__.py b/src/megatron/bridge/models/inkling/__init__.py
+index 73b8d4051..d83e994f0 100644
+--- a/src/megatron/bridge/models/inkling/__init__.py
++++ b/src/megatron/bridge/models/inkling/__init__.py
+@@ -23,6 +23,11 @@ from megatron.bridge.models.inkling.data import Inkling2ImageProcessor, Inkling2
+ from megatron.bridge.models.inkling.inkling2_bridge import Inkling2Bridge
+ from megatron.bridge.models.inkling.inkling2_builder import Inkling2ModelBuilder
+ from megatron.bridge.models.inkling.inkling2_config import Inkling2ModelConfig, Inkling2TransformerConfig
++from megatron.bridge.models.inkling.inkling2_loop_bridge import (
++    Inkling2LoopBridge,
++    Inkling2LoopConfig,
++    Inkling2LoopTextConfig,
++)
+ from megatron.bridge.models.inkling.modeling_inkling2.model import Inkling2Model
+ 
+ 
+@@ -30,6 +35,9 @@ __all__ = [
+     "Inkling2Bridge",
+     "Inkling2Config",
+     "Inkling2ImageProcessor",
++    "Inkling2LoopBridge",
++    "Inkling2LoopConfig",
++    "Inkling2LoopTextConfig",
+     "Inkling2Model",
+     "Inkling2ModelBuilder",
+     "Inkling2ModelConfig",
+diff --git a/src/megatron/bridge/models/inkling/inkling2_bridge.py b/src/megatron/bridge/models/inkling/inkling2_bridge.py
+index c378dd5a9..68ace12a6 100644
+--- a/src/megatron/bridge/models/inkling/inkling2_bridge.py
++++ b/src/megatron/bridge/models/inkling/inkling2_bridge.py
+@@ -66,8 +66,16 @@ _VISION_KEYS = (
+ _VISION_KEY_ALIASES = {"native_patch_size": "patch_size", "adapter_merge_size": "spatial_merge_size"}
+ _EXPERT_SUFFIXES = (".mlp.experts.w13_weight", ".mlp.experts.w2_weight")
+ _SCALE_SUFFIXES = ("_scale", "_amax", "_outer_scale_denominator")
+-# Tensors the model holds in FP32 and the release stores in FP32: the AttnRes queries and the router biases.
+-_FLOAT32_PARAM_SUFFIXES = (".attn_res_query", ".mlp_res_query", ".output_res_query", ".mlp.router.expert_bias")
++# Tensors the model holds in FP32 and the release stores in FP32: the AttnRes queries, the router biases,
++# and Inkling-2-Mini's cross-pass loop queries.
++_FLOAT32_PARAM_SUFFIXES = (
++    ".attn_res_query",
++    ".mlp_res_query",
++    ".output_res_query",
++    ".mlp.router.expert_bias",
++    ".loop_queries",
++    ".loop_kv_queries",
++)
+ # Safetensors header dtypes of the tensors an Inkling2 checkpoint stores.
+ _SAFETENSORS_DTYPES = {
+     "BF16": "bfloat16",
+diff --git a/src/megatron/bridge/models/inkling/inkling2_config.py b/src/megatron/bridge/models/inkling/inkling2_config.py
+index 3f1147869..127b20b57 100644
+--- a/src/megatron/bridge/models/inkling/inkling2_config.py
++++ b/src/megatron/bridge/models/inkling/inkling2_config.py
+@@ -65,6 +65,16 @@ class Inkling2TransformerConfig(TransformerConfig):
+     inkling2_unpadded_vocab_size: int | None = None
+     """Logits at and above this token ID are masked out of the softmax."""
+ 
++    inkling2_loop_core_start: int = 0
++    inkling2_loop_core_end: int = 0
++    """Decoder blocks ``[core_start, core_end)`` form the looped core of Inkling-2-Mini."""
++
++    inkling2_loop_num_passes: int = 1
++    """Passes over the looped core; 1 means the model has no loop."""
++
++    inkling2_loop_gate_rank: int = 0
++    """Rank of the low-rank message controllers that mix earlier passes into later ones."""
++
+     inkling2_compile_ops: bool = False
+     """Run the AttnRes mixtures, short convolutions, L2 clips, SiTU activations, and residual additions through
+     ``torch.compile`` as fused kernels. Dynamo compiles a graph for every new call signature, so this suits training
+@@ -129,6 +139,15 @@ class Inkling2ModelConfig(BridgeHybridModelConfig):
+             config.num_layers // 2
+         ):
+             raise ValueError("Inkling2 requires an alternating attention/MoE Hybrid pattern ('*E' per block).")
++        if config.inkling2_loop_num_passes > 1:
++            if config.pipeline_model_parallel_size != 1:
++                raise ValueError("Inkling2 loop runs the core several times on one stage; PP must be 1.")
++            if not 0 < config.inkling2_loop_core_start < config.inkling2_loop_core_end <= config.num_layers // 2:
++                raise ValueError("Inkling2 loop core must be a non-empty range of decoder blocks after block 0.")
++            if config.inkling2_loop_core_start % config.inkling2_attn_res_block_size:
++                raise ValueError("Inkling2 loop core must start at an AttnRes block boundary.")
++            if config.inkling2_loop_gate_rank <= 0:
++                raise ValueError("Inkling2 loop needs a positive controller gate rank.")
+         super().finalize()
+ 
+     def _get_num_floating_point_operations_with_runtime_stats(
+diff --git a/src/megatron/bridge/models/inkling/inkling2_loop_bridge.py b/src/megatron/bridge/models/inkling/inkling2_loop_bridge.py
+new file mode 100644
+index 000000000..9a59501d8
+--- /dev/null
++++ b/src/megatron/bridge/models/inkling/inkling2_loop_bridge.py
+@@ -0,0 +1,129 @@
++# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Hugging Face <-> Megatron conversion for Inkling-2-Mini (``inkling2_loop``).
++
++The checkpoint is Inkling2 plus a looped core: per-block message controllers
++(``layers.N.controllers.{attn,k,v,mlp}``) on the core blocks and two FP32 tables of
++cross-pass message queries (``middle_cycle_cross_pass_queries`` and ``..._kv_queries``).
++"""
++
++from typing import Any
++
++from huggingface_hub.dataclasses import strict
++from transformers import AutoConfig, PretrainedConfig
++from transformers.models.auto.configuration_auto import CONFIG_MAPPING
++from transformers.models.inkling2.configuration_inkling2 import Inkling2Config, Inkling2TextConfig
++
++from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
++from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
++from megatron.bridge.models.conversion.param_mapping import ReplicatedMapping
++from megatron.bridge.models.inkling.inkling2_bridge import _LLM, Inkling2Bridge
++from megatron.bridge.models.inkling.inkling2_config import Inkling2ModelConfig
++from megatron.bridge.models.inkling.modeling_inkling2.model import Inkling2Model
++
++
++if "inkling2_loop" in CONFIG_MAPPING:
++    Inkling2LoopConfig = CONFIG_MAPPING["inkling2_loop"]
++    Inkling2LoopTextConfig = Inkling2LoopConfig.sub_configs["text_config"]
++else:
++    # Transformers before v5.24.0 has no ``inkling2_loop`` classes.
++
++    @strict
++    class Inkling2LoopTextConfig(Inkling2TextConfig):
++        """Inkling2 text config with the looped-core settings of Inkling-2-Mini."""
++
++        model_type = "inkling2_loop_text"
++        loop_config: dict | None = None
++        # The Mini release omits these; SGLang defaults them to False.
++        pre_norm_pre_affine: bool = False
++        final_norm_pre_affine: bool = False
++
++    @strict
++    class Inkling2LoopConfig(Inkling2Config):
++        """Inkling-2-Mini config: Inkling2 with ``text_config.loop_config``."""
++
++        model_type = "inkling2_loop"
++        sub_configs_defaults = {**Inkling2Config.sub_configs_defaults, "text_config": Inkling2LoopTextConfig}
++
++    AutoConfig.register("inkling2_loop_text", Inkling2LoopTextConfig)
++    AutoConfig.register("inkling2_loop", Inkling2LoopConfig)
++
++
++@MegatronModelBridge.register_bridge(
++    source="Inkling2LoopForConditionalGeneration",
++    target=Inkling2Model,
++    model_type="inkling2_loop",
++)
++class Inkling2LoopBridge(Inkling2Bridge):
++    """Megatron Bridge for Inkling-2-Mini, whose decoder runs its core blocks several times."""
++
++    MODEL_CONFIG_CLASS = Inkling2ModelConfig
++
++    def hf_config_to_model_config_kwargs(self, hf_config: PretrainedConfig) -> dict[str, Any]:
++        """Add the loop settings to the Inkling2 kwargs."""
++        config_kwargs = super().hf_config_to_model_config_kwargs(hf_config)
++        loop = hf_config.text_config.loop_config
++        if loop is None:
++            return config_kwargs
++        if loop.get("is_varloop"):
++            raise ValueError("Variable-pass Inkling2 loops are not supported")
++        config_kwargs.update(
++            inkling2_loop_core_start=loop["core_start"],
++            inkling2_loop_core_end=loop["core_end"],
++            inkling2_loop_num_passes=loop["num_passes"],
++            inkling2_loop_gate_rank=loop["gate_rank"],
++        )
++        return config_kwargs
++
++    @classmethod
++    def megatron_to_hf_config(cls, model_config: Inkling2ModelConfig) -> dict[str, Any]:
++        """Write the release's ``inkling2_loop`` layout."""
++        hf_config = super().megatron_to_hf_config(model_config)
++        transformer = model_config.transformer
++        hf_config["architectures"] = ["Inkling2LoopForConditionalGeneration"]
++        hf_config["model_type"] = "inkling2_loop"
++        hf_config["text_config"]["loop_config"] = {
++            "core_start": transformer.inkling2_loop_core_start,
++            "core_end": transformer.inkling2_loop_core_end,
++            "num_passes": transformer.inkling2_loop_num_passes,
++            "gate_rank": transformer.inkling2_loop_gate_rank,
++            "is_varloop": False,
++        }
++        return hf_config
++
++    def mapping_registry(self) -> MegatronMappingRegistry:
++        """Add the controllers of the core blocks and the cross-pass queries to the Inkling2 mappings."""
++        mappings = list(super().mapping_registry().mappings)
++        loop = self.hf_config.text_config.loop_config
++        if loop is None:
++            return MegatronMappingRegistry(*mappings)
++        mappings += [
++            ReplicatedMapping("decoder.loop_queries", f"{_LLM}.middle_cycle_cross_pass_queries"),
++            ReplicatedMapping("decoder.loop_kv_queries", f"{_LLM}.middle_cycle_cross_pass_kv_queries"),
++        ]
++        for index in range(loop["core_start"], loop["core_end"]):
++            hf_controllers = f"{_LLM}.layers.{index}.controllers"
++            controllers = {
++                "attn": f"decoder.layers.{2 * index}.loop_controllers.attn",
++                "k": f"decoder.layers.{2 * index}.loop_controllers.k",
++                "v": f"decoder.layers.{2 * index}.loop_controllers.v",
++                "mlp": f"decoder.layers.{2 * index + 1}.loop_controller",
++            }
++            for name, megatron_prefix in controllers.items():
++                for weight in ("down_weight", "gain_weight", "forget_weight"):
++                    mappings.append(
++                        ReplicatedMapping(f"{megatron_prefix}.{weight}", f"{hf_controllers}.{name}.{weight}")
++                    )
++        return MegatronMappingRegistry(*mappings)
+diff --git a/src/megatron/bridge/models/inkling/modeling_inkling2/attention.py b/src/megatron/bridge/models/inkling/modeling_inkling2/attention.py
+index 4626102e5..0427b8d21 100644
+--- a/src/megatron/bridge/models/inkling/modeling_inkling2/attention.py
++++ b/src/megatron/bridge/models/inkling/modeling_inkling2/attention.py
+@@ -80,12 +80,21 @@ _BLACKWELL_BACKWARD_KERNEL_OPTIONS = {
+ }
+ 
+ 
++_FLEX_RECOMPILE_LIMIT = 64
++
++
+ def _flex_attention():
+     global _compiled_flex_attention
+     if _compiled_flex_attention is None:
+         from torch.nn.attention.flex_attention import flex_attention
+ 
+-        _compiled_flex_attention = torch.compile(flex_attention, dynamic=False)
++        # Dynamic shapes from the start: RL packing changes the sequence length every micro-batch.
++        # Graphs still split by (local/global window, grad mode), 4 or so in training; past Dynamo's
++        # recompile limit flex_attention silently runs eagerly, materializes the scores and runs out of memory.
++        _compiled_flex_attention = torch.compile(flex_attention, dynamic=True)
++    # Re-asserted per call: something in the training process can reset it to the default (8) after import.
++    if torch._dynamo.config.recompile_limit < _FLEX_RECOMPILE_LIMIT:
++        torch._dynamo.config.recompile_limit = _FLEX_RECOMPILE_LIMIT
+     return _compiled_flex_attention
+ 
+ 
+diff --git a/src/megatron/bridge/models/inkling/modeling_inkling2/layers.py b/src/megatron/bridge/models/inkling/modeling_inkling2/layers.py
+index eb8ea63bd..a6e0c9912 100644
+--- a/src/megatron/bridge/models/inkling/modeling_inkling2/layers.py
++++ b/src/megatron/bridge/models/inkling/modeling_inkling2/layers.py
+@@ -40,6 +40,8 @@ from torch import nn
+ 
+ from megatron.bridge.models.inkling.modeling_inkling2.attention import packed_cu_seqlens
+ from megatron.bridge.models.inkling.modeling_inkling2.context_parallel import context_parallel_layout
++from megatron.bridge.models.inkling.modeling_inkling2.loop import Inkling2LoopController
++from megatron.bridge.models.inkling.modeling_inkling2.loop import loop_messages as compute_loop_messages
+ from megatron.bridge.models.inkling.modeling_inkling2.ops import (
+     attn_res_mix,
+     document_positions,
+@@ -90,6 +92,15 @@ class _Inkling2HybridLayer(TransformerLayer):
+         self.num_blocks_before = num_attn_res_blocks_before(self.block_index, self.block_size)
+         self.normalize_values = config.inkling2_attn_res_normalize_values
+         self._keep_in_float32_parameter_names: tuple[str, ...] = ()
++        self.is_loop_core = (
++            config.inkling2_loop_num_passes > 1
++            and config.inkling2_loop_core_start <= self.block_index < config.inkling2_loop_core_end
++        )
++
++    def _loop_controller(self) -> Inkling2LoopController:
++        return Inkling2LoopController(
++            self.config.hidden_size, self.config.inkling2_loop_gate_rank, self.config.params_dtype
++        )
+ 
+     def _add_float32_parameter(self, name: str, *shape: int) -> None:
+         """Register an AttnRes query, which stays FP32 under BF16 training."""
+@@ -131,6 +142,8 @@ class Inkling2AttentionLayer(_Inkling2HybridLayer):
+             self.v_input_norm = TENorm(config, hidden, config.layernorm_epsilon)
+         if self.block_index > 0:
+             self._add_float32_parameter("attn_res_query", *((hidden,) if self.is_local else (3, hidden)))
++        if self.is_loop_core:
++            self.loop_controllers = nn.ModuleDict({name: self._loop_controller() for name in ("attn", "k", "v")})
+ 
+     def forward(
+         self,
+@@ -138,6 +151,7 @@ class Inkling2AttentionLayer(_Inkling2HybridLayer):
+         attention_mask: torch.Tensor | None = None,
+         inference_context=None,
+         packed_seq_params: PackedSeqParams | None = None,
++        loop_messages: tuple | None = None,
+         **kwargs,
+     ) -> tuple[torch.Tensor, None]:
+         """Attend over the AttnRes mixtures and hand the block's state to its MoE layer.
+@@ -145,6 +159,8 @@ class Inkling2AttentionLayer(_Inkling2HybridLayer):
+         Args:
+             hidden_states: Packed ``[partial, *bank]`` state of the previous block.
+             packed_seq_params: Document boundaries of a packed batch.
++            loop_messages: In a later pass over the loop core, the previous pass's
++                ``(bank, [3, H] queries)``, whose messages mix into the Q, K, and V inputs.
+ 
+         Returns:
+             ``[attention, *bank, partial]`` when the block starts a new AttnRes block,
+@@ -161,12 +177,29 @@ class Inkling2AttentionLayer(_Inkling2HybridLayer):
+             query_input = key_input = value_input = mixtures[0]
+             if not self.is_local:
+                 key_input, value_input = mixtures[1], mixtures[2]
+-        normalized_query = self._normalize(self.input_layernorm, query_input)
+-        if self.is_local:
+-            normalized_key = normalized_value = normalized_query
++        if loop_messages is not None:
++            messages = compute_loop_messages(*loop_messages)
++            query_input, key_input, value_input = (
++                self.loop_controllers[name](source, message)
++                for name, source, message in zip(
++                    ("attn", "k", "v"), (query_input, key_input, value_input), messages, strict=True
++                )
++            )
++            normalized_query = self._normalize(self.input_layernorm, query_input)
++            if self.is_local:
++                # A later pass splits a local block's single input into separate Q, K, and V inputs.
++                normalized_key = self._normalize(self.input_layernorm, key_input)
++                normalized_value = self._normalize(self.input_layernorm, value_input)
++            else:
++                normalized_key = self._normalize(self.k_input_norm, key_input)
++                normalized_value = self._normalize(self.v_input_norm, value_input)
+         else:
+-            normalized_key = self._normalize(self.k_input_norm, key_input)
+-            normalized_value = self._normalize(self.v_input_norm, value_input)
++            normalized_query = self._normalize(self.input_layernorm, query_input)
++            if self.is_local:
++                normalized_key = normalized_value = normalized_query
++            else:
++                normalized_key = self._normalize(self.k_input_norm, key_input)
++                normalized_value = self._normalize(self.v_input_norm, value_input)
+         attention = self.self_attention(
+             normalized_query, normalized_key, normalized_value, packed_seq_params=packed_seq_params
+         )
+@@ -196,6 +229,8 @@ class Inkling2MoELayer(_Inkling2HybridLayer):
+         self.is_last_block = self.layer_number == config.num_layers
+         if self.is_last_block:
+             self._add_float32_parameter("output_res_query", hidden)
++        if self.is_loop_core:
++            self.loop_controller = self._loop_controller()
+ 
+     def _mlp_conv(self, output: torch.Tensor, packed_seq_params: PackedSeqParams | None) -> torch.Tensor:
+         sequence_parallel = self.config.sequence_parallel
+@@ -240,6 +275,7 @@ class Inkling2MoELayer(_Inkling2HybridLayer):
+         inference_context=None,
+         packed_seq_params: PackedSeqParams | None = None,
+         padding_mask: torch.Tensor | None = None,
++        loop_messages: tuple | None = None,
+         **kwargs,
+     ) -> tuple[torch.Tensor, None]:
+         """Run the MoE on its AttnRes mixture and update the partial block.
+@@ -248,6 +284,8 @@ class Inkling2MoELayer(_Inkling2HybridLayer):
+             hidden_states: Packed state from the block's attention layer.
+             packed_seq_params: Document boundaries of a packed batch.
+             padding_mask: Optional MoE router padding mask.
++            loop_messages: In a later pass over the loop core, the previous pass's
++                ``(bank, [1, H] query)``, whose message mixes into the MoE input.
+ 
+         Returns:
+             The packed ``[partial, *bank]`` state, or the final AttnRes output after
+@@ -262,8 +300,11 @@ class Inkling2MoELayer(_Inkling2HybridLayer):
+         else:
+             partial, attention, *bank = unpack_attn_res_state(hidden_states, hidden, 2 + self.num_blocks_after)
+             mlp_input = self._mix([*bank, partial], self.mlp_res_query, partial_addend=attention)
++        mlp_input = mlp_input[0]
++        if loop_messages is not None:
++            mlp_input = self.loop_controller(mlp_input, compute_loop_messages(*loop_messages)[0])
+         mlp_output = self._without_bias(
+-            self.mlp(self._normalize(self.pre_mlp_layernorm, mlp_input[0]), padding_mask=padding_mask)
++            self.mlp(self._normalize(self.pre_mlp_layernorm, mlp_input), padding_mask=padding_mask)
+         )
+         mlp_output = self._mlp_conv(mlp_output, packed_seq_params)
+         if self.starts_attn_res_block:
+diff --git a/src/megatron/bridge/models/inkling/modeling_inkling2/loop.py b/src/megatron/bridge/models/inkling/modeling_inkling2/loop.py
+new file mode 100644
+index 000000000..2ad31aae7
+--- /dev/null
++++ b/src/megatron/bridge/models/inkling/modeling_inkling2/loop.py
+@@ -0,0 +1,186 @@
++# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Looped core of Inkling-2-Mini (``inkling2_loop``).
++
++Decoder blocks ``[core_start, core_end)`` share their weights and run ``num_passes`` times.
++Every pass starts from the AttnRes state the prelude left; later passes see the previous
++pass only through messages. A message is an AttnRes mixture, with RMS-normalized values,
++over the blocks the previous core pass wrote and its final partial block. Each core block
++mixes one message into each of its Q, K, and V inputs and its MoE input through low-rank
++controllers: ``(1 - tanh(h @ forget.T)) * dest + tanh(h @ gain.T) * message`` with ``h``
++the BF16 down projection of the RMS-normalized ``(dest, message)`` pair. The rounding
++points follow SGLang's ``message_controllers`` kernel.
++"""
++
++from __future__ import annotations
++
++from collections.abc import Sequence
++
++import torch
++import torch.nn.functional as F
++from megatron.core import tensor_parallel
++from megatron.core.models.hybrid.hybrid_block import HybridStack
++from megatron.core.transformer.module import mark_keep_in_fp32
++from megatron.core.utils import make_viewless_tensor
++from torch import Tensor, nn
++
++from megatron.bridge.models.inkling.modeling_inkling2.ops import attn_res_mix
++
++
++CONTROLLER_EPS = 1e-6
++
++
++class Inkling2LoopController(nn.Module):
++    """One low-rank message controller; replicated across TP like the AttnRes queries."""
++
++    def __init__(self, width: int, rank: int, dtype: torch.dtype) -> None:
++        super().__init__()
++        device = torch.cuda.current_device()
++        self.down_weight = nn.Parameter(torch.zeros(rank, 2 * width, device=device, dtype=dtype))
++        self.gain_weight = nn.Parameter(torch.zeros(width, rank, device=device, dtype=dtype))
++        self.forget_weight = nn.Parameter(torch.zeros(width, rank, device=device, dtype=dtype))
++        for parameter in self.parameters():
++            # Each sequence-parallel rank sees different tokens; their gradients add.
++            parameter.sequence_parallel = True
++
++    def forward(self, dest: Tensor, message: Tensor) -> Tensor:
++        """Mix an FP32 ``message`` into an FP32 ``dest`` of the same shape; returns FP32."""
++        dest = dest.float()
++        message = message.float()
++        width = dest.shape[-1]
++        normed = torch.cat(
++            (
++                F.rms_norm(dest, (width,), eps=CONTROLLER_EPS),
++                F.rms_norm(message, (width,), eps=CONTROLLER_EPS),
++            ),
++            dim=-1,
++        ).to(self.down_weight.dtype)
++        hidden = F.linear(normed, self.down_weight)
++        # BF16 operands with FP32 products and accumulation, as the fused kernel computes them.
++        gain = torch.tanh(F.linear(hidden.float(), self.gain_weight.float()))
++        forget = torch.tanh(F.linear(hidden.float(), self.forget_weight.float()))
++        return (1.0 - forget) * dest + gain * message
++
++
++def loop_messages(bank: Sequence[Tensor], queries: Tensor) -> Tensor:
++    """FP32 messages ``[Q, ..., H]`` read from the previous pass's ``bank``."""
++    return attn_res_mix(list(bank), queries, normalize_values=True)
++
++
++class Inkling2LoopStack(HybridStack):
++    """HybridStack that runs the prelude once, the core ``num_passes`` times, and the coda once."""
++
++    def __init__(self, config, *args, **kwargs) -> None:
++        super().__init__(config, *args, **kwargs)
++        self.loop_core_start = config.inkling2_loop_core_start
++        self.loop_core_end = config.inkling2_loop_core_end
++        self.loop_num_passes = config.inkling2_loop_num_passes
++        num_core = self.loop_core_end - self.loop_core_start
++        # Row 2i holds core block i's attention query and row 2i + 1 its MLP query;
++        # the KV queries hold its K (2i) and V (2i + 1) queries.
++        for name in ("loop_queries", "loop_kv_queries"):
++            parameter = nn.Parameter(
++                torch.zeros(2 * num_core, config.hidden_size, device=torch.cuda.current_device(), dtype=torch.float32)
++            )
++            parameter.sequence_parallel = True
++            self.register_parameter(name, mark_keep_in_fp32(parameter))
++
++    def _core_queries(self, core_index: int) -> tuple[Tensor, Tensor]:
++        """Return the ``[3, H]`` Q/K/V message queries and the ``[1, H]`` MLP query of a core block."""
++        attn = torch.stack(
++            (
++                self.loop_queries[2 * core_index],
++                self.loop_kv_queries[2 * core_index],
++                self.loop_kv_queries[2 * core_index + 1],
++            )
++        )
++        return attn, self.loop_queries[2 * core_index + 1 : 2 * core_index + 2]
++
++    def _run_layer(self, layer, hidden_states, bank, queries, attention_mask, packed_seq_params, padding_mask):
++        def run(hidden_states, queries, *bank):
++            kwargs = {}
++            if bank:
++                kwargs["loop_messages"] = (bank, queries)
++            output, _ = layer(
++                hidden_states,
++                attention_mask=attention_mask,
++                packed_seq_params=packed_seq_params,
++                padding_mask=padding_mask,
++                **kwargs,
++            )
++            return output
++
++        bank = tuple(bank or ())
++        if self.config.recompute_granularity == "full" and self.training:
++            return tensor_parallel.checkpoint(
++                run, self.config.distribute_saved_activations, hidden_states, queries, *bank
++            )
++        return run(hidden_states, queries, *bank)
++
++    def forward(
++        self,
++        hidden_states: Tensor,
++        attention_mask: Tensor | None,
++        inference_context=None,
++        rotary_pos_emb: Tensor | None = None,
++        *,
++        packed_seq_params=None,
++        padding_mask=None,
++        **kwargs,
++    ):
++        """Run the looped decoder; see the module docstring."""
++        if self.loop_num_passes <= 1:
++            return super().forward(
++                hidden_states,
++                attention_mask,
++                inference_context,
++                rotary_pos_emb,
++                packed_seq_params=packed_seq_params,
++                padding_mask=padding_mask,
++                **kwargs,
++            )
++        if inference_context is not None:
++            raise ValueError("Inkling2 loop does not support Megatron's KV-cache inference")
++        if not (self.pre_process and self.post_process):
++            raise ValueError("Inkling2 loop requires the whole decoder on one pipeline stage")
++        hidden = self.config.hidden_size
++        run = lambda layer, h, bank=None, queries=None: self._run_layer(  # noqa: E731
++            layer, h, bank, queries, attention_mask, packed_seq_params, padding_mask
++        )
++        # Hybrid layer 2 * i is block i's attention and 2 * i + 1 its MoE.
++        core_lo, core_hi = 2 * self.loop_core_start, 2 * self.loop_core_end
++        for layer in self.layers[:core_lo]:
++            hidden_states = run(layer, hidden_states)
++        prelude_state = hidden_states
++        # The packed state is [partial, *blocks]; entering the core seals the prelude's partial.
++        num_prelude_blocks = prelude_state.shape[-1] // hidden - 1
++        for pass_idx in range(self.loop_num_passes):
++            bank = None
++            if pass_idx:
++                partial, *blocks = hidden_states.split(hidden, dim=-1)
++                bank = (*blocks[num_prelude_blocks + 1 :], partial)
++                hidden_states = prelude_state
++            for offset, layer in enumerate(self.layers[core_lo:core_hi]):
++                queries = None
++                if bank is not None:
++                    attn_queries, mlp_queries = self._core_queries(offset // 2)
++                    queries = attn_queries if offset % 2 == 0 else mlp_queries
++                hidden_states = run(layer, hidden_states, bank, queries)
++        for layer in self.layers[core_hi:]:
++            hidden_states = run(layer, hidden_states)
++
++        if self.post_layer_norm:
++            hidden_states = self.final_norm(hidden_states)
++        return make_viewless_tensor(inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True)
+diff --git a/src/megatron/bridge/models/inkling/modeling_inkling2/spec.py b/src/megatron/bridge/models/inkling/modeling_inkling2/spec.py
+index f52f17a1d..a76064275 100644
+--- a/src/megatron/bridge/models/inkling/modeling_inkling2/spec.py
++++ b/src/megatron/bridge/models/inkling/modeling_inkling2/spec.py
+@@ -32,6 +32,7 @@ from megatron.bridge.models.inkling.modeling_inkling2.layers import (
+     Inkling2MoELayer,
+     Inkling2SiTU,
+ )
++from megatron.bridge.models.inkling.modeling_inkling2.loop import Inkling2LoopStack
+ 
+ 
+ def _with_situ_activation(builder):
+@@ -65,7 +66,7 @@ def build_inkling2_hybrid_stack_spec(config) -> ModuleSpec:
+         use_te=True, num_experts=config.num_moe_experts, moe_grouped_gemm=config.moe_grouped_gemm
+     )
+     return ModuleSpec(
+-        module=HybridStack,
++        module=Inkling2LoopStack if config.inkling2_loop_num_passes > 1 else HybridStack,
+         submodules=HybridStackSubmodules(
+             attention_layer=ModuleSpec(
+                 module=Inkling2AttentionLayer,

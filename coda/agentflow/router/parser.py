@@ -39,7 +39,7 @@ from coda.agentflow.multimodal import (
     has_images,
     replace_images_with_hashes,
 )
-from coda.agentflow.tokenizer_manager import DEFAULT_THINK_TAGS
+from coda.agentflow.tokenizer_manager import DEEPSEEK_MODEL_FAMILIES, DEFAULT_THINK_TAGS
 from coda.agentflow.trajectory_store import (
     Segment,
     Trajectory,
@@ -138,6 +138,38 @@ def _detect_parser_names(tokenizer: Any) -> tuple[str | None, str | None]:
         match_rules(ctx, REASONING_PARSER_RULES, "reasoning parser"),
         match_rules(ctx, TOOL_CALL_PARSER_RULES, "tool-call parser"),
     )
+
+
+def _special_token_strings(tokenizer: Any) -> set[str]:
+    """Tokens that ``skip_special_tokens=True`` drops from decoded text."""
+    specials = set(getattr(tokenizer, "all_special_tokens", None) or ())
+    for added in (getattr(tokenizer, "added_tokens_decoder", None) or {}).values():
+        if getattr(added, "special", False):
+            specials.add(added.content)
+    return specials
+
+
+def _parser_markers_are_special(
+    tokenizer: Any,
+    reasoning_parser: "ReasoningParser | None",
+    tool_call_parser_name: str | None,
+) -> bool:
+    """Whether a parser's framing markers are special tokens, so SGLang must keep them in the text."""
+    if tokenizer is None:
+        return False
+    markers: list[str] = []
+    if reasoning_parser is not None:
+        detector = reasoning_parser.detector
+        markers += [detector.think_start_token, detector.think_end_token]
+    if tool_call_parser_name is not None:
+        detector = FunctionCallParser(tools=_SENTINEL_TOOLS, tool_call_parser=tool_call_parser_name).detector
+        # Detectors name their markers bot_token / eot_token or tool_call_start_token / tool_call_end_token.
+        markers += [
+            getattr(detector, attr, "")
+            for attr in ("bot_token", "eot_token", "tool_call_start_token", "tool_call_end_token")
+        ]
+    specials = _special_token_strings(tokenizer)
+    return any(marker and marker in specials for marker in markers)
 
 
 def _resolve_parser_name(
@@ -476,6 +508,19 @@ class TrajectoryParser:
             ReasoningParser(model_type=self._reasoning_parser_name, stream_reasoning=False)
             if self._reasoning_parser_name else None
         )
+        # SGLang's detokenizer drops special tokens by default. Keep them when the parsers
+        # frame on special tokens (Inkling's content blocks); Qwen-style <think> tags are
+        # plain tokens and survive either way. DeepSeek-V4/V4.1 keep their model-family rule.
+        self.keep_special_tokens: bool = (
+            self.model_family in DEEPSEEK_MODEL_FAMILIES
+            or _parser_markers_are_special(
+                getattr(tokenizer_manager, "tokenizer", None),
+                self._reasoning_parser,
+                self._tool_call_parser_name,
+            )
+        )
+        if self.keep_special_tokens:
+            logger.info("Parser markers are special tokens; requesting skip_special_tokens=False")
         # Built on demand for generations that carry only the think end tag.
         self._forced_reasoning_parser: ReasoningParser | None = None
 

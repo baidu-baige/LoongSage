@@ -1,8 +1,8 @@
 diff --git a/megatron/core/models/gpt/experimental_attention_variant_module_specs.py b/megatron/core/models/gpt/experimental_attention_variant_module_specs.py
-index 37ce266..4edd051 100644
+index d333aa553..028951ea1 100644
 --- a/megatron/core/models/gpt/experimental_attention_variant_module_specs.py
 +++ b/megatron/core/models/gpt/experimental_attention_variant_module_specs.py
-@@ -170,6 +170,14 @@ def get_experimental_attention_variant_module_spec(
+@@ -176,6 +176,14 @@ def get_experimental_attention_variant_module_spec(
          return get_dsa_module_spec_for_backend(config=config, backend=backend)
      elif config.experimental_attention_variant == "dsv4_hybrid":
          return get_dsv4_hybrid_module_spec_for_backend(config=config, backend=backend)
@@ -18,7 +18,7 @@ index 37ce266..4edd051 100644
          raise ValueError(
              f"Invalid experimental attention variant: {config.experimental_attention_variant}"
 diff --git a/megatron/core/tensor_parallel/mappings.py b/megatron/core/tensor_parallel/mappings.py
-index eaed823..9b615b1 100644
+index eaed82318..9b615b142 100644
 --- a/megatron/core/tensor_parallel/mappings.py
 +++ b/megatron/core/tensor_parallel/mappings.py
 @@ -222,6 +222,32 @@ class _CopyToModelParallelRegion(torch.autograd.Function):
@@ -74,10 +74,10 @@ index eaed823..9b615b1 100644
  
  
 diff --git a/megatron/core/transformer/experimental_attention_variant/csa_utils/fused_sparse_attention.py b/megatron/core/transformer/experimental_attention_variant/csa_utils/fused_sparse_attention.py
-index c28f28d..47663ca 100644
+index 5bc45a4bc..725c3386f 100644
 --- a/megatron/core/transformer/experimental_attention_variant/csa_utils/fused_sparse_attention.py
 +++ b/megatron/core/transformer/experimental_attention_variant/csa_utils/fused_sparse_attention.py
-@@ -680,7 +680,7 @@ def _ensure_flash_mla():
+@@ -681,7 +681,7 @@ def _ensure_flash_mla():
      except ImportError as e:
          raise ImportError(
              "FlashMLA is required for DSA sparse attention forward. "
@@ -86,7 +86,7 @@ index c28f28d..47663ca 100644
              "so that `from flash_mla import flash_mla_sparse_fwd` succeeds."
          ) from e
      _flash_mla_sparse_fwd = _fwd
-@@ -721,9 +721,9 @@ def _csa_fwd_flash_mla(
+@@ -722,9 +722,9 @@ def _csa_fwd_flash_mla(
      Accepts flat (unbatched) tensors with global indices; pads ``TopK`` to
      the GPU-specific alignment; returns ``(out, lse, lse_indexer)``.
      """
@@ -99,7 +99,7 @@ index c28f28d..47663ca 100644
      _ensure_flash_mla()
  
      _total_S_q, actual_num_heads, _D = q.shape
-@@ -748,7 +748,9 @@ def _csa_fwd_flash_mla(
+@@ -749,7 +749,9 @@ def _csa_fwd_flash_mla(
              attn_sink = attn_sink_padded
  
      with torch.cuda.nvtx.range("flash_mla_sparse_fwd"):
@@ -110,7 +110,7 @@ index c28f28d..47663ca 100644
              q,
              kv_3d,
              indices,
-@@ -756,27 +758,14 @@ def _csa_fwd_flash_mla(
+@@ -757,27 +759,14 @@ def _csa_fwd_flash_mla(
              d_v=d_v,
              attn_sink=attn_sink,
              topk_length=topk_length,
@@ -141,10 +141,10 @@ index c28f28d..47663ca 100644
  
  
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsa_cudnn_kernels.py b/megatron/core/transformer/experimental_attention_variant/dsa_cudnn_kernels.py
-index 3a9186a..803de09 100644
+index 11c42045f..7946d543b 100644
 --- a/megatron/core/transformer/experimental_attention_variant/dsa_cudnn_kernels.py
 +++ b/megatron/core/transformer/experimental_attention_variant/dsa_cudnn_kernels.py
-@@ -388,7 +388,7 @@ def _ensure_flash_mla() -> None:
+@@ -416,7 +416,7 @@ def _ensure_flash_mla() -> None:
      except ImportError as e:
          raise ImportError(
              "FlashMLA is required for DSA sparse attention forward. "
@@ -153,7 +153,7 @@ index 3a9186a..803de09 100644
              "so that `from flash_mla import flash_mla_sparse_fwd` succeeds."
          ) from e
      _flash_mla_sparse_fwd = _fwd
-@@ -1149,7 +1149,7 @@ def _dsa_fwd_flash_mla(
+@@ -1177,7 +1177,7 @@ def _dsa_fwd_flash_mla(
              d_v=d_v,
              attn_sink=attn_sink,
              topk_length=topk_length,
@@ -164,7 +164,7 @@ index 3a9186a..803de09 100644
      if padded_num_heads != actual_num_heads:
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/deepseek_v41.py b/megatron/core/transformer/experimental_attention_variant/dsv41/deepseek_v41.py
 new file mode 100644
-index 0000000..0520cd8
+index 000000000..0520cd8b0
 --- /dev/null
 +++ b/megatron/core/transformer/experimental_attention_variant/dsv41/deepseek_v41.py
 @@ -0,0 +1,732 @@
@@ -902,7 +902,7 @@ index 0000000..0520cd8
 +    return block_spec
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/dsa_topk.py b/megatron/core/transformer/experimental_attention_variant/dsv41/dsa_topk.py
 new file mode 100644
-index 0000000..ed1b7c5
+index 000000000..ed1b7c544
 --- /dev/null
 +++ b/megatron/core/transformer/experimental_attention_variant/dsv41/dsa_topk.py
 @@ -0,0 +1,59 @@
@@ -967,7 +967,7 @@ index 0000000..ed1b7c5
 +    return _FLASHINFER_TIE_BREAK_VALUES[mode]
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/engram.py b/megatron/core/transformer/experimental_attention_variant/dsv41/engram.py
 new file mode 100644
-index 0000000..feffa94
+index 000000000..feffa9453
 --- /dev/null
 +++ b/megatron/core/transformer/experimental_attention_variant/dsv41/engram.py
 @@ -0,0 +1,390 @@
@@ -1363,10 +1363,10 @@ index 0000000..feffa94
 +        return out
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/ops/__init__.py b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/__init__.py
 new file mode 100644
-index 0000000..e69de29
+index 000000000..e69de29bb
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/ops/compressor.py b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/compressor.py
 new file mode 100644
-index 0000000..c38c43d
+index 000000000..c38c43dae
 --- /dev/null
 +++ b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/compressor.py
 @@ -0,0 +1,37 @@
@@ -1409,7 +1409,7 @@ index 0000000..c38c43d
 +        return self.norm(kv.to(torch.bfloat16))
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/ops/cp_utils.py b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/cp_utils.py
 new file mode 100644
-index 0000000..5e612be
+index 000000000..5e612be4d
 --- /dev/null
 +++ b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/cp_utils.py
 @@ -0,0 +1,156 @@
@@ -1571,7 +1571,7 @@ index 0000000..5e612be
 +    return freqs_cis[start : start + seqlen_local : stride]
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/ops/hc_mix.py b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/hc_mix.py
 new file mode 100644
-index 0000000..583e622
+index 000000000..583e622db
 --- /dev/null
 +++ b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/hc_mix.py
 @@ -0,0 +1,197 @@
@@ -1774,7 +1774,7 @@ index 0000000..583e622
 +    return _Aggregate.apply(x, pre, n)
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/ops/indexer.py b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/indexer.py
 new file mode 100644
-index 0000000..4002415
+index 000000000..400241539
 --- /dev/null
 +++ b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/indexer.py
 @@ -0,0 +1,342 @@
@@ -2122,10 +2122,10 @@ index 0000000..4002415
 +        return idx, candidates
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/__init__.py b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/__init__.py
 new file mode 100644
-index 0000000..e69de29
+index 000000000..e69de29bb
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/act_quant.py b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/act_quant.py
 new file mode 100644
-index 0000000..eb6526b
+index 000000000..eb6526bf2
 --- /dev/null
 +++ b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/act_quant.py
 @@ -0,0 +1,137 @@
@@ -2268,7 +2268,7 @@ index 0000000..eb6526b
 +    return y, s
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/flashmla_sparse_mla.py b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/flashmla_sparse_mla.py
 new file mode 100644
-index 0000000..84a94d0
+index 000000000..84a94d044
 --- /dev/null
 +++ b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/flashmla_sparse_mla.py
 @@ -0,0 +1,123 @@
@@ -2397,7 +2397,7 @@ index 0000000..84a94d0
 +    return FlashMLASparseAttention.apply(q, kv, attn_sink, topk_idxs, sm_scale)
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/phased_blocks.py b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/phased_blocks.py
 new file mode 100644
-index 0000000..70ba9a6
+index 000000000..70ba9a65f
 --- /dev/null
 +++ b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/phased_blocks.py
 @@ -0,0 +1,79 @@
@@ -2482,7 +2482,7 @@ index 0000000..70ba9a6
 +    return out.view(*blocks.shape[:-1], width).view(torch.bool)
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/tilelang_indexer_fwd.py b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/tilelang_indexer_fwd.py
 new file mode 100644
-index 0000000..5e0efe5
+index 000000000..5e0efe5f8
 --- /dev/null
 +++ b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/tilelang_indexer_fwd.py
 @@ -0,0 +1,187 @@
@@ -2675,7 +2675,7 @@ index 0000000..5e0efe5
 +    return all_logits
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/tilelang_sparse_mla.py b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/tilelang_sparse_mla.py
 new file mode 100644
-index 0000000..44e3524
+index 000000000..44e352437
 --- /dev/null
 +++ b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/tilelang_sparse_mla.py
 @@ -0,0 +1,31 @@
@@ -2712,7 +2712,7 @@ index 0000000..44e3524
 +    return DeepSeekV4SparseAttention.apply(q, kv, attn_sink, topk_idxs, sm_scale)
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/tilelang_sparse_mla_bwd.py b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/tilelang_sparse_mla_bwd.py
 new file mode 100644
-index 0000000..c3b19a3
+index 000000000..c3b19a363
 --- /dev/null
 +++ b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/tilelang_sparse_mla_bwd.py
 @@ -0,0 +1,283 @@
@@ -3001,7 +3001,7 @@ index 0000000..c3b19a3
 +    return dq, dkv, d_attn_sink
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/tilelang_sparse_mla_fwd.py b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/tilelang_sparse_mla_fwd.py
 new file mode 100644
-index 0000000..e8a833a
+index 000000000..e8a833a58
 --- /dev/null
 +++ b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kernel/tilelang_sparse_mla_fwd.py
 @@ -0,0 +1,194 @@
@@ -3201,7 +3201,7 @@ index 0000000..e8a833a
 +    return out, lse
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kvnorm.py b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kvnorm.py
 new file mode 100644
-index 0000000..27816bf
+index 000000000..27816bff1
 --- /dev/null
 +++ b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/kvnorm.py
 @@ -0,0 +1,74 @@
@@ -3281,7 +3281,7 @@ index 0000000..27816bf
 +    return soft + (hard - soft).detach()
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/ops/norm.py b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/norm.py
 new file mode 100644
-index 0000000..613b017
+index 000000000..613b017fb
 --- /dev/null
 +++ b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/norm.py
 @@ -0,0 +1,25 @@
@@ -3312,7 +3312,7 @@ index 0000000..613b017
 +        return (self.weight * x).to(dtype)
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/ops/qat.py b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/qat.py
 new file mode 100644
-index 0000000..aad9371
+index 000000000..aad9371c8
 --- /dev/null
 +++ b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/qat.py
 @@ -0,0 +1,51 @@
@@ -3369,7 +3369,7 @@ index 0000000..aad9371
 +fp8_simulate_qat = DeepSeekV4LinearQATFunc.apply
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/ops/quant.py b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/quant.py
 new file mode 100644
-index 0000000..3535616
+index 000000000..353561604
 --- /dev/null
 +++ b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/quant.py
 @@ -0,0 +1,124 @@
@@ -3499,7 +3499,7 @@ index 0000000..3535616
 +    return _StraightThrough.apply(x, fake_quant_compressed_kv_forward)
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/ops/rope.py b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/rope.py
 new file mode 100644
-index 0000000..b2fd716
+index 000000000..b2fd7164f
 --- /dev/null
 +++ b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/rope.py
 @@ -0,0 +1,86 @@
@@ -3591,7 +3591,7 @@ index 0000000..b2fd716
 +    return _RotaryEmbInplace.apply(x, freqs_cis, rope_dim, inverse)
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/ops/rope_tables.py b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/rope_tables.py
 new file mode 100644
-index 0000000..97f8f56
+index 000000000..97f8f56ad
 --- /dev/null
 +++ b/megatron/core/transformer/experimental_attention_variant/dsv41/ops/rope_tables.py
 @@ -0,0 +1,97 @@
@@ -3694,7 +3694,7 @@ index 0000000..97f8f56
 +    return precompute_freqs_cis(**inputs, device=device)
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsv41/replay.py b/megatron/core/transformer/experimental_attention_variant/dsv41/replay.py
 new file mode 100644
-index 0000000..bcda5df
+index 000000000..bcda5dfa2
 --- /dev/null
 +++ b/megatron/core/transformer/experimental_attention_variant/dsv41/replay.py
 @@ -0,0 +1,22 @@
@@ -3721,10 +3721,10 @@ index 0000000..bcda5df
 +
 +indexer_replay_manager = _NoopIndexerReplayManager()
 diff --git a/megatron/core/transformer/moe/router.py b/megatron/core/transformer/moe/router.py
-index 929c5e7..8c1674c 100644
+index 4558bf68b..baf71bc92 100644
 --- a/megatron/core/transformer/moe/router.py
 +++ b/megatron/core/transformer/moe/router.py
-@@ -15,7 +15,7 @@ from megatron.core.tensor_observation import is_observing_tensor, observe_tensor
+@@ -17,7 +17,7 @@ from megatron.core.tensor_observation import is_observing_tensor, observe_tensor
  from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
      is_batch_invariant_mode_enabled,
  )
@@ -3733,7 +3733,7 @@ index 929c5e7..8c1674c 100644
  from megatron.core.transformer.moe.fused_a2a import HAVE_HYBRIDEP_DENSE_ROUTING
  from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
  from megatron.core.transformer.moe.moe_utils import (
-@@ -44,6 +44,39 @@ logger = logging.getLogger(__name__)
+@@ -46,6 +46,39 @@ logger = logging.getLogger(__name__)
  _HYBRIDEP_INT16_EXPERT_LIMIT = 1 << 15
  
  
@@ -3773,7 +3773,7 @@ index 929c5e7..8c1674c 100644
  @dataclass(frozen=True)
  class _AuxLossGroupConfig:
      """Process groups for local aux/seq-aux loss and its metric logging."""
-@@ -287,6 +320,28 @@ class TopKRouter(Router):
+@@ -289,6 +322,28 @@ class TopKRouter(Router):
              self.qb_histogram = None
              self.qb_bin_bounds = None
  
@@ -3802,7 +3802,7 @@ index 929c5e7..8c1674c 100644
          # Initialize global tokens per expert for global aux loss
          if self.get_aux_loss_coeff("global_aux_loss") > 0:
              self.register_buffer(
-@@ -1092,6 +1147,27 @@ class TopKRouter(Router):
+@@ -1100,6 +1155,27 @@ class TopKRouter(Router):
          routing_map = torch.zeros_like(logits, dtype=torch.bool).scatter(1, top_indices, True)
          return routing_probs, routing_map
  
@@ -3830,7 +3830,7 @@ index 929c5e7..8c1674c 100644
      def routing(
          self,
          logits: torch.Tensor,
-@@ -1149,6 +1225,7 @@ class TopKRouter(Router):
+@@ -1157,6 +1233,7 @@ class TopKRouter(Router):
                  "Hash routing requires a layer number. Construct the router through MoELayer "
                  "or call set_layer_number() before routing."
              )
@@ -3838,7 +3838,7 @@ index 929c5e7..8c1674c 100644
          if self.is_hash_layer:
              assert input_ids is not None, (
                  "input_ids is required for hash-based routing. Pass token IDs through "
-@@ -1188,6 +1265,10 @@ class TopKRouter(Router):
+@@ -1196,6 +1273,10 @@ class TopKRouter(Router):
                  if dense_output and fused
                  else None
              )
@@ -3849,7 +3849,7 @@ index 929c5e7..8c1674c 100644
              probs, routing_map = topk_routing_with_score_function(
                  logits,
                  self.topk,
-@@ -1196,7 +1277,7 @@ class TopKRouter(Router):
+@@ -1204,7 +1285,7 @@ class TopKRouter(Router):
                  group_topk=self.config.moe_router_group_topk,
                  scaling_factor=self.config.moe_router_topk_scaling_factor,
                  score_function=self.score_function,
@@ -3858,7 +3858,7 @@ index 929c5e7..8c1674c 100644
                  fused=fused,
                  router_replay=self.router_replay,
                  qb_histogram=self.qb_histogram if accumulate_qb_histogram else None,
-@@ -1297,8 +1378,12 @@ class TopKRouter(Router):
+@@ -1310,8 +1391,12 @@ class TopKRouter(Router):
                      with_padding_mask=padding_mask is not None,
                  )
  
@@ -3874,10 +3874,10 @@ index 929c5e7..8c1674c 100644
          return probs, routing_map
  
 diff --git a/megatron/core/transformer/transformer_config.py b/megatron/core/transformer/transformer_config.py
-index 6f16f80..aaead6d 100644
+index d6b5c5cf5..090e558af 100644
 --- a/megatron/core/transformer/transformer_config.py
 +++ b/megatron/core/transformer/transformer_config.py
-@@ -384,7 +384,7 @@ class TransformerConfig(ModelParallelConfig):
+@@ -469,7 +469,7 @@ class TransformerConfig(ModelParallelConfig):
      # attention variant
      ####################
      experimental_attention_variant: Optional[
@@ -3886,7 +3886,7 @@ index 6f16f80..aaead6d 100644
      ] = None
      """Type of experimental attention variant to use.
  
-@@ -2471,13 +2471,13 @@ class TransformerConfig(ModelParallelConfig):
+@@ -2981,13 +2981,13 @@ class TransformerConfig(ModelParallelConfig):
              if self.cp_partition_mode == "contiguous":
                  if (
                      self.multi_latent_attention
@@ -3902,7 +3902,7 @@ index 6f16f80..aaead6d 100644
                      is_gated_delta_net_variant(self.experimental_attention_variant)
                  ):
                      raise ValueError(
-@@ -2500,7 +2500,7 @@ class TransformerConfig(ModelParallelConfig):
+@@ -3010,7 +3010,7 @@ class TransformerConfig(ModelParallelConfig):
                          "experimental_attention_variant='gdn2', which supports only headwise CP."
                      )
              elif self.cp_partition_mode == "zigzag":
@@ -3911,7 +3911,7 @@ index 6f16f80..aaead6d 100644
                      raise ValueError(
                          "DSv4 Hybrid with context parallelism requires "
                          "cp_partition_mode='contiguous'."
-@@ -2898,6 +2898,27 @@ class TransformerConfig(ModelParallelConfig):
+@@ -3425,6 +3425,27 @@ class TransformerConfig(ModelParallelConfig):
                              "build or set dsa_kernel_backend='none'."
                          )
  
@@ -3936,10 +3936,10 @@ index 6f16f80..aaead6d 100644
 +            assert not self.qk_clip, "QK clipping is not supported with DSv4.1 Hybrid Attention."
 +            self.hetereogenous_dist_checkpoint = True
 +
-         if self.gdn_pre_gated_delta_rule_fusion and self.experimental_attention_variant == "kda":
-             raise NotImplementedError(
-                 "gdn_pre_gated_delta_rule_fusion is not implemented for KDA yet."
-@@ -6339,7 +6360,7 @@ class MLATransformerConfig(TransformerConfig):
+         if self.gdn_pre_gated_delta_rule_fusion and self.experimental_attention_variant not in (
+             "gdn",
+             "kda",
+@@ -7074,7 +7095,7 @@ class MLATransformerConfig(TransformerConfig):
              )
  
          # DSv4 hybrid: derive qk_head_dim and kv_lora_rank from v_head_dim and qk_pos_emb_head_dim.
@@ -3948,7 +3948,7 @@ index 6f16f80..aaead6d 100644
              assert (
                  not self.mla_down_proj_fusion
              ), "MLA down projection fusion must be disabled for DSv4 hybrid mode."
-@@ -6361,10 +6382,17 @@ class MLATransformerConfig(TransformerConfig):
+@@ -7096,10 +7117,17 @@ class MLATransformerConfig(TransformerConfig):
                  "DSv4 hybrid mode is enabled, deriving qk_head_dim and kv_lora_rank from "
                  "v_head_dim and qk_pos_emb_head_dim",
              )
