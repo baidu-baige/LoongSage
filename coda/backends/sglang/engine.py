@@ -12,7 +12,7 @@ import time
 from typing import override
 
 import requests
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, ListConfig, OmegaConf
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.auth import admin_auth_headers
@@ -356,6 +356,9 @@ def _compute_server_args(
         kwargs["prefill_round_robin_balance"] = True
 
     for key, value in engine_args.items():
+        # Nested sglang_args (e.g. engram_config) arrive as OmegaConf nodes; ServerArgs wants plain dicts/lists.
+        if isinstance(value, (DictConfig, ListConfig)):
+            value = OmegaConf.to_container(value, resolve=True)
         kwargs[key] = value
 
     # sglang_args is a verbatim ServerArgs passthrough and may carry api_key.

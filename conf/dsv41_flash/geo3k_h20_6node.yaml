@@ -47,8 +47,6 @@ data_source:
 
 rollout:
   env_vars:
-    SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE: "1"
-    SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT: "per_rank"
     SGLANG_DSV4_FP4_EXPERTS: "1"        # MXFP4 routed experts (flashinfer_mxfp4 CUTLASS, W4A16 on SM90)
     SGLANG_SHARED_EXPERT_TP1: "1"       # shared experts unsharded: 2304/16 is not 32-block aligned
     SGLANG_OPT_FP8_WO_A_GEMM: "0"       # no-op for 32x32 blocks (wo_a -> bf16); guard checked by the QAT adapter
@@ -60,6 +58,8 @@ rollout:
   retry_limit: 3
   num_gpus_per_node: 8
   sglang_args:
+    # Engram tables in pinned host memory, one shard per rank (the old ENGRAM_HOST_TABLE=1, LAYOUT=per_rank).
+    engram_config: {placement: cpu}
     image_processor_backend: pil                # same patchify as the Router, see doc 4.3
     moe_runner_backend: flashinfer_mxfp4        # the backend with the in-place MXFP4 hot update
     flashinfer_mxfp4_moe_precision: bf16        # W4A16 (QAT does not model expert act quant)
