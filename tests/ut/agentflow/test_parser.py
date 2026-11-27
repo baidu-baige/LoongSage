@@ -22,6 +22,7 @@ pytest.importorskip(
 )
 
 from coda.agentflow.router.parser import (
+    LLMGenerateResponse,
     TrajectoryParser,
     TurnInputContext,
     decode_generate_body,
@@ -403,6 +404,7 @@ def test_parser_sampling_params_keep_special_tokens_only_for_deepseek_v4(
         MagicMock(),
         config=SimpleNamespace(
             trainer=SimpleNamespace(temperature=1.0),
+            algorithm=SimpleNamespace(score_centering=SimpleNamespace(enable=False, topk=128)),
             rollout=SimpleNamespace(eval=SimpleNamespace(temperature=None)),
         ),
         trajectory_store=TrajectoryStore(),
@@ -439,6 +441,7 @@ def test_parser_owns_temperature(
         MagicMock(),
         config=SimpleNamespace(
             trainer=SimpleNamespace(temperature=1.0),
+            algorithm=SimpleNamespace(score_centering=SimpleNamespace(enable=False, topk=128)),
             rollout=SimpleNamespace(
                 eval=SimpleNamespace(temperature=eval_temperature)
             ),
@@ -478,6 +481,7 @@ def test_responses_context_limited_length_triggers_compaction_retry() -> None:
         MagicMock(),
         config=SimpleNamespace(
             trainer=SimpleNamespace(temperature=1.0),
+            algorithm=SimpleNamespace(score_centering=SimpleNamespace(enable=False, topk=128)),
             rollout=SimpleNamespace(eval=SimpleNamespace(temperature=None)),
         ),
         trajectory_store=store,
@@ -698,6 +702,130 @@ def test_append_routed_experts_grows_buffer_in_place() -> None:
     merged = trajectory.rollout_routed_experts
     assert merged.untyped_storage().data_ptr() == first.untyped_storage().data_ptr()
     assert merged[:, 0].tolist() == [0] * 7 + [1, 1, 2, 2]
+
+
+def _topk_middleware(enable: bool, topk: int = 2) -> ParserMiddleware:
+    return ParserMiddleware(
+        MagicMock(),
+        config=SimpleNamespace(
+            trainer=SimpleNamespace(temperature=1.0),
+            algorithm=SimpleNamespace(score_centering=SimpleNamespace(enable=enable, topk=topk)),
+            rollout=SimpleNamespace(eval=SimpleNamespace(temperature=None)),
+        ),
+        trajectory_store=TrajectoryStore(),
+        tokenizer_manager=SimpleNamespace(),
+    )
+
+
+@pytest.mark.parametrize(("enable", "is_eval", "expected"), [(True, False, 2), (True, True, None), (False, False, None)])
+def test_generate_body_requests_top_logprobs_on_training_turns_only(enable, is_eval, expected) -> None:
+    middleware = _topk_middleware(enable)
+    payload = json.loads(
+        middleware._build_generate_body([101], request_id="req-0", max_new_tokens=16, is_eval=is_eval)
+    )
+    assert payload.get("top_logprobs_num") == expected
+    assert payload.get("return_flat_raw_output_top_logprobs") is (True if expected else None)
+    assert payload.get("return_flat_raw_top_logprobs_b64") is (True if expected else None)
+    assert middleware.parser.rollout_top_logprobs_num == (2 if enable else 0)
+
+
+def _flat_top_logprobs(ids: list[list[int]], log_probs: list[list[float]], null_prefix: int = 0) -> dict:
+    """SGLang's flat base64 output top log-prob fields for the given [rows, k] arrays."""
+    return {
+        "output_top_logprobs_val_flat_b64": _b64(torch.tensor(log_probs, dtype=torch.float32)),
+        "output_top_logprobs_idx_flat_b64": _b64(torch.tensor(ids, dtype=torch.int32)),
+        "output_top_logprobs_val_flat_b64_dtype": "float32",
+        "output_top_logprobs_idx_flat_b64_dtype": "int32",
+        "output_top_logprobs_shape": [len(ids), len(ids[0]) if ids else 0],
+        "output_top_logprobs_null_prefix": null_prefix,
+    }
+
+
+def test_decode_generate_body_decodes_flat_top_logprobs() -> None:
+    body = json.dumps({
+        "text": "hi",
+        "meta_info": {
+            "weight_version": "1",
+            "output_token_logprobs": [[-0.1, 101, None], [-0.2, 102, None]],
+            **_flat_top_logprobs([[101, 7], [102, 8]], [[-0.1, -2.5], [-0.2, -1.9]]),
+        },
+    }).encode()
+
+    response_json, _ = decode_generate_body(body, routed_experts_start_len=0, r3_enabled=False)
+
+    assert not any(key.startswith("output_top_logprobs") for key in response_json["meta_info"])
+    payload, _, _ = make_parser(r3_enabled=False).build_assistant_message(response_json)
+    assert payload.topk_ids.dtype == torch.int32 and payload.topk_log_probs.dtype == torch.float32
+    assert payload.topk_ids.tolist() == [[101, 7], [102, 8]]
+    assert torch.allclose(payload.topk_log_probs, torch.tensor([[-0.1, -2.5], [-0.2, -1.9]]))
+
+
+def test_decode_generate_body_rejects_flat_top_logprobs_null_prefix() -> None:
+    body = json.dumps({
+        "text": "hi",
+        "meta_info": {
+            "weight_version": "1",
+            "output_token_logprobs": [[-0.1, 101], [-0.2, 102]],
+            **_flat_top_logprobs([[102, 8]], [[-0.2, -1.9]], null_prefix=1),
+        },
+    }).encode()
+    with pytest.raises(ValueError, match="1 leading positions without a row"):
+        decode_generate_body(body, routed_experts_start_len=0, r3_enabled=False)
+
+
+def test_build_assistant_message_rejects_top_logprobs_length_mismatch() -> None:
+    body = json.dumps({
+        "text": "hi",
+        "meta_info": {
+            "weight_version": "1",
+            "output_token_logprobs": [[-0.1, 101], [-0.2, 102]],
+            **_flat_top_logprobs([[101]], [[-0.1]]),
+        },
+    }).encode()
+    response_json, _ = decode_generate_body(body, routed_experts_start_len=0, r3_enabled=False)
+    with pytest.raises(ValueError, match="output top logprobs have 1 rows for 2 response tokens"):
+        make_parser(r3_enabled=False).build_assistant_message(response_json)
+
+
+def _topk_payload(ids: list[list[int]]) -> LLMGenerateResponse:
+    topk_ids = torch.tensor(ids, dtype=torch.int32)
+    return LLMGenerateResponse(
+        generated_text="", response_ids=[row[0] for row in ids], logprobs=[-0.1] * len(ids), weight_version=0,
+        topk_ids=topk_ids, topk_log_probs=-topk_ids.float(),
+    )
+
+
+def test_append_rollout_topk_fills_non_llm_rows() -> None:
+    """Tool-output rows added before a response get id -1 / log-prob 0.0, keeping rows aligned."""
+    parser = make_parser(r3_enabled=False)
+    parser.rollout_top_logprobs_num = 2
+    trajectory = Trajectory(trajectory_id="traj-topk", prompt_id="p", rollout_log_probs=[-0.1, -0.1])
+    parser._append_rollout_topk(trajectory, _topk_payload([[1, 2], [3, 4]]))
+    # Turn 2: one tool-output token, then a one-token response.
+    trajectory.rollout_log_probs.extend([0.0, -0.1])
+    parser._append_rollout_topk(trajectory, _topk_payload([[5, 6]]))
+
+    assert trajectory.rollout_topk_ids.tolist() == [[1, 2], [3, 4], [-1, -1], [5, 6]]
+    assert trajectory.rollout_topk_log_probs[2].tolist() == [0.0, 0.0]
+    assert trajectory.rollout_topk_ids.size(0) == len(trajectory.rollout_log_probs)
+
+
+def test_update_trajectory_rejects_missing_top_logprobs_before_writing() -> None:
+    """A turn without its top-k rows must fail before tokens / log-probs are appended."""
+    parser = make_parser(r3_enabled=False)
+    parser.rollout_top_logprobs_num = 2
+    trajectory = Trajectory(trajectory_id="traj-topk", prompt_id="p", status=TrajectoryStatus.GENERATING)
+    parser.trajectory_store.add(trajectory.trajectory_id, trajectory)
+    turn_ctx = TurnInputContext(
+        delta_prompt_ids=[1, 2], input_ids=[1, 2], start_new_segment=True, raw_new_messages=[],
+    )
+    payload = LLMGenerateResponse(generated_text="", response_ids=[3], logprobs=[-0.1], weight_version=0)
+
+    with pytest.raises(ValueError, match="no output top logprobs"):
+        parser.update_trajectory(trajectory, turn_ctx, payload, {"role": "assistant", "content": ""})
+
+    stored = parser.trajectory_store.get([trajectory.trajectory_id])[trajectory.trajectory_id][-1]
+    assert len(stored.tokens) == 0 and len(stored.rollout_log_probs) == 0
 
 
 def test_build_assistant_message_decodes_weight_version() -> None:
@@ -1181,6 +1309,38 @@ def test_prune_last_response_think_preserves_existing_loss_mask_slice() -> None:
     assert trajectory.loss_masks == [0, 1]
     assert trajectory.rollout_weight_versions == [2, 2]
     assert trajectory.segments[0].triplets[0].logprob_end == 2
+
+
+def test_prune_last_response_think_keeps_rollout_topk_aligned() -> None:
+    parser = make_parser(r3_enabled=False)
+    parser.think_end_ids = [99]
+    trajectory = Trajectory(
+        trajectory_id="traj-prune-topk",
+        prompt_id="prompt-0",
+        tokens=[10, 11, 1, 2, 99, 3, 4],
+        loss_masks=[1] * 5,
+        rollout_log_probs=[-0.1, -0.2, -0.3, -0.4, -0.5],
+        rollout_weight_versions=[1] * 5,
+        rollout_topk_ids=torch.arange(10, dtype=torch.int32).reshape(5, 2),
+        rollout_topk_log_probs=-torch.arange(10, dtype=torch.float32).reshape(5, 2),
+        segments=[
+            Segment(
+                token_start=0,
+                token_end=7,
+                logprob_start=0,
+                logprob_end=5,
+                triplets=[
+                    Triplet(token_start=0, token_end=7, logprob_start=0, logprob_end=5),
+                ],
+            )
+        ],
+    )
+
+    asyncio.run(parser._prune_last_response_think(trajectory))
+
+    # Response [1, 2, 99, 3, 4] keeps its answer [3, 4]: response rows 3 and 4.
+    assert trajectory.rollout_topk_ids.tolist() == [[6, 7], [8, 9]]
+    assert trajectory.rollout_topk_log_probs.size(0) == len(trajectory.rollout_log_probs) == 2
 
 
 def make_prefix_parser():

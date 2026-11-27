@@ -148,6 +148,8 @@ def put_dp_shards_to_ray(dp_traj_groups_list: list[list[TrajectoryGroup]], dp_si
         response_lengths: list[int] = []
         total_lengths: list[int] = []
         rollout_routed_experts: list[torch.Tensor | None] = []
+        rollout_topk_ids: list[torch.Tensor | None] = []
+        rollout_topk_log_probs: list[torch.Tensor | None] = []
         multimodal_train_inputs: list[list[str] | None] = []
         image_table: dict[str, dict[str, torch.Tensor]] = {}
         metadata: list[dict] = []
@@ -182,6 +184,12 @@ def put_dp_shards_to_ray(dp_traj_groups_list: list[list[TrajectoryGroup]], dp_si
                     token_rewards.append(traj_token_rewards[ls:le].clone())
                     rollout_routed_experts.append(
                         traj_experts[ts:te].clone() if traj_experts is not None else None
+                    )
+                    rollout_topk_ids.append(
+                        traj.rollout_topk_ids[ls:le].clone() if traj.rollout_topk_ids is not None else None
+                    )
+                    rollout_topk_log_probs.append(
+                        traj.rollout_topk_log_probs[ls:le].clone() if traj.rollout_topk_log_probs is not None else None
                     )
                     # Hashes of the images whose pad run lies in this Segment's token span (None if none);
                     # their tensors go into the shard's `image_table`. Raises if the Segment's pad
@@ -224,6 +232,16 @@ def put_dp_shards_to_ray(dp_traj_groups_list: list[list[TrajectoryGroup]], dp_si
                 "Omitting rollout_routed_experts for DP shard because %d/%d Segments have no R3 data",
                 sum(experts is None for experts in rollout_routed_experts),
                 len(rollout_routed_experts),
+            )
+        # Rollout top-k log-probs (score centering), response-space rows; numpy for Ray zero-copy as R3.
+        if rollout_topk_ids and all(ids is not None for ids in rollout_topk_ids):
+            rollout_data["rollout_topk_ids"] = [t.numpy() for t in rollout_topk_ids]
+            rollout_data["rollout_topk_log_probs"] = [t.numpy() for t in rollout_topk_log_probs]
+        elif any(ids is not None for ids in rollout_topk_ids):
+            logger.warning(
+                "Omitting rollout top-k for DP shard because %d/%d Segments have no top-k data",
+                sum(ids is None for ids in rollout_topk_ids),
+                len(rollout_topk_ids),
             )
         ref: ray.ObjectRef = ray.put(rollout_data)
         rollout_data_refs.append(Box(ref))
@@ -305,4 +323,8 @@ def get_dp_shard_from_ray(rollout_data_ref: Box) -> dict[str, Any]:
     }
     if "rollout_routed_experts" in data:
         result["rollout_routed_experts"] = data["rollout_routed_experts"]
+    if "rollout_topk_ids" in data:
+        result["rollout_topk_ids"] = data["rollout_topk_ids"]
+    if "rollout_topk_log_probs" in data:
+        result["rollout_topk_log_probs"] = data["rollout_topk_log_probs"]
     return result
