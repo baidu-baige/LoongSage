@@ -1,30 +1,29 @@
 # @package _global_
-# Qwen3.8-27B mini-swe / R2E-Gym on two 8-GPU H20 nodes (colocated rollout + training).
+# Inkling-2-Mini mini-swe / R2E-Gym on a single 8-GPU H20 node (colocated rollout + training), text only, BF16.
 #
-# 1. Download the model and dataset:
-#      hf download Qwen/Qwen3.8-27B --local-dir /root/Qwen3.8-27B
+# 1. Download the model and dataset, then dequantize the NVFP4/MXFP8 experts to BF16 so training
+#    and rollout read the same weights:
+#      hf download thinkingmachines/Inkling-2-Mini --local-dir /root/Inkling-2-Mini
 #      hf download R2E-Gym/R2E-Gym-Subset --repo-type=dataset --local-dir /root/R2E-Gym-Subset
+#      python examples/convert_inkling2_to_bf16.py --model-dir /root/Inkling-2-Mini --save-dir /root/Inkling-2-Mini-BF16
 #
 # 2. Prepare the kubeconfig of the K8s sandbox used for SWE rollouts at k8s/kubeconfig.yaml, or
 #    override data_source.sandbox.kubeconfig on the command line.
 #
-# 3. Start a Ray cluster spanning both machines. Run the same command on each machine; the script
-#    starts the head on <master-ip> and joins the other machine as a worker:
-#      bash examples/start_ray_cluster.sh <master-ip>
-#
-# 4. Once both nodes have joined (`ray status` shows 16 GPUs), launch on the head node only:
-#      bash examples/start.sh qwen3.8_27b/swe_h20_2node \
-#        hf_model_path=/root/Qwen3.8-27B \
+# 3. Launch with those paths:
+#      bash examples/start.sh inkling2_mini/swe_h20_1node \
+#        hf_model_path=/root/Inkling-2-Mini-BF16 \
 #        data_source.dataset.prompt_data_path=/root/R2E-Gym-Subset
 #
-#    Both machines load the model, so hf_model_path must exist at the same path on each (local copies or a shared filesystem).
+# The looped core (blocks 6-17 run 3 times) needs the whole decoder on one stage: PP must be 1.
+# Rollout routing replay (R3) is not supported: SGLang's Inkling2 MoE does not capture routed experts.
 defaults:
   - /default
   - _self_
 
 checkpoint_path: "./checkpoints"
 hf_model_path: ???
-colocate: true    # must be false in fully-async mode
+colocate: true
 total_steps: 300
 log_level: INFO
 
@@ -60,11 +59,11 @@ rollout:
   retry_limit: 5
   num_gpus_per_node: 8
   sglang_args:
-    mem_fraction_static: 0.8
+    mem_fraction_static: 0.5
     disable_cuda_graph: false
   sglang_replicas:
     regular:
-      num_nodes: 2
+      num_nodes: 1
       num_gpus_per_replica: 4
   sampler:
     timeout: 10800
@@ -74,25 +73,29 @@ agentflow:
   dump_trajectory_path: "log/trajectories"
   router:
     proxy_timeout_seconds: 1800
-  tokenizer:
-    generation_prompt_kwargs:
-      enable_thinking: true
+    middleware:
+      parser:
+        # Inkling's template matches no auto-detection rule (SGLang sets these in its model override).
+        reasoning_parser: inkling
+        tool_call_parser: inkling2
 
 trainer:
   num_gpus_per_node: 8
-  num_nodes: 2
+  num_nodes: 1
   mini_batch_size: 128
-  max_tokens_per_gpu: 20480
   use_dynamic_batch_size: true
-  use_fp32_lm_head: true
+  max_tokens_per_gpu: 20480
 
 megatron:
   model:
     tensor_model_parallel_size: 4
-    pipeline_model_parallel_size: 2
+    pipeline_model_parallel_size: 1
+    expert_model_parallel_size: 8
     context_parallel_size: 2
-    mtp_num_layers: null
-    attention_backend: flash
+    expert_tensor_parallel_size: 1  # Bridge's Inkling2 rejects anything else, including null
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 1
   optimizer:
     lr: 1.0e-6
     optimizer_cpu_offload: true
