@@ -111,7 +111,7 @@ def compute_approx_kl(
         diff = log_probs - ref_log_probs
         kl = 0.5 * diff * diff
     elif kl_type == "k3":
-        ratio = ref_log_probs - log_probs
+        ratio = torch.clamp(ref_log_probs - log_probs, min=-20.0, max=20.0)
         kl = torch.exp(ratio) - ratio - 1.0
     else:
         raise ValueError(f"unknown kl_type: {kl_type!r}")
