@@ -61,7 +61,7 @@ def compute_opsm_mask(
 
         # Per-token drop mask: 1 where (advantage < 0 AND seq_kl > delta), else 0.
         mask = ((advantage < 0) & (seq_kl > delta)).float()
-        opsm_clipfrac += mask.sum() / torch.clamp_min(loss_mask.sum(), 1)
+        opsm_clipfrac += (mask * loss_mask).sum() / torch.clamp_min(loss_mask.sum(), 1)
 
         # Keep mask: 1 - drop mask.
         opsm_mask_list.append(1 - mask)

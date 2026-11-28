@@ -99,9 +99,11 @@ def apply_is_correction(
         num_tokens += mask_i.sum()
         if mask_i.any():
             num_seqs += 1
-        ratio = old_lp - rollout_lp
+        active = mask_i.bool()
+        ratio = torch.where(active, old_lp - rollout_lp, 0.0)
         sum_abs_log_prob_diff = (ratio.abs() * mask_i).sum()
-        per_token_kl = (torch.exp(ratio) - ratio - 1.0) * mask_i
+        ratio_safe = torch.clamp(ratio, min=-20.0, max=20.0)
+        per_token_kl = (torch.exp(ratio_safe) - ratio_safe - 1.0) * mask_i
         if loss_agg_mode == "seq-mean-token-mean":
             is_approx_k3_kl += per_token_kl.sum() / torch.clamp_min(mask_i.sum(), 1)
             logprob_abs_diff += sum_abs_log_prob_diff / torch.clamp_min(mask_i.sum(), 1)
